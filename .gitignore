@@ -1,0 +1,59 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+lerna-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+!.env.example
+
+# turbo
+.turbo
+
+# rust
+/target
+**/*.rs.bk
+
+# momotaro workspace state
+.momotaro/
+
+# research notes (not committed)
+/research/
+
+# node
+node_modules
+dist
+dist-ssr
+*.local
+coverage/
+.eslintcache
+.vite/
+.pnpm-store/
+
+# docusaurus
+docs/build/
+docs/.docusaurus/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Windows system files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# typescript
+*.tsbuildinfo

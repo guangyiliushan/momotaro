@@ -1,0 +1,12 @@
+[package]
+name = "momotaro-retrieve"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+momotaro-contracts.workspace = true
+tantivy.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

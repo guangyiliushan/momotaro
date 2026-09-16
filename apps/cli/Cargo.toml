@@ -1,0 +1,12 @@
+[package]
+name = "momotaro-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clap = { workspace = true }
+momotaro-run = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

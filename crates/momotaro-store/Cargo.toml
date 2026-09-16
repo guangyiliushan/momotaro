@@ -1,0 +1,12 @@
+[package]
+name = "momotaro-store"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+momotaro-contracts = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

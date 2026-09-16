@@ -1,0 +1,10 @@
+{
+  "name": "@momotaro/cli",
+  "version": "0.1.0",
+  "scripts": {
+    "test": "cargo test -p momotaro-cli --locked",
+    "dev": "cargo run -p momotaro-cli --",
+    "build": "cargo build -p momotaro-cli --release"
+  },
+  "private": true
+}

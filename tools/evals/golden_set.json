@@ -1,0 +1,17 @@
+{
+  "description": "Momotaro v0.2 retrieval golden set. Queries against crates/momotaro-run/tests/fixtures/vault. expected is a list of source_keys where at least one hit in top_k counts toward recall.",
+  "queries": [
+    { "query": "傅里叶变换", "expected": ["fourier.md"] },
+    { "query": "谱定理", "expected": ["long-mixed.md"] },
+    { "query": "PCA 方差", "expected": ["pca.md"] },
+    { "query": "Dirichlet 条件", "expected": ["fourier.md"] },
+    { "query": "正交对角化", "expected": ["long-mixed.md"] },
+    { "query": "特征值 特征向量", "expected": ["pca.md", "long-mixed.md"] },
+    { "query": "kernel", "expected": ["only-code.md"] },
+    { "query": "SVD 协方差", "expected": ["pca.md"] },
+    { "query": "QR 算法", "expected": ["long-mixed.md"] },
+    { "query": "explained variance", "expected": ["pca.md"] },
+    { "query": "雅可比方法", "expected": ["long-mixed.md"] },
+    { "query": "RBF kernel rust", "expected": ["only-code.md"] }
+  ]
+}
