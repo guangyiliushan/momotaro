@@ -438,6 +438,11 @@ pub fn index_workspace(
         let source_key = match source_key_for(&vault_root, &file) {
             Ok(key) => key,
             Err(error) => {
+                // Reachable codes here: `invalid_utf8`, `outside_vault`,
+                // `invalid_source_key` (see `IngestError::kind`). A non-UTF-8
+                // name cannot be created on Windows, so no portable test drives
+                // this arm; it stays correct by construction because the row's
+                // code is the typed kind's spelling, never a literal.
                 seq += 1;
                 let reason = error.kind().to_string();
                 let message = error.to_string();
@@ -528,7 +533,7 @@ pub fn index_workspace(
                     seq,
                     Some(&source_key),
                     "error",
-                    Some("other"),
+                    Some(&IndexFileErrorKind::Other.to_string()),
                     Some(&message),
                 ))?;
                 report.errors.push(file_error(

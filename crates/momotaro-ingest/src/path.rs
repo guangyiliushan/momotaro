@@ -213,15 +213,16 @@ mod tests {
         ];
         #[cfg(not(windows))]
         let windows_only: [&str; 0] = [];
-        let bad = [
+        let mut bad = vec![
             "/etc/passwd",
             "..",
             "../a.md",
             "a/../../b.md",
             "./../../b.md",
-        ]
-        .into_iter()
-        .chain(windows_only);
+        ];
+        // `extend` runs on both platforms, so `mut` is always used — the reason
+        // this is not an `.into_iter().chain(...)`.
+        bad.extend(windows_only);
         for value in bad {
             assert!(
                 matches!(

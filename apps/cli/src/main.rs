@@ -45,7 +45,8 @@ enum Command {
 
     /// Index Markdown notes into the local store and search index.
     Index {
-        /// Optional vault path override (defaults to momotaro.toml [vault].path).
+        /// Optional vault path override (defaults to `[vault].path` in
+        /// `momotaro.toml`).
         path: Option<PathBuf>,
     },
 

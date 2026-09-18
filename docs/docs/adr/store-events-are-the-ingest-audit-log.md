@@ -58,8 +58,11 @@ That is a truthful "latest" only while all three hold:
    `VACUUM INTO` into an archive file that stays canonical. This is D30's rule for
    `run_events` and `history_items`, applied here for the same reason: an audit
    log with holes is not an audit log.
-3. **No out-of-order imports** — an append is one transaction, in `seq` order. `occurred_at` may be older than the row before it (a replay, an import),
-   but `id` is insertion order and nothing rewrites it.
+3. **No out-of-order imports** — an append is one transaction. The API accepts
+   events in any order (a caller may hand a batch over in whatever sequence it
+   built them, and the tests do), so `id` is insertion order and nothing rewrites
+   it; a reader that wants the batch's own order asks for `ORDER BY seq`, which is
+   why that clause is in the read path rather than left to the query planner.
 
 If a premise falls, the read path orders by `(recorded_at, id)` and the premises
 are renegotiated — not quietly patched into the query.
@@ -76,8 +79,8 @@ decision; making that decision is not part of this contract.
 
 - One `ingest.coverage` row per file makes a batch's work visible and measurable —
   `indexed | skipped | metadata_refreshed | error` per source, beside the batch's
-  own counters. The row is small and the transaction is the one the batch already
-  commits.
+  own counters. The row is small, and it is appended right after the file's own
+  write.
 - **Events never claim work that is not there.** Each append is one transaction,
   and the ingest path writes a file's data *before* the event that describes it,
   so a crash can lose an event but never invent one. The other half of that

@@ -71,6 +71,20 @@ done
 }
 
 (cd "$scratch" && "$binary" init && "$binary" index)
+
+# The retrieval numbers say nothing about the ingest audit trail (ADR 0026): a
+# deleted `ingest.coverage` write would still score 0.9583. The batch is checked
+# here so the instrument cannot call a broken indexer healthy.
+"$python" - "$scratch" <<'PY'
+import sqlite3, sys
+db = sys.argv[1].rstrip("/\\") + "/.momotaro/momotaro.db"
+counts = dict(sqlite3.connect(db).execute("select type, count(*) from store_events group by type"))
+expected = {"ingest.started": 1, "ingest.finished": 1, "ingest.coverage": 5}
+if counts != expected:
+    print(f"FAIL: store_events {counts!r}, expected {expected!r}")
+    sys.exit(1)
+print(f"store_events ok: {counts}")
+PY
 "$python" "$repo/tools/evals/eval_search.py" \
   --workspace "$scratch" \
   --cli "$binary" \

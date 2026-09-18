@@ -150,7 +150,7 @@ impl crate::Store {
 
     /// One trust class per source key, fetched in a single query.
     ///
-    /// Mirrors [`Store::current_titles`]; a source missing from the map means
+    /// Mirrors [`Self::current_titles`]; a source missing from the map means
     /// the store has no current revision for it (the column itself is NOT NULL).
     pub fn current_origins(
         &self,

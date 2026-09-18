@@ -446,8 +446,9 @@ fn is_unprintable(c: char) -> bool {
 /// Renders the excerpt line under one search hit.
 ///
 /// Excerpts are indexed content — including `paper` and `web` material that is
-/// not user-authored — so the text goes through [`sanitize`] and is cut to
-/// [`EXCERPT_LINE_CHARS`].
+/// not user-authored — so the text goes through `sanitize` (private, but the
+/// reason is the reader's: control characters must not reach a terminal) and is
+/// cut to `EXCERPT_LINE_CHARS`.
 pub fn format_search_excerpt(excerpt: &str) -> String {
     let cleaned = sanitize(excerpt);
     if cleaned.chars().count() <= EXCERPT_LINE_CHARS {
@@ -1010,6 +1011,26 @@ mod tests {
             revision.local_path.as_deref(),
             Some("notes/vault/fourier.md"),
             "the stored path follows the move"
+        );
+
+        // The move is a coverage row too (ADR 0026): a path-only refresh is
+        // reported as `metadata_refreshed`, not silently folded into the counts.
+        let coverage: Vec<_> = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read batch")
+            .into_iter()
+            .filter(|event| event.event_type == "ingest.coverage")
+            .collect();
+        assert_eq!(coverage.len(), 5, "one row per file, five files");
+        assert!(
+            coverage
+                .iter()
+                .all(|event| event.outcome.as_deref() == Some("metadata_refreshed")),
+            "a moved path is a metadata refresh, not a re-index: {coverage:?}"
+        );
+        assert!(
+            coverage.iter().all(|event| event.reason_code.is_none()),
+            "a refresh is not a failure"
         );
     }
 
