@@ -1570,6 +1570,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_an_uninitialized_workspace_is_asked_to_run_init() {
+        // The advice branch hangs off this predicate, so its exact meaning is
+        // worth pinning: an *invalid* workspace is not one to send to `init`.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("a.md"), "# A\n\nbody\n").expect("write");
+        write_config(dir.path(), &vault);
+
+        let fresh = doctor(dir.path()).expect("doctor on a fresh workspace");
+        assert!(is_uninitialized(&fresh), "{fresh:?}");
+        assert!(!is_healthy(&fresh), "{fresh:?}");
+
+        init_workspace(dir.path()).expect("init");
+        let ready = doctor(dir.path()).expect("doctor on an initialized workspace");
+        assert!(!is_uninitialized(&ready), "{ready:?}");
+        assert!(is_healthy(&ready), "{ready:?}");
+
+        // A 0-byte database is `Uninitialized` by the store's own definition, so
+        // `init` is the right advice for it too.
+        let store_dir = dir.path().join(".momotaro");
+        fs::write(store_dir.join("momotaro.db"), b"").expect("empty store");
+        let empty = doctor(dir.path()).expect("doctor on an empty store");
+        assert!(!is_healthy(&empty), "{empty:?}");
+        assert!(is_uninitialized(&empty), "{empty:?}");
+
+        // Someone else's database is not a missing one: `init` is not its advice.
+        let connection =
+            rusqlite::Connection::open(store_dir.join("momotaro.db")).expect("open the store file");
+        connection
+            .execute_batch("CREATE TABLE recipes (name TEXT); PRAGMA application_id = 1234567;")
+            .expect("write a foreign database");
+        drop(connection);
+        let foreign = doctor(dir.path()).expect("doctor on a foreign workspace");
+        assert!(!is_healthy(&foreign), "{foreign:?}");
+        assert!(
+            !is_uninitialized(&foreign),
+            "a foreign store is not a missing store: {foreign:?}"
+        );
+    }
+
     fn store_of(root: &Path) -> Store {
         Store::open(database_path(root)).expect("open store")
     }

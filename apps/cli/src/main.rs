@@ -128,29 +128,40 @@ fn main() -> ExitCode {
                         serde_json::to_string_pretty(&report).expect("coverage report serializes"),
                         &format_coverage(&report),
                     ),
-                    Ok(None) => {
-                        // Scripts read stdout, so `--json` says "there is no
-                        // batch" in the only place they look (docs/docs/usage.md,
-                        // "Exit codes": the JSON body comes first).
-                        if cli.json {
-                            println!("null");
-                        }
-                        // A workspace nothing has run in needs `init`, not
-                        // `index`: the flat "run index first" would send its
-                        // owner to a command that cannot succeed.
-                        let uninitialized =
-                            doctor(&root).is_ok_and(|report| is_uninitialized(&report));
-                        eprintln!(
-                            "{}",
-                            if uninitialized {
+                    Ok(None) => match doctor(&root) {
+                        // A workspace that exists but has nothing in it yet: the
+                        // advice must be runnable, so `init` and `index` are two
+                        // different sentences.
+                        Ok(report) if is_uninitialized(&report) => {
+                            if cli.json {
+                                println!("null");
+                            }
+                            eprintln!(
                                 "no ingest batch recorded yet; this workspace is not initialized, \
                                  run `momotaro init` first"
-                            } else {
-                                "no ingest batch recorded yet; run `momotaro index` first"
+                            );
+                            ExitCode::SUCCESS
+                        }
+                        Ok(report) if is_healthy(&report) => {
+                            if cli.json {
+                                println!("null");
                             }
-                        );
-                        ExitCode::SUCCESS
-                    }
+                            eprintln!("no ingest batch recorded yet; run `momotaro index` first");
+                            ExitCode::SUCCESS
+                        }
+                        // Any other state — invalid, foreign, newer schema, or a
+                        // directory that is not a workspace at all — has its own
+                        // sentence and its own exit code, and they are the ones
+                        // `doctor` gives it. Inventing advice here would send the
+                        // reader to a command that cannot run.
+                        Ok(report) => {
+                            let payload = serde_json::to_string_pretty(&report)
+                                .expect("health report serializes");
+                            print_success(cli.json, payload, &format_health(&report));
+                            ExitCode::FAILURE
+                        }
+                        Err(error) => print_error(cli.json, error),
+                    },
                     Err(error) => print_error(cli.json, error),
                 };
             }

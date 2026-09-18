@@ -113,13 +113,15 @@ fn store_chunk_count(root: &Path) -> Option<u64> {
 
 /// Reads the most recent **ingest** batch back out of the audit log (ADR 0026).
 ///
-/// `Ok(None)` means no database file has ever been written — a workspace nothing
-/// has run in yet, which the caller turns into "run `init`" — never that a batch
-/// failed. Everything else goes through the same two questions every read asks,
-/// from the same home: the file-state check decides whether a file is worth
-/// opening, and `store_fault` answers for it when it is not usable, so this path
-/// cannot drift from what `doctor` says. It also asks for the newest *ingest* row
-/// rather than the newest row, because the table carries several domains.
+/// `Ok(None)` covers both "nothing has ever been written here" — no database file
+/// at all, which the caller turns into "run `init`" — and "a store with no ingest
+/// batch in it", which the caller turns into "run `index`". Never a batch that
+/// failed, and never a fault the caller has to guess at: everything else goes
+/// through the same two questions every read asks, from the same home — the
+/// file-state check decides whether a file is worth opening, and `store_fault`
+/// answers for it when it is not usable, so this path cannot drift from what
+/// `doctor` says. It also asks for the newest *ingest* row rather than the newest
+/// row, because the table carries several domains.
 pub fn coverage_report(root: impl AsRef<Path>) -> Result<Option<CoverageReport>, RunError> {
     let root = root.as_ref();
     if matches!(store_file(root), StoreFile::Absent) {

@@ -173,9 +173,10 @@ workspace that was never indexed): nothing having happened yet is a fact, not a
 failure. With `--json` it prints `null` on stdout in that case, so a script still
 gets an answer where it looks. A store this build cannot use is an error and
 exits `1`, with the same refusal text `doctor` reports (its own line adds the
-engine version; this one does not). A workspace with no database file at all is
-still "nothing has happened yet", and the sentence tells its owner to run `init`
-rather than `index`.
+engine version; this one does not). A workspace whose database file does not
+exist yet is still "nothing has happened yet": the sentence tells its owner to
+run `init` — and if the directory is not a workspace at all (no `momotaro.toml`),
+`--coverage` reports that instead, because `init` would fail there too.
 
 Other commands exit `1` only when they fail.
 

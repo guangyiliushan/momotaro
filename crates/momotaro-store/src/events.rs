@@ -176,9 +176,8 @@ impl Store {
     /// Reads the most recently **written** events, newest first (ADR 0026: this
     /// is insertion order, which is why `occurred_at` may go backwards).
     ///
-    /// Stays public as the unfiltered view of the log — the W2.1 card's API, and
-    /// what the event tests speak in — while domain-scoped readers use
-    /// [`Store::latest_store_events_in`].
+    /// Stays public as the unfiltered view of the log — the one the event tests
+    /// speak in — while domain-scoped readers use `latest_store_events_in`.
     pub fn latest_store_events(&self, limit: u32) -> Result<Vec<StoreEvent>, StoreError> {
         self.latest_store_events_in(None, limit)
     }

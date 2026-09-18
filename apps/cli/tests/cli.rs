@@ -172,6 +172,24 @@ fn doctor_coverage_reads_the_last_batch_back() {
 
     let (_, stderr, ok) = run_cli(workspace.path(), &["init"]);
     assert!(ok, "init: {stderr}");
+    // Initialized but never indexed: the advice is `index`, not `init`.
+    let (_, stderr, ok) = run_cli(workspace.path(), &["doctor", "--coverage"]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stderr.contains("run `momotaro index` first"),
+        "an initialized workspace is one `index` away: {stderr}"
+    );
+
+    // A directory that is not a workspace at all gets the reason, not advice
+    // that cannot run: `init` fails there too, for want of a configuration. The
+    // sentence is `doctor`'s, and it goes to stdout like `doctor`'s does.
+    let bare = tempfile::tempdir().expect("bare dir");
+    let (stdout, _, ok) = run_cli(bare.path(), &["doctor", "--coverage"]);
+    assert!(
+        !ok,
+        "not a workspace is not the same as 'nothing happened yet': {stdout}"
+    );
+    assert!(stdout.contains("momotaro.toml"), "{stdout}");
     let (stdout, stderr, ok) = run_cli(workspace.path(), &["index", "--json"]);
     assert!(ok, "index: {stderr}");
     let report: serde_json::Value = serde_json::from_str(stdout.trim())
