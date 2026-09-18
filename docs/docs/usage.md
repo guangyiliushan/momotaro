@@ -37,6 +37,22 @@ momotaro index ./notes
 
 索引是确定性的，不需要 API key。
 
+`index --json` 还会给出本批次的标识：
+
+```json
+{"batch_id": "index-1737000000000-2d87c684", "files_scanned": 5, "files_indexed": 5, …}
+```
+
+`batch_id` 也是 `store_events` 里那一批审计行的 `batch_id`（[ADR 0026](adr/store-events-are-the-ingest-audit-log.md)）：
+想知道「这次索引对每个文件做了什么」，按它查即可——
+
+```sql
+select seq, type, outcome, reason_code, source_key from store_events
+ where batch_id = ? order by seq;
+```
+
+人类可读的摘要行不带批次号（只有 `--json` 给）。
+
 ## Search
 
 ```bash

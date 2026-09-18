@@ -1066,19 +1066,52 @@ mod tests {
             .filter(|event| event.event_type == "ingest.coverage")
             .collect();
         assert_eq!(coverage.len(), 2, "one row per file");
+
+        // The pairing is the point of an audit row: which file, and what
+        // happened to it. A row naming the wrong source is the one failure this
+        // table must not have, so the pairs are asserted — not just the keys.
+        let mut pairs: Vec<(&str, &str)> = coverage
+            .iter()
+            .map(|event| {
+                (
+                    event.source_key.as_deref().expect("a row names its source"),
+                    event.outcome.as_deref().expect("a row says what happened"),
+                )
+            })
+            .collect();
+        pairs.sort_unstable();
+        assert_eq!(
+            pairs,
+            vec![("note:a.md", "indexed"), ("note:b.md", "indexed")],
+            "each row names the file it is about"
+        );
         assert!(
-            coverage
+            coverage.iter().all(|event| event.reason_code.is_none()),
+            "a successful file gets no failure code"
+        );
+        assert!(
+            events.iter().all(|event| event.domain == "ingest"),
+            "every ingest row says so"
+        );
+        assert!(
+            events
                 .iter()
-                .all(|event| event.outcome.as_deref() == Some("indexed")),
-            "both files were new"
+                .all(|event| event.occurred_at > 0 && event.recorded_at >= event.occurred_at),
+            "the write moment is the store's clock, not the event's"
         );
         assert!(
-            coverage.iter().all(|event| event
-                .source_key
-                .as_deref()
-                .is_some_and(|key| key.starts_with("note:"))),
-            "the row names the source it is about"
+            events.iter().all(|event| event.external_id.is_none()),
+            "ingest has no provider ids"
         );
+
+        // `ingest.finished` carries the report's counters — that payload is the
+        // reason the event has one at all.
+        let payload: serde_json::Value =
+            serde_json::from_str(&events[events.len() - 1].data_json).expect("finished is JSON");
+        assert_eq!(payload["files_scanned"], 2, "{payload}");
+        assert_eq!(payload["files_indexed"], 2, "{payload}");
+        assert_eq!(payload["errors"], 0, "{payload}");
+
         assert!(
             events.iter().all(|event| event.batch_id == report.batch_id),
             "the report and the rows agree on the batch"
@@ -1093,7 +1126,7 @@ mod tests {
         fs::write(vault.join("a.md"), "# A\n\nbody\n").expect("write");
         write_config(dir.path(), &vault);
         init_workspace(dir.path()).expect("init");
-        index_workspace(dir.path(), None).expect("first index");
+        let first = index_workspace(dir.path(), None).expect("first index");
 
         let report = index_workspace(dir.path(), None).expect("second index");
         let store = store_of(dir.path());
@@ -1111,6 +1144,42 @@ mod tests {
             "an unchanged file is covered, not silently dropped"
         );
         assert!(coverage[0].reason_code.is_none(), "no failure to explain");
+        assert_ne!(first.batch_id, report.batch_id, "two runs are two batches");
+        assert!(
+            report.batch_id.starts_with("index-"),
+            "the shape the ADR documents: {}",
+            report.batch_id
+        );
+    }
+
+    #[test]
+    fn an_empty_vault_still_leaves_a_beginning_and_an_end() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+
+        let report = index_workspace(dir.path(), None).expect("index");
+        let store = store_of(dir.path());
+        let events = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read batch");
+
+        let types: Vec<&str> = events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect();
+        assert_eq!(
+            types,
+            vec!["ingest.started", "ingest.finished"],
+            "no files, no coverage rows"
+        );
+        assert_eq!(
+            events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(report.files_scanned, 0);
     }
 
     #[test]

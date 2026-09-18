@@ -416,8 +416,7 @@ pub fn index_workspace(
     // reader can tell "running" from "never started"; `finished` last, after
     // every per-file row, so a batch is never called complete while a file is
     // still unrecorded.
-    let mut seq: i64 = 0;
-    seq += 1;
+    let mut seq: i64 = 1;
     store.append_store_event(&NewStoreEvent {
         occurred_at: now_epoch_secs(),
         batch_id: &batch_id,
@@ -488,19 +487,18 @@ pub fn index_workspace(
         if let Some(first) = claimed.get(&source_key) {
             seq += 1;
             let message = format!("claimed by both {first:?} and {raw_name:?}");
+            let kind = IndexFileErrorKind::KeyCollision;
             store.append_store_event(&coverage_event(
                 &batch_id,
                 seq,
                 Some(&source_key),
                 "error",
-                Some("key_collision"),
+                Some(&kind.to_string()),
                 Some(&message),
             ))?;
-            report.errors.push(file_error(
-                Some(&source_key),
-                IndexFileErrorKind::KeyCollision,
-                message,
-            ));
+            report
+                .errors
+                .push(file_error(Some(&source_key), kind, message));
             continue;
         }
         claimed.insert(source_key.clone(), raw_name.clone());
@@ -603,7 +601,7 @@ fn coverage_event<'a>(
 }
 
 /// What one file's pass through [`process_file`] did (ADR 0026's outcomes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum FileOutcome {
     /// Unchanged: same fingerprint, stored path and raw name.
     Skipped,
@@ -614,7 +612,8 @@ enum FileOutcome {
 }
 
 impl FileOutcome {
-    fn as_str(self) -> &'static str {
+    /// The wire spelling written to `store_events.outcome` (ADR 0026).
+    fn as_str(&self) -> &'static str {
         match self {
             Self::Skipped => "skipped",
             Self::MetadataRefreshed => "metadata_refreshed",
