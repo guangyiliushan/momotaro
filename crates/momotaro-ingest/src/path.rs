@@ -200,21 +200,28 @@ mod tests {
     #[test]
     fn resolve_rejects_absolute_and_parent_dir_values() {
         let root = ws();
-        let mut bad = vec![
-            "/etc/passwd",
-            "..",
-            "../a.md",
-            "a/../../b.md",
-            "./../../b.md",
-        ];
+        // Kept as two lists joined at use: a `#[cfg(windows)] extend` would leave
+        // `mut` unused on the other platform, and `-D warnings` turns that into a
+        // red CI leg that only one platform can see.
         #[cfg(windows)]
-        bad.extend([
+        let windows_only = [
             r"C:\ws\a.md",
             r"\\srv\share\a.md",
             r"\a.md",
             r"a\..\..\b.md",
             "C:a.md",
-        ]);
+        ];
+        #[cfg(not(windows))]
+        let windows_only: [&str; 0] = [];
+        let bad = [
+            "/etc/passwd",
+            "..",
+            "../a.md",
+            "a/../../b.md",
+            "./../../b.md",
+        ]
+        .into_iter()
+        .chain(windows_only);
         for value in bad {
             assert!(
                 matches!(
