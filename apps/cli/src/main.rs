@@ -129,6 +129,12 @@ fn main() -> ExitCode {
                         &format_coverage(&report),
                     ),
                     Ok(None) => {
+                        // Scripts read stdout, so `--json` says "there is no
+                        // batch" in the only place they look (docs/docs/usage.md,
+                        // "Exit codes": the JSON body comes first).
+                        if cli.json {
+                            println!("null");
+                        }
                         eprintln!("no ingest batch recorded yet; run `momotaro index` first");
                         ExitCode::SUCCESS
                     }

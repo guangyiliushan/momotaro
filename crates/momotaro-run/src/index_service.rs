@@ -111,18 +111,32 @@ fn store_chunk_count(root: &Path) -> Option<u64> {
     Some(store.counts().ok()?.chunks)
 }
 
-/// Reads the most recent ingest batch back out of the audit log (ADR 0026).
+/// Reads the most recent **ingest** batch back out of the audit log (ADR 0026).
 ///
-/// `Ok(None)` means the workspace has no store, or a store with no batch in it —
-/// never that a batch failed. A read path: it opens nothing that is not already
-/// there (a missing database file is not created by asking).
+/// `Ok(None)` means the workspace has no store, or a store with no ingest batch
+/// in it — never that a batch failed. The table holds several domains by design,
+/// so this asks for the newest *ingest* row rather than the newest row, and it
+/// asks the same health predicate every other read does: a store this build
+/// cannot use is reported as such, not as a missing table.
 pub fn coverage_report(root: impl AsRef<Path>) -> Result<Option<CoverageReport>, RunError> {
     let root = root.as_ref();
     if !matches!(store_file(root), StoreFile::Present) {
         return Ok(None);
     }
     let store = Store::open(database_path(root))?;
-    let Some(latest) = store.latest_store_events(1)?.into_iter().next() else {
+    let health = store.health()?;
+    if health.status != WorkspaceStatus::Ready {
+        return Err(RunError::StoreUnhealthy(
+            health
+                .message
+                .unwrap_or_else(|| format!("workspace is {:?}", health.status)),
+        ));
+    }
+    let Some(latest) = store
+        .latest_store_events_in(Some("ingest"), 1)?
+        .into_iter()
+        .next()
+    else {
         return Ok(None);
     };
     let events = store.store_events_for_batch(&latest.batch_id)?;
@@ -148,9 +162,11 @@ fn summarize_coverage(batch_id: &str, events: &[momotaro_store::StoreEvent]) -> 
         match event.event_type.as_str() {
             "ingest.finished" => report.finished = true,
             "ingest.coverage" => match event.outcome.as_deref() {
-                Some("indexed") => report.indexed += 1,
-                Some("skipped") => report.skipped += 1,
-                Some("metadata_refreshed") => report.refreshed += 1,
+                Some(outcome) if outcome == FileOutcome::Indexed.as_str() => report.indexed += 1,
+                Some(outcome) if outcome == FileOutcome::Skipped.as_str() => report.skipped += 1,
+                Some(outcome) if outcome == FileOutcome::MetadataRefreshed.as_str() => {
+                    report.refreshed += 1;
+                }
                 _ => report.failures.push(CoverageFailure {
                     source_key: event.source_key.clone(),
                     reason_code: event.reason_code.clone(),

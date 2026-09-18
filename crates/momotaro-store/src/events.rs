@@ -176,12 +176,36 @@ impl Store {
     /// Reads the most recently **written** events, newest first (ADR 0026: this
     /// is insertion order, which is why `occurred_at` may go backwards).
     pub fn latest_store_events(&self, limit: u32) -> Result<Vec<StoreEvent>, StoreError> {
-        let mut statement = self
-            .connection
-            .prepare(&format!("{SELECT} ORDER BY id DESC LIMIT ?1"))?;
-        let rows = statement.query_map([limit], read_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(StoreError::from)
+        self.latest_store_events_in(None, limit)
+    }
+
+    /// [`Store::latest_store_events`] bounded to one `domain`.
+    ///
+    /// The table carries several domains by design (ADR 0026), so "the newest
+    /// row" and "the newest ingest batch" are different questions: a feed poll
+    /// that ran after the last `index` must not be reported as the ingest batch.
+    pub fn latest_store_events_in(
+        &self,
+        domain: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<StoreEvent>, StoreError> {
+        let rows = match domain {
+            Some(domain) => {
+                let mut statement = self.connection.prepare(&format!(
+                    "{SELECT} WHERE domain = ?1 ORDER BY id DESC LIMIT ?2"
+                ))?;
+                let mapped = statement.query_map(params![domain, limit], read_row)?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            None => {
+                let mut statement = self
+                    .connection
+                    .prepare(&format!("{SELECT} ORDER BY id DESC LIMIT ?1"))?;
+                let mapped = statement.query_map([limit], read_row)?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            }
+        };
+        Ok(rows)
     }
 }
 
@@ -547,6 +571,30 @@ mod tests {
         let stored = store.store_events_for_batch(batch).expect("read");
         assert_eq!(stored.len(), 1, "the refused event did not land");
         assert_eq!(stored[0].event_type, "ingest.started");
+    }
+
+    #[test]
+    fn a_domain_filter_ignores_other_domains() {
+        let (_dir, mut store) = temp_store();
+        let ingest = event("index-1", 1, "ingest.started");
+        let mut feed = event("feed-1", 1, "feed.poll.started");
+        feed.domain = "feed";
+        store.append_store_event(&ingest).expect("append ingest");
+        store.append_store_event(&feed).expect("append feed");
+
+        assert_eq!(
+            store.latest_store_events(10).expect("all")[0].domain,
+            "feed",
+            "the newest row overall is the feed one"
+        );
+        let ingest_only = store
+            .latest_store_events_in(Some("ingest"), 10)
+            .expect("filtered");
+        assert_eq!(ingest_only.len(), 1);
+        assert_eq!(
+            ingest_only[0].batch_id, "index-1",
+            "the newest *ingest* row is the one that matters"
+        );
     }
 
     #[test]

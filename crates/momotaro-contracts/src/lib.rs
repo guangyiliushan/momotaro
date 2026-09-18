@@ -487,7 +487,7 @@ pub struct CoverageReport {
     pub skipped: u64,
     /// Rows whose file only moved or was re-spelled.
     pub refreshed: u64,
-    /// Rows that failed, in the order they were written.
+    /// Rows that failed, in the batch's own order (`seq`, not `id`).
     pub failures: Vec<CoverageFailure>,
     /// Every row in the batch, including its beginning and its end.
     pub events: u64,

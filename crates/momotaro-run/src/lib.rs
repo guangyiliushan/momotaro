@@ -527,6 +527,11 @@ pub fn format_search_hit(hit: &SearchHit) -> String {
 }
 
 /// The human rendering of one coverage report: the counts, then every failure.
+///
+/// The key is escaped as a debug string and the code and message are sanitized:
+/// all three carry text this program did not author (a `source_key` comes from a
+/// file name, and POSIX allows control characters in one), and none of them may
+/// drive or spoof the terminal — the same reason [`format_index_error`] does it.
 pub fn format_coverage(report: &CoverageReport) -> String {
     let mut line = format!(
         "ingest batch {}: {} indexed, {} skipped, {} refreshed, {} failed{}",
@@ -535,18 +540,20 @@ pub fn format_coverage(report: &CoverageReport) -> String {
         report.skipped,
         report.refreshed,
         report.failures.len(),
+        // An unfinished batch is exactly what ADR 0026 says this log cannot tell
+        // apart: still running, or the process died.
         if report.finished {
             ""
         } else {
-            " (no ingest.finished: aborted)"
+            " (no ingest.finished yet: still running, or the process died)"
         },
     );
     for failure in &report.failures {
         line.push('\n');
         line.push_str(&format!(
-            "  {}: {}: {}",
+            "  {:?}: {}: {}",
             failure.source_key.as_deref().unwrap_or("<no key>"),
-            failure.reason_code.as_deref().unwrap_or("unknown"),
+            sanitize(failure.reason_code.as_deref().unwrap_or("unknown")),
             sanitize(failure.message.as_deref().unwrap_or("")),
         ));
     }
@@ -1421,7 +1428,89 @@ mod tests {
         assert!(!coverage.finished, "{coverage:?}");
         assert_eq!(coverage.events, 1);
         let line = format_coverage(&coverage);
-        assert!(line.contains("aborted"), "the line says so: {line}");
+        assert!(
+            line.contains("no ingest.finished yet"),
+            "the line says so: {line}"
+        );
+    }
+
+    #[test]
+    fn a_feed_row_does_not_hide_the_ingest_batch() {
+        // ADR 0026 puts several domains in one table, so "the newest row" and
+        // "the newest ingest batch" are different questions.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("a.md"), "# A\n\nbody\n").expect("write");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        let mut store = store_of(dir.path());
+        store
+            .append_store_event(&momotaro_store::NewStoreEvent {
+                occurred_at: 1,
+                batch_id: "feed-1",
+                seq: 1,
+                domain: "feed",
+                event_type: "feed.poll.started",
+                source_key: None,
+                outcome: None,
+                reason_code: None,
+                message: None,
+                data_json: "{}",
+                external_id: None,
+            })
+            .expect("append a feed row after the ingest batch");
+
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(
+            coverage.batch_id, report.batch_id,
+            "the ingest batch, not the newest row of any domain"
+        );
+        assert_eq!(coverage.indexed, 1);
+    }
+
+    #[test]
+    fn reading_the_coverage_creates_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        write_config(dir.path(), &vault);
+
+        assert!(
+            coverage_report(dir.path()).expect("read").is_none(),
+            "no store is no batch"
+        );
+        assert!(
+            !dir.path().join(".momotaro").join("momotaro.db").exists(),
+            "a read path must never be the reason a file appears"
+        );
+    }
+
+    #[test]
+    fn the_coverage_line_escapes_what_it_did_not_write() {
+        // A `source_key` comes from a file name and POSIX allows control
+        // characters in one: the line may not be able to move the cursor or
+        // spoof a line, which is why the key is printed as a debug string.
+        let report = CoverageReport {
+            batch_id: "index-1".to_owned(),
+            indexed: 0,
+            skipped: 0,
+            refreshed: 0,
+            failures: vec![momotaro_contracts::CoverageFailure {
+                source_key: Some("note:\u{1b}[31mred\u{1b}[0m".to_owned()),
+                reason_code: Some("key_collision".to_owned()),
+                message: Some("danger \u{202e}".to_owned()),
+            }],
+            events: 1,
+            finished: false,
+        };
+        let line = format_coverage(&report);
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        assert!(!line.contains('\u{202e}'), "{line:?}");
+        assert!(line.contains("note:"), "the name stays readable: {line}");
+        assert!(line.contains("key_collision"), "{line}");
     }
 
     fn store_of(root: &Path) -> Store {

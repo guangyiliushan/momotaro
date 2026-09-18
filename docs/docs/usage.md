@@ -60,7 +60,7 @@ momotaro doctor
 momotaro doctor --json      # the same report for scripts
 ```
 
-`doctor` 不写任何东西，未初始化的 workspace 也会退非零（见下方 "Exit codes"）。
+`doctor` 不写任何东西，未初始化的 workspace 也会退非零（见下方 "Exit codes"）——**`--coverage` 是例外**：它是报告不是检查。
 
 想知道**上一次 `index` 对每个文件做了什么**（包括被拒的那些），读审计日志：
 
@@ -70,8 +70,11 @@ momotaro doctor --coverage
 momotaro doctor --coverage --json   # CoverageReport，字段同上有事件计数与 finished
 ```
 
-还没索引过时它会说 `no ingest batch recorded yet` 并**成功退出**（"没有批次"是事实，不是故障）。
-`ingest.coverage` 的三种结果分别计数；任何看不懂的 outcome 都会**归入 failures** 而不是被丢掉。
+还没索引过时它会说 `no ingest batch recorded yet` 并**成功退出**（"没有批次"是事实，不是故障；
+`--json` 下 stdout 给 `null`）。未结束的批次会标成 `no ingest.finished yet: still running, or the
+process died`——日志分不出这两者，所以它不假装能分。`ingest.coverage` 的三种结果分别计数；
+任何看不懂的 outcome 都会**归入 failures** 而不是被丢掉。库不可用时（版本过新、外来库）退 1，
+用的就是 `doctor` 那句话。
 
 ## Search
 
@@ -162,8 +165,16 @@ command that gates on health, not just on failure:** it exits `1` for an
 `invalid` **and** for an `uninitialized` workspace, so `if momotaro doctor; then
 momotaro index; fi` never indexes a workspace that is not ready (run `init` on a
 fresh directory first). `--json` still prints the full report on stdout first,
-so gating on the exit code loses nothing. Other commands exit `1` only when they
-fail.
+so gating on the exit code loses nothing.
+
+**Exception — `doctor --coverage` is a report, not a check.** It exits `0`
+whenever the log could be read, including "no ingest batch recorded yet" (a
+workspace that was never indexed): nothing having happened yet is a fact, not a
+failure. With `--json` it prints `null` on stdout in that case, so a script still
+gets an answer where it looks. A store this build cannot use is an error and
+exits `1`, with the sentence `doctor` prints for it.
+
+Other commands exit `1` only when they fail.
 
 An engine inside the WAL-reset window — or a withdrawn 3.52.x release — is
 reported as `invalid` too, with the bundled `sqlite_version()` /
