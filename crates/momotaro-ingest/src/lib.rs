@@ -9,6 +9,7 @@
 use momotaro_contracts::IndexFileErrorKind;
 
 mod chunker;
+pub mod frontmatter;
 mod hash;
 mod normalize;
 mod path;
