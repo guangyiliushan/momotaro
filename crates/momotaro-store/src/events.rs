@@ -15,7 +15,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use crate::{Store, StoreError, invalid_value};
 
@@ -98,6 +98,28 @@ fn now_epoch_secs() -> i64 {
         .unwrap_or_default()
 }
 
+impl Store {
+    /// Transaction time for the batch about to be written.
+    ///
+    /// Store-assigned, once per batch, and **never below the newest row's**:
+    /// wall-clock steps (NTP) must not move transaction time backwards
+    /// (`docs/docs/storage-events.md`, "缺失不得代偿"; Jensen & Snodgrass on
+    /// transaction time). Read by `id`, which is the same order the log is read
+    /// in, so this is one row lookup rather than an aggregate over the table.
+    fn next_recorded_at(&self) -> Result<i64, StoreError> {
+        let now = now_epoch_secs();
+        let last: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT recorded_at FROM store_events ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(last.map_or(now, |last| now.max(last)))
+    }
+}
+
 fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreEvent> {
     Ok(StoreEvent {
         id: row.get("id")?,
@@ -135,7 +157,7 @@ impl Store {
         batch_id: &str,
         events: &[NewStoreEvent<'_>],
     ) -> Result<(), StoreError> {
-        let recorded_at = now_epoch_secs();
+        let recorded_at = self.next_recorded_at()?;
         let transaction = self.connection.transaction()?;
         {
             let mut statement = transaction.prepare(INSERT)?;
@@ -597,6 +619,34 @@ mod tests {
         assert_eq!(
             ingest_only[0].batch_id, "index-1",
             "the newest *ingest* row is the one that matters"
+        );
+    }
+
+    #[test]
+    fn a_batch_never_writes_a_recorded_at_before_the_last_row() {
+        let (_dir, mut store) = temp_store();
+        let ahead = now_epoch_secs() + 3600;
+        // A row already in the log whose clock was ahead of ours: an NTP step
+        // must not move transaction time backwards past it (storage-events.md).
+        store
+            .connection
+            .execute(
+                "INSERT INTO store_events
+                     (occurred_at, recorded_at, batch_id, seq, domain, type, data_json)
+                 VALUES (?1, ?2, 'index-ahead', 1, 'ingest', 'ingest.started', '{}')",
+                params![ahead, ahead],
+            )
+            .expect("seed a row written by a clock that is ahead");
+
+        assert!(now_epoch_secs() < ahead, "the test needs the clock behind");
+        store
+            .append_store_event(&event("index-after", 1, "ingest.started"))
+            .expect("append after the clock went back");
+
+        let rows = store.latest_store_events(1).expect("read back");
+        assert_eq!(
+            rows[0].recorded_at, ahead,
+            "the new row sits at the last row's timestamp, not below it"
         );
     }
 
