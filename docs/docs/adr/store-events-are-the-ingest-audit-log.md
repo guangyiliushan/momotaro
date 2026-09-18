@@ -27,11 +27,17 @@ CREATE TABLE store_events (
   id INTEGER PRIMARY KEY,            -- rowid; no AUTOINCREMENT (SQLite's own advice: extra CPU/memory/disk/IO for nothing)
   occurred_at INTEGER NOT NULL,      -- when it happened (a replay or an import is not when it was written)
   recorded_at INTEGER NOT NULL,      -- transaction time: store-assigned once per
-                                     -- append batch, and never below the previous
-                                     -- row's (max(now, last)) — wall-clock NTP steps
-                                     -- must not move it backwards. No CHECK exists
-                                     -- for this: SQLite cannot express a cross-row
-                                     -- constraint, so the store enforces it.
+                                     -- `append_store_events` call — one index run
+                                     -- issues many of them, so rows sharing a
+                                     -- `batch_id` may carry different transaction
+                                     -- times — and never below the previous row's
+                                     -- (max(now, last)): wall-clock NTP steps must
+                                     -- not move it backwards. No CHECK exists for
+                                     -- this: SQLite cannot express a cross-row
+                                     -- constraint, so the store enforces it. The
+                                     -- read sits outside the write transaction,
+                                     -- which is sound under the single-writer
+                                     -- premise this ADR states.
   batch_id TEXT NOT NULL,            -- one index / feed poll / rename batch
   seq INTEGER NOT NULL,              -- monotonic inside the batch
   domain TEXT NOT NULL,              -- ingest | feed | vault | annotate

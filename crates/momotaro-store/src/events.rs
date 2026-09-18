@@ -21,7 +21,7 @@ use crate::{Store, StoreError, invalid_value};
 
 /// One event to append. The store assigns `id` and `recorded_at`; the caller
 /// says *when* it happened and *which batch* it belongs to.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewStoreEvent<'a> {
     /// When it happened. A replay or an import keeps the original moment, so
     /// this may be older than the row before it.
@@ -36,7 +36,11 @@ pub struct NewStoreEvent<'a> {
     pub event_type: &'a str,
     /// The source this event is about, when it is about one.
     pub source_key: Option<&'a str>,
-    /// Adapter outcome: `success` | `no_results` | `upstream_error` | `parse_error`.
+    /// Adapter outcome — **one column, two vocabularies** (ADR 0026): feed
+    /// adapters write `success` | `no_results` | `upstream_error` |
+    /// `parse_error`; ingest writes `indexed` | `skipped` |
+    /// `metadata_refreshed` | `error` (`FileOutcome::as_str`). A reader that
+    /// branches on this must know which domain it is reading.
     pub outcome: Option<&'a str>,
     /// Why something was skipped or degraded, as a stable code.
     pub reason_code: Option<&'a str>,
@@ -51,7 +55,7 @@ pub struct NewStoreEvent<'a> {
 }
 
 /// One stored event, exactly as the row reads.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreEvent {
     /// Insertion order (`rowid`); the only truthful "latest" (ADR 0026).
     pub id: i64,

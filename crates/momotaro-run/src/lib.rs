@@ -543,7 +543,7 @@ pub fn format_search_hit(hit: &SearchHit) -> String {
 /// drive or spoof the terminal — the same reason [`format_index_error`] does it.
 pub fn format_coverage(report: &CoverageReport) -> String {
     let mut line = format!(
-        "ingest batch {}: {} indexed, {} skipped, {} refreshed, {} failed{}",
+        "ingest batch {:?}: {} indexed, {} skipped, {} refreshed, {} failed{}",
         report.batch_id,
         report.indexed,
         report.skipped,
@@ -1539,7 +1539,7 @@ mod tests {
 
         let error = coverage_report(dir.path()).expect_err("0 bytes is not a batch");
         assert!(
-            error.to_string().contains("has not been initialized"),
+            matches!(&error, RunError::StoreUnhealthy(reason) if reason.contains("has not been initialized")),
             "{error}"
         );
         assert_eq!(
@@ -1565,7 +1565,7 @@ mod tests {
 
         let error = coverage_report(dir.path()).expect_err("a foreign store is not a log");
         assert!(
-            error.to_string().contains("is not a Momotaro store"),
+            matches!(&error, RunError::StoreUnhealthy(reason) if reason.contains("is not a Momotaro store")),
             "{error}"
         );
     }

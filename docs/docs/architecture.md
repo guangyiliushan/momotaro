@@ -435,7 +435,7 @@ CREATE TABLE source_revisions (
   title TEXT,
   uri TEXT,
   local_path TEXT,
-  raw_name TEXT,                   -- 原始相对字节；键只做身份（D42）
+  raw_name TEXT,                   -- 原始相对字节；键只做身份（D42）。（真实列由 v3 的 ALTER 追加在表末；本 DDL 按可读性排在路径列旁。）
   origin_class TEXT NOT NULL,      -- owner | paper | web | agent | system
   metadata_json TEXT NOT NULL,
   ingested_at INTEGER NOT NULL,
@@ -1123,7 +1123,7 @@ cargo test --workspace
 
 `index` / lexical `search` / Tantivy。重建索引不丢 canonical 数据。1,000 个 Markdown 可完成。
 
-已做：`source_key` NFC 身份键、vault ⊆ workspace、origin 乘性权重、`store_events` 审计日志、`doctor --coverage`。本波剩余：frontmatter 接线与十类降级事件、wikilink → `graph_links`、watcher + 对账四触发、平台测试矩阵。D40 的「单文件 = 恰好一个事务」见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 的诚实口径，**不是已交付**。
+已做：`source_key` NFC 身份键、vault ⊆ workspace、origin 乘性权重、`store_events` 审计日志、`doctor --coverage`。本波剩余：frontmatter 接线与十类降级事件、D42 的碰撞消歧后缀策略（两条目都保留 + 消歧后缀 + 事件，ADR 0002 与 ADR 0026 都指向它）、wikilink → `graph_links`、watcher + 对账四触发、平台测试矩阵、D24 的多链头暴露。D40 的「单文件 = 恰好一个事务」见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 的诚实口径，**不是已交付**。
 
 ### v0.3 可追溯问答
 
@@ -1363,7 +1363,8 @@ Pin 与检索资格分离见 [ADR 0013](adr/pin-without-five-tuple-is-not-indexe
 双时间戳），不可 UPDATE/DELETE 他人工件；清理属于人的控制面（Mem0 投毒后
 整体回撤 ADD-only 的一手证据链）。检索命中已被取代的工件时自动改投链头或
 降权；**多链头时无定义**——取唯一代表的读函数不是单调的，所以并列链头必须
-多值暴露（一并返回）并落事件，不许静默选一个。固化/蒸馏产物的信任级显示不得高于其源记录的最低信任档（provenance
+多值暴露（一并返回）并落事件，不许静默选一个（**未实现**：sparks / `supersedes_spark_id`
+尚未落地，本条随 D24 的读函数一起实现）。固化/蒸馏产物的信任级显示不得高于其源记录的最低信任档（provenance
 洗白防御）；pin（人审）授予检索资格，不改变信任构成。会话间只共享**已提交
 工件**（run 串行提交边界内），私有上下文与中间 token 永不入共享层。
 

@@ -551,7 +551,10 @@ mod tests {
         let source = "---\ntitle: A\n...\nbody\n";
         let (frontmatter, body) = split(source);
         assert_eq!(body, "body\n");
-        assert_eq!(field(&frontmatter, "title").key, "title");
+        assert_eq!(
+            field(&frontmatter, "title").value,
+            Value::Scalar("A".to_owned())
+        );
     }
 
     #[test]

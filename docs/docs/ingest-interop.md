@@ -119,9 +119,10 @@ parse_error。
 7. **索引事务边界**：单文件一次一致性更新的**目标** = 恰好一个 SQLite 事务（BEGIN
    IMMEDIATE）；v0.2 ingest 实际是每文件三次小事务（revision / chunks / 事件，
    数据先写、事件随后；口径与代价见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md)）
-   —— 三合一 API 落地之前，本文不声称它已满足。事务首步复核 stat、不一致
-   ROLLBACK 重入队；chunk 以
-   chunk_hash 内容寻址 upsert；提交前不再读文件；极端落旧 revision 由每日
+   —— 三合一 API 落地之前，本文不声称它已满足。**watcher 上线后要满足的是**：事务
+   首步复核 stat、不一致 ROLLBACK 重入队；chunk 以 `chunk_id`（= `f(source_key,
+   revision_hash, ordinal)` 的内容寻址主键）幂等替换、按 `(source_key, revision_hash)`
+   整体换版（`chunk_hash` 只是内容指纹）；提交前不再读文件；极端落旧 revision 由每日
    对账收敛——最终一致且 canonical 永不污染；
 8. **网络盘立场**：维持 D31 的探测告警，不做 PollWatcher 降级实现、不承诺
    支持；文案明示网络盘不承诺实时。
