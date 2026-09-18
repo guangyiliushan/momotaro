@@ -437,26 +437,6 @@ fn frontmatter_json(parse: &FrontmatterParse) -> serde_json::Value {
     }
 }
 
-/// The fingerprint for a refresh, carrying the frontmatter the old blob held.
-///
-/// `update_revision_fingerprint` replaces the whole blob, and a refresh means the
-/// bytes did not change — so the block parsed before is still the truth and must
-/// survive the rewrite.
-fn with_carried_frontmatter(fresh: &str, previous: &str) -> String {
-    let carried = serde_json::from_str::<serde_json::Value>(previous)
-        .ok()
-        .and_then(|blob| blob.get("frontmatter").cloned());
-    let Some(carried) = carried else {
-        return fresh.to_owned();
-    };
-    let mut blob =
-        serde_json::from_str::<serde_json::Value>(fresh).unwrap_or_else(|_| serde_json::json!({}));
-    if let Some(object) = blob.as_object_mut() {
-        object.insert("frontmatter".to_owned(), carried);
-    }
-    blob.to_string()
-}
-
 fn file_error(
     source_key: Option<&str>,
     kind: IndexFileErrorKind,
@@ -712,9 +692,13 @@ pub fn index_workspace(
 
 /// One `ingest.coverage` row for one file (ADR 0026).
 ///
-/// `outcome` is one of `indexed | skipped | metadata_refreshed | error`;
-/// `reason_code` is set exactly when the outcome is `error`, and is the stable
-/// spelling of the error kind rather than a message.
+/// `outcome` is one of `indexed | skipped | metadata_refreshed | error`.
+///
+/// `reason_code` is set in two cases, and a reader must branch on the pair, never
+/// on the outcome alone: an `error` row carries the stable spelling of the error
+/// kind, and an `indexed` row carries the degradation code of something the file
+/// lost on the way in (`frontmatter_parse_error`, D41.5) — the file was indexed
+/// anyway, so the outcome stays `indexed`.
 fn coverage_event<'a>(
     batch_id: &'a str,
     seq: i64,
@@ -822,12 +806,15 @@ fn process_file(
         && revision.revision_hash == hash
     {
         // Same bytes, moved or re-spelled: refresh the mutable columns in place
-        // instead of appending a revision that would say nothing new.
+        // instead of appending a revision that would say nothing new. The block is
+        // re-derived from the very text that hashed equal — one blob builder, and
+        // a workspace indexed before the `frontmatter` key existed gets it here.
+        let (frontmatter, _) = frontmatter::split(&normalized);
         store
             .update_revision_fingerprint(
                 source_key,
                 &revision.revision_hash,
-                &with_carried_frontmatter(&fingerprint, &revision.metadata_json),
+                &revision_metadata(&fingerprint, &frontmatter),
                 &local_path,
                 raw_name,
             )

@@ -1617,36 +1617,92 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let vault = dir.path().join("vault");
         fs::create_dir_all(&vault).expect("create vault");
-        let note = "---\ntitle: Hiddentoken\n---\n# Heading\n\nbody text here\n";
+        // The block holds a *list*, which is the shape that can actually tell the
+        // two implementations apart: a scalar-only block is a fixed point of the
+        // "chunk the whole note" mutant (the parser folds it into a setext heading
+        // that the body's own H1 then pops, and the offset cancels byte for byte),
+        // so any assertion on it stays green either way.
+        let note = "---\ntags:\n  - alphatoken\n---\n# Heading\n\nbody text here\n";
         fs::write(vault.join("a.md"), note).expect("write");
         write_config(dir.path(), &vault);
         init_workspace(dir.path()).expect("init");
         index_workspace(dir.path(), None).expect("index");
 
-        // The block is not index text: a field value is not searchable.
-        let hits = search_workspace(dir.path(), "Hiddentoken", 10).expect("search");
-        assert!(hits.hits.is_empty(), "frontmatter is not body: {hits:?}");
+        // Asserted on our own artifact, not on a downstream hit: a hit depends on
+        // how markdown classified the block's lines, which is exactly what makes
+        // the assertion toothless.
+        let store = store_of(dir.path());
+        let chunks = store.all_current_chunks().expect("chunks");
+        assert!(!chunks.is_empty(), "the note was chunked");
+        for chunk in &chunks {
+            assert!(
+                !chunk.text.contains("alphatoken"),
+                "block text reached a chunk's text: {:?}",
+                chunk.text
+            );
+            assert!(
+                !chunk
+                    .heading_path
+                    .clone()
+                    .unwrap_or_default()
+                    .contains("alphatoken"),
+                "block text reached a heading path: {:?}",
+                chunk.heading_path
+            );
+        }
+        assert!(
+            search_workspace(dir.path(), "alphatoken", 10)
+                .expect("search")
+                .hits
+                .is_empty(),
+            "and it is not searchable either"
+        );
 
-        // The body is, and its locator counts lines from the note's first line.
+        // The body is indexed, and its locator counts lines from the note's first
+        // line (the paragraph is line 7 of the note, line 3 of the body).
         let hits = search_workspace(dir.path(), "body text here", 10).expect("search");
         let hit = hits.hits.first().expect("the body is indexed");
         assert!(
-            hit.hit.locator_json.contains("\"start_line\":6"),
+            hit.hit.locator_json.contains("\"start_line\":7"),
             "locators are note-relative, not body-relative: {}",
             hit.hit.locator_json
         );
 
-        // And the block rides in the revision's metadata blob, fields and raw alike.
-        let store = store_of(dir.path());
+        // And the parsed fields are what lands in the blob — asserted structurally,
+        // or deleting the field mapping would still pass on the raw block's text.
         let revision = store
             .current_revision("note:a.md")
             .expect("read")
             .expect("the note was indexed");
-        assert!(
-            revision.metadata_json.contains("\"frontmatter\"")
-                && revision.metadata_json.contains("Hiddentoken"),
-            "the block is kept verbatim: {}",
-            revision.metadata_json
+        let blob: serde_json::Value =
+            serde_json::from_str(&revision.metadata_json).expect("the blob is JSON");
+        assert_eq!(
+            blob["frontmatter"]["state"], "parsed",
+            "the block's state is in the blob: {blob}"
+        );
+        assert_eq!(blob["frontmatter"]["fields"][0]["key"], "tags", "{blob}");
+        assert_eq!(
+            blob["frontmatter"]["fields"][0]["value"]["list"][0], "alphatoken",
+            "{blob}"
+        );
+
+        // The title comes from the body: a `#` inside the block is a YAML comment,
+        // and letting it through would make the note's title (and the title the
+        // search hit shows) a comment.
+        fs::write(
+            vault.join("b.md"),
+            "---\n# Fakename\ntitle: x\n---\nbody text here too\n",
+        )
+        .expect("write the comment note");
+        index_workspace(dir.path(), None).expect("reindex");
+        let titled = store
+            .current_revision("note:b.md")
+            .expect("read")
+            .expect("the second note was indexed");
+        assert_eq!(
+            titled.title.as_deref(),
+            Some("b"),
+            "the file stem, not the block's `#` comment"
         );
     }
 

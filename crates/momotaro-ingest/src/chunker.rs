@@ -189,6 +189,10 @@ impl SourceOffset {
     /// The offset a frontmatter block occupies: the note's text, and the body cut
     /// from it.
     pub fn before_body(note: &str, body: &str) -> Self {
+        debug_assert!(
+            note.ends_with(body),
+            "the body must be a suffix of the note it was cut from"
+        );
         let bytes = note.len() - body.len();
         let lines = note[..bytes].matches('\n').count() as u32;
         SourceOffset { bytes, lines }
@@ -238,12 +242,13 @@ pub fn chunk_markdown_with(
         };
         let chunk_id = hash::chunk_id(source_key, revision_hash, ordinal);
         let chunk_hash = hash::chunk_hash(&chunk_id, &open.text);
-        // The locator must address the ORIGINAL source bytes so citation
-        // verification can slice the document directly. `open.text` may be
-        // longer than `last_range` (packed blocks insert "\n\n" where the
-        // source has one "\n"), so end_byte/end_line come from the last
-        // block's own span, never from the joined text length. `offset` shifts
-        // both axes back into the note when this text is a body slice.
+        // The locator addresses the text this chunker was handed — the NORMALISED
+        // note (BOM stripped, CRLF to LF), not the file's own bytes; a consumer
+        // that wants to slice the file must normalise first (or carry a byte map).
+        // Within that text, `open.text` may be longer than `last_range` (packed
+        // blocks insert "\n\n" where the source has one "\n"), so end_byte/end_line
+        // come from the last block's own span, never from the joined text length.
+        // `offset` shifts both axes back into the note when this text is a body slice.
         let start_byte = offset.bytes + open.first_range.start;
         let end_byte = offset.bytes + open.last_range.end;
         let start_line = offset.lines + line_number_for(&starts, open.first_range.start as u32);

@@ -13,12 +13,14 @@
 //!   `normalize_markdown` first (BOM off, CRLF to LF), and a BOM in front of the
 //!   opening `---` makes this function report `Absent`, which would index the
 //!   block as body. Normalise first; the block then means what it looks like.
-//! - **Chunk offsets stay relative to the source.** The body is returned as a
-//!   slice of the input, so `input.len() - body.len()` is the block's byte
-//!   length: `Chunk::locator_json` addresses the *original* bytes, so whatever
-//!   chunks the body must add that offset (and the block's line count) back, or
-//!   every locator in a note with frontmatter silently points into the wrong
-//!   place.
+//! - **Chunk offsets stay relative to the normalised text.** The body is returned
+//!   as a slice of the input, so `input.len() - body.len()` is the block's byte
+//!   length: `Chunk::locator_json` addresses the *normalised* note (BOM stripped,
+//!   CRLF to LF) — the same text this function is handed — so whatever chunks the
+//!   body must add that offset (and the block's line count) back, or every locator
+//!   in a note with frontmatter silently points into the wrong place. A consumer
+//!   that slices the *file* must normalise first; `metadata_json.size_bytes` is the
+//!   raw size when the two differ.
 
 use std::fmt;
 
