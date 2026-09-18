@@ -116,8 +116,11 @@ parse_error。
    留给每日对账——**绝不把撕裂内容落库**；
 6. **黑名单**（事件层直接丢弃）：`.~lock.*#`、`~$*`、`*.swp`、`*~`、`*.tmp`、
    点开头目录内一切事件；
-7. **索引事务边界**：单文件一次一致性更新 = 恰好一个 SQLite 事务（BEGIN
-   IMMEDIATE）；事务首步复核 stat、不一致 ROLLBACK 重入队；chunk 以
+7. **索引事务边界**：单文件一次一致性更新的**目标** = 恰好一个 SQLite 事务（BEGIN
+   IMMEDIATE）；v0.2 ingest 实际是每文件三次小事务（revision / chunks / 事件，
+   数据先写、事件随后；口径与代价见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md)）
+   —— 三合一 API 落地之前，本文不声称它已满足。事务首步复核 stat、不一致
+   ROLLBACK 重入队；chunk 以
    chunk_hash 内容寻址 upsert；提交前不再读文件；极端落旧 revision 由每日
    对账收敛——最终一致且 canonical 永不污染；
 8. **网络盘立场**：维持 D31 的探测告警，不做 PollWatcher 降级实现、不承诺
@@ -163,7 +166,8 @@ parse_error。
 3. **查询层折叠另建 fold 索引列**（ASCII-only 起步，unicase 完整折叠）——
    键层不做任何 casefold（Linux 大小写双写合法并存，折叠 = 数据丢失级事故）；
 4. **碰撞策略**：NFC 键相同而原始字节不同 → 两条目都保留 + 消歧后缀 +
-   `key_collision` 警告事件；绝不静默合并；
+   `key_collision` 警告事件；**「绝不静默合并」只作用于身份键**（内容寻址的
+   revision 集与同策略幂等替换的 chunk 集允许静默并）；
 5. **同步盘预警**：OneDrive placeholder 检查属性位（RECALL_*）→ 只建元数据
    条目 + 事件，绝不默认读内容；iCloud `*.icloud` 跳过 + 事件；Windows 非法名
    （保留名/尾随空格点）在非 Windows 端照常索引但发 `windows_incompatible_name`

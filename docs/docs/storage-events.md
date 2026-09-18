@@ -158,6 +158,12 @@ Momotaro 一座 SQLite 直接拥有——「SQLite canonical」决策被双库�
 存储形态。`occurred_at` / `created_at` 双时间戳在公开同类中无先例，保留并在
 重放/导入断言中明确「occurred_at 保持事件时刻」。
 
+**缺失不得代偿**（通用纪律，价格红线升级而来）：未知值不许由其它字段、其它
+时间轴或当前时刻填充；替换必须具名、显式、默认关闭（Dyreson & Snodgrass,
+TODS 1998 的替换语义）。具体到本表：`recorded_at` 不得用 `occurred_at` 回填，
+也不得用当前时刻去补 `occurred_at`；`created_at` 与本表的写入时刻同源于
+store，永不取自事件载荷。
+
 ## 参考
 
 - [ENGRAM](https://arxiv.org/abs/2511.12960)：SQLite 内持久化 normalized JSON +

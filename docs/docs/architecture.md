@@ -435,6 +435,7 @@ CREATE TABLE source_revisions (
   title TEXT,
   uri TEXT,
   local_path TEXT,
+  raw_name TEXT,                   -- 原始相对字节；键只做身份（D42）
   origin_class TEXT NOT NULL,      -- owner | paper | web | agent | system
   metadata_json TEXT NOT NULL,
   ingested_at INTEGER NOT NULL,
@@ -1121,7 +1122,7 @@ cargo test --workspace
 
 `index` / lexical `search` / Tantivy。重建索引不丢 canonical 数据。1,000 个 Markdown 可完成。
 
-一致性协议从第一行代码做对（D40–D42）：事件=hint、重扫走 stat 双验 + racy 内容校验 + 单事务边界、对账四触发；source_key = NFC 规范化（P0 级主键）；wikilink 基础建边（D22/D41）。
+已做：`source_key` NFC 身份键、vault ⊆ workspace、origin 乘性权重、`store_events` 审计日志、`doctor --coverage`。本波剩余：frontmatter 接线与十类降级事件、wikilink → `graph_links`、watcher + 对账四触发、平台测试矩阵。D40 的「单文件 = 恰好一个事务」见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 的诚实口径，**不是已交付**。
 
 ### v0.3 可追溯问答
 
@@ -1305,6 +1306,13 @@ derived 存 `graph_links`；实体图只在 schema 限定（方法/数据集/任
 且检索基线显示多跳需求真实存在后才考虑。PPR 扩展是后置接缝，不是 1.0
 承诺。
 
+2026-09-18 的形式化调查从四条独立路径**加固**本决策，而不是提供新路线：
+无约束 OpenIE 的最强系统在 CaRB 基准上 P=0.553 / R=0.437；抽取误差不能被
+分量界定（假边在单调演绎下只增结论）；开放世界假设下分不出「假」与「漏」；
+把检索 token 对齐之后，GraphRAG-Bench 的事实型差距消失（71.01 vs 71.17）。
+实体图仍只在 schema 限定、且检索基线证明多跳需求真实之后才考虑——「加
+schema 前后」的对照数字在文献中未找到，故本项目不预埋接缝。
+
 ### D20：缓存是第一等工程约束；上下文常数是待校准参数
 
 （2026-09-15 上下文工程调查，239 项文献）三条公理：上下文是有限资源且边际
@@ -1354,7 +1362,8 @@ Pin 与检索资格分离见 [ADR 0013](adr/pin-without-five-tuple-is-not-indexe
 任何 agent 角色对黑板工件只可追加（新行 + supersedes 指针 + `superseded_at`
 双时间戳），不可 UPDATE/DELETE 他人工件；清理属于人的控制面（Mem0 投毒后
 整体回撤 ADD-only 的一手证据链）。检索命中已被取代的工件时自动改投链头或
-降权。固化/蒸馏产物的信任级显示不得高于其源记录的最低信任档（provenance
+降权；**多链头时无定义**——取唯一代表的读函数不是单调的，所以并列链头必须
+多值暴露（一并返回）并落事件，不许静默选一个。固化/蒸馏产物的信任级显示不得高于其源记录的最低信任档（provenance
 洗白防御）；pin（人审）授予检索资格，不改变信任构成。会话间只共享**已提交
 工件**（run 串行提交边界内），私有上下文与中间 token 永不入共享层。
 
@@ -1526,8 +1535,11 @@ watcher = `notify` 8.2.0 稳定线 + `notify-debouncer-full`（Windows 溢出缺
 由对账兜底，不冒险 RC）；事件永不 trust，全部归并为「重扫该路径」：stat
 双验（racy 强制内容校验，git 同构）→ 读全文双 stat（撕裂重试，绝不落库）→
 sha256 与库比对才重建 chunk。对账四触发（启动全 walk / 每日 / 手动 / watcher
-异常恢复），10k 文件亚秒级。单文件更新 = 恰好一个 SQLite 事务，chunk 内容
-寻址 upsert，canonical 永不污染。网络盘维持探测告警（D31），不做轮询降级
+异常恢复），10k 文件亚秒级。单文件更新的**目标**是恰好一个 SQLite 事务，chunk
+内容寻址 upsert，canonical 永不污染；v0.2 ingest 实际是每文件三次小事务
+（revision / chunks / 事件），数据先写、事件随后——崩溃只可能丢事件、不可能
+凭空造事件，三者一体的 store API 登记在
+[ADR 0026](adr/store-events-are-the-ingest-audit-log.md)，本文不假装它已满足。网络盘维持探测告警（D31），不做轮询降级
 实现。细则见 [摄取安全与 Vault 互操作](ingest-interop.md)。
 
 ### D41：vault 语法边界与建边矩阵
@@ -1541,7 +1553,7 @@ wikilink 全形态建边（pulldown-cmark `ENABLE_WIKILINKS`）；dangling 链�
 
 ### D42：source_key = NFC 身份键，键层永不折叠
 
-`source_key = note:<vault-relative NFC path> | arxiv:<id>`；NFC/不折叠/碰撞规则作用于 scheme 之后的 tail。verbatim 前缀与盘符大小写由解析时的 `canonicalize` 决定（既不是键的一部分，也不是我们做的改写）——用户可见处一律渲染存储的 `local_path`，不渲染解析后的路径（[ADR 0002](adr/source-key-is-scheme-prefixed.md) / [ADR 0024](adr/local-path-is-workspace-relative.md)）。大小写原样保留、`/` 分隔；**禁用 NFKC 与 casefold**（Linux 大小写双写合法并存，折叠 = 数据丢失级事故）；`raw_name` 原始字节另存（事件匹配/显示）；查询层大小写折叠另建 fold 索引列。NFC 碰撞（NFC/NFD 双写）：两条目都保留 + 消歧后缀 + 事件，绝不静默合并。同步盘预警：OneDrive placeholder 只建元数据不读内容；Windows 非法名在非 Windows 端照常索引但发预警（会经同步盘毒化 Windows 端）。平台测试矩阵 11 项进 CI。
+`source_key = note:<vault-relative NFC path> | arxiv:<id>`；NFC/不折叠/碰撞规则作用于 scheme 之后的 tail。verbatim 前缀与盘符大小写由解析时的 `canonicalize` 决定（既不是键的一部分，也不是我们做的改写）——用户可见处一律渲染存储的 `local_path`，不渲染解析后的路径（[ADR 0002](adr/source-key-is-scheme-prefixed.md) / [ADR 0024](adr/local-path-is-workspace-relative.md)）。大小写原样保留、`/` 分隔；**禁用 NFKC 与 casefold**（Linux 大小写双写合法并存，折叠 = 数据丢失级事故）；`raw_name` 原始字节另存（事件匹配/显示）；查询层大小写折叠另建 fold 索引列。**「绝不静默合并」作用于身份键**：NFC 碰撞（NFC/NFD 双写）两条目都保留 + 消歧后缀 + 事件，绝不静默合并——唯一性不变量不在并操作下封闭。它不是一条普遍禁令：**内容寻址**的 revision 集、同策略幂等替换的 chunk 集满足 join-semilattice 且不变量在并下封闭，静默并是对的；禁止的是对自由文本、互斥修改、或「取唯一代表」的读函数做静默并。同步盘预警：OneDrive placeholder 只建元数据不读内容；Windows 非法名在非 Windows 端照常索引但发预警（会经同步盘毒化 Windows 端）。平台测试矩阵 11 项进 CI。
 
 ### D43：更新管线——动态薄层 + 通道 endpoint 隔离 + 灰度
 

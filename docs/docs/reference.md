@@ -29,6 +29,8 @@ A chunk is a retained projection of one source revision: the retrieval and citat
 
 Once written for a `(source_key, revision_hash)`, rows stay while any citation or context still points at them. Same policy and revision → idempotent replace. Changing the hash function is a new index policy. A full wipe is disaster recovery and must emit drift.
 
+`chunk_hash` identifies and deduplicates; it does not prove that this store's history was never rewritten. A check that reads only the current bytes cannot tell "rewritten" from "never so": source integrity means the bytes named by the row are present and match the hash, not that an earlier row was never deleted.
+
 A chunk records:
 
 1. source key;

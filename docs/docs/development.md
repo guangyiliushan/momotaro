@@ -81,6 +81,7 @@ momotaro/
 6. 桌面 / 移动 / 未来 HTTP 面只能调用 `momotaro-run` 暴露的服务函数。
 7. UI 不直连 SQLite，不拼 prompt，不执行 policy。
 8. 跨 crate 依赖必须在各自 `Cargo.toml` 显式声明。
+9. 未实现不得返回空成功（响亮拒绝）：`refuse_write` / `IndexUnusable` 是本仓既有的形态，读路径同样适用——库不可用时报库自己的原因，不报「先跑 index」；仪器看不到的面要在报告里明说，不许把「仪器绿」当「特性成立」。
 
 ## Canonical versus derived
 

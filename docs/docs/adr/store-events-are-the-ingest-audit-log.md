@@ -26,7 +26,12 @@ no use for. The two tables stay apart, and ingest gets the small log it needs.
 CREATE TABLE store_events (
   id INTEGER PRIMARY KEY,            -- rowid; no AUTOINCREMENT (SQLite's own advice: extra CPU/memory/disk/IO for nothing)
   occurred_at INTEGER NOT NULL,      -- when it happened (a replay or an import is not when it was written)
-  recorded_at INTEGER NOT NULL,      -- when it was written
+  recorded_at INTEGER NOT NULL,      -- transaction time: store-assigned once per
+                                     -- append batch, and never below the previous
+                                     -- row's (max(now, last)) — wall-clock NTP steps
+                                     -- must not move it backwards. No CHECK exists
+                                     -- for this: SQLite cannot express a cross-row
+                                     -- constraint, so the store enforces it.
   batch_id TEXT NOT NULL,            -- one index / feed poll / rename batch
   seq INTEGER NOT NULL,              -- monotonic inside the batch
   domain TEXT NOT NULL,              -- ingest | feed | vault | annotate
