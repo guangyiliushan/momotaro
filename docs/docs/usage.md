@@ -74,7 +74,7 @@ momotaro doctor --coverage --json   # CoverageReport，字段同上有事件计�
 `--json` 下 stdout 给 `null`）。未结束的批次会标成 `no ingest.finished yet: still running, or the
 process died`——日志分不出这两者，所以它不假装能分。`ingest.coverage` 的三种结果分别计数；
 任何看不懂的 outcome 都会**归入 failures** 而不是被丢掉。库不可用时（版本过新、外来库）退 1，
-用的就是 `doctor` 那句话。
+报的是与 `doctor` **同一句拒绝文本**（`doctor` 自己那行还会带引擎版本）。
 
 ## Search
 
@@ -172,7 +172,10 @@ whenever the log could be read, including "no ingest batch recorded yet" (a
 workspace that was never indexed): nothing having happened yet is a fact, not a
 failure. With `--json` it prints `null` on stdout in that case, so a script still
 gets an answer where it looks. A store this build cannot use is an error and
-exits `1`, with the sentence `doctor` prints for it.
+exits `1`, with the same refusal text `doctor` reports (its own line adds the
+engine version; this one does not). A workspace with no database file at all is
+still "nothing has happened yet", and the sentence tells its owner to run `init`
+rather than `index`.
 
 Other commands exit `1` only when they fail.
 

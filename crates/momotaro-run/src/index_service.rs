@@ -113,25 +113,22 @@ fn store_chunk_count(root: &Path) -> Option<u64> {
 
 /// Reads the most recent **ingest** batch back out of the audit log (ADR 0026).
 ///
-/// `Ok(None)` means the workspace has no store, or a store with no ingest batch
-/// in it — never that a batch failed. The table holds several domains by design,
-/// so this asks for the newest *ingest* row rather than the newest row, and it
-/// asks the same health predicate every other read does: a store this build
-/// cannot use is reported as such, not as a missing table.
+/// `Ok(None)` means no database file has ever been written — a workspace nothing
+/// has run in yet, which the caller turns into "run `init`" — never that a batch
+/// failed. Everything else goes through the same two questions every read asks,
+/// from the same home: the file-state check decides whether a file is worth
+/// opening, and `store_fault` answers for it when it is not usable, so this path
+/// cannot drift from what `doctor` says. It also asks for the newest *ingest* row
+/// rather than the newest row, because the table carries several domains.
 pub fn coverage_report(root: impl AsRef<Path>) -> Result<Option<CoverageReport>, RunError> {
     let root = root.as_ref();
-    if !matches!(store_file(root), StoreFile::Present) {
+    if matches!(store_file(root), StoreFile::Absent) {
         return Ok(None);
     }
-    let store = Store::open(database_path(root))?;
-    let health = store.health()?;
-    if health.status != WorkspaceStatus::Ready {
-        return Err(RunError::StoreUnhealthy(
-            health
-                .message
-                .unwrap_or_else(|| format!("workspace is {:?}", health.status)),
-        ));
+    if let Some(reason) = store_fault(root) {
+        return Err(RunError::StoreUnhealthy(reason));
     }
+    let store = Store::open(database_path(root))?;
     let Some(latest) = store
         .latest_store_events_in(Some("ingest"), 1)?
         .into_iter()

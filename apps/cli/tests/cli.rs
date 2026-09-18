@@ -157,6 +157,10 @@ fn doctor_coverage_reads_the_last_batch_back() {
     let (_, stderr, ok) = run_cli(workspace.path(), &["doctor", "--coverage"]);
     assert!(ok, "no batch yet is not a failure: {stderr}");
     assert!(stderr.contains("no ingest batch recorded yet"), "{stderr}");
+    assert!(
+        stderr.contains("`momotaro init` first"),
+        "advice a reader can act on: {stderr}"
+    );
     // …and `--json` still answers on stdout, where a script looks.
     let (stdout, _, ok) = run_cli(workspace.path(), &["doctor", "--coverage", "--json"]);
     assert!(ok, "{stdout}");

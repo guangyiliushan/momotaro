@@ -9,8 +9,8 @@ use clap::{Parser, Subcommand};
 use momotaro_run::{
     RunError, SearchOutput, coverage_report, doctor, format_coverage, format_error, format_health,
     format_index_error, format_index_summary, format_rebuild, format_search_excerpt,
-    format_search_hit, index_workspace, init_workspace, is_healthy, rebuild_index,
-    search_workspace, stats,
+    format_search_hit, index_workspace, init_workspace, is_healthy, is_uninitialized,
+    rebuild_index, search_workspace, stats,
 };
 
 /// A personal knowledge engine for serious learners.
@@ -135,7 +135,20 @@ fn main() -> ExitCode {
                         if cli.json {
                             println!("null");
                         }
-                        eprintln!("no ingest batch recorded yet; run `momotaro index` first");
+                        // A workspace nothing has run in needs `init`, not
+                        // `index`: the flat "run index first" would send its
+                        // owner to a command that cannot succeed.
+                        let uninitialized =
+                            doctor(&root).is_ok_and(|report| is_uninitialized(&report));
+                        eprintln!(
+                            "{}",
+                            if uninitialized {
+                                "no ingest batch recorded yet; this workspace is not initialized, \
+                                 run `momotaro init` first"
+                            } else {
+                                "no ingest batch recorded yet; run `momotaro index` first"
+                            }
+                        );
                         ExitCode::SUCCESS
                     }
                     Err(error) => print_error(cli.json, error),

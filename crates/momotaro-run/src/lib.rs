@@ -494,6 +494,15 @@ pub fn is_healthy(report: &HealthReport) -> bool {
     report.status == WorkspaceStatus::Ready
 }
 
+/// Whether the report says this workspace has never been initialized.
+///
+/// A caller uses it to give the right advice: a workspace nothing has run in
+/// needs `init`, and telling its owner to run `index` would send them to a
+/// command that cannot succeed.
+pub fn is_uninitialized(report: &HealthReport) -> bool {
+    report.status == WorkspaceStatus::Uninitialized
+}
+
 /// Renders one workspace health report as a terminal line.
 ///
 /// A report that is not `Ready` must say why: printing "workspace is ready" for
@@ -1500,7 +1509,9 @@ mod tests {
             refreshed: 0,
             failures: vec![momotaro_contracts::CoverageFailure {
                 source_key: Some("note:\u{1b}[31mred\u{1b}[0m".to_owned()),
-                reason_code: Some("key_collision".to_owned()),
+                // The code is sanitized too, and this row is where that is
+                // pinned: a foreign row can carry anything in this column.
+                reason_code: Some("key_\u{1b}collision".to_owned()),
                 message: Some("danger \u{202e}".to_owned()),
             }],
             events: 1,
@@ -1510,7 +1521,53 @@ mod tests {
         assert!(!line.contains('\u{1b}'), "{line:?}");
         assert!(!line.contains('\u{202e}'), "{line:?}");
         assert!(line.contains("note:"), "the name stays readable: {line}");
-        assert!(line.contains("key_collision"), "{line}");
+        assert!(
+            line.contains("key_collision"),
+            "the code is readable once the escape is gone: {line:?}"
+        );
+    }
+
+    #[test]
+    fn an_uninitialized_store_is_not_an_empty_log() {
+        // A 0-byte database is a workspace that was never written, and the answer
+        // must not depend on whether some earlier command happened to touch it.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store_dir = dir.path().join(".momotaro");
+        fs::create_dir_all(&store_dir).expect("create store dir");
+        let database = store_dir.join("momotaro.db");
+        fs::write(&database, b"").expect("create an empty database file");
+
+        let error = coverage_report(dir.path()).expect_err("0 bytes is not a batch");
+        assert!(
+            error.to_string().contains("has not been initialized"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::metadata(&database).expect("stat").len(),
+            0,
+            "a read path must never be the reason a file changes"
+        );
+    }
+
+    #[test]
+    fn a_store_this_build_cannot_use_is_named_as_such() {
+        // Someone else's database (F7): the reader must say what `doctor` says,
+        // not fall through to `no such table: store_events`.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store_dir = dir.path().join(".momotaro");
+        fs::create_dir_all(&store_dir).expect("create store dir");
+        let connection = rusqlite::Connection::open(store_dir.join("momotaro.db"))
+            .expect("create a database that is not ours");
+        connection
+            .execute_batch("CREATE TABLE recipes (name TEXT); PRAGMA application_id = 1234567;")
+            .expect("write a foreign database");
+        drop(connection);
+
+        let error = coverage_report(dir.path()).expect_err("a foreign store is not a log");
+        assert!(
+            error.to_string().contains("is not a Momotaro store"),
+            "{error}"
+        );
     }
 
     fn store_of(root: &Path) -> Store {
