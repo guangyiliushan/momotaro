@@ -1,11 +1,26 @@
-//! The `---` block at the top of a note: parsed, kept, and taken out of the body.
+//! The `---` block at the top of a note: parsed, kept, and taken out of the index text.
 //!
 //! The block is Obsidian's data, not ours (D41.5 in
 //! `docs/docs/ingest-interop.md`): unknown fields are first-class, the block is
-//! never folded back into the body, and a block that does not parse is kept
-//! verbatim while the body is indexed anyway. What comes out of here goes to
-//! `source_revisions.metadata_json`; only the *body* reaches the chunker, which
-//! is what "正文 FTS 排除 frontmatter" means in practice.
+//! never folded back into the note, and a block that does not parse is kept
+//! verbatim while the body is indexed anyway. What comes out of here belongs in
+//! `source_revisions.metadata_json`; the *body* is what gets chunked, which is
+//! what "正文 FTS 排除 frontmatter" means.
+//!
+//! Two things the caller has to get right, because this module cannot check them:
+//!
+//! - **Call this on normalised text.** The indexing path runs
+//!   `normalize_markdown` first (BOM off, CRLF to LF), and a BOM in front of the
+//!   opening `---` makes this function report `Absent`, which would index the
+//!   block as body. Normalise first; the block then means what it looks like.
+//! - **Chunk offsets stay relative to the source.** The body is returned as a
+//!   slice of the input, so `input.len() - body.len()` is the block's byte
+//!   length: `Chunk::locator_json` addresses the *original* bytes, so whatever
+//!   chunks the body must add that offset (and the block's line count) back, or
+//!   every locator in a note with frontmatter silently points into the wrong
+//!   place.
+
+use std::fmt;
 
 /// A parsed `---` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,7 +36,7 @@ pub struct Frontmatter {
 /// One `key: value` pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
-    /// The key as written.
+    /// The key as written, trimmed.
     pub key: String,
     /// The value as written, in the closest shape the parser can name.
     pub value: Value,
@@ -30,13 +45,35 @@ pub struct Field {
 /// A field's value, kept as close to its source as it can be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
-    /// `key: text`
+    /// `key: text` — one line, nothing continuing it.
     Scalar(String),
     /// `key:` followed by `- item` lines, in order.
     List(Vec<String>),
-    /// Anything else — a bare `key:`, nested maps, block scalars, shapes this
-    /// parser does not model — as the source lines, verbatim.
+    /// Everything else as source lines: a bare `key:` with nothing under it
+    /// (`""`), nested maps, block scalars (`|`, `>`), or a shape that mixes
+    /// lists with continuations. Nothing is dropped and nothing is guessed.
     Raw(String),
+}
+
+/// Why a block could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    /// A line that is neither a field nor a continuation of one.
+    NotAField,
+    /// A `- item` with no field to belong to.
+    OrphanListItem,
+    /// `: value` with nothing before the colon.
+    EmptyFieldName,
+}
+
+impl fmt::Display for Reason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Reason::NotAField => write!(f, "not a `key: value` line and not a continuation"),
+            Reason::OrphanListItem => write!(f, "a list item outside any field"),
+            Reason::EmptyFieldName => write!(f, "a field with an empty name"),
+        }
+    }
 }
 
 /// What a note's frontmatter turned out to be.
@@ -47,21 +84,29 @@ pub enum FrontmatterParse {
     /// A block that parsed.
     Parsed(Frontmatter),
     /// A block that was there but could not be read: kept verbatim, with the
-    /// reason, and the body still indexed (`frontmatter_parse_error`, D41.5).
+    /// line and the reason, and the body still indexed
+    /// (`frontmatter_parse_error`, D41.5).
     Failed {
         /// The block's text, delimiter lines excluded, exactly as written.
         raw: String,
-        /// Why it could not be read, naming the line.
-        reason: String,
+        /// 1-based line where reading stopped, counting the opening `---` as
+        /// line 1.
+        line: usize,
+        /// What was wrong with that line.
+        reason: Reason,
     },
 }
 
 /// Splits a note into its frontmatter and its body.
 ///
-/// A block counts as frontmatter only when line 1 is exactly `---`: a note that
-/// merely starts with a horizontal rule is not frontmatter, and guessing would
-/// eat its first paragraph. The block ends at the first line that is exactly
-/// `---` or `...`; without one there is no block at all (that `---` was a rule).
+/// A block counts as frontmatter only when line 1 is `---` (trailing horizontal
+/// whitespace aside): a note that merely starts with a horizontal rule is not
+/// frontmatter, and guessing would eat its first paragraph. The block ends at
+/// the first line that is `---` or `...` under the same rule; without one there
+/// is no block at all (that `---` was a rule).
+///
+/// The returned body is a slice of `source`, so byte and line offsets can be
+/// recovered from it — see the module documentation.
 pub fn split(source: &str) -> (FrontmatterParse, &str) {
     let Some((block, body)) = take_block(source) else {
         return (FrontmatterParse::Absent, source);
@@ -74,9 +119,10 @@ pub fn split(source: &str) -> (FrontmatterParse, &str) {
             }),
             body,
         ),
-        Err(reason) => (
+        Err((line, reason)) => (
             FrontmatterParse::Failed {
                 raw: block.to_owned(),
+                line,
                 reason,
             },
             body,
@@ -86,12 +132,10 @@ pub fn split(source: &str) -> (FrontmatterParse, &str) {
 
 /// The block's text (delimiters excluded) and the body after it, if there is one.
 fn take_block(source: &str) -> Option<(&str, &str)> {
-    let rest = strip_line(source, "---")?;
+    let rest = strip_delimiter_line(source, "---")?;
     let mut offset = 0;
     for line in rest.split_inclusive('\n') {
-        let bare = line.strip_suffix('\n').unwrap_or(line);
-        let bare = bare.strip_suffix('\r').unwrap_or(bare);
-        if bare == "---" || bare == "..." {
+        if is_delimiter(line, "---") || is_delimiter(line, "...") {
             let block = &rest[..offset];
             let body = &rest[offset + line.len()..];
             return Some((block, body));
@@ -101,95 +145,129 @@ fn take_block(source: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// Consumes an exact first line, returning the rest.
-fn strip_line<'a>(source: &'a str, expected: &str) -> Option<&'a str> {
-    let rest = source.strip_prefix(expected)?;
-    match rest.strip_prefix("\r\n") {
-        Some(rest) => Some(rest),
-        None => rest.strip_prefix('\n'),
+/// Consumes an exact opening line, returning the rest.
+fn strip_delimiter_line<'a>(source: &'a str, expected: &str) -> Option<&'a str> {
+    let (line, rest) = first_line(source);
+    if !is_delimiter(line, expected) {
+        return None;
     }
+    Some(rest)
 }
 
-/// Reads the block's lines into fields, or says why it could not.
-fn parse_block(block: &str) -> Result<Vec<Field>, String> {
-    let mut fields: Vec<Field> = Vec::new();
-    let mut list: Vec<String> = Vec::new();
-    let mut raw: Vec<&str> = Vec::new();
+/// The first line's content, and everything after its ending.
+fn first_line(source: &str) -> (&str, &str) {
+    let end = source
+        .find('\n')
+        .map(|index| index + 1)
+        .unwrap_or(source.len());
+    let (line, rest) = source.split_at(end);
+    (split_ending(line).0, rest)
+}
 
-    // Whatever is open — a list or an unmodelled block — closes here.
-    fn settled(
-        fields: &mut Vec<Field>,
-        key: &mut Option<String>,
-        list: &mut Vec<String>,
-        raw: &mut Vec<&str>,
-    ) {
-        let Some(current) = key.take() else {
-            raw.clear();
-            return;
-        };
-        let value = if !raw.is_empty() {
-            Value::Raw(raw.join("\n"))
-        } else if !list.is_empty() {
-            Value::List(std::mem::take(list))
+/// Whether a full line is a bare delimiter, tolerating trailing spaces and tabs.
+fn is_delimiter(line: &str, expected: &str) -> bool {
+    let (line, _) = split_ending(line);
+    line == expected || line.trim_end_matches([' ', '\t']) == expected
+}
+
+/// Splits one line into its content and its ending (`\r\n`, `\n`, or nothing).
+fn split_ending(line: &str) -> (&str, &str) {
+    let mut end = line.len();
+    if line.ends_with('\n') {
+        end -= 1;
+    }
+    if line[..end].ends_with('\r') {
+        end -= 1;
+    }
+    line.split_at(end)
+}
+
+/// What has been read of the field currently open, if any.
+#[derive(Default)]
+struct Pending {
+    key: String,
+    /// The value written on the key's own line (`key: value`).
+    inline: Option<String>,
+    /// `- item` lines, trimmed, in order.
+    list: Vec<String>,
+    /// Every line of the field as written, continuations included.
+    source: Vec<String>,
+    /// Set when a line went past what this parser models, which makes the whole
+    /// field `Value::Raw` — nothing is dropped, and no list is half-read.
+    unmodelled: bool,
+}
+
+impl Pending {
+    fn settle(self) -> Field {
+        let value = if self.unmodelled {
+            Value::Raw(self.source.join("\n"))
+        } else if !self.list.is_empty() {
+            Value::List(self.list)
+        } else if let Some(inline) = self.inline {
+            Value::Scalar(inline)
         } else {
             Value::Raw(String::new())
         };
-        fields.push(Field {
-            key: current,
+        Field {
+            key: self.key,
             value,
-        });
-        raw.clear();
+        }
     }
+}
 
-    let mut key: Option<String> = None;
+/// Reads the block's lines into fields, or says which line stopped it and why.
+fn parse_block(block: &str) -> Result<Vec<Field>, (usize, Reason)> {
+    let mut fields: Vec<Field> = Vec::new();
+    let mut pending: Option<Pending> = None;
+
     for (number, line) in block.split_inclusive('\n').enumerate() {
-        let bare = line.strip_suffix('\n').unwrap_or(line);
-        let bare = bare.strip_suffix('\r').unwrap_or(bare);
+        let (bare, _) = split_ending(line);
         let line_number = number + 2; // 1 is the opening delimiter.
 
         if bare.trim().is_empty() || bare.trim_start().starts_with('#') {
-            settled(&mut fields, &mut key, &mut list, &mut raw);
+            // Neither closes the open field: YAML allows both inside a sequence
+            // and inside a block scalar, and Obsidian's properties use exactly
+            // those shapes. The next `key:` line (or the end of the block) is
+            // what ends a field.
             continue;
         }
         if let Some(item) = bare.trim_start().strip_prefix("- ") {
-            if key.is_some() && raw.is_empty() {
-                list.push(item.trim().to_owned());
-                continue;
+            match pending.as_mut() {
+                Some(open) if !open.unmodelled => {
+                    open.list.push(item.trim().to_owned());
+                    open.source.push(bare.to_owned());
+                }
+                // An item below a field that is already something else (or with
+                // no field at all) is a shape this parser will not guess at.
+                _ => return Err((line_number, Reason::OrphanListItem)),
             }
-            // A list item with no field to belong to is not readable.
-            return Err(format!(
-                "line {line_number}: a list item with no field above it"
-            ));
+            continue;
         }
         if bare.starts_with(char::is_whitespace) {
-            // Indented under something: not modelled, kept as source.
-            if key.is_none() {
-                return Err(format!(
-                    "line {line_number}: an indented line with no field above it"
-                ));
-            }
-            raw.push(bare);
+            let Some(open) = pending.as_mut() else {
+                return Err((line_number, Reason::NotAField));
+            };
+            open.source.push(bare.to_owned());
+            open.unmodelled = true;
             continue;
         }
         let Some((name, value)) = bare.split_once(':') else {
-            return Err(format!("line {line_number}: not a `key: value` line"));
+            return Err((line_number, Reason::NotAField));
         };
         let name = name.trim();
         if name.is_empty() {
-            return Err(format!("line {line_number}: a field with an empty name"));
+            return Err((line_number, Reason::EmptyFieldName));
         }
-        settled(&mut fields, &mut key, &mut list, &mut raw);
+        fields.extend(pending.take().map(Pending::settle));
         let value = value.trim();
-        if value.is_empty() {
-            key = Some(name.to_owned());
-        } else {
-            fields.push(Field {
-                key: name.to_owned(),
-                value: Value::Scalar(value.to_owned()),
-            });
-        }
+        pending = Some(Pending {
+            key: name.to_owned(),
+            inline: (!value.is_empty()).then(|| value.to_owned()),
+            source: vec![bare.to_owned()],
+            ..Pending::default()
+        });
     }
-    settled(&mut fields, &mut key, &mut list, &mut raw);
+    fields.extend(pending.take().map(Pending::settle));
     Ok(fields)
 }
 
@@ -202,6 +280,13 @@ mod tests {
             FrontmatterParse::Parsed(frontmatter) => &frontmatter.fields,
             other => panic!("expected parsed frontmatter, got {other:?}"),
         }
+    }
+
+    fn field<'a>(frontmatter: &'a FrontmatterParse, key: &str) -> &'a Field {
+        fields(frontmatter)
+            .iter()
+            .find(|field| field.key == key)
+            .unwrap_or_else(|| panic!("no field {key:?}"))
     }
 
     #[test]
@@ -226,6 +311,18 @@ mod tests {
     }
 
     #[test]
+    fn the_block_is_measured_from_the_body() {
+        // The wiring contract: body is a slice of the input, so its offset is
+        // the block's byte length and every locator can stay source-relative.
+        let source = "---\ntitle: A\n---\nbody\n";
+        let (_, body) = split(source);
+        assert_eq!(
+            source.len() - body.len(),
+            source.find("body").expect("body")
+        );
+    }
+
+    #[test]
     fn a_note_without_a_block_is_all_body() {
         let source = "# Just a note\n\n---\n\nrule, not frontmatter\n";
         let (frontmatter, body) = split(source);
@@ -242,28 +339,108 @@ mod tests {
     }
 
     #[test]
+    fn a_byte_order_mark_hides_the_block() {
+        // Pinned rather than fixed: the indexing path normalises first (BOM
+        // off), and this test is the reason it has to.
+        let source = "\u{feff}---\ntitle: A\n---\nbody\n";
+        let (frontmatter, body) = split(source);
+        assert_eq!(frontmatter, FrontmatterParse::Absent);
+        assert_eq!(body, source);
+    }
+
+    #[test]
+    fn trailing_spaces_on_a_delimiter_do_not_hide_the_block() {
+        let source = "--- \ntitle: A\n--- \nbody\n";
+        let (frontmatter, body) = split(source);
+        assert_eq!(body, "body\n");
+        assert_eq!(
+            field(&frontmatter, "title").value,
+            Value::Scalar("A".to_owned())
+        );
+    }
+
+    #[test]
     fn unknown_shapes_are_kept_as_they_were_written() {
         let source = "---\ntitle: A\naliases:\n  - one\n  - two\ncssclasses:\n  - wide\nnested:\n  deep:\n    key: value\n---\nbody\n";
         let (frontmatter, body) = split(source);
         assert_eq!(body, "body\n");
-        let fields = fields(&frontmatter);
-        let by_key = |key: &str| fields.iter().find(|field| field.key == key).expect(key);
 
         assert_eq!(
-            by_key("aliases").value,
+            field(&frontmatter, "aliases").value,
             Value::List(vec!["one".to_owned(), "two".to_owned()]),
             "an indented list is a list: it is how Obsidian's property editor writes one"
         );
         assert_eq!(
-            by_key("cssclasses").value,
+            field(&frontmatter, "cssclasses").value,
             Value::List(vec!["wide".to_owned()])
         );
         assert_eq!(
-            by_key("nested").value,
-            Value::Raw("  deep:\n    key: value".to_owned()),
-            "a nested map is not modelled, so it is kept as source"
+            field(&frontmatter, "nested").value,
+            Value::Raw("nested:\n  deep:\n    key: value".to_owned()),
+            "a nested map is not modelled, so the whole field is kept as source"
         );
-        assert_eq!(by_key("title").value, Value::Scalar("A".to_owned()));
+        assert_eq!(
+            field(&frontmatter, "title").value,
+            Value::Scalar("A".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_block_scalar_is_kept_as_source_not_fatal() {
+        // `|` and `>` are how Obsidian's property editor writes multi-line text:
+        // failing the whole block over one of them would drop every other field
+        // in the note (and every frontmatter link with them).
+        let source = "---\ntitle: A\ndescription: |\n  line one\n  line two\nnote: >\n  folded\nstatus: draft\n---\nbody\n";
+        let (frontmatter, body) = split(source);
+
+        assert_eq!(body, "body\n");
+        assert_eq!(
+            field(&frontmatter, "description").value,
+            Value::Raw("description: |\n  line one\n  line two".to_owned())
+        );
+        assert_eq!(
+            field(&frontmatter, "note").value,
+            Value::Raw("note: >\n  folded".to_owned())
+        );
+        assert_eq!(
+            field(&frontmatter, "status").value,
+            Value::Scalar("draft".to_owned()),
+            "the fields after it are untouched"
+        );
+        assert_eq!(fields(&frontmatter).len(), 4);
+    }
+
+    #[test]
+    fn a_list_does_not_leak_into_the_next_field() {
+        // The shape that made this parser wrong: a field whose content stops
+        // being a list, followed by another list.
+        let source = "---\na:\n  - one\n  x: y\nb:\n  - two\n---\nbody\n";
+        let (frontmatter, _) = split(source);
+
+        assert_eq!(
+            field(&frontmatter, "a").value,
+            Value::Raw("a:\n  - one\n  x: y".to_owned()),
+            "the field keeps its own lines"
+        );
+        assert_eq!(
+            field(&frontmatter, "b").value,
+            Value::List(vec!["two".to_owned()]),
+            "and the next field does not inherit them"
+        );
+    }
+
+    #[test]
+    fn a_bare_key_is_the_empty_raw_value() {
+        let source = "---\nempty:\ntitle: A\n---\nbody\n";
+        let (frontmatter, _) = split(source);
+        assert_eq!(
+            field(&frontmatter, "empty").value,
+            Value::Raw(String::new())
+        );
+        assert_eq!(
+            field(&frontmatter, "title").value,
+            Value::Scalar("A".to_owned())
+        );
     }
 
     #[test]
@@ -271,8 +448,23 @@ mod tests {
         let source = "---\ntags:\n- one\n- two\n---\nbody\n";
         let (frontmatter, _) = split(source);
         assert_eq!(
-            fields(&frontmatter)[0].value,
+            field(&frontmatter, "tags").value,
             Value::List(vec!["one".to_owned(), "two".to_owned()])
+        );
+    }
+
+    #[test]
+    fn keys_and_values_are_trimmed_but_kept_as_text() {
+        let source = "---\ntitle :   A  \nitems:\n-  spaced\n---\nbody\n";
+        let (frontmatter, _) = split(source);
+        assert_eq!(
+            field(&frontmatter, "title").value,
+            Value::Scalar("A".to_owned())
+        );
+        assert_eq!(
+            field(&frontmatter, "items").value,
+            Value::List(vec!["spaced".to_owned()]),
+            "the item's own padding is not part of the item"
         );
     }
 
@@ -286,9 +478,31 @@ mod tests {
             "the body is indexed anyway: only its frontmatter was unreadable"
         );
         match frontmatter {
-            FrontmatterParse::Failed { raw, reason } => {
+            FrontmatterParse::Failed { raw, line, reason } => {
                 assert_eq!(raw, "title: A\nthis line has no colon\n");
-                assert!(reason.contains("line 3"), "it points at the line: {reason}");
+                assert_eq!(line, 3, "the line is a value, not a string to match on");
+                assert_eq!(reason, Reason::NotAField);
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_other_two_reasons_are_named_as_such() {
+        let (frontmatter, _) = split("---\n- orphan\n---\nbody\n");
+        match frontmatter {
+            FrontmatterParse::Failed { line, reason, .. } => {
+                assert_eq!(line, 2);
+                assert_eq!(reason, Reason::OrphanListItem);
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+
+        let (frontmatter, _) = split("---\ntitle: A\n: value\n---\nbody\n");
+        match frontmatter {
+            FrontmatterParse::Failed { line, reason, .. } => {
+                assert_eq!(line, 3);
+                assert_eq!(reason, Reason::EmptyFieldName);
             }
             other => panic!("expected a failure, got {other:?}"),
         }
@@ -307,9 +521,29 @@ mod tests {
     fn comments_and_blank_lines_are_not_fields() {
         let source = "---\n# a comment\n\ntitle: A\n\n---\nbody\n";
         let (frontmatter, _) = split(source);
-        let fields = fields(&frontmatter);
-        assert_eq!(fields.len(), 1, "{fields:?}");
-        assert_eq!(fields[0].key, "title");
+        assert_eq!(
+            field(&frontmatter, "title").value,
+            Value::Scalar("A".to_owned())
+        );
+        assert_eq!(fields(&frontmatter).len(), 1);
+    }
+
+    #[test]
+    fn a_comment_or_a_blank_line_does_not_close_a_field() {
+        let source = "---\ndescription: |\n  line one\n# a comment\n  line two\n\ntags:\n- one\n\n- two\n---\nbody\n";
+        let (frontmatter, _) = split(source);
+
+        assert_eq!(
+            field(&frontmatter, "description").value,
+            Value::Raw("description: |\n  line one\n  line two".to_owned()),
+            "a comment inside a field is not the field's end"
+        );
+        assert_eq!(
+            field(&frontmatter, "tags").value,
+            Value::List(vec!["one".to_owned(), "two".to_owned()]),
+            "a blank line inside a list is not the list's end either"
+        );
+        assert_eq!(fields(&frontmatter).len(), 2);
     }
 
     #[test]
@@ -317,16 +551,17 @@ mod tests {
         let source = "---\ntitle: A\n...\nbody\n";
         let (frontmatter, body) = split(source);
         assert_eq!(body, "body\n");
-        assert_eq!(fields(&frontmatter)[0].key, "title");
+        assert_eq!(field(&frontmatter, "title").key, "title");
     }
 
     #[test]
-    fn carriage_returns_do_not_leak_into_keys() {
+    fn carriage_returns_do_not_leak_into_keys_or_bodies() {
         let source = "---\r\ntitle: A\r\n---\r\nbody\r\n";
         let (frontmatter, body) = split(source);
         assert_eq!(body, "body\r\n");
-        let fields = fields(&frontmatter);
-        assert_eq!(fields[0].key, "title", "{fields:?}");
-        assert_eq!(fields[0].value, Value::Scalar("A".to_owned()));
+        assert_eq!(
+            field(&frontmatter, "title").value,
+            Value::Scalar("A".to_owned())
+        );
     }
 }
