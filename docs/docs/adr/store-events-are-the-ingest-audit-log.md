@@ -1,0 +1,86 @@
+---
+sidebar_position: 26
+sidebar_label: ADR 0026
+---
+
+# ADR 0026 · Store events are the ingest audit log
+
+`store_events` is the append-only log of what the **store** did on its own
+authority: ingest batches, feed polls, renames, annotations, typeahead. It is
+schema v4, and it exists so that "what happened to this file" has one answer that
+is not a fresh scan of the vault.
+
+## Why it is not `run_events`
+
+`run_events` records a **Run** — the process of an accepted piece of work
+([harness](../harness.md)), bounded by a `RunSpec`, whose status must reach a
+terminal value. Indexing, polling a feed, renaming, annotating and serving
+typeahead are not Runs: nobody accepted them, they carry no budget, and their
+failure is a per-file outcome rather than a failed unit of work. Folding them into
+`run_events` would hand every `index` command a run id and a status machine it has
+no use for. The two tables stay apart, and ingest gets the small log it needs.
+
+## The table
+
+```sql
+CREATE TABLE store_events (
+  id INTEGER PRIMARY KEY,            -- rowid; no AUTOINCREMENT (SQLite's own advice: extra CPU/memory/disk/IO for nothing)
+  occurred_at INTEGER NOT NULL,      -- when it happened (a replay or an import is not when it was written)
+  recorded_at INTEGER NOT NULL,      -- when it was written
+  batch_id TEXT NOT NULL,            -- one index / feed poll / rename batch
+  seq INTEGER NOT NULL,              -- monotonic inside the batch
+  domain TEXT NOT NULL,              -- ingest | feed | vault | annotate
+  type TEXT NOT NULL,                -- ingest.started / ingest.finished / ingest.coverage / source_moved / …
+  source_key TEXT,                   -- set when the event is about one source
+  outcome TEXT,                      -- success | no_results | upstream_error | parse_error
+  reason_code TEXT,                  -- frontmatter_parse_error / empty_feed / …
+  message TEXT,
+  data_json TEXT NOT NULL,
+  external_id TEXT,                  -- provider-issued, for deduplication only
+  UNIQUE (batch_id, seq)
+);
+CREATE UNIQUE INDEX idx_store_events_external
+  ON store_events(domain, external_id) WHERE external_id IS NOT NULL;
+CREATE INDEX idx_store_events_source ON store_events(source_key) WHERE source_key IS NOT NULL;
+```
+
+`UNIQUE (batch_id, seq)` already serves `WHERE batch_id = ?` through its leftmost
+prefix, so no second index on those columns is added.
+
+## `ORDER BY id DESC` rests on three premises
+
+The read path (latest batch, coverage for a batch) is `ORDER BY id DESC LIMIT ?`.
+That is a truthful "latest" only while all three hold:
+
+1. **One writer** — the database has a single owning process (WAL, workspace not
+   shared), so nothing else appends.
+2. **Nothing is ever deleted** — governance is move-only: archiving goes through
+   `VACUUM INTO` into an archive file that stays canonical. This is D30's rule for
+   `run_events` and `history_items`, applied here for the same reason: an audit
+   log with holes is not an audit log.
+3. **No out-of-order imports** — a batch is appended in one transaction in `seq`
+   order. `occurred_at` may be older than the row before it (a replay, an import),
+   but `id` is insertion order and nothing rewrites it.
+
+If a premise falls, the read path orders by `(recorded_at, id)` and the premises
+are renegotiated — not quietly patched into the query.
+
+## A move is a hint, not a rename
+
+`source_moved` records that a file was seen at a new path. It does **not** rewrite
+a `source_key`: a renamed note is a new source
+([ADR 0014](note-rename-is-a-new-source.md)), and the key is the name. The event
+exists so a later tool can offer the user a "these look like the same note"
+decision; making that decision is not part of this contract.
+
+## Consequences
+
+- One `ingest.coverage` row per file makes a batch's work visible and measurable —
+  `indexed | skipped | metadata_refreshed | error` per source, beside the batch's
+  own counters. The row is small and the transaction is the one the batch already
+  commits.
+- One batch, one transaction: a batch's events become visible exactly when the
+  batch does, so a crash cannot leave an `ingest.finished` with no work behind it.
+- Removing rows from `store_events` requires a migration rather than a prune path;
+  there is no retention policy to tune until archiving exists, and archiving is
+  `VACUUM INTO`, never `DELETE`.
