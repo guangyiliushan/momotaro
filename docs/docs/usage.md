@@ -53,6 +53,26 @@ select seq, type, outcome, reason_code, source_key from store_events
 
 人类可读的摘要行不带批次号（只有 `--json` 给）。
 
+## Check the workspace
+
+```bash
+momotaro doctor
+momotaro doctor --json      # the same report for scripts
+```
+
+`doctor` 不写任何东西，未初始化的 workspace 也会退非零（见下方 "Exit codes"）。
+
+想知道**上一次 `index` 对每个文件做了什么**（包括被拒的那些），读审计日志：
+
+```bash
+momotaro doctor --coverage
+# ingest batch index-1737000000000-2d87c684: 5 indexed, 0 skipped, 0 refreshed, 0 failed
+momotaro doctor --coverage --json   # CoverageReport，字段同上有事件计数与 finished
+```
+
+还没索引过时它会说 `no ingest batch recorded yet` 并**成功退出**（"没有批次"是事实，不是故障）。
+`ingest.coverage` 的三种结果分别计数；任何看不懂的 outcome 都会**归入 failures** 而不是被丢掉。
+
 ## Search
 
 ```bash

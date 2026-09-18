@@ -6,7 +6,8 @@
 mod index_service;
 
 pub use index_service::{
-    RebuildReport, SearchHit, SearchOutput, index_workspace, rebuild_index, search_workspace,
+    RebuildReport, SearchHit, SearchOutput, coverage_report, index_workspace, rebuild_index,
+    search_workspace,
 };
 
 use std::fs;
@@ -14,8 +15,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use momotaro_contracts::{
-    HealthReport, IndexFileError, IndexFileErrorKind, IndexPolicy, IndexReport, SchemaVersion,
-    SqliteFacts, StatsReport, VaultScope, WorkspaceStatus,
+    CoverageReport, HealthReport, IndexFileError, IndexFileErrorKind, IndexPolicy, IndexReport,
+    SchemaVersion, SqliteFacts, StatsReport, VaultScope, WorkspaceStatus,
 };
 use momotaro_ingest::IngestError;
 use momotaro_retrieve::RetrieveError;
@@ -525,6 +526,33 @@ pub fn format_search_hit(hit: &SearchHit) -> String {
     )
 }
 
+/// The human rendering of one coverage report: the counts, then every failure.
+pub fn format_coverage(report: &CoverageReport) -> String {
+    let mut line = format!(
+        "ingest batch {}: {} indexed, {} skipped, {} refreshed, {} failed{}",
+        report.batch_id,
+        report.indexed,
+        report.skipped,
+        report.refreshed,
+        report.failures.len(),
+        if report.finished {
+            ""
+        } else {
+            " (no ingest.finished: aborted)"
+        },
+    );
+    for failure in &report.failures {
+        line.push('\n');
+        line.push_str(&format!(
+            "  {}: {}: {}",
+            failure.source_key.as_deref().unwrap_or("<no key>"),
+            failure.reason_code.as_deref().unwrap_or("unknown"),
+            sanitize(failure.message.as_deref().unwrap_or("")),
+        ));
+    }
+    line
+}
+
 /// Renders one per-file index failure as a terminal line.
 ///
 /// The key is escaped as a debug string and the message is sanitized: both
@@ -1032,6 +1060,13 @@ mod tests {
             coverage.iter().all(|event| event.reason_code.is_none()),
             "a refresh is not a failure"
         );
+
+        // …and the reader counts them as refreshes, not as new work.
+        let summary = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(summary.batch_id, report.batch_id);
+        assert_eq!(summary.refreshed, 5, "{summary:?}");
+        assert_eq!(summary.indexed, 0, "{summary:?}");
+        assert!(summary.failures.is_empty(), "{summary:?}");
     }
 
     #[test]
@@ -1246,6 +1281,147 @@ mod tests {
             "the row keeps the detail: {:?}",
             error.message
         );
+    }
+
+    #[test]
+    fn the_last_batch_can_be_read_back() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("a.md"), "# A\n\nbody\n").expect("write");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+
+        assert!(
+            coverage_report(dir.path()).expect("read").is_none(),
+            "nothing indexed yet is not a batch"
+        );
+
+        let report = index_workspace(dir.path(), None).expect("index");
+        let coverage = coverage_report(dir.path())
+            .expect("read")
+            .expect("a batch exists");
+        assert_eq!(coverage.batch_id, report.batch_id);
+        assert_eq!(coverage.indexed, 1);
+        assert_eq!(coverage.skipped, 0);
+        assert_eq!(coverage.refreshed, 0);
+        assert!(coverage.failures.is_empty(), "{:?}", coverage.failures);
+        assert_eq!(coverage.events, 3, "started + one file + finished");
+        assert!(coverage.finished);
+
+        // The next run reports itself, not the one before it.
+        let second = index_workspace(dir.path(), None).expect("second index");
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(coverage.batch_id, second.batch_id);
+        assert_eq!(coverage.skipped, 1, "the file did not change");
+        let line = format_coverage(&coverage);
+        assert!(line.contains(&second.batch_id), "{line}");
+        assert!(line.contains("1 skipped"), "{line}");
+    }
+
+    #[test]
+    fn a_refused_file_shows_up_as_a_failure() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("caf\u{00e9}.md"), "# A\n\nnfc\n").expect("write");
+        fs::write(vault.join("cafe\u{0301}.md"), "# B\n\nnfd\n").expect("write");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        index_workspace(dir.path(), None).expect("index");
+
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(coverage.indexed, 1, "first writer wins");
+        assert_eq!(coverage.failures.len(), 1, "{:?}", coverage.failures);
+        assert_eq!(
+            coverage.failures[0].reason_code.as_deref(),
+            Some("key_collision"),
+            "the failure keeps the stable code, not just the text"
+        );
+        let line = format_coverage(&coverage);
+        assert!(line.contains("key_collision"), "{line}");
+        assert!(line.contains("1 failed"), "{line}");
+    }
+
+    #[test]
+    fn an_unreadable_outcome_is_reported_not_dropped() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("a.md"), "# A\n\nbody\n").expect("write");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        // A row whose outcome this build does not know: the reader must say so
+        // rather than skip the row (an unexplained row is a fact about the
+        // batch).
+        let mut store = store_of(dir.path());
+        store
+            .append_store_event(&momotaro_store::NewStoreEvent {
+                occurred_at: 1,
+                batch_id: &report.batch_id,
+                seq: 99,
+                domain: "ingest",
+                event_type: "ingest.coverage",
+                source_key: Some("note:from-the-future.md"),
+                outcome: Some("reticulated"),
+                reason_code: None,
+                message: None,
+                data_json: "{}",
+                external_id: None,
+            })
+            .expect("append a foreign row");
+
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(coverage.failures.len(), 1, "{:?}", coverage.failures);
+        assert_eq!(
+            coverage.failures[0].source_key.as_deref(),
+            Some("note:from-the-future.md"),
+            "the row is reported, with what it carried"
+        );
+        assert_eq!(
+            coverage.failures[0].reason_code.as_deref(),
+            None,
+            "the row had no code; the reader does not invent one"
+        );
+    }
+
+    #[test]
+    fn a_batch_without_its_end_is_reported_as_unfinished() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("a.md"), "# A\n\nbody\n").expect("write");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        index_workspace(dir.path(), None).expect("index");
+
+        // What an aborted run leaves behind: a beginning with no end. The reader
+        // must not call it complete.
+        let mut store = store_of(dir.path());
+        store
+            .append_store_event(&momotaro_store::NewStoreEvent {
+                occurred_at: 1,
+                batch_id: "index-aborted",
+                seq: 1,
+                domain: "ingest",
+                event_type: "ingest.started",
+                source_key: None,
+                outcome: None,
+                reason_code: None,
+                message: None,
+                data_json: "{}",
+                external_id: None,
+            })
+            .expect("append the beginning of a batch that never ends");
+
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(coverage.batch_id, "index-aborted", "the newest batch wins");
+        assert!(!coverage.finished, "{coverage:?}");
+        assert_eq!(coverage.events, 1);
+        let line = format_coverage(&coverage);
+        assert!(line.contains("aborted"), "the line says so: {line}");
     }
 
     fn store_of(root: &Path) -> Store {

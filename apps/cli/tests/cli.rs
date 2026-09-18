@@ -147,6 +147,44 @@ fn doctor_gates_on_health_not_on_failure() {
     );
 }
 
+#[test]
+fn doctor_coverage_reads_the_last_batch_back() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    stage_vault(workspace.path());
+    write_config(workspace.path());
+
+    // Nothing indexed yet: not a failure, a fact worth saying out loud.
+    let (_, stderr, ok) = run_cli(workspace.path(), &["doctor", "--coverage"]);
+    assert!(ok, "no batch yet is not a failure: {stderr}");
+    assert!(stderr.contains("no ingest batch recorded yet"), "{stderr}");
+
+    let (_, stderr, ok) = run_cli(workspace.path(), &["init"]);
+    assert!(ok, "init: {stderr}");
+    let (stdout, stderr, ok) = run_cli(workspace.path(), &["index", "--json"]);
+    assert!(ok, "index: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|error| panic!("json: {error}\n{stdout}"));
+    let batch_id = report["batch_id"].as_str().expect("index names its batch");
+
+    let (stdout, _, ok) = run_cli(workspace.path(), &["doctor", "--coverage"]);
+    assert!(ok, "{stdout}");
+    assert!(stdout.contains(batch_id), "the batch is named: {stdout}");
+    assert!(
+        stdout.contains("5 indexed"),
+        "the fixture is five files: {stdout}"
+    );
+    assert!(stdout.contains("0 failed"), "{stdout}");
+
+    // The JSON form is the same report, for scripts.
+    let (stdout, _, ok) = run_cli(workspace.path(), &["doctor", "--coverage", "--json"]);
+    assert!(ok, "{stdout}");
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|error| panic!("json: {error}\n{stdout}"));
+    assert_eq!(value["batch_id"], batch_id);
+    assert_eq!(value["indexed"], 5);
+    assert_eq!(value["finished"], true);
+}
+
 /// The source key is derived from the file name, and POSIX allows control
 /// characters in names — an ESC or newline must never reach stderr raw.
 /// Linux-only: Win32 refuses such names outright, and macOS normalizes the

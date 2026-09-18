@@ -474,6 +474,38 @@ pub struct IndexFileError {
     pub message: String,
 }
 
+/// What the most recent ingest batch did, read back out of `store_events`
+/// (ADR 0026). `None` comes back from `momotaro_run::coverage_report` when no
+/// batch was ever recorded — never because one failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageReport {
+    /// The batch these counts describe.
+    pub batch_id: String,
+    /// Rows that wrote a revision and its chunks.
+    pub indexed: u64,
+    /// Rows whose file was unchanged.
+    pub skipped: u64,
+    /// Rows whose file only moved or was re-spelled.
+    pub refreshed: u64,
+    /// Rows that failed, in the order they were written.
+    pub failures: Vec<CoverageFailure>,
+    /// Every row in the batch, including its beginning and its end.
+    pub events: u64,
+    /// Whether the batch reached `ingest.finished`.
+    pub finished: bool,
+}
+
+/// One file a batch could not ingest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageFailure {
+    /// The source the row is about, when it has one.
+    pub source_key: Option<String>,
+    /// The stable code (`key_collision`, `outside_vault`, …).
+    pub reason_code: Option<String>,
+    /// The detail the row carried.
+    pub message: Option<String>,
+}
+
 /// Aggregate outcome of one `momotaro index` invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexReport {
