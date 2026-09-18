@@ -42,7 +42,9 @@ pub struct NewStoreEvent<'a> {
     pub reason_code: Option<&'a str>,
     /// Human-readable detail; never the only copy of a fact.
     pub message: Option<&'a str>,
-    /// The event's payload. Must be valid JSON: the column is `data_json`.
+    /// The event's payload. JSON **by convention**, not by enforcement: the
+    /// store neither parses nor validates it (ADR 0026 puts no `CHECK` on the
+    /// column, and this crate does not depend on a JSON parser).
     pub data_json: &'a str,
     /// Provider-issued identifier, for deduplication only.
     pub external_id: Option<&'a str>,
@@ -243,6 +245,35 @@ mod tests {
             ],
             "the table and both partial indexes exist"
         );
+
+        // Names alone would let the shape rot: the `UNIQUE` is the access path
+        // the ADR leans on (so no second index is added), and both indexes are
+        // meant to be *partial*. Mutations that drop either stayed green until
+        // these text assertions existed.
+        let table_sql = object_sql(&store, "store_events");
+        assert!(table_sql.contains("UNIQUE (batch_id, seq)"), "{table_sql}");
+        let source_sql = object_sql(&store, "idx_store_events_source");
+        assert!(
+            source_sql.contains("WHERE source_key IS NOT NULL"),
+            "{source_sql}"
+        );
+        let external_sql = object_sql(&store, "idx_store_events_external");
+        assert!(
+            external_sql.contains("WHERE external_id IS NOT NULL"),
+            "{external_sql}"
+        );
+    }
+
+    /// The `sqlite_master` DDL of one object.
+    fn object_sql(store: &Store, name: &str) -> String {
+        store
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .expect("read object DDL")
     }
 
     #[test]
@@ -279,7 +310,9 @@ mod tests {
         let mut replayed = event("feed-1", 1, "feed.poll.started");
         replayed.occurred_at = old;
 
+        let before = now_epoch_secs();
         store.append_store_event(&replayed).expect("append");
+        let after = now_epoch_secs();
 
         let stored = store
             .store_events_for_batch("feed-1")
@@ -288,8 +321,8 @@ mod tests {
             .expect("one event");
         assert_eq!(stored.occurred_at, old, "the event keeps its own moment");
         assert!(
-            stored.recorded_at > old,
-            "the write moment is the store's own: {}",
+            (before..=after).contains(&stored.recorded_at),
+            "the write moment is the store's own clock: {} not in {before}..={after}",
             stored.recorded_at
         );
     }
@@ -308,6 +341,14 @@ mod tests {
         let latest = store.latest_store_events(1).expect("read latest");
         assert_eq!(latest.len(), 1);
         assert_eq!(latest[0].batch_id, "index-2", "newest by id, not by moment");
+
+        let both = store.latest_store_events(2).expect("read two");
+        let batches: Vec<&str> = both.iter().map(|event| event.batch_id.as_str()).collect();
+        assert_eq!(batches, vec!["index-2", "index-1"], "newest first, both");
+        assert!(
+            store.latest_store_events(0).expect("read none").is_empty(),
+            "a zero limit is empty, not an error"
+        );
     }
 
     #[test]
@@ -325,6 +366,16 @@ mod tests {
         store
             .append_store_event(&same_provider)
             .expect_err("the same provider id in the same domain is refused");
+
+        // The case the feed poll actually hits: the same provider item seen
+        // again in a *later* batch. Same refusal, and a read-back proves the
+        // first row is still the only one.
+        let mut next_poll = event("feed-2", 1, "feed.item");
+        next_poll.external_id = Some("provider-1");
+        store
+            .append_store_event(&next_poll)
+            .expect_err("a second batch does not make the provider id fresh");
+
         let mut null_provider = event("feed-1", 4, "feed.item");
         null_provider.external_id = None;
         let mut another_null = event("feed-1", 5, "feed.item");
@@ -348,13 +399,33 @@ mod tests {
             .append_store_events("index-2", std::slice::from_ref(&stray))
             .expect_err("a stray batch id is a programming error");
         let text = error.to_string();
-        assert!(text.contains("batch_id"), "{text}");
+        assert!(
+            matches!(&error, StoreError::InvalidValue { column, .. } if column == &"batch_id"),
+            "the refusal names the column, by type: {text}"
+        );
         assert!(
             store
                 .store_events_for_batch("index-1")
                 .expect("read")
                 .is_empty(),
             "the refused batch wrote nothing"
+        );
+    }
+
+    #[test]
+    fn a_stray_batch_id_after_a_good_event_writes_nothing() {
+        // The guard has to fire before the *whole* batch is written, not only
+        // when the first event is the stray one.
+        let (_dir, mut store) = temp_store();
+        let good = event("index-1", 1, "ingest.started");
+        let stray = event("index-9", 2, "ingest.finished");
+        store
+            .append_store_events("index-1", &[good, stray])
+            .expect_err("the second event's batch id is wrong");
+
+        assert!(
+            store.latest_store_events(10).expect("read all").is_empty(),
+            "no event of a refused batch reaches a reader"
         );
     }
 
@@ -388,5 +459,102 @@ mod tests {
             ],
             "the batch reads in `seq` order, whatever order it was handed in"
         );
+    }
+
+    #[test]
+    fn every_column_round_trips() {
+        // The read mapper is by name, so a swap between two `Option<String>`
+        // columns is invisible to any test that leaves them `None`. This one
+        // gives every column a value and compares the whole row.
+        let (_dir, mut store) = temp_store();
+        let batch = "feed-1";
+        store
+            .append_store_event(&NewStoreEvent {
+                occurred_at: 1_000_000,
+                batch_id: batch,
+                seq: 7,
+                domain: "feed",
+                event_type: "feed.poll.finished",
+                source_key: Some("note:a.md"),
+                outcome: Some("no_results"),
+                reason_code: Some("empty_feed"),
+                message: Some("nothing new"),
+                data_json: r#"{"seen":0}"#,
+                external_id: Some("provider-7"),
+            })
+            .expect("append");
+
+        let stored = store
+            .store_events_for_batch(batch)
+            .expect("read")
+            .pop()
+            .expect("one event");
+        let expected = StoreEvent {
+            id: stored.id,
+            occurred_at: 1_000_000,
+            recorded_at: stored.recorded_at,
+            batch_id: batch.to_owned(),
+            seq: 7,
+            domain: "feed".to_owned(),
+            event_type: "feed.poll.finished".to_owned(),
+            source_key: Some("note:a.md".to_owned()),
+            outcome: Some("no_results".to_owned()),
+            reason_code: Some("empty_feed".to_owned()),
+            message: Some("nothing new".to_owned()),
+            data_json: r#"{"seen":0}"#.to_owned(),
+            external_id: Some("provider-7".to_owned()),
+        };
+        assert_eq!(stored, expected, "every column survives the round trip");
+    }
+
+    #[test]
+    fn one_batch_shares_one_write_moment() {
+        // Honest scope: at one-second resolution a per-event clock read lands in
+        // the same second, so this pins the promise the API makes, not the
+        // implementation detail of where the clock is read.
+        let (_dir, mut store) = temp_store();
+        let batch = "index-1";
+        store
+            .append_store_events(
+                batch,
+                &[
+                    event(batch, 1, "ingest.started"),
+                    event(batch, 2, "ingest.coverage"),
+                ],
+            )
+            .expect("append");
+
+        let stored = store.store_events_for_batch(batch).expect("read");
+        assert_eq!(stored.len(), 2);
+        assert_eq!(
+            stored[0].recorded_at, stored[1].recorded_at,
+            "a batch is written as one thing, so it carries one write moment"
+        );
+    }
+
+    #[test]
+    fn a_sequence_number_is_unique_across_append_calls() {
+        let (_dir, mut store) = temp_store();
+        let batch = "index-1";
+        store
+            .append_store_event(&event(batch, 1, "ingest.started"))
+            .expect("first append");
+
+        store
+            .append_store_event(&event(batch, 1, "ingest.finished"))
+            .expect_err("re-using a seq inside one batch is refused, however it is written");
+
+        let stored = store.store_events_for_batch(batch).expect("read");
+        assert_eq!(stored.len(), 1, "the refused event did not land");
+        assert_eq!(stored[0].event_type, "ingest.started");
+    }
+
+    #[test]
+    fn an_empty_batch_is_accepted_and_writes_nothing() {
+        let (_dir, mut store) = temp_store();
+        store
+            .append_store_events("index-1", &[])
+            .expect("a batch with no events is not an error");
+        assert!(store.latest_store_events(10).expect("read").is_empty());
     }
 }
