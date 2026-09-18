@@ -47,6 +47,21 @@ CREATE INDEX idx_store_events_source ON store_events(source_key) WHERE source_ke
 `UNIQUE (batch_id, seq)` already serves `WHERE batch_id = ?` through its leftmost
 prefix, so no second index on those columns is added.
 
+### One column, two vocabularies
+
+`outcome` and `reason_code` stay text so a new adapter code needs no migration,
+and each **domain** owns its set:
+
+| domain | `outcome` | `reason_code` |
+|---|---|---|
+| `ingest` | `indexed` \| `skipped` \| `metadata_refreshed` \| `error` | the `IndexFileErrorKind` spelling (`key_collision`, `invalid_utf8`, `outside_vault`, `invalid_source_key`, `other`) |
+| `feed` | `success` \| `no_results` \| `upstream_error` \| `parse_error` | provider codes (`response_too_large`, `empty_feed`, …) |
+| `vault` / `annotate` | not implemented | not implemented |
+
+The column cannot catch a third spelling; the writers keep the vocabularies
+closed instead — `FileOutcome` and `IndexFileErrorKind` each render through their
+own `Display`, so the ingest codes have one home and a reader can branch on them.
+
 ## `ORDER BY id DESC` rests on three premises
 
 The read path (latest batch, coverage for a batch) is `ORDER BY id DESC LIMIT ?`.
@@ -92,6 +107,10 @@ decision; making that decision is not part of this contract.
   that `ingest.coverage` rows can lag their file by one crash; the next reconcile
   closes that, and `ingest.finished` is written last so a batch is never reported
   complete while a file is still unrecorded.
+- A batch that aborts mid-way leaves `ingest.started` with no terminal event, so a
+  reader sees "running" rather than "crashed". That is stated here rather than
+  discovered later; the fix, when a consumer needs it, is an `ingest.failed`
+  written on the error path — and a reconcile pass supersedes the batch anyway.
 - Removing rows from `store_events` requires a migration rather than a prune path;
   there is no retention policy to tune until archiving exists, and archiving is
   `VACUUM INTO`, never `DELETE`.
