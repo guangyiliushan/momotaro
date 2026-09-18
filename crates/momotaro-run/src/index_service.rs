@@ -547,10 +547,11 @@ pub fn index_workspace(
         };
 
         // D42: two distinct files must never fold into one identity — NFC and
-        // NFD spellings of one name, or two paths to one object. Until the
-        // store event table carries the collision policy (keep both entries +
-        // disambiguating suffix + `key_collision`), refuse the second claimant
-        // instead of silently overwriting the first.
+        // NFD spellings of one name, or two paths to one object. The store event
+        // table exists (schema v4, ADR 0026) and this refusal is one of its rows
+        // (`outcome = error`, `reason_code = key_collision`); what is still
+        // missing is the disambiguating-suffix policy, so the batch refuses the
+        // second claimant instead of silently overwriting the first.
         if let Some(first) = claimed.get(&source_key) {
             seq += 1;
             let message = format!("claimed by both {first:?} and {raw_name:?}");

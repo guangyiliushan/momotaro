@@ -626,17 +626,20 @@ mod tests {
     fn a_batch_never_writes_a_recorded_at_before_the_last_row() {
         let (_dir, mut store) = temp_store();
         let ahead = now_epoch_secs() + 3600;
-        // A row already in the log whose clock was ahead of ours: an NTP step
-        // must not move transaction time backwards past it (storage-events.md).
+        // Two rows already in the log, and they must differ: with a single row,
+        // "the newest row" and "the oldest row" are the same input, so the read
+        // order is not pinned at all (a mutant reading the oldest survives).
         store
             .connection
-            .execute(
+            .execute_batch(&format!(
                 "INSERT INTO store_events
                      (occurred_at, recorded_at, batch_id, seq, domain, type, data_json)
-                 VALUES (?1, ?2, 'index-ahead', 1, 'ingest', 'ingest.started', '{}')",
-                params![ahead, ahead],
-            )
-            .expect("seed a row written by a clock that is ahead");
+                 VALUES ({old}, {old}, 'index-old', 1, 'ingest', 'ingest.started', '{{}}'),
+                        ({ahead}, {ahead}, 'index-ahead', 1, 'ingest', 'ingest.started', '{{}}');",
+                old = ahead - 60,
+                ahead = ahead,
+            ))
+            .expect("seed an older row and the newest row");
 
         assert!(now_epoch_secs() < ahead, "the test needs the clock behind");
         store
@@ -646,7 +649,7 @@ mod tests {
         let rows = store.latest_store_events(1).expect("read back");
         assert_eq!(
             rows[0].recorded_at, ahead,
-            "the new row sits at the last row's timestamp, not below it"
+            "the clamp reads the NEWEST row's timestamp, not the oldest one's"
         );
     }
 

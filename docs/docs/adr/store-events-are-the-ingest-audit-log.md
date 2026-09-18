@@ -80,9 +80,9 @@ pair, or two paths to one object). The batch refuses the second claimant and
 writes its `ingest.coverage` row with `outcome = error` and
 `reason_code = key_collision`; the fuller D42 policy (keep both entries with a
 disambiguating suffix) arrives with the vault-syntax work. Until then the refused
-file is distinguishable only by `message` — which contradicts this log's own rule
-that a message is never the only copy of a fact. Stated here rather than left to
-be discovered.
+file's *raw spelling* is the only thing carried by `message`: the refusal itself is
+never only text — it is a row with `outcome = error` and `reason_code = key_collision`.
+Stated here rather than left to be discovered.
 
 ## `ORDER BY id DESC` rests on three premises
 

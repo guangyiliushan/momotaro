@@ -505,7 +505,7 @@ CREATE TABLE sparks (
 );
 ```
 
-未 pin 的 spark 不进入检索。空 citations 视为 unverified。**pin 不需要引用，检索资格才需要**：检索资格 = `pinned` 且至少一条指向 live chunk 的五元组；只有 `run_id` / `history_id` 的 pin 不算 provenance。未 pin 或无五元组的 pinned spark 都不进索引（[ADR 0013](adr/pin-without-five-tuple-is-not-indexed.md) / [ADR 0018](adr/spark-actions-are-pin-and-dismiss.md)）。pin 是人审动作，不改变信任构成（2026-09-15 调查：记忆投毒 OVERWRITE/ENTRENCH；Mem0 已回撤到 ADD-only）。
+未 pin 的 spark 不进入检索。空 citations 视为 unverified。**pin 不需要引用，检索资格才需要**：检索资格 = `pinned` 且至少一条指向 live chunk 的五元组；只有 `run_id` / `history_id` 的 pin **不算检索资格**（`retrieval eligibility`——它们既不是引用坐标，也不是内容指纹）。未 pin 或无五元组的 pinned spark 都不进索引（[ADR 0013](adr/pin-without-five-tuple-is-not-indexed.md) / [ADR 0018](adr/spark-actions-are-pin-and-dismiss.md)）。pin 是人审动作，不改变信任构成（2026-09-15 调查：记忆投毒 OVERWRITE/ENTRENCH；Mem0 已回撤到 ADD-only）。
 
 **取代链语义（D24）**：取代 = 新行 + `supersedes_spark_id` 指针，被取代行保留
 （可加 `superseded_at` 投影）；检索命中已被取代的工件时自动改投链头或降权，
@@ -882,9 +882,10 @@ final_score = bm25_score × class_weight
 `class_weight` 是乘性因子（Q4 裁决；owner ×2.0 / paper ×1.0 / web ×0.6）。
 **加性公式（`bm25 + weight`）已被否决**：同一个常数在不同查询上改变排名的幅度
 不同（一次项查询值 +48.7%，六次项只值 +8.1%），乘法因子才是"同一个类在任何
-查询下都按同一比例缩放"。（两个百分比出自
-`research/2026-09-16-六问决策复核/agents/01-boost实现口径-引擎与文献.md` §3.1 的
-**示意模型**——k1=1.2、b=0.75、N=1000、avgdl=100 的自算 BM25，不是本仓基准测试。）
+查询下都按同一比例缩放"。（两个百分比来自本仓外做过的一次**示意模型**演算：
+k1=1.2、b=0.75、N=1000、avgdl=100 的自算 BM25，**不是本仓的基准测试**。它们
+要说明的是量纲——同一个加性常数在不同查询上的相对幅度不同，而乘法因子恒为
+同一比例。）
 recency 与 link 两项**后置**（v0.5+；link 见 D22，recency 尚无对应决策项）：进入
 时同为乘性因子（`link_score` 写作 `×(1+δ)`），不回到加性。
 
@@ -1306,12 +1307,11 @@ derived 存 `graph_links`；实体图只在 schema 限定（方法/数据集/任
 且检索基线显示多跳需求真实存在后才考虑。PPR 扩展是后置接缝，不是 1.0
 承诺。
 
-2026-09-18 的形式化调查从四条独立路径**加固**本决策，而不是提供新路线：
-无约束 OpenIE 的最强系统在 CaRB 基准上 P=0.553 / R=0.437；抽取误差不能被
-分量界定（假边在单调演绎下只增结论）；开放世界假设下分不出「假」与「漏」；
-把检索 token 对齐之后，GraphRAG-Bench 的事实型差距消失（71.01 vs 71.17）。
-实体图仍只在 schema 限定、且检索基线证明多跳需求真实之后才考虑——「加
-schema 前后」的对照数字在文献中未找到，故本项目不预埋接缝。
+2026-09-18 的形式化调查从三条独立路径**加固**本决策，而不是提供新路线：
+无约束 OpenIE 的最强系统在 CaRB（EMNLP 2019）上 P=0.553 / R=0.437；抽取误差
+不能被分量界定（假边在单调演绎下只增结论）；开放世界假设下分不出「假」与
+「漏」。实体图仍只在 schema 限定、且检索基线证明多跳需求真实之后才考虑——
+「加 schema 前后」的对照数字在文献中未找到，故本项目不预埋接缝。
 
 ### D20：缓存是第一等工程约束；上下文常数是待校准参数
 
