@@ -47,6 +47,36 @@ CREATE INDEX IF NOT EXISTS idx_revisions_current ON source_revisions(source_key)
     ),
     // 2 -> 3: key scheme v2 — the raw spelling of a name beside its key.
     (3, "ALTER TABLE source_revisions ADD COLUMN raw_name TEXT;"),
+    // 3 -> 4: the store's own audit log (ADR 0026). `id` is the rowid: no
+    // `AUTOINCREMENT`, which SQLite's own advice prices at extra CPU, memory,
+    // disk and IO for a strictly worse guarantee than insertion order.
+    // `UNIQUE (batch_id, seq)` carries an autoindex that already serves
+    // `WHERE batch_id = ?` through its leftmost prefix, so no second index on
+    // those columns; the two partial indexes cover the lookup columns that
+    // would otherwise scan the domain or the source history.
+    (
+        4,
+        "CREATE TABLE IF NOT EXISTS store_events (
+  id INTEGER PRIMARY KEY,
+  occurred_at INTEGER NOT NULL,
+  recorded_at INTEGER NOT NULL,
+  batch_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  domain TEXT NOT NULL,
+  type TEXT NOT NULL,
+  source_key TEXT,
+  outcome TEXT,
+  reason_code TEXT,
+  message TEXT,
+  data_json TEXT NOT NULL,
+  external_id TEXT,
+  UNIQUE (batch_id, seq)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_store_events_external
+  ON store_events(domain, external_id) WHERE external_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_store_events_source
+  ON store_events(source_key) WHERE source_key IS NOT NULL;",
+    ),
 ];
 
 /// Applies every migration newer than `version`.

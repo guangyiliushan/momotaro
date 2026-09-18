@@ -13,10 +13,12 @@ use thiserror::Error;
 
 mod backup;
 pub mod chunks;
+pub mod events;
 mod migration;
 pub mod revisions;
 
 pub use chunks::SourceCounts;
+pub use events::{NewStoreEvent, StoreEvent};
 pub use revisions::NewSourceRevision;
 
 /// Table holding multi-value store metadata. Never the schema version: that
@@ -797,9 +799,10 @@ mod tests {
             .expect("read the clock")
             .as_secs();
         for offset in 0..30 {
-            let blocker = dir
-                .path()
-                .join(format!(".tmp-backup-backup-v2-to-v3-{}.db", now + offset));
+            let blocker = dir.path().join(format!(
+                ".tmp-backup-backup-v2-to-v{CURRENT_SCHEMA_VERSION}-{}.db",
+                now + offset
+            ));
             std::fs::create_dir(&blocker).expect("block the temp artifact path");
         }
 
@@ -853,7 +856,10 @@ mod tests {
         let mut store = Store::open(&path).expect("reopen store");
         store.init_schema().expect("migrate with backup");
 
-        let backups = backup_files(dir.path(), "backup-v2-to-v3-");
+        let backups = backup_files(
+            dir.path(),
+            &format!("backup-v2-to-v{CURRENT_SCHEMA_VERSION}-"),
+        );
         assert_eq!(backups.len(), 1, "one verified backup before migrating");
         assert_eq!(
             store.user_version().expect("read user_version"),
