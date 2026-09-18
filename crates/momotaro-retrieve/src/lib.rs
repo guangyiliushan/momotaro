@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub(crate) mod boost;
 pub mod cjk;
 pub mod index;
 pub mod query;
@@ -35,6 +36,9 @@ pub enum RetrieveError {
     /// truncated, or foreign index). Rebuild the index to recover.
     #[error("index schema mismatch: missing field `{0}`; rebuild the index")]
     SchemaMismatch(String),
+    /// A rebuild was handed a chunk whose source has no trust class.
+    #[error("no origin class for source {0}; refusing to guess what it is")]
+    MissingOrigin(String),
     /// Filesystem failure.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -44,9 +48,34 @@ pub enum RetrieveError {
 mod tests {
     use std::collections::HashMap;
 
-    use momotaro_contracts::Chunk;
+    use momotaro_contracts::{Chunk, OriginClass};
+    use tantivy::collector::TopDocs;
+    use tantivy::query::TermQuery;
+    use tantivy::schema::{IndexRecordOption, Value};
+    use tantivy::{TantivyDocument, Term};
 
     use super::*;
+
+    /// Indexes one source as owner content.
+    ///
+    /// Every vault note is owner content today, so the class is stated once
+    /// here rather than repeated down every test.
+    fn upsert_owner(
+        writer: &mut IndexWriterHandle,
+        fields: &Fields,
+        source_key: &str,
+        title: &str,
+        chunks: &[Chunk],
+    ) -> Result<(), RetrieveError> {
+        SearchIndex::upsert_source(
+            writer,
+            fields,
+            source_key,
+            title,
+            OriginClass::Owner,
+            chunks,
+        )
+    }
 
     fn chunk(
         chunk_id: &str,
@@ -99,7 +128,7 @@ mod tests {
             ),
             chunk("zh-2", "ml/prob.md", 1, None, "概率论是统计学的基石。"),
         ];
-        SearchIndex::upsert_source(
+        upsert_owner(
             &mut writer,
             si.fields(),
             "ml/fourier.md",
@@ -107,7 +136,7 @@ mod tests {
             &chunks[..1],
         )
         .expect("upsert zh");
-        SearchIndex::upsert_source(
+        upsert_owner(
             &mut writer,
             si.fields(),
             "ml/basics.md",
@@ -115,7 +144,7 @@ mod tests {
             &chunks[1..2],
         )
         .expect("upsert en");
-        SearchIndex::upsert_source(&mut writer, si.fields(), "ml/prob.md", "概率", &chunks[2..])
+        upsert_owner(&mut writer, si.fields(), "ml/prob.md", "概率", &chunks[2..])
             .expect("upsert zh2");
         writer.commit().expect("commit");
 
@@ -136,7 +165,7 @@ mod tests {
     fn english_query_hits_english_chunk() {
         let si = ram_index();
         let mut writer = si.writer(20_000_000).expect("writer");
-        SearchIndex::upsert_source(
+        upsert_owner(
             &mut writer,
             si.fields(),
             "ml/basics.md",
@@ -161,7 +190,7 @@ mod tests {
     fn garbage_and_empty_queries_return_ok_empty() {
         let si = ram_index();
         let mut writer = si.writer(20_000_000).expect("writer");
-        SearchIndex::upsert_source(
+        upsert_owner(
             &mut writer,
             si.fields(),
             "a.md",
@@ -181,7 +210,7 @@ mod tests {
     fn upsert_replaces_chunk_set() {
         let si = ram_index();
         let mut writer = si.writer(20_000_000).expect("writer");
-        SearchIndex::upsert_source(
+        upsert_owner(
             &mut writer,
             si.fields(),
             "a.md",
@@ -195,7 +224,7 @@ mod tests {
         writer.commit().expect("commit v1");
         assert_eq!(si.search("傅里叶", 10).expect("hits").len(), 1);
 
-        SearchIndex::upsert_source(
+        upsert_owner(
             &mut writer,
             si.fields(),
             "a.md",
@@ -219,7 +248,7 @@ mod tests {
     fn rebuild_from_replaces_everything() {
         let si = ram_index();
         let mut writer = si.writer(20_000_000).expect("writer");
-        SearchIndex::upsert_source(
+        upsert_owner(
             &mut writer,
             si.fields(),
             "junk.md",
@@ -236,8 +265,14 @@ mod tests {
         let mut titles = HashMap::new();
         titles.insert("r/a.md".to_string(), "Alpha".to_string());
         titles.insert("r/b.md".to_string(), "深度".to_string());
-        let count =
-            SearchIndex::rebuild_from(&mut writer, si.fields(), &fresh, &titles).expect("rebuild");
+        // One source carries a non-owner class, so the rebuild path is exercised
+        // with a real map rather than with the default.
+        let origins = HashMap::from([
+            ("r/a.md".to_string(), OriginClass::Owner),
+            ("r/b.md".to_string(), OriginClass::Paper),
+        ]);
+        let count = SearchIndex::rebuild_from(&mut writer, si.fields(), &fresh, &titles, &origins)
+            .expect("rebuild");
         assert_eq!(count, 2);
         writer.commit().expect("rebuild commit");
 
@@ -250,6 +285,57 @@ mod tests {
         let zh = si.search("深度", 10).expect("zh");
         assert_eq!(zh.len(), 1);
         assert_eq!(zh[0].chunk_id, "r-2");
+
+        // The class survives the rebuild, and it belongs to the right source:
+        // this is the input the trust weighting reads, so "the map was passed"
+        // is not enough — a hardcoded default would pass every assertion above.
+        let searcher = si.index().reader().expect("reader").searcher();
+        let class_query = TermQuery::new(
+            Term::from_field_text(si.fields().origin_class, "paper"),
+            IndexRecordOption::Basic,
+        );
+        let hits = searcher
+            .search(&class_query, &TopDocs::with_limit(10).order_by_score())
+            .expect("class query");
+        assert_eq!(hits.len(), 1, "exactly the paper source carries that class");
+        let stored: TantivyDocument = searcher.doc(hits[0].1).expect("doc");
+        assert_eq!(
+            stored
+                .get_first(si.fields().source_key)
+                .and_then(|v| v.as_str()),
+            Some("r/b.md"),
+            "and it is the source the map named"
+        );
+        assert_eq!(
+            stored
+                .get_first(si.fields().origin_class)
+                .and_then(|v| v.as_str()),
+            Some("paper"),
+            "readable back, not only searchable"
+        );
+    }
+
+    #[test]
+    fn a_chunk_with_no_class_is_refused_not_defaulted() {
+        // Fail-closed, and the reason matters: silently calling a source `owner`
+        // is a doubled weight in T1.8 and nobody would ever see the mistake.
+        let si = ram_index();
+        let mut writer = si.writer(20_000_000).expect("writer");
+        let chunks = [chunk("r-1", "r/a.md", 0, None, "alpha beta")];
+
+        let error = SearchIndex::rebuild_from(
+            &mut writer,
+            si.fields(),
+            &chunks,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect_err("no class for r/a.md");
+
+        assert!(
+            matches!(&error, RetrieveError::MissingOrigin(key) if key == "r/a.md"),
+            "names the key it could not classify: {error:?}"
+        );
     }
 
     #[test]
@@ -267,8 +353,7 @@ mod tests {
                 )
             })
             .collect();
-        SearchIndex::upsert_source(&mut writer, si.fields(), "k/all.md", "K", &chunks)
-            .expect("upsert");
+        upsert_owner(&mut writer, si.fields(), "k/all.md", "K", &chunks).expect("upsert");
         writer.commit().expect("commit");
 
         let hits = si.search("common token", 3).expect("hits");
@@ -282,7 +367,7 @@ mod tests {
     fn escaped_plus_query_finds_cpp_doc() {
         let si = ram_index();
         let mut writer = si.writer(20_000_000).expect("writer");
-        SearchIndex::upsert_source(
+        upsert_owner(
             &mut writer,
             si.fields(),
             "cpp.md",
@@ -310,7 +395,7 @@ mod tests {
         {
             let si = SearchIndex::open_or_create(&path).expect("create");
             let mut writer = si.writer(20_000_000).expect("writer");
-            SearchIndex::upsert_source(
+            upsert_owner(
                 &mut writer,
                 si.fields(),
                 "d/a.md",
@@ -335,7 +420,7 @@ mod tests {
         // (same term, same length, same field stats).
         let sources = ["z.md", "a.md", "m.md"];
         for (i, key) in sources.iter().enumerate() {
-            SearchIndex::upsert_source(
+            upsert_owner(
                 &mut writer,
                 si.fields(),
                 key,
@@ -367,7 +452,7 @@ mod tests {
     fn bare_keyword_queries_never_error() {
         let si = ram_index();
         let mut writer = si.writer(20_000_000).expect("writer");
-        SearchIndex::upsert_source(
+        upsert_owner(
             &mut writer,
             si.fields(),
             "a.md",

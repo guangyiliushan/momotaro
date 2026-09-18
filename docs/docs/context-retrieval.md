@@ -170,7 +170,7 @@ compact_reserve_abs = 12000       # 吸收工具输出突发；按预算缩放 m
 4. 中文走 CJK tokenizer，不做空格假设；
 5. `max_chunk_tokens` / `chunk_overlap_tokens` 是 index policy 参数，改动视为
    策略版本变化，触发重索引，不影响 canonical 表；
-6. **标题链前缀进索引**：检索文本 = `《标题》 > §heading_path：` + chunk 正文。
+6. **标题链前缀进索引**：检索文本 = `《标题》 > heading_path：` + chunk 正文。
    2026-09 调查（arXiv:2608.00824）证实零 LLM 成本可拿到 contextual
    retrieval 方案的大部分收益；Markdown / LaTeX 源的标题结构是天然供给。
    注意区分：**索引文本**带前缀（帮助命中），**canonical `chunks.text` 保持
@@ -188,7 +188,14 @@ BM25 基线没有量化之前，不上 dense / hybrid：
 
 1. fixture golden set：每个 query 标注期望命中的 source / chunk；
 2. 离线指标：`recall@k`、`MRR`，零 LLM、可重复；
-3. 任何检索改动（分词、分块、权重、融合）必须先过回归再合入；
+3. 任何检索改动（分词、分块、权重、融合）必须先过回归再合入；CI 在每 PR 与
+   每日 schedule 上跑 `bash tools/evals/run_golden.sh`（内部调
+   `tools/evals/eval_search.py`），**低于门槛即红**——门槛写在脚本里，不在
+   文档里抄第二份（脚本的守卫自测见 `tools/evals/test_guards.sh`）。门槛贴着基线
+   （recall@5 = 0.9583 / MRR = 0.9028，12 条 query 且仪器确定性——三次独立运行
+   逐位一致），因为它是**回归绊线**而不是容差：漏一条期望命中就是 −1/12 ≈
+   −0.083，任何真实的召回退化都会被拦下。golden set 扩容（目标 50–200 条）时
+   要显式重设脚本里的门槛，别让它悄悄变松；
 4. 这是 Architecture §20 中「BM25 基线有了」这一触发条件的验收方式。
 
 **golden set 口径升级**（2026-09-15 调查：选择的目标函数是「充分性」而非

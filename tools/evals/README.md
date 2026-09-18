@@ -13,28 +13,35 @@ outside both the pnpm and Cargo workspaces (see docs/docs/python-rust.md).
 ## Run
 
 ```bash
-# 1. build a workspace against the fixture vault
-cargo run -p momotaro-cli -- init
-cargo run -p momotaro-cli -- index ./crates/momotaro-run/tests/fixtures/vault
-
-# 2. evaluate (advisory — no floor)
-python tools/evals/eval_search.py --workspace .
-
-# 3. gate (fails below the floor — the D16 upgrade gate)
-python tools/evals/eval_search.py --workspace . --k 5 --floor-recall 0.9
+# Builds the CLI, indexes the fixture vault in a scratch directory (never in the
+# repo root: `init` writes `.momotaro/` where it runs) and gates the golden set
+# with the same thresholds CI uses.
+bash tools/evals/run_golden.sh
 ```
 
-The first full run establishes the BM25-bigram baseline. Any future tokenizer
+Drop the floors to get the numbers without the D16 gate:
+
+```bash
+bash tools/evals/run_golden.sh /tmp/momotaro-eval      # scratch dir is optional
+python tools/evals/eval_search.py --workspace /tmp/momotaro-eval \
+    --cli "$PWD/target/debug/momotaro-cli" --k 5       # advisory, no floor
+```
+
+The first full run established the BM25-bigram baseline. Any future tokenizer
 or ranking change must match or beat that number before merging (D16).
 
-## Recorded baseline (v0.2, cjk bigram, 2026-09-14)
+## Recorded baseline (v0.2, cjk bigram)
 
-Fixture vault, k=5, CLI build at this commit:
+Fixture vault, k=5:
 
 ```text
 recall@5: 0.9583
 mrr:      0.9028
 ```
+
+CI gates on the thresholds inside `run_golden.sh` — the instrument is
+deterministic, so they are tripwires, not tolerances, and a bigger golden set
+must reset them in the same change.
 
 Known miss: `特征值 特征向量` — the multi-word zh query ranks fourier.md and
 long-mixed.md into all top-5 slots, pushing pca.md out. Single-word zh/en

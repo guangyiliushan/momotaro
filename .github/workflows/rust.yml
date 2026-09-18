@@ -8,6 +8,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
+      - "deny.toml"
+      - "tools/evals/**"
       - ".github/workflows/rust.yml"
   pull_request:
     paths:
@@ -16,7 +18,17 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
+      - "deny.toml"
+      - "tools/evals/**"
       - ".github/workflows/rust.yml"
+  schedule:
+    # Advisories and yanks land between commits. On a schedule the whole file
+    # runs against the default branch, so a dependency that was fine yesterday
+    # is disclosed today without anyone having to remember to look (D39).
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -26,13 +38,65 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      # Node 20 actions are removed from runners; pin 40-char SHAs on the Node 24 line (D39).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace --locked
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The windows leg runs the same suite, and its test processes build
+          # tantivy indexes side by side: a file still being mapped gets refused
+          # (code 5 / 145) and the run goes red for reasons no change caused.
+          # Measured: parallel 5/40 and 2/12 red, serial 0/11. Serialising this
+          # leg is a stability trade, not a fix — a judge that cries wolf on
+          # trunk costs more than a slower one.
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            export RUST_TEST_THREADS=1
+          fi
+          cargo test --workspace --locked
+
+  deny:
+    # Supply chain: licenses, advisories, yanks, sources. A policy file nobody
+    # runs is decoration.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          # `--locked` is a global flag, so it has to precede the subcommand —
+          # which is what the action's two argument inputs are for (D39's
+          # `cargo deny --locked check`). Feature coverage is not a CLI flag in
+          # cargo-deny 0.20; it comes from `[graph] all-features = true`.
+          arguments: --locked
+          command: check
+
+  instruments:
+    # The two checks `cargo test` cannot see: the ignored performance smoke and
+    # the retrieval golden set. Both lived outside CI, which is how a ranking
+    # change could merge green.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build the CLI
+        run: cargo build --locked -p momotaro-cli
+      - name: Performance smoke (1000 files)
+        run: cargo test -p momotaro-run --lib --locked -- --ignored --nocapture perf_smoke
+      - name: Golden-set guard tests
+        # The guard is the only thing between this job and the repository; it
+        # gets a test step of its own so it cannot rot silently.
+        run: bash tools/evals/test_guards.sh
+      - name: Retrieval gate (golden set)
+        # The recipe and the thresholds live in the script, which the README
+        # documents: one copy, so the two cannot drift apart. Invoked through
+        # `bash` so the executable bit is not part of the contract.
+        run: bash tools/evals/run_golden.sh

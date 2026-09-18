@@ -81,7 +81,11 @@ parse_error。
    每个 PR 拦新增；main 每日 schedule 拦存量后被披露（arrayref 式时滞）；
 3. **license 白名单**：MIT/Apache-2.0/BSD/ISC/0BSD/Unicode/CC0 起步；MPL-2.0
    桌面分发可放行；GPL/LGPL/AGPL 默认不放行；-sys crate 触发单条 allow 并记录
-   理由；
+   理由。**白名单以 `deny.toml` 为准**；2026-09 按实际依赖图核对：图里出现的
+   `Unlicense OR MIT` 与 `zlib-acknowledgement OR MIT` 都由 **MIT 分支**满足，
+   不必为它们各开一条 allow。真要为后者开的话，ID 要写小写
+   `zlib-acknowledgement`——cargo-deny 的 license 词表区分大小写，
+   `Zlib-acknowledgement` 会直接报 unknown term；
 4. **新增依赖验收八条**：维护活跃度（无维护热门 crate 是接管首选靶位）/
    下载量×stars 交叉 / 传递依赖数 / unsafe 与 -sys 辨识 / build.rs 行为 /
    可替代性（默认答案是不新增）/ 许可证 / 发布者身份；
@@ -150,7 +154,7 @@ parse_error。
 
 ## 6. source_key 规范与同步盘边界（D42）
 
-1. **键构造**：`source_key = note:<vault-relative NFC path> | arxiv:<id>`。NFC/不折叠/碰撞规则作用于 scheme 之后的 tail。笔记 tail：大小写原样保留、分隔符统一 `/`、`..` 剥离后重校验仍指向 vault 内。**禁用 NFKC**（兼容分解会把不同文件折成同一键）。`local_path` 一律相对 workspace root；解析时归一化后必须仍落在工作区内，拒绝 symlink 逃逸（[ADR 0002](adr/source-key-is-scheme-prefixed.md) / [ADR 0024](adr/local-path-is-workspace-relative.md)）。verbatim 前缀剥离、Windows 盘符小写属于 `local_path` 解析，不是键。
+1. **键构造**：`source_key = note:<vault-relative NFC path> | arxiv:<id>`。NFC/不折叠/碰撞规则作用于 scheme 之后的 tail。笔记 tail：大小写原样保留；分隔符统一 `/`——**这是指 walker 拼装组件时用 `/` 连接，不是对名字做字符替换**：`/` 之外的字节一律原样保留（名字里的 `\` 就是 `\`，`docs\ml\a.md` 与 `docs/ml/a.md` 是两个身份）；`..` 组件一律拒绝（键只接受已在 vault 内的相对组件序列，不做「剥离后重校验」）。**禁用 NFKC**（兼容分解会把不同文件折成同一键）。`local_path` 一律相对 workspace root；解析时归一化后必须仍落在工作区内，拒绝 symlink 逃逸（[ADR 0002](adr/source-key-is-scheme-prefixed.md) / [ADR 0024](adr/local-path-is-workspace-relative.md)）。verbatim 前缀与盘符大小写由解析时的 `canonicalize` 决定——既不是键的一部分，也不是我们做的改写；用户可见处渲染存储的 `local_path`。
 2. **原始字节另存** `raw_name`（事件匹配、改名回写、显示用）；键只做身份；
 3. **查询层折叠另建 fold 索引列**（ASCII-only 起步，unicase 完整折叠）——
    键层不做任何 casefold（Linux 大小写双写合法并存，折叠 = 数据丢失级事故）；

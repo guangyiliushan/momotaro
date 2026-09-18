@@ -375,6 +375,7 @@ poll_interval_s = 3600
 3. `RunSpec` 在 run accepted 时冻结。
 4. run 期间不允许修改 model、toolsets、policy 或 index revision。
 5. 移动端用更小的 `max_context_tokens`，同一字段，不是另一套模型。
+6. `[vault].path` 必须落在 workspace 内（`vault == workspace root` 合法，检查用 canonicalize 双验——[ADR 0025](adr/vault-must-live-inside-the-workspace.md) / D31）；存储的 `local_path` 一律相对 workspace root。
 
 ## 8. 数据模型
 
@@ -509,13 +510,14 @@ CREATE TABLE sparks (
 （可加 `superseded_at` 投影）；检索命中已被取代的工件时自动改投链头或降权，
 provenance 面板显示「该断言已被 X 取代」。
 
-**记忆检索的 boost 阶梯**（Tantivy 字段级权重，0.x 起生效）：
+**记忆检索的 boost 阶梯**（per-document origin 类权重 —— 是**每文档的类权重**，不是字段权重：类相同的文档在任何查询下都按同一比例缩放（[ADR 0004](adr/same-library-retrieval-is-mixed-bm25.md)）；**乘性**，0.x 起生效；实现见 `crates/momotaro-retrieve/src/boost.rs`）：
 
 ```text
-owner note chunk                 2.0
-pinned spark（≥1 五元组）        1.5
-普通 chunk                       1.0
-proposed / 无五元组的 pinned spark  不进索引
+owner note chunk                  ×2.0
+paper                             ×1.0
+web（含抓取的网页正文）             ×0.6
+agent / system                    不进索引（查询侧也不可检索）
+pinned spark（≥1 五元组）          ×1.5 —— v0.5，尚未实现
 ```
 
 annotation 不进这张表（[ADR 0016](adr/annotations-are-not-retrieval-hits.md)）。`wiki_pages` 不在 0.x/1.0 索引与 boost 阶梯里。
@@ -860,27 +862,30 @@ MVP 检索：
 
 1. **Tantivy BM25**：主检索。
 2. **显式 query expand**：一次短 LLM，然后确定性检索。
-3. **Link expansion**：第一实现是 **wiki-link 确定性解析**（v0.5，D22）——笔记 `[[双链]]` 在 ingest 时解析入 derived `graph_links`，`link_score` 是 1-hop 小额加成（+δ，离线 recall 校准）；LLM 只能建议链接，不能建立链接。引用网络边在 paper add 时从参考文献与 S2AG/OpenAlex 类免费引用 API 确定性抽取。**PPR 定位为「种子发现面板」**（对标 Inciteful），不进 `final_score`——HippoRAG 消融显示 PPR 增益依赖 LLM 抽取图，确定性图上仅存产品级证据。
+3. **Link expansion**：第一实现是 **wiki-link 确定性解析**（v0.5，D22）——笔记 `[[双链]]` 在 ingest 时解析入 derived `graph_links`，`link_score` 是 1-hop 小额**乘性**加成（`×(1+δ)`，离线 recall 校准，不进加性项）；LLM 只能建议链接，不能建立链接。引用网络边在 paper add 时从参考文献与 S2AG/OpenAlex 类免费引用 API 确定性抽取。**PPR 定位为「种子发现面板」**（对标 Inciteful），不进 `final_score`——HippoRAG 消融显示 PPR 增益依赖 LLM 抽取图，确定性图上仅存产品级证据。
 4. **dense / BM42 / SPLADE**：派生索引，默认关闭。接缝是 `retrievers: [bm25]`。
 
 排序因子：
 
 ```text
-final_score =
-  bm25_score
-  + source_weight
-  + recency_weight
-  + link_score
+final_score = bm25_score × class_weight
 ```
 
-| Source | Weight |
+`class_weight` 是乘性因子（Q4 裁决；owner ×2.0 / paper ×1.0 / web ×0.6）。
+**加性公式（`bm25 + weight`）已被否决**：同一个常数在不同查询上改变排名的幅度
+不同（一次项查询值 +48.7%，六次项只值 +8.1%），乘法因子才是"同一个类在任何
+查询下都按同一比例缩放"。（两个百分比出自
+`research/2026-09-16-六问决策复核/agents/01-boost实现口径-引擎与文献.md` §3.1 的
+**示意模型**——k1=1.2、b=0.75、N=1000、avgdl=100 的自算 BM25，不是本仓基准测试。）
+recency 与 link 两项**后置**（v0.5+；link 见 D22，recency 尚无对应决策项）：进入
+时同为乘性因子（`link_score` 写作 `×(1+δ)`），不回到加性。
+
+| Source | 是否进索引 |
 |---|---|
-| `owner` note chunk | **2.0**（boost 阶梯最高档，见 sparks；annotation 不进索引） |
-| pinned spark（≥1 五元组） | **1.5** |
-| `paper` | high（1.0 基准档） |
-| curated `web` | medium（默认降权，定界渲染） |
-| untrusted `web` | low or excluded |
-| unpinned spark | excluded（不进索引） |
+| `owner` / `paper` / `web` | 进；权重数值**只在上面那张阶梯里**（×2.0 / ×1.0 / ×0.6，逐文档类权重，不分 curated/untrusted） |
+| `agent` / `system` | 不进（非用户内容） |
+| pinned spark（≥1 五元组） | 不实现（v0.5；阶梯里同款标注） |
+| unpinned spark / annotation | 不进 |
 
 ## 12. Context Pipeline
 
@@ -1320,7 +1325,7 @@ tools canonical 序列化 + `cached_tokens` 记账 + session 内证据位置守�
 
 `[[双链]]` 在 ingest 时确定性解析入 `graph_links`，是 §11 Link expansion 的
 第一实现；LLM 只能建议链接，不能建立链接。`link_score` = 1-hop 小额加成
-（+δ，离线 recall 校准）。PPR 不进 `final_score`：HippoRAG 消融（换非 LLM
+（`×(1+δ)`，离线 recall 校准，同为乘性因子）。PPR 不进 `final_score`：HippoRAG 消融（换非 LLM
 抽取器后 PPR 增益近乎消失，72.9→58.4 R@5）说明其增益依赖 LLM 抽取图；确定性
 引用图上仅存的产品级证据是 Inciteful 式「种子发现面板」。
 
@@ -1392,11 +1397,14 @@ keyring「不可用/被锁」与「无凭据」显式区分并提示；Windows �
 ### D29：SQLite 引擎纪律（PRAGMA 定稿 + 版本钉扎 + 红线=治理触发）
 
 缺省 PRAGMA 八条定稿与容量触发表见 [规模与生命周期](scale-lifecycle.md)。
-**rusqlite ≥0.40.x 升级是唯一立即代码项**：本仓捆绑 SQLite 3.50.2 落在
-WAL-reset 窗口 3.7.0–3.51.2 内（Tailscale 19 起损坏同因），3.53.2 已修复；
-`doctor` 输出捆绑版本、窗口内告警。容量红线不是「库不能超过 X」而是指标
-越线触发治理动作（数字待 pilot）；写连接唯一、读连接不限；mmap 与
-auto_vacuum 显式不开（Windows VACUUM 静默失败）。
+**引擎版本钉扎**：捆绑引擎必须落在 WAL-reset 窗口之外。上游口径（sqlite.org/wal.html
+§11）：缺陷存在于 **3.7.0（2010-07-21）至 3.51.2（2026-01-09）**，**自 3.51.3
+（2026-03-13）起修复**；窗口内另有 3.44.6 / 3.50.7 两个回补版本。3.52.0 已撤回
+（误报 `integrity_check` 损坏），**永不采用**——它与窗口是两个不同的拒绝理由。
+`doctor` 输出 `sqlite_version()` / `sqlite_source_id()` / `PRAGMA compile_options`，
+并**在窗口内硬失败**（`status = invalid`、退出码非 0）——引擎版本不是可选信息。
+容量红线不是「库不能超过 X」而是指标越线触发治理动作（数字待 pilot）；
+写连接唯一、读连接不限；mmap 与 auto_vacuum 显式不开（Windows VACUUM 静默失败）。
 
 ### D30：run_events 生命周期——归档 ≠ 删除
 
@@ -1526,7 +1534,7 @@ wikilink 全形态建边（pulldown-cmark `ENABLE_WIKILINKS`）；dangling 链�
 
 ### D42：source_key = NFC 身份键，键层永不折叠
 
-`source_key = note:<vault-relative NFC path> | arxiv:<id>`；NFC/不折叠/碰撞规则作用于 scheme 之后的 tail。verbatim 前缀剥离、盘符小写属于 `local_path` 的解析规则（[ADR 0002](adr/source-key-is-scheme-prefixed.md) / [ADR 0024](adr/local-path-is-workspace-relative.md)）。大小写原样保留、`/` 分隔；**禁用 NFKC 与 casefold**（Linux 大小写双写合法并存，折叠 = 数据丢失级事故）；`raw_name` 原始字节另存（事件匹配/显示）；查询层大小写折叠另建 fold 索引列。NFC 碰撞（NFC/NFD 双写）：两条目都保留 + 消歧后缀 + 事件，绝不静默合并。同步盘预警：OneDrive placeholder 只建元数据不读内容；Windows 非法名在非 Windows 端照常索引但发预警（会经同步盘毒化 Windows 端）。平台测试矩阵 11 项进 CI。
+`source_key = note:<vault-relative NFC path> | arxiv:<id>`；NFC/不折叠/碰撞规则作用于 scheme 之后的 tail。verbatim 前缀与盘符大小写由解析时的 `canonicalize` 决定（既不是键的一部分，也不是我们做的改写）——用户可见处一律渲染存储的 `local_path`，不渲染解析后的路径（[ADR 0002](adr/source-key-is-scheme-prefixed.md) / [ADR 0024](adr/local-path-is-workspace-relative.md)）。大小写原样保留、`/` 分隔；**禁用 NFKC 与 casefold**（Linux 大小写双写合法并存，折叠 = 数据丢失级事故）；`raw_name` 原始字节另存（事件匹配/显示）；查询层大小写折叠另建 fold 索引列。NFC 碰撞（NFC/NFD 双写）：两条目都保留 + 消歧后缀 + 事件，绝不静默合并。同步盘预警：OneDrive placeholder 只建元数据不读内容；Windows 非法名在非 Windows 端照常索引但发预警（会经同步盘毒化 Windows 端）。平台测试矩阵 11 项进 CI。
 
 ### D43：更新管线——动态薄层 + 通道 endpoint 隔离 + 灰度
 

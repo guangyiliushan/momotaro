@@ -6,10 +6,13 @@ is given (--floor-recall / --floor-mrr) and the metric falls below it. Without
 a floor the run is advisory (the D16 baseline instrument).
 
 Usage:
-    python tools/evals/eval_search.py --cli cargo --workspace <dir> [--k 5] [--floor-recall 1.0]
+    python tools/evals/eval_search.py --workspace <dir> --cli <path/to/momotaro-cli[.exe]> \
+        [--k 5] [--floor-recall 0.95] [--floor-mrr 0.90]
 
-The CLI command is invoked as: <cli> run -p momotaro-cli -- search <q> --json --top <k>
-(executed from the repo root, with the search run inside <workspace>).
+`--cli` is the *command prefix* that runs the binary — a path here, but the
+default is `cargo run -p momotaro-cli --` — and each query is executed as
+`<cli...> search <query> --json --top <k>` with the workspace as the working
+directory. Give it explicitly for a workspace that is not a cargo project.
 """
 
 from __future__ import annotations

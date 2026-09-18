@@ -9,9 +9,10 @@ use tantivy::query::QueryParser;
 use tantivy::schema::{Field, Value};
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
-use momotaro_contracts::{Chunk, RetrievalHit};
+use momotaro_contracts::{Chunk, OriginClass, RetrievalHit};
 
 use crate::RetrieveError;
+use crate::boost;
 use crate::cjk::{CJK_TOKENIZER_NAME, cjk_analyzer};
 use crate::query::{escape_query, normalize_query};
 use crate::schema::{self, Fields};
@@ -118,6 +119,13 @@ impl SearchIndex {
         &self.fields
     }
 
+    /// The underlying index; test-only (the tests that read stored fields and
+    /// class terms).
+    #[cfg(test)]
+    pub(crate) fn index(&self) -> &Index {
+        &self.index
+    }
+
     /// Creates a writer with the given total memory budget in bytes.
     pub fn writer(&self, heap_bytes: usize) -> Result<IndexWriterHandle, RetrieveError> {
         Ok(IndexWriterHandle {
@@ -135,13 +143,14 @@ impl SearchIndex {
         fields: &Fields,
         source_key: &str,
         title: &str,
+        origin: OriginClass,
         chunks: &[Chunk],
     ) -> Result<(), RetrieveError> {
         writer
             .inner
             .delete_term(Term::from_field_text(fields.source_key, source_key));
         for chunk in chunks {
-            let doc = schema::doc_from_chunk(fields, title, chunk);
+            let doc = schema::doc_from_chunk(fields, title, origin, chunk);
             writer.inner.add_document(doc)?;
         }
         Ok(())
@@ -149,14 +158,16 @@ impl SearchIndex {
 
     /// Rebuilds the whole index from a full chunk set.
     ///
-    /// Deletes all documents, then indexes every chunk. Titles are looked
-    /// up per `chunk.source_key` (empty string when absent). Returns the
-    /// number of chunks queued. Nothing is committed.
+    /// Deletes all documents, then indexes every chunk. Titles and trust classes
+    /// are looked up per `chunk.source_key` (an empty title is fine; a missing
+    /// class is refused — guessing one would silently mis-weight the source).
+    /// Returns the number of chunks queued. Nothing is committed.
     pub fn rebuild_from(
         writer: &mut IndexWriterHandle,
         fields: &Fields,
         chunks: &[Chunk],
         titles: &HashMap<String, String>,
+        origins: &HashMap<String, OriginClass>,
     ) -> Result<u64, RetrieveError> {
         writer.inner.delete_all_documents()?;
         for chunk in chunks {
@@ -164,7 +175,11 @@ impl SearchIndex {
                 .get(&chunk.source_key)
                 .map(String::as_str)
                 .unwrap_or("");
-            let doc = schema::doc_from_chunk(fields, title, chunk);
+            let origin = origins
+                .get(&chunk.source_key)
+                .copied()
+                .ok_or_else(|| RetrieveError::MissingOrigin(chunk.source_key.clone()))?;
+            let doc = schema::doc_from_chunk(fields, title, origin, chunk);
             writer.inner.add_document(doc)?;
         }
         Ok(chunks.len() as u64)
@@ -213,6 +228,9 @@ impl SearchIndex {
                 }
             }
         };
+        // Class scoping is the ranking backbone, not a filter bolted on after:
+        // every hit is produced by exactly one weighted class branch.
+        let parsed = boost::origin_scoped(&self.fields, parsed);
         let searcher = self.reader.searcher();
         let top_docs = searcher.search(&parsed, &TopDocs::with_limit(top_k).order_by_score())?;
 

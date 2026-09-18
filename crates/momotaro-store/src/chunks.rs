@@ -147,6 +147,7 @@ mod tests {
                 title: Some("T"),
                 uri: None,
                 local_path: None,
+                raw_name: None,
                 origin_class: OriginClass::Owner,
                 metadata_json: "{}",
                 ingested_at: 1,

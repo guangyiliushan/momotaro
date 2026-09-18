@@ -7,8 +7,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use momotaro_run::{
-    RunError, SearchOutput, doctor, index_workspace, init_workspace, rebuild_index,
-    search_workspace, stats,
+    RunError, SearchOutput, doctor, format_error, format_health, format_index_error,
+    format_index_summary, format_rebuild, format_search_excerpt, format_search_hit,
+    index_workspace, init_workspace, is_healthy, rebuild_index, search_workspace, stats,
 };
 
 /// A personal knowledge engine for serious learners.
@@ -76,7 +77,8 @@ fn print_error(json: bool, error: RunError) -> ExitCode {
     if json {
         println!("{}", serde_json::json!({ "error": error.to_string() }));
     } else {
-        eprintln!("error: {error}");
+        // The serializer escapes the JSON form; a terminal needs the same care.
+        eprintln!("error: {}", format_error(&error));
     }
 
     ExitCode::FAILURE
@@ -108,11 +110,18 @@ fn main() -> ExitCode {
             Err(error) => print_error(cli.json, error),
         },
         Command::Doctor => match doctor(&root) {
-            Ok(report) => print_success(
-                cli.json,
-                serde_json::to_string_pretty(&report).expect("health report serializes"),
-                "workspace is ready",
-            ),
+            Ok(report) => {
+                let payload =
+                    serde_json::to_string_pretty(&report).expect("health report serializes");
+                print_success(cli.json, payload, &format_health(&report));
+                // A health check that cannot fail a script is not a check
+                // (docs/docs/usage.md, "Exit codes").
+                if is_healthy(&report) {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
             Err(error) => print_error(cli.json, error),
         },
         Command::Stats => match stats(&root) {
@@ -134,18 +143,9 @@ fn main() -> ExitCode {
                             "",
                         );
                     } else {
-                        println!(
-                            "indexed {} of {} files ({} new revisions, {} unchanged), {} chunks, {} errors in {} ms",
-                            report.files_indexed,
-                            report.files_scanned,
-                            report.revisions_created,
-                            report.files_skipped,
-                            report.chunks_written,
-                            report.errors.len(),
-                            report.duration_ms
-                        );
+                        println!("{}", format_index_summary(&report));
                         for item in &report.errors {
-                            eprintln!("error: {}: {}", item.source_key, item.message);
+                            eprintln!("error: {}", format_index_error(item));
                         }
                     }
                     ExitCode::SUCCESS
@@ -178,10 +178,7 @@ fn main() -> ExitCode {
                         "",
                     );
                 } else {
-                    println!(
-                        "rebuilt index over {} chunks in {} ms",
-                        report.chunks, report.duration_ms
-                    );
+                    println!("{}", format_rebuild(&report));
                 }
                 ExitCode::SUCCESS
             }
@@ -197,17 +194,7 @@ fn print_hits(output: &SearchOutput) {
     }
 
     for hit in &output.hits {
-        let title = hit.title.as_deref().unwrap_or("-");
-        println!(
-            "{}. {}#{}  {}  score={:.3}",
-            hit.hit.rank, hit.hit.source_key, hit.hit.ordinal, title, hit.hit.score
-        );
-        let excerpt = hit.excerpt.replace('\n', " ");
-        if excerpt.chars().count() > 100 {
-            let truncated: String = excerpt.chars().take(100).collect();
-            println!("    {truncated}...");
-        } else {
-            println!("    {excerpt}");
-        }
+        println!("{}", format_search_hit(hit));
+        println!("    {}", format_search_excerpt(&hit.excerpt));
     }
 }

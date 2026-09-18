@@ -26,12 +26,14 @@ trusted_schema=OFF;
 -- 显式不开：mmap（Windows VACUUM 截断静默失败）、auto_vacuum（存量库改造需整库 VACUUM）
 ```
 
-### 版本钉扎（唯一立即代码项）
+### 版本钉扎
 
-升级 `rusqlite` ≥ 0.40.x（bundled SQLite 3.53.2，出 WAL-reset 窗口
-3.7.0–3.51.2）。本仓原捆绑 3.50.2 落在窗口内（WAL 重置可致库损坏；
-Tailscale 19 起实害同因；修复亦回补 3.44.6/3.50.7）。`momotaro doctor`
-输出捆绑 SQLite 版本，窗口内即告警。
+`rusqlite` ≥ 0.40.x（本仓 bundled SQLite **3.53.2**）。上游口径（sqlite.org/wal.html §11）：
+该缺陷存在于 **3.7.0（2010-07-21）至 3.51.2（2026-01-09）** 的所有版本，**自 3.51.3
+（2026-03-13）起修复**；窗口内另有 3.44.6 / 3.50.7 两个回补版本。3.52.0 已撤回
+（误报 `integrity_check` 损坏），永不采用。`momotaro doctor` 输出
+`sqlite_version()` / `sqlite_source_id()` / `PRAGMA compile_options`，
+**落在窗口内即硬失败**（`status = invalid`、退出码非 0），不是"告警"。
 
 ### 连接层单写
 

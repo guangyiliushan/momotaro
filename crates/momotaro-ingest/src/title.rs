@@ -39,8 +39,22 @@ fn first_h1(normalized: &str) -> Option<String> {
 }
 
 fn file_stem_of(source_key: &str) -> &str {
-    let base = source_key.rsplit('/').next().unwrap_or(source_key);
-    base.strip_suffix(".md").unwrap_or(base)
+    let key = source_key
+        .strip_prefix(momotaro_contracts::NOTE_SCHEME)
+        .unwrap_or(source_key);
+    let base = key.rsplit('/').next().unwrap_or(key);
+    strip_md_extension(base)
+}
+
+/// Strips a trailing `.md`, ignoring ASCII case (the walker accepts `.MD`).
+///
+/// Never splits a multi-byte character: `rsplit_once` works on characters,
+/// and a name with no dot is returned unchanged.
+fn strip_md_extension(name: &str) -> &str {
+    match name.rsplit_once('.') {
+        Some((stem, extension)) if extension.eq_ignore_ascii_case("md") => stem,
+        _ => name,
+    }
 }
 
 #[cfg(test)]
@@ -66,6 +80,32 @@ mod tests {
             "decay"
         );
         assert_eq!(derive_title("", "plain"), "plain");
+    }
+
+    #[test]
+    fn falls_back_to_file_stem_for_prefixed_keys() {
+        assert_eq!(derive_title("no heading\n", "note:fourier.md"), "fourier");
+        assert_eq!(derive_title("no heading\n", "note:ml/decay.md"), "decay");
+    }
+
+    /// The vault walker accepts `.MD` (case-insensitive); the stem strip must
+    /// agree, or the title keeps a dangling extension (review suggestion).
+    #[test]
+    fn falls_back_to_file_stem_for_uppercase_extension() {
+        assert_eq!(derive_title("no heading\n", "note:Notes/Inner.MD"), "Inner");
+    }
+
+    /// Names shorter than the extension, and a cut that would land inside a
+    /// multi-byte character, fall back to the whole name without panicking
+    /// (review suggestion: pin both edge branches).
+    #[test]
+    fn file_stem_handles_short_and_multibyte_names() {
+        assert_eq!(derive_title("", "note:a"), "a");
+        assert_eq!(derive_title("", "note:ab"), "ab");
+        assert_eq!(derive_title("", "note:\u{65e5}"), "\u{65e5}");
+        assert_eq!(derive_title("", "note:\u{1f600}"), "\u{1f600}");
+        assert_eq!(derive_title("", "note:\u{65e5}.md"), "\u{65e5}");
+        assert_eq!(derive_title("", "note:.MD"), "");
     }
 
     #[test]

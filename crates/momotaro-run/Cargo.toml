@@ -2,6 +2,7 @@
 name = "momotaro-run"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 momotaro-contracts = { workspace = true }

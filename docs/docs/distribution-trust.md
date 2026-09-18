@@ -144,6 +144,15 @@ Omnisearch 187.9 万下载会被内行指出）。差异化护城河是四项的
    更高）；
 5. **崩溃循环防护 = 数据防线组合**：迁移后首启崩 → 二次进安全模式（只读
    视图）+ 「从迁移前备份另存副本」出口 + 服务端 stable 清单回指旧版；
-6. **通道数据隔离**：beta 与 stable 分库目录（VS Code Insiders 模式）；首个
+6. **库文件身份**：每个自建库写入 `PRAGMA application_id = 0x4D4D4F54`
+   （ASCII `MMOT`）；打开时身份不符即 `ForeignDatabase` 拒绝，"带版本载体却无
+   身份"的文件同样拒绝（`NoIdentity`）——凡写过版本载体的构建都写过身份，两者
+   出自同一次改动。**拒绝路径零写入**：`Store::refuse_write()` 依次判 身份（`ForeignDatabase`）
+   → 版本过新（`SchemaTooNew`）→ 旧载体（`LegacyStore`；**刻意排在第三方对象之前**，
+   好让真旧库读到"重建"而不是"这不是我们的库"）→ 无身份却带版本（`NoIdentity`）
+   → 第三方对象（`ForeignObjects`），全部通过才允许第一次写入（建表与 WAL 切换
+   都算写入）。旧 dev 库（版本号记在 `schema_meta`）报 `LegacyStore`，不迁移、按
+   [ADR 0002](adr/source-key-is-scheme-prefixed.md) 重建。
+7. **通道数据隔离**：beta 与 stable 分库目录（VS Code Insiders 模式）；首个
    beta 从 stable 复制副本初始化，从此各自演化；schema 不承诺跨通道兼容；
    beta 发布说明必须注明「含 schema 迁移 vN，加入后无法回退 stable」。

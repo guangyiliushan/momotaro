@@ -2,9 +2,12 @@
 name = "momotaro-contracts"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 serde = { workspace = true }
+thiserror = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -113,6 +113,23 @@ CLI shim 示例（业务不写在 package.json 里）：
 }
 ```
 
+## CI
+
+`.github/workflows/rust.yml` 三个 job（`uses:` 全部 pin 完整 40 位 SHA，D39）：
+
+| job | 触发 | 内容 |
+|---|---|---|
+| `test` | push / PR（Rust 路径、`tools/evals/**` 或 workflow 自身改动）+ 每日 | ubuntu 与 windows 两腿：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`cargo test --workspace --locked`。**windows 腿串行**（`RUST_TEST_THREADS=1`）：并行建索引在该平台会瞬时拒绝访问（实测并行 5/40 与 2/12 红、串行 0/11）——这是**换稳定，不是修因**，flaky 本体仍登记在册 |
+| `deny` | 同上 | `cargo deny --locked check`（`deny.toml` 是唯一策略文件：licenses / bans / advisories / sources；特性覆盖来自 `[graph] all-features`，不是 CLI flag） |
+| `instruments` | 同上 | `perf_smoke`（1000 文件性能冒烟，`#[ignore]` 那条）与 `bash tools/evals/run_golden.sh`（golden set 回归绊线）。**配方与门槛只有这一份**：README 教的就是它、CI 调的就是它，门槛写在脚本里（贴基线，仪器确定性 ⇒ 不是容差；golden set 扩容时显式重设） |
+
+`test` 之外的两位是「`cargo test` 看不见的东西」：冒烟与 golden set 原先只在本地跑，
+检索排序改动可以一路绿到合入。**冒烟不设时间阈值**——它只断言跑通与计数，时间门在
+共享 runner 上会抖；要卡性能得用同机基准。
+
+文档站由 `docs-test.yml`（push→dev / PR→main 构建，断链 throw）与
+`docs-deploy.yml`（push main 发布）负责。
+
 ## Beta definition of done
 
 更宽测试前，至少：

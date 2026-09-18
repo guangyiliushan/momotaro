@@ -1,0 +1,49 @@
+# Supply-chain policy (D39). `cargo deny check` runs in CI on every change and
+# on a daily schedule, so a new advisory against an already-pinned dependency is
+# disclosed without anyone having to remember to look.
+
+[graph]
+# Every target we build for, so a Windows-only or test-only dependency cannot
+# hide from the license and advisory checks.
+all-features = true
+
+[advisories]
+# A yanked crate is not a version anybody can rely on; refuse it rather than
+# warning, because the fix is always "move off the yanked version".
+yanked = "deny"
+
+[licenses]
+# Permissive licenses only. Anything else needs a deliberate decision recorded
+# here, not a surprise in a lockfile.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+# An allowance nobody uses yet is policy (the list is the licences this project
+# accepts), not drift, so a never-encountered entry is not worth a warning.
+unused-allowed-license = "allow"
+# Workspace crates are `publish = false`: internal, so the license check does
+# not apply to them (the repo-root LICENSE covers the project itself).
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Every crate here depends on its workspace siblings by path, with no version
+# to check; `workspace = true` is not a wildcard to be afraid of.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

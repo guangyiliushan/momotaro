@@ -31,3 +31,4 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 sha2 = "0.11"
 hex = "0.4"
 walkdir = "2.5"
+unicode-normalization = "0.1"

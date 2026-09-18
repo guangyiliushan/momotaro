@@ -1,9 +1,19 @@
 //! Reading and appending canonical source revisions.
 
+use std::collections::{HashMap, HashSet};
+
 use momotaro_contracts::{OriginClass, SourceKind, SourceRevision};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{StoreError, invalid_value};
+
+/// `?1, ?2, …` covering `keys`, for an `IN` clause bound positionally.
+fn numbered_placeholders(keys: &HashSet<&str>) -> String {
+    (1..=keys.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// A new source revision to append; the store owns the `is_current` flag.
 #[derive(Debug, Clone, PartialEq)]
@@ -18,8 +28,13 @@ pub struct NewSourceRevision<'a> {
     pub title: Option<&'a str>,
     /// Remote URI, when the source has one.
     pub uri: Option<&'a str>,
-    /// Absolute local path, when the source lives on disk.
+    /// Workspace-relative, `/`-joined path when the source lives on disk
+    /// (ADR 0024). Never absolute: the store only describes what lives inside
+    /// the workspace that holds it.
     pub local_path: Option<&'a str>,
+    /// The file name exactly as the vault spelled it (display / rename
+    /// matching). Never an identity: `source_key` is.
+    pub raw_name: Option<&'a str>,
     /// Trust origin.
     pub origin_class: OriginClass,
     /// JSON metadata blob (fingerprint, tool tag, provider data).
@@ -28,42 +43,15 @@ pub struct NewSourceRevision<'a> {
     pub ingested_at: i64,
 }
 
-pub(crate) fn kind_to_string(kind: SourceKind) -> &'static str {
-    match kind {
-        SourceKind::Note => "note",
-        SourceKind::Paper => "paper",
-        SourceKind::Web => "web",
-    }
-}
-
-pub(crate) fn kind_from_string(value: &str) -> Result<SourceKind, StoreError> {
-    match value {
-        "note" => Ok(SourceKind::Note),
-        "paper" => Ok(SourceKind::Paper),
-        "web" => Ok(SourceKind::Web),
-        other => Err(invalid_value("kind", other)),
-    }
-}
-
-pub(crate) fn origin_to_string(origin: OriginClass) -> &'static str {
-    match origin {
-        OriginClass::Owner => "owner",
-        OriginClass::Paper => "paper",
-        OriginClass::Web => "web",
-        OriginClass::Agent => "agent",
-        OriginClass::System => "system",
-    }
+/// Decodes the stored spelling, which lives on [`SourceKind`] (`as_str` / `FromStr`).
+fn kind_from_string(value: &str) -> Result<SourceKind, StoreError> {
+    value.parse().map_err(|_| invalid_value("kind", value))
 }
 
 pub(crate) fn origin_from_string(value: &str) -> Result<OriginClass, StoreError> {
-    match value {
-        "owner" => Ok(OriginClass::Owner),
-        "paper" => Ok(OriginClass::Paper),
-        "web" => Ok(OriginClass::Web),
-        "agent" => Ok(OriginClass::Agent),
-        "system" => Ok(OriginClass::System),
-        other => Err(invalid_value("origin_class", other)),
-    }
+    value
+        .parse()
+        .map_err(|_| invalid_value("origin_class", value))
 }
 
 fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRevision> {
@@ -86,6 +74,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRevision> {
         title: row.get("title")?,
         uri: row.get("uri")?,
         local_path: row.get("local_path")?,
+        raw_name: row.get("raw_name")?,
         origin_class,
         metadata_json: row.get("metadata_json")?,
         ingested_at: row.get("ingested_at")?,
@@ -99,8 +88,8 @@ fn query_current(
 ) -> Result<Option<SourceRevision>, StoreError> {
     let revision = connection
         .query_row(
-            "SELECT source_key, revision_hash, kind, title, uri, local_path, origin_class,
-                    metadata_json, ingested_at, is_current
+            "SELECT source_key, revision_hash, kind, title, uri, local_path, raw_name,
+                    origin_class, metadata_json, ingested_at, is_current
              FROM source_revisions
              WHERE source_key = ?1 AND is_current = 1",
             params![source_key],
@@ -123,18 +112,19 @@ impl crate::Store {
         )?;
         tx.execute(
             "INSERT INTO source_revisions
-                (source_key, revision_hash, kind, title, uri, local_path, origin_class,
+                (source_key, revision_hash, kind, title, uri, local_path, raw_name, origin_class,
                  metadata_json, ingested_at, is_current)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)
              ON CONFLICT(source_key, revision_hash) DO UPDATE SET is_current = 1",
             params![
                 revision.source_key,
                 revision.revision_hash,
-                kind_to_string(revision.kind),
+                revision.kind.as_str(),
                 revision.title,
                 revision.uri,
                 revision.local_path,
-                origin_to_string(revision.origin_class),
+                revision.raw_name,
+                revision.origin_class.as_str(),
                 revision.metadata_json,
                 revision.ingested_at,
             ],
@@ -158,22 +148,46 @@ impl crate::Store {
             .and_then(|revision| revision.title))
     }
 
+    /// One trust class per source key, fetched in a single query.
+    ///
+    /// Mirrors [`Store::current_titles`]; a source missing from the map means
+    /// the store has no current revision for it (the column itself is NOT NULL).
+    pub fn current_origins(
+        &self,
+        source_keys: &HashSet<&str>,
+    ) -> Result<HashMap<String, OriginClass>, StoreError> {
+        if source_keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = numbered_placeholders(source_keys);
+        let sql = format!(
+            "SELECT source_key, origin_class FROM source_revisions
+             WHERE is_current = 1 AND source_key IN ({placeholders})"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let params: Vec<&str> = source_keys.iter().copied().collect();
+        let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut origins = HashMap::new();
+        for row in rows {
+            let (key, origin) = row?;
+            origins.insert(key, origin_from_string(&origin)?);
+        }
+        Ok(origins)
+    }
+
     /// Returns display titles for the current revision of each requested
     /// source key, in a single query. Keys without a current revision are
     /// absent from the result.
     pub fn current_titles(
         &self,
-        source_keys: &std::collections::HashSet<&str>,
-    ) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        source_keys: &HashSet<&str>,
+    ) -> Result<HashMap<String, String>, StoreError> {
         if source_keys.is_empty() {
-            return Ok(std::collections::HashMap::new());
+            return Ok(HashMap::new());
         }
-        let placeholders = source_keys
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let placeholders = numbered_placeholders(source_keys);
         let sql = format!(
             "SELECT source_key, title FROM source_revisions
              WHERE is_current = 1 AND source_key IN ({placeholders})"
@@ -183,7 +197,7 @@ impl crate::Store {
         let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })?;
-        let mut titles = std::collections::HashMap::new();
+        let mut titles = HashMap::new();
         for row in rows {
             let (key, title) = row?;
             if let Some(title) = title {
@@ -193,18 +207,38 @@ impl crate::Store {
         Ok(titles)
     }
 
-    /// Replaces the metadata blob of one specific revision.
-    pub fn update_revision_metadata(
+    /// Refreshes the mutable columns of one revision in place.
+    ///
+    /// Used when a file's bytes did not change but its fingerprint, stored path
+    /// or raw spelling moved — a directory move must not leave a stale absolute
+    /// path behind (ADR 0024). Never touches `source_key` or `revision_hash`:
+    /// identity is not mutable.
+    pub fn update_revision_fingerprint(
         &mut self,
         source_key: &str,
         revision_hash: &str,
         metadata_json: &str,
+        local_path: &str,
+        raw_name: &str,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
-            "UPDATE source_revisions SET metadata_json = ?3
+        let changed = self.connection.execute(
+            "UPDATE source_revisions
+             SET metadata_json = ?3, local_path = ?4, raw_name = ?5
              WHERE source_key = ?1 AND revision_hash = ?2",
-            params![source_key, revision_hash, metadata_json],
+            params![
+                source_key,
+                revision_hash,
+                metadata_json,
+                local_path,
+                raw_name
+            ],
         )?;
+        if changed != 1 {
+            return Err(StoreError::RevisionMissing {
+                source_key: source_key.to_owned(),
+                revision_hash: revision_hash.to_owned(),
+            });
+        }
         Ok(())
     }
 }
@@ -229,6 +263,7 @@ mod tests {
             title: Some("Demo"),
             uri: None,
             local_path: None,
+            raw_name: Some("Demo.md"),
             origin_class: OriginClass::Owner,
             metadata_json: "{\"fingerprint\":\"x\"}",
             ingested_at: 1_700_000_000,
@@ -264,6 +299,11 @@ mod tests {
         assert_eq!(current.kind, SourceKind::Note);
         assert_eq!(current.origin_class, OriginClass::Owner);
         assert_eq!(current.title.as_deref(), Some("Demo"));
+        assert_eq!(
+            current.raw_name.as_deref(),
+            Some("Demo.md"),
+            "raw_name round-trips beside the key"
+        );
     }
 
     #[test]
@@ -342,7 +382,23 @@ mod tests {
     }
 
     #[test]
-    fn metadata_update_targets_one_revision() {
+    fn refreshing_a_missing_revision_is_an_error() {
+        let mut store = open_temp_store();
+        store
+            .append_revision(&revision("a.md", "hash1"))
+            .expect("append");
+
+        let error = store
+            .update_revision_fingerprint("a.md", "missing", "{}", "a.md", "a.md")
+            .expect_err("a missing revision must not look like a successful refresh");
+        assert!(
+            matches!(&error, StoreError::RevisionMissing { revision_hash, .. } if revision_hash == "missing"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn refresh_updates_exactly_one_row() {
         let mut store = open_temp_store();
         store
             .append_revision(&revision("a.md", "hash1"))
@@ -352,8 +408,14 @@ mod tests {
             .expect("append hash2");
 
         store
-            .update_revision_metadata("a.md", "hash1", "{\"updated\":true}")
-            .expect("update metadata");
+            .update_revision_fingerprint(
+                "a.md",
+                "hash1",
+                "{\"updated\":true}",
+                "notes/a.md",
+                "a.md",
+            )
+            .expect("update the mutable columns");
 
         let metadata: Vec<String> = store
             .connection
@@ -370,6 +432,28 @@ mod tests {
                 "{\"updated\":true}".to_owned(),
                 "{\"fingerprint\":\"x\"}".to_owned()
             ]
+        );
+
+        // The refresh is path-aware: a moved file updates both the stored path
+        // and the raw spelling, and touches nothing else.
+        let refreshed: (Option<String>, Option<String>, String, String) = store
+            .connection
+            .query_row(
+                "SELECT local_path, raw_name, source_key, revision_hash
+                 FROM source_revisions WHERE source_key = 'a.md' AND revision_hash = 'hash1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read the refreshed row");
+        assert_eq!(
+            refreshed,
+            (
+                Some("notes/a.md".to_owned()),
+                Some("a.md".to_owned()),
+                "a.md".to_owned(),
+                "hash1".to_owned()
+            ),
+            "identity columns survive a refresh"
         );
     }
 
