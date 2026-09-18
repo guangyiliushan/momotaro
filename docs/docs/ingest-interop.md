@@ -149,6 +149,11 @@ parse_error。
    的续行；孤儿列表项；空字段名）——那时整块原文保留 + `frontmatter_parse_error`
    事件，正文照常索引。未闭合的 `---` 是水平线、整篇即正文；`chunks.text` 仍是
    原文切片，locator 必须把切掉的字节/行加回（见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 同层的口径）；
+   **现状（2026-09-18）**：解析、接线与排除**已落地**（字段进
+   `source_revisions.metadata_json` 的 `frontmatter` 键、正文进 chunker 且 locator
+   按原 note 计、失败发 `frontmatter_parse_error` 且 `outcome` 仍为 `indexed`）；
+   **未做**的是其余九类降级（wikilink 五类属 W2.4）、`.canvas` 解析、附件登记与
+   同步盘三条（OneDrive/iCloud/Windows 非法名）——它们随本波剩余任务落地；
 6. **解析基座**：pulldown-cmark ≥ 0.13.3 + `ENABLE_WIKILINKS`（官方内置、
    Obsidian 兼容目标）；私有语法（Dendron 式）当 `unknown_link_syntax` 降级；
 7. **降级事件十类**：frontmatter_parse_error / unresolved_wikilink /

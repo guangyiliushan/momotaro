@@ -11,9 +11,10 @@ use momotaro_contracts::{
     Chunk, CoverageFailure, CoverageReport, IndexFileError, IndexFileErrorKind, IndexPolicy,
     IndexReport, OriginClass, RetrievalHit, SourceKind, WorkspaceStatus,
 };
+use momotaro_ingest::frontmatter::{self, FrontmatterParse};
 use momotaro_ingest::{
-    chunk_markdown, derive_title, normalize_markdown, raw_name_for, revision_hash, source_key_for,
-    walk_markdown_files,
+    SourceOffset, chunk_markdown_with, derive_title, normalize_markdown, raw_name_for,
+    revision_hash, source_key_for, walk_markdown_files,
 };
 use momotaro_retrieve::{IndexWriterHandle, SearchIndex};
 use momotaro_store::{NewSourceRevision, NewStoreEvent, Store};
@@ -161,7 +162,7 @@ fn summarize_coverage(batch_id: &str, events: &[momotaro_store::StoreEvent]) -> 
         match event.event_type.as_str() {
             "ingest.finished" => report.finished = true,
             "ingest.coverage" => match event.outcome.as_deref() {
-                Some(outcome) if outcome == FileOutcome::Indexed.as_str() => report.indexed += 1,
+                Some(outcome) if outcome == FileOutcome::INDEXED => report.indexed += 1,
                 Some(outcome) if outcome == FileOutcome::Skipped.as_str() => report.skipped += 1,
                 Some(outcome) if outcome == FileOutcome::MetadataRefreshed.as_str() => {
                     report.refreshed += 1;
@@ -390,6 +391,72 @@ fn fingerprint_matches(metadata_json: &str, metadata: &fs::Metadata) -> bool {
         && value.get("size_bytes").and_then(serde_json::Value::as_u64) == Some(metadata.len())
 }
 
+/// The revision's metadata blob: the stat fingerprint plus what the frontmatter
+/// block turned out to be.
+fn revision_metadata(fingerprint: &str, frontmatter: &FrontmatterParse) -> String {
+    let mut blob = serde_json::from_str::<serde_json::Value>(fingerprint)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = blob.as_object_mut() {
+        object.insert("frontmatter".to_owned(), frontmatter_json(frontmatter));
+    }
+    blob.to_string()
+}
+
+/// The block's JSON form, built here rather than in `momotaro-ingest` so the
+/// parser crate stays free of a JSON dependency on its production path.
+///
+/// Tagged and self-describing on purpose: a reader of the blob must be able to
+/// tell "there was no block" from "the block could not be read" from "here are
+/// the fields" without guessing, and the failure keeps its raw text and line so
+/// a later pass can retry the parse (`frontmatter_parse_error`).
+fn frontmatter_json(parse: &FrontmatterParse) -> serde_json::Value {
+    match parse {
+        FrontmatterParse::Absent => serde_json::json!({ "state": "absent" }),
+        FrontmatterParse::Parsed(frontmatter) => serde_json::json!({
+            "state": "parsed",
+            "raw": frontmatter.raw,
+            "fields": frontmatter
+                .fields
+                .iter()
+                .map(|field| serde_json::json!({
+                    "key": field.key,
+                    "value": match &field.value {
+                        frontmatter::Value::Scalar(text) => serde_json::json!({ "scalar": text }),
+                        frontmatter::Value::List(items) => serde_json::json!({ "list": items }),
+                        frontmatter::Value::Raw(text) => serde_json::json!({ "raw": text }),
+                    },
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        FrontmatterParse::Failed { raw, line, reason } => serde_json::json!({
+            "state": "failed",
+            "raw": raw,
+            "line": line,
+            "reason": reason.to_string(),
+        }),
+    }
+}
+
+/// The fingerprint for a refresh, carrying the frontmatter the old blob held.
+///
+/// `update_revision_fingerprint` replaces the whole blob, and a refresh means the
+/// bytes did not change — so the block parsed before is still the truth and must
+/// survive the rewrite.
+fn with_carried_frontmatter(fresh: &str, previous: &str) -> String {
+    let carried = serde_json::from_str::<serde_json::Value>(previous)
+        .ok()
+        .and_then(|blob| blob.get("frontmatter").cloned());
+    let Some(carried) = carried else {
+        return fresh.to_owned();
+    };
+    let mut blob =
+        serde_json::from_str::<serde_json::Value>(fresh).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = blob.as_object_mut() {
+        object.insert("frontmatter".to_owned(), carried);
+    }
+    blob.to_string()
+}
+
 fn file_error(
     source_key: Option<&str>,
     kind: IndexFileErrorKind,
@@ -584,13 +651,16 @@ pub fn index_workspace(
             &mut report,
         ) {
             Ok(outcome) => {
+                let degraded = outcome.reason_code();
                 store.append_store_event(&coverage_event(
                     &batch_id,
                     seq,
                     Some(&source_key),
                     outcome.as_str(),
-                    None,
-                    None,
+                    degraded,
+                    degraded.map(
+                        |_| "the file was indexed; its frontmatter block could not be read (D41.5)",
+                    ),
                 ))?;
             }
             Err(message) => {
@@ -675,17 +745,33 @@ enum FileOutcome {
     Skipped,
     /// Same bytes under a new path or spelling: the mutable columns moved.
     MetadataRefreshed,
-    /// A revision and its chunks were written.
-    Indexed,
+    /// A revision and its chunks were written. `degraded` carries the stable
+    /// code of anything the file lost on the way in (today: a frontmatter block
+    /// that could not be read, D41.5) — the file *was* indexed, so the outcome
+    /// stays `indexed` and the code rides alongside it.
+    Indexed { degraded: Option<&'static str> },
 }
 
 impl FileOutcome {
+    /// The wire spelling of the `indexed` outcome. A reader that only needs the
+    /// word compares against this; the variant itself carries the degradation
+    /// code beside the outcome.
+    const INDEXED: &'static str = "indexed";
+
     /// The wire spelling written to `store_events.outcome` (ADR 0026).
     fn as_str(&self) -> &'static str {
         match self {
             Self::Skipped => "skipped",
             Self::MetadataRefreshed => "metadata_refreshed",
-            Self::Indexed => "indexed",
+            Self::Indexed { .. } => Self::INDEXED,
+        }
+    }
+
+    /// The stable code the coverage row carries, when the file was indexed anyway.
+    fn reason_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Indexed { degraded } => *degraded,
+            Self::Skipped | Self::MetadataRefreshed => None,
         }
     }
 }
@@ -741,7 +827,7 @@ fn process_file(
             .update_revision_fingerprint(
                 source_key,
                 &revision.revision_hash,
-                &fingerprint,
+                &with_carried_frontmatter(&fingerprint, &revision.metadata_json),
                 &local_path,
                 raw_name,
             )
@@ -750,8 +836,15 @@ fn process_file(
         return Ok(FileOutcome::MetadataRefreshed);
     }
 
-    let chunks = chunk_markdown(source_key, &hash, &normalized, policy);
-    let title = derive_title(&normalized, source_key);
+    let (frontmatter, body) = frontmatter::split(&normalized);
+    let offset = SourceOffset::before_body(&normalized, body);
+    let chunks = chunk_markdown_with(source_key, &hash, body, policy, offset);
+    // The title comes from the body: a `#` inside a frontmatter block is a YAML
+    // comment, not a heading.
+    let title = derive_title(body, source_key);
+    // The parsed block rides in the revision blob (D41.5: unknown fields are
+    // Obsidian's data, so the whole block is kept rather than modelled further).
+    let metadata_json = revision_metadata(&fingerprint, &frontmatter);
     // Vault content is owner content — stated once, used by the revision row and
     // the index document alike, so the two can never disagree.
     let origin = OriginClass::Owner;
@@ -766,7 +859,7 @@ fn process_file(
             local_path: Some(&local_path),
             raw_name: Some(raw_name),
             origin_class: origin,
-            metadata_json: &fingerprint,
+            metadata_json: &metadata_json,
             ingested_at: now_epoch_secs(),
         })
         .map_err(|error| error.to_string())?;
@@ -787,7 +880,13 @@ fn process_file(
     report.files_indexed += 1;
     report.revisions_created += 1;
     report.chunks_written += chunks.len() as u64;
-    Ok(FileOutcome::Indexed)
+    // A block that could not be read does not stop the file: the body is indexed
+    // and the failure becomes a code on the coverage row (`frontmatter_parse_error`).
+    let degraded = match &frontmatter {
+        FrontmatterParse::Failed { .. } => Some("frontmatter_parse_error"),
+        FrontmatterParse::Absent | FrontmatterParse::Parsed(_) => None,
+    };
+    Ok(FileOutcome::Indexed { degraded })
 }
 
 /// Rebuilds the tantivy index from canonical store chunks.

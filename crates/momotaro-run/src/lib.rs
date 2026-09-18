@@ -1612,6 +1612,80 @@ mod tests {
         );
     }
 
+    #[test]
+    fn frontmatter_stays_out_of_the_index_but_keeps_the_locator_honest() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        let note = "---\ntitle: Hiddentoken\n---\n# Heading\n\nbody text here\n";
+        fs::write(vault.join("a.md"), note).expect("write");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        index_workspace(dir.path(), None).expect("index");
+
+        // The block is not index text: a field value is not searchable.
+        let hits = search_workspace(dir.path(), "Hiddentoken", 10).expect("search");
+        assert!(hits.hits.is_empty(), "frontmatter is not body: {hits:?}");
+
+        // The body is, and its locator counts lines from the note's first line.
+        let hits = search_workspace(dir.path(), "body text here", 10).expect("search");
+        let hit = hits.hits.first().expect("the body is indexed");
+        assert!(
+            hit.hit.locator_json.contains("\"start_line\":6"),
+            "locators are note-relative, not body-relative: {}",
+            hit.hit.locator_json
+        );
+
+        // And the block rides in the revision's metadata blob, fields and raw alike.
+        let store = store_of(dir.path());
+        let revision = store
+            .current_revision("note:a.md")
+            .expect("read")
+            .expect("the note was indexed");
+        assert!(
+            revision.metadata_json.contains("\"frontmatter\"")
+                && revision.metadata_json.contains("Hiddentoken"),
+            "the block is kept verbatim: {}",
+            revision.metadata_json
+        );
+    }
+
+    #[test]
+    fn a_broken_block_costs_the_block_not_the_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(
+            vault.join("a.md"),
+            "---\ntitle: A\nnot a field\n---\nbody text here\n",
+        )
+        .expect("write");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        assert!(
+            report.errors.is_empty(),
+            "a bad block is not a bad file: {report:?}"
+        );
+        let hits = search_workspace(dir.path(), "body text here", 10).expect("search");
+        assert_eq!(hits.hits.len(), 1, "the body was indexed anyway");
+
+        let store = store_of(dir.path());
+        let row = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read the batch")
+            .into_iter()
+            .find(|event| event.source_key.as_deref() == Some("note:a.md"))
+            .expect("a coverage row for the file");
+        assert_eq!(row.outcome.as_deref(), Some("indexed"));
+        assert_eq!(
+            row.reason_code.as_deref(),
+            Some("frontmatter_parse_error"),
+            "the degradation is recorded beside the outcome, not instead of it"
+        );
+    }
+
     fn store_of(root: &Path) -> Store {
         Store::open(database_path(root)).expect("open store")
     }
