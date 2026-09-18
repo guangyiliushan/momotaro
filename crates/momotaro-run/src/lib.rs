@@ -633,6 +633,7 @@ mod tests {
         // collision count, not the total. (A mutation that counted every error
         // survived the earlier version of this test.)
         let report = IndexReport {
+            batch_id: "index-1".to_owned(),
             files_scanned: 3,
             files_skipped: 0,
             files_indexed: 2,
@@ -1009,6 +1010,128 @@ mod tests {
             revision.local_path.as_deref(),
             Some("notes/vault/fourier.md"),
             "the stored path follows the move"
+        );
+    }
+
+    #[test]
+    fn an_index_run_is_one_batch_with_one_row_per_file() {
+        // ADR 0026 through the public API: the batch has a beginning, one row
+        // per file and an end, and the report names the same batch.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("a.md"), "# A\n\nfirst\n").expect("write");
+        fs::write(vault.join("b.md"), "# B\n\nsecond\n").expect("write");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+
+        let report = index_workspace(dir.path(), None).expect("index");
+        let store = store_of(dir.path());
+        let events = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read batch");
+
+        assert_eq!(events.len(), 4, "started + two files + finished");
+        assert_eq!(events[0].event_type, "ingest.started");
+        assert_eq!(events[events.len() - 1].event_type, "ingest.finished");
+        assert_eq!(
+            events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+            "one batch, one sequence"
+        );
+
+        let coverage: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "ingest.coverage")
+            .collect();
+        assert_eq!(coverage.len(), 2, "one row per file");
+        assert!(
+            coverage
+                .iter()
+                .all(|event| event.outcome.as_deref() == Some("indexed")),
+            "both files were new"
+        );
+        assert!(
+            coverage.iter().all(|event| event
+                .source_key
+                .as_deref()
+                .is_some_and(|key| key.starts_with("note:"))),
+            "the row names the source it is about"
+        );
+        assert!(
+            events.iter().all(|event| event.batch_id == report.batch_id),
+            "the report and the rows agree on the batch"
+        );
+    }
+
+    #[test]
+    fn a_second_index_run_reports_its_files_as_skipped() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("a.md"), "# A\n\nbody\n").expect("write");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        index_workspace(dir.path(), None).expect("first index");
+
+        let report = index_workspace(dir.path(), None).expect("second index");
+        let store = store_of(dir.path());
+        let coverage: Vec<_> = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read batch")
+            .into_iter()
+            .filter(|event| event.event_type == "ingest.coverage")
+            .collect();
+
+        assert_eq!(coverage.len(), 1);
+        assert_eq!(
+            coverage[0].outcome.as_deref(),
+            Some("skipped"),
+            "an unchanged file is covered, not silently dropped"
+        );
+        assert!(coverage[0].reason_code.is_none(), "no failure to explain");
+    }
+
+    #[test]
+    fn a_collision_gets_an_error_row_with_a_stable_code() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("caf\u{00e9}.md"), "# A\n\nnfc\n").expect("write");
+        fs::write(vault.join("cafe\u{0301}.md"), "# B\n\nnfd\n").expect("write");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+
+        let report = index_workspace(dir.path(), None).expect("index");
+        let store = store_of(dir.path());
+        let coverage: Vec<_> = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read batch")
+            .into_iter()
+            .filter(|event| event.event_type == "ingest.coverage")
+            .collect();
+
+        assert_eq!(
+            coverage.len(),
+            2,
+            "both files get a row, one of them an error"
+        );
+        let error = coverage
+            .iter()
+            .find(|event| event.outcome.as_deref() == Some("error"))
+            .expect("the refused file is an error row");
+        assert_eq!(
+            error.reason_code.as_deref(),
+            Some("key_collision"),
+            "the code is the typed kind's spelling, not a message"
+        );
+        assert!(
+            error
+                .message
+                .as_deref()
+                .is_some_and(|text| text.contains("caf")),
+            "the row keeps the detail: {:?}",
+            error.message
         );
     }
 

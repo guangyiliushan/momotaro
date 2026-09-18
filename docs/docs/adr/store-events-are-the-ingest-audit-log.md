@@ -58,8 +58,7 @@ That is a truthful "latest" only while all three hold:
    `VACUUM INTO` into an archive file that stays canonical. This is D30's rule for
    `run_events` and `history_items`, applied here for the same reason: an audit
    log with holes is not an audit log.
-3. **No out-of-order imports** — a batch is appended in one transaction in `seq`
-   order. `occurred_at` may be older than the row before it (a replay, an import),
+3. **No out-of-order imports** — an append is one transaction, in `seq` order. `occurred_at` may be older than the row before it (a replay, an import),
    but `id` is insertion order and nothing rewrites it.
 
 If a premise falls, the read path orders by `(recorded_at, id)` and the premises
@@ -79,8 +78,17 @@ decision; making that decision is not part of this contract.
   `indexed | skipped | metadata_refreshed | error` per source, beside the batch's
   own counters. The row is small and the transaction is the one the batch already
   commits.
-- One batch, one transaction: a batch's events become visible exactly when the
-  batch does, so a crash cannot leave an `ingest.finished` with no work behind it.
+- **Events never claim work that is not there.** Each append is one transaction,
+  and the ingest path writes a file's data *before* the event that describes it,
+  so a crash can lose an event but never invent one. The other half of that
+  window — work that landed without its event — is what reconciliation exists
+  for (D40: events are the hint, reconciliation is the truth).
+- A batch-wide transaction was considered and rejected: it would hold the write
+  lock across a 1000-file run and turn one crash into a lost batch, against
+  D40's rule that a single file update is exactly one transaction. The cost is
+  that `ingest.coverage` rows can lag their file by one crash; the next reconcile
+  closes that, and `ingest.finished` is written last so a batch is never reported
+  complete while a file is still unrecorded.
 - Removing rows from `store_events` requires a migration rather than a prune path;
   there is no retention policy to tune until archiving exists, and archiving is
   `VACUUM INTO`, never `DELETE`.

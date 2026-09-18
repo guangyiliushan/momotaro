@@ -477,6 +477,9 @@ pub struct IndexFileError {
 /// Aggregate outcome of one `momotaro index` invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexReport {
+    /// Identifier of this indexing batch, as written to `store_events`
+    /// (ADR 0026): one `index` run, one batch.
+    pub batch_id: String,
     /// Markdown files discovered under the vault root.
     pub files_scanned: u64,
     /// Files skipped because the fingerprint was unchanged.

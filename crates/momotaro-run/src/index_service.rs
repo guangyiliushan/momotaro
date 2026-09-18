@@ -16,7 +16,7 @@ use momotaro_ingest::{
     walk_markdown_files,
 };
 use momotaro_retrieve::{IndexWriterHandle, SearchIndex};
-use momotaro_store::{NewSourceRevision, Store};
+use momotaro_store::{NewSourceRevision, NewStoreEvent, Store};
 use serde::{Deserialize, Serialize};
 
 use crate::{RunError, WorkspaceConfig, database_path, load_config, validate_policy, vault_scope};
@@ -393,7 +393,16 @@ pub fn index_workspace(
 
     let files = walk_markdown_files(&vault_root)?;
 
+    // One batch per run (ADR 0026). Unique without a new dependency: the
+    // millisecond is for a human reading the table, the nanosecond half makes
+    // two runs in the same millisecond distinct.
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let batch_id = format!("index-{}-{:x}", stamp.as_millis(), stamp.subsec_nanos());
+
     let mut report = IndexReport {
+        batch_id: batch_id.clone(),
         files_scanned: files.len() as u64,
         files_skipped: 0,
         files_indexed: 0,
@@ -403,13 +412,44 @@ pub fn index_workspace(
         duration_ms: 0,
     };
 
+    // The batch's own edges (ADR 0026): `started` before any file work, so a
+    // reader can tell "running" from "never started"; `finished` last, after
+    // every per-file row, so a batch is never called complete while a file is
+    // still unrecorded.
+    let mut seq: i64 = 0;
+    seq += 1;
+    store.append_store_event(&NewStoreEvent {
+        occurred_at: now_epoch_secs(),
+        batch_id: &batch_id,
+        seq,
+        domain: "ingest",
+        event_type: "ingest.started",
+        source_key: None,
+        outcome: None,
+        reason_code: None,
+        message: None,
+        data_json: &serde_json::json!({ "files_scanned": files.len() }).to_string(),
+        external_id: None,
+    })?;
+
     let mut claimed: HashMap<String, String> = HashMap::new();
 
     for file in files {
         let source_key = match source_key_for(&vault_root, &file) {
             Ok(key) => key,
             Err(error) => {
-                report.errors.push(file_error(None, error.kind(), error));
+                seq += 1;
+                let reason = error.kind().to_string();
+                let message = error.to_string();
+                store.append_store_event(&coverage_event(
+                    &batch_id,
+                    seq,
+                    None,
+                    "error",
+                    Some(&reason),
+                    Some(&message),
+                ))?;
+                report.errors.push(file_error(None, error.kind(), message));
                 continue;
             }
         };
@@ -417,9 +457,20 @@ pub fn index_workspace(
         let raw_name = match raw_name_for(&vault_root, &file) {
             Ok(name) => name,
             Err(error) => {
+                seq += 1;
+                let reason = error.kind().to_string();
+                let message = error.to_string();
+                store.append_store_event(&coverage_event(
+                    &batch_id,
+                    seq,
+                    Some(&source_key),
+                    "error",
+                    Some(&reason),
+                    Some(&message),
+                ))?;
                 report
                     .errors
-                    .push(file_error(Some(&source_key), error.kind(), error));
+                    .push(file_error(Some(&source_key), error.kind(), message));
                 continue;
             }
         };
@@ -430,16 +481,27 @@ pub fn index_workspace(
         // disambiguating suffix + `key_collision`), refuse the second claimant
         // instead of silently overwriting the first.
         if let Some(first) = claimed.get(&source_key) {
+            seq += 1;
+            let message = format!("claimed by both {first:?} and {raw_name:?}");
+            store.append_store_event(&coverage_event(
+                &batch_id,
+                seq,
+                Some(&source_key),
+                "error",
+                Some("key_collision"),
+                Some(&message),
+            ))?;
             report.errors.push(file_error(
                 Some(&source_key),
                 IndexFileErrorKind::KeyCollision,
-                format!("claimed by both {first:?} and {raw_name:?}"),
+                message,
             ));
             continue;
         }
         claimed.insert(source_key.clone(), raw_name.clone());
 
-        if let Err(message) = process_file(
+        seq += 1;
+        match process_file(
             &mut store,
             &search_index,
             &mut writer,
@@ -450,25 +512,117 @@ pub fn index_workspace(
             policy,
             &mut report,
         ) {
-            report.errors.push(file_error(
-                Some(&source_key),
-                IndexFileErrorKind::Other,
-                message,
-            ));
+            Ok(outcome) => {
+                store.append_store_event(&coverage_event(
+                    &batch_id,
+                    seq,
+                    Some(&source_key),
+                    outcome.as_str(),
+                    None,
+                    None,
+                ))?;
+            }
+            Err(message) => {
+                store.append_store_event(&coverage_event(
+                    &batch_id,
+                    seq,
+                    Some(&source_key),
+                    "error",
+                    Some("other"),
+                    Some(&message),
+                ))?;
+                report.errors.push(file_error(
+                    Some(&source_key),
+                    IndexFileErrorKind::Other,
+                    message,
+                ));
+            }
         }
     }
 
     writer.commit()?;
 
+    seq += 1;
+    store.append_store_event(&NewStoreEvent {
+        occurred_at: now_epoch_secs(),
+        batch_id: &batch_id,
+        seq,
+        domain: "ingest",
+        event_type: "ingest.finished",
+        source_key: None,
+        outcome: None,
+        reason_code: None,
+        message: None,
+        data_json: &serde_json::json!({
+            "files_scanned": report.files_scanned,
+            "files_indexed": report.files_indexed,
+            "files_skipped": report.files_skipped,
+            "revisions_created": report.revisions_created,
+            "chunks_written": report.chunks_written,
+            "errors": report.errors.len(),
+        })
+        .to_string(),
+        external_id: None,
+    })?;
+
     report.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     Ok(report)
 }
 
+/// One `ingest.coverage` row for one file (ADR 0026).
+///
+/// `outcome` is one of `indexed | skipped | metadata_refreshed | error`;
+/// `reason_code` is set exactly when the outcome is `error`, and is the stable
+/// spelling of the error kind rather than a message.
+fn coverage_event<'a>(
+    batch_id: &'a str,
+    seq: i64,
+    source_key: Option<&'a str>,
+    outcome: &'a str,
+    reason_code: Option<&'a str>,
+    message: Option<&'a str>,
+) -> NewStoreEvent<'a> {
+    NewStoreEvent {
+        occurred_at: now_epoch_secs(),
+        batch_id,
+        seq,
+        domain: "ingest",
+        event_type: "ingest.coverage",
+        source_key,
+        outcome: Some(outcome),
+        reason_code,
+        message,
+        data_json: "{}",
+        external_id: None,
+    }
+}
+
+/// What one file's pass through [`process_file`] did (ADR 0026's outcomes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileOutcome {
+    /// Unchanged: same fingerprint, stored path and raw name.
+    Skipped,
+    /// Same bytes under a new path or spelling: the mutable columns moved.
+    MetadataRefreshed,
+    /// A revision and its chunks were written.
+    Indexed,
+}
+
+impl FileOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::MetadataRefreshed => "metadata_refreshed",
+            Self::Indexed => "indexed",
+        }
+    }
+}
+
 /// Ingests one file into the store and the search index.
 ///
-/// `Err` carries the per-file failure message; the caller records it and
-/// moves on. Only batch-level failures (config, store open, walk, commit)
-/// bubble up to [`index_workspace`].
+/// `Err` carries the per-file failure message; the caller records it, writes
+/// the matching `ingest.coverage` row and moves on. Only batch-level failures
+/// (config, store open, walk, commit) bubble up to [`index_workspace`].
 #[allow(clippy::too_many_arguments)]
 fn process_file(
     store: &mut Store,
@@ -480,7 +634,7 @@ fn process_file(
     raw_name: &str,
     policy: &IndexPolicy,
     report: &mut IndexReport,
-) -> Result<(), String> {
+) -> Result<FileOutcome, String> {
     let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
     let fingerprint = fingerprint_json(&metadata);
     // Workspace-relative and `/`-joined (ADR 0024). Computed before the skip
@@ -499,7 +653,7 @@ fn process_file(
         && revision.raw_name.as_deref() == Some(raw_name)
     {
         report.files_skipped += 1;
-        return Ok(());
+        return Ok(FileOutcome::Skipped);
     }
 
     let bytes = fs::read(file).map_err(|error| error.to_string())?;
@@ -521,7 +675,7 @@ fn process_file(
             )
             .map_err(|error| error.to_string())?;
         report.files_indexed += 1;
-        return Ok(());
+        return Ok(FileOutcome::MetadataRefreshed);
     }
 
     let chunks = chunk_markdown(source_key, &hash, &normalized, policy);
@@ -561,7 +715,7 @@ fn process_file(
     report.files_indexed += 1;
     report.revisions_created += 1;
     report.chunks_written += chunks.len() as u64;
-    Ok(())
+    Ok(FileOutcome::Indexed)
 }
 
 /// Rebuilds the tantivy index from canonical store chunks.

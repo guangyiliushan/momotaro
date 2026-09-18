@@ -7,8 +7,8 @@
 //!
 //! Two rules the callers depend on:
 //!
-//! - A batch is appended in **one transaction**, so its events become visible
-//!   exactly when the work they describe does.
+//! - An append is **one transaction**, and callers write the work before the
+//!   event that describes it: a crash can lose an event, never invent one.
 //! - `occurred_at` is when the thing happened and `recorded_at` is when it was
 //!   written; a replay or an import keeps the first and updates the second
 //!   (checked by a test, because the pair has no precedent to lean on).
@@ -126,7 +126,7 @@ impl Store {
         self.append_store_events(event.batch_id, std::slice::from_ref(event))
     }
 
-    /// Appends a whole batch in **one transaction** (ADR 0026).
+    /// Appends a set of events in **one transaction** (ADR 0026).
     ///
     /// `batch_id` is passed once and every event must carry it; a mismatch is a
     /// programming error, refused by name rather than written.
