@@ -437,6 +437,52 @@ fn frontmatter_json(parse: &FrontmatterParse) -> serde_json::Value {
     }
 }
 
+/// Appends one `ingest.coverage` row, and records the failure when there is one.
+///
+/// Five call sites used to spell these four steps out — bump `seq`, render the
+/// code, append the row, push the failure — with the "the code is the typed
+/// spelling, never a literal" rule copied into each. One entry point keeps that
+/// rule in one place before the remaining nine degradation codes land here.
+#[allow(clippy::too_many_arguments)]
+fn record_coverage(
+    store: &mut Store,
+    report: &mut IndexReport,
+    batch_id: &str,
+    seq: &mut i64,
+    source_key: Option<&str>,
+    outcome: &str,
+    reason_code: Option<&str>,
+    message: Option<&str>,
+    failure: Option<(IndexFileErrorKind, String)>,
+) -> Result<(), RunError> {
+    *seq += 1;
+    store.append_store_event(&coverage_event(
+        batch_id,
+        *seq,
+        source_key,
+        outcome,
+        reason_code,
+        message,
+    ))?;
+    if let Some((kind, message)) = failure {
+        report.errors.push(file_error(source_key, kind, message));
+    }
+    Ok(())
+}
+
+/// What one degradation code means.
+///
+/// The code and its sentence are paired here rather than at the call site: a
+/// hardcoded sentence would keep saying "frontmatter" for every code D41 adds.
+fn degradation_message(code: &str) -> &'static str {
+    match code {
+        "frontmatter_parse_error" => {
+            "the file was indexed; its frontmatter block could not be read (D41.5)"
+        }
+        _ => "the file was indexed with a degradation this build does not describe",
+    }
+}
+
 fn file_error(
     source_key: Option<&str>,
     kind: IndexFileErrorKind,
@@ -556,18 +602,19 @@ pub fn index_workspace(
                 // name cannot be created on Windows, so no portable test drives
                 // this arm; it stays correct by construction because the row's
                 // code is the typed kind's spelling, never a literal.
-                seq += 1;
                 let reason = error.kind().to_string();
                 let message = error.to_string();
-                store.append_store_event(&coverage_event(
+                record_coverage(
+                    &mut store,
+                    &mut report,
                     &batch_id,
-                    seq,
+                    &mut seq,
                     None,
                     "error",
-                    Some(&reason),
-                    Some(&message),
-                ))?;
-                report.errors.push(file_error(None, error.kind(), message));
+                    Some(reason.as_str()),
+                    Some(message.as_str()),
+                    Some((error.kind(), message.clone())),
+                )?;
                 continue;
             }
         };
@@ -575,20 +622,19 @@ pub fn index_workspace(
         let raw_name = match raw_name_for(&vault_root, &file) {
             Ok(name) => name,
             Err(error) => {
-                seq += 1;
                 let reason = error.kind().to_string();
                 let message = error.to_string();
-                store.append_store_event(&coverage_event(
+                record_coverage(
+                    &mut store,
+                    &mut report,
                     &batch_id,
-                    seq,
-                    Some(&source_key),
+                    &mut seq,
+                    Some(source_key.as_str()),
                     "error",
-                    Some(&reason),
-                    Some(&message),
-                ))?;
-                report
-                    .errors
-                    .push(file_error(Some(&source_key), error.kind(), message));
+                    Some(reason.as_str()),
+                    Some(message.as_str()),
+                    Some((error.kind(), message.clone())),
+                )?;
                 continue;
             }
         };
@@ -600,25 +646,23 @@ pub fn index_workspace(
         // missing is the disambiguating-suffix policy, so the batch refuses the
         // second claimant instead of silently overwriting the first.
         if let Some(first) = claimed.get(&source_key) {
-            seq += 1;
             let message = format!("claimed by both {first:?} and {raw_name:?}");
             let kind = IndexFileErrorKind::KeyCollision;
-            store.append_store_event(&coverage_event(
+            record_coverage(
+                &mut store,
+                &mut report,
                 &batch_id,
-                seq,
-                Some(&source_key),
+                &mut seq,
+                Some(source_key.as_str()),
                 "error",
                 Some(&kind.to_string()),
-                Some(&message),
-            ))?;
-            report
-                .errors
-                .push(file_error(Some(&source_key), kind, message));
+                Some(message.as_str()),
+                Some((kind, message.clone())),
+            )?;
             continue;
         }
         claimed.insert(source_key.clone(), raw_name.clone());
 
-        seq += 1;
         match process_file(
             &mut store,
             &search_index,
@@ -632,31 +676,30 @@ pub fn index_workspace(
         ) {
             Ok(outcome) => {
                 let degraded = outcome.reason_code();
-                store.append_store_event(&coverage_event(
+                record_coverage(
+                    &mut store,
+                    &mut report,
                     &batch_id,
-                    seq,
-                    Some(&source_key),
+                    &mut seq,
+                    Some(source_key.as_str()),
                     outcome.as_str(),
                     degraded,
-                    degraded.map(
-                        |_| "the file was indexed; its frontmatter block could not be read (D41.5)",
-                    ),
-                ))?;
+                    degraded.map(degradation_message),
+                    None,
+                )?;
             }
             Err(message) => {
-                store.append_store_event(&coverage_event(
+                record_coverage(
+                    &mut store,
+                    &mut report,
                     &batch_id,
-                    seq,
-                    Some(&source_key),
+                    &mut seq,
+                    Some(source_key.as_str()),
                     "error",
                     Some(&IndexFileErrorKind::Other.to_string()),
-                    Some(&message),
-                ))?;
-                report.errors.push(file_error(
-                    Some(&source_key),
-                    IndexFileErrorKind::Other,
-                    message,
-                ));
+                    Some(message.as_str()),
+                    Some((IndexFileErrorKind::Other, message.clone())),
+                )?;
             }
         }
     }
