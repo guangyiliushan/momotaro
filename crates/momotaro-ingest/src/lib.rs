@@ -16,7 +16,7 @@ mod path;
 mod title;
 mod walk;
 
-pub use chunker::chunk_markdown;
+pub use chunker::{SourceOffset, chunk_markdown, chunk_markdown_with};
 pub use hash::{chunk_hash, chunk_id, revision_hash};
 pub use normalize::normalize_markdown;
 pub use path::{canonical_workspace_root, is_within, local_path_in, resolve_local_path};

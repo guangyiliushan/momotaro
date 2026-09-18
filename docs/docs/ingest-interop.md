@@ -139,8 +139,12 @@ parse_error。
    保留原始锚点串（ingest 规则升级后可离线重放重建边）；锚点校验失败记
    `stale_anchor` 不静默丢边；
 5. **frontmatter**：全量结构化解析（未知字段是 Obsidian 一等数据）；正文 FTS
-   排除 frontmatter 块；解析失败 → 整块原文保留 + `frontmatter_parse_error`
-   事件，正文照常索引；
+   排除 frontmatter 块。失败降到**字段级**：块里某个字段的形状没被建模（`|`/`>`
+   块标量、嵌套 map、混着续行的列表）→ **该字段**按源行保留（`Raw`），其余字段照常
+   解析；整块失败只留给块本身读不出来的情况（既不是 `key: value`、也不是任何字段
+   的续行；孤儿列表项；空字段名）——那时整块原文保留 + `frontmatter_parse_error`
+   事件，正文照常索引。未闭合的 `---` 是水平线、整篇即正文；`chunks.text` 仍是
+   原文切片，locator 必须把切掉的字节/行加回（见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 同层的口径）；
 6. **解析基座**：pulldown-cmark ≥ 0.13.3 + `ENABLE_WIKILINKS`（官方内置、
    Obsidian 兼容目标）；私有语法（Dendron 式）当 `unknown_link_syntax` 降级；
 7. **降级事件十类**：frontmatter_parse_error / unresolved_wikilink /

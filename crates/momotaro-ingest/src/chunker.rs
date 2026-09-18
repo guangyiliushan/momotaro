@@ -160,6 +160,49 @@ pub fn chunk_markdown(
     normalized: &str,
     policy: &IndexPolicy,
 ) -> Vec<Chunk> {
+    chunk_markdown_with(
+        source_key,
+        revision_hash,
+        normalized,
+        policy,
+        SourceOffset::default(),
+    )
+}
+
+/// Where a slice of text starts in the note it was cut from.
+///
+/// `chunk_markdown` reads byte ranges and line numbers off the text it is handed.
+/// When that text is the *body* of a note — the note minus its frontmatter block —
+/// those ranges are relative to the slice, while the locator must address the
+/// original bytes so citation verification can slice the document directly. Pass
+/// the cut here and the locators come back source-relative. (D41 in
+/// `docs/docs/ingest-interop.md` puts the same obligation on the wiring side.)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceOffset {
+    /// Bytes cut off the front of the note.
+    pub bytes: usize,
+    /// Lines cut off the front of the note.
+    pub lines: u32,
+}
+
+impl SourceOffset {
+    /// The offset a frontmatter block occupies: the note's text, and the body cut
+    /// from it.
+    pub fn before_body(note: &str, body: &str) -> Self {
+        let bytes = note.len() - body.len();
+        let lines = note[..bytes].matches('\n').count() as u32;
+        SourceOffset { bytes, lines }
+    }
+}
+
+/// [`chunk_markdown`] for a slice of a larger note: locators are shifted by `offset`.
+pub fn chunk_markdown_with(
+    source_key: &str,
+    revision_hash: &str,
+    normalized: &str,
+    policy: &IndexPolicy,
+    offset: SourceOffset,
+) -> Vec<Chunk> {
     if normalized.trim().is_empty() {
         return Vec::new();
     }
@@ -199,11 +242,12 @@ pub fn chunk_markdown(
         // verification can slice the document directly. `open.text` may be
         // longer than `last_range` (packed blocks insert "\n\n" where the
         // source has one "\n"), so end_byte/end_line come from the last
-        // block's own span, never from the joined text length.
-        let start_byte = open.first_range.start;
-        let end_byte = open.last_range.end;
-        let start_line = line_number_for(&starts, start_byte as u32);
-        let end_line = line_number_for(&starts, end_byte as u32);
+        // block's own span, never from the joined text length. `offset` shifts
+        // both axes back into the note when this text is a body slice.
+        let start_byte = offset.bytes + open.first_range.start;
+        let end_byte = offset.bytes + open.last_range.end;
+        let start_line = offset.lines + line_number_for(&starts, open.first_range.start as u32);
+        let end_line = offset.lines + line_number_for(&starts, open.last_range.end as u32);
         chunks.push(Chunk {
             chunk_id,
             source_key: source_key.to_string(),
@@ -312,6 +356,48 @@ mod tests {
             chunk_overlap_tokens: overlap,
             ..IndexPolicy::default()
         }
+    }
+
+    #[test]
+    fn a_body_slice_keeps_locators_on_the_original_note() {
+        let note = "---\ntitle: A\n---\n# Heading\n\nbody text here\n";
+        let (frontmatter, body) = crate::frontmatter::split(note);
+        assert!(matches!(
+            frontmatter,
+            crate::frontmatter::FrontmatterParse::Parsed(_)
+        ));
+
+        let offset = SourceOffset::before_body(note, body);
+        let chunks = chunk_markdown_with("note:a.md", "rh", body, &IndexPolicy::default(), offset);
+        assert_eq!(chunks.len(), 1, "{chunks:?}");
+
+        // The chunk's first block is the paragraph (the heading is structure, and
+        // lands in `heading_path`), so the locator's start is the paragraph's
+        // offset *in the note* — not its offset in the body slice.
+        let paragraph_at = note
+            .find("body text here")
+            .expect("the paragraph is in the note");
+        assert!(
+            chunks[0]
+                .locator_json
+                .contains(&format!("\"start_byte\":{paragraph_at}")),
+            "the locator addresses the note, not the slice: {}",
+            chunks[0].locator_json
+        );
+        assert!(
+            chunks[0].locator_json.contains("\"start_line\":6"),
+            "line numbers are relative to the note too: {}",
+            chunks[0].locator_json
+        );
+        assert!(
+            note[paragraph_at..].starts_with("body text here"),
+            "and slicing the note at the locator lands on the paragraph"
+        );
+        assert_eq!(
+            chunks[0].heading_path.as_deref(),
+            Some("Heading"),
+            "the block is out of the body but its heading still frames the chunk"
+        );
     }
 
     #[test]
