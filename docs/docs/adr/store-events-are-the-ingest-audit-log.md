@@ -62,6 +62,23 @@ The column cannot catch a third spelling; the writers keep the vocabularies
 closed instead — `FileOutcome` and `IndexFileErrorKind` each render through their
 own `Display`, so the ingest codes have one home and a reader can branch on them.
 
+The `ingest.finished` payload carries the report's counters, and they do **not**
+map one-to-one onto the rows: `files_indexed` counts both `indexed` and
+`metadata_refreshed` rows, `files_skipped` counts `skipped`, and `errors` counts
+`error`. An outcome breakdown is deliberately absent from the payload — the rows
+are the breakdown.
+
+### A collision is refused, and the refusal is a row
+
+Two distinct files in one batch can derive the same `source_key` (an NFC/NFD
+pair, or two paths to one object). The batch refuses the second claimant and
+writes its `ingest.coverage` row with `outcome = error` and
+`reason_code = key_collision`; the fuller D42 policy (keep both entries with a
+disambiguating suffix) arrives with the vault-syntax work. Until then the refused
+file is distinguishable only by `message` — which contradicts this log's own rule
+that a message is never the only copy of a fact. Stated here rather than left to
+be discovered.
+
 ## `ORDER BY id DESC` rests on three premises
 
 The read path (latest batch, coverage for a batch) is `ORDER BY id DESC LIMIT ?`.
@@ -102,11 +119,15 @@ decision; making that decision is not part of this contract.
   window — work that landed without its event — is what reconciliation exists
   for (D40: events are the hint, reconciliation is the truth).
 - A batch-wide transaction was considered and rejected: it would hold the write
-  lock across a 1000-file run and turn one crash into a lost batch, against
-  D40's rule that a single file update is exactly one transaction. The cost is
-  that `ingest.coverage` rows can lag their file by one crash; the next reconcile
-  closes that, and `ingest.finished` is written last so a batch is never reported
-  complete while a file is still unrecorded.
+  lock across a 1000-file run and turn one crash into a lost batch. **What the
+  code does today is three appends per file** — the revision (`revisions.rs`),
+  its chunks (`chunks.rs`) and then the coverage row (`events.rs`) — so D40's
+  "a single file update is exactly one transaction" is met by none of them, and a
+  crash between the appends can lose a row for a file whose data landed. The
+  *never invent* half above holds because every data write precedes its event;
+  closing the *lose* half needs a store API that writes revision + chunks + event
+  as one unit. That API does not exist yet and is registered as follow-up work
+  rather than claimed here.
 - A batch that aborts mid-way leaves `ingest.started` with no terminal event, so a
   reader sees "running" rather than "crashed". That is stated here rather than
   discovered later; the fix, when a consumer needs it, is an `ingest.failed`

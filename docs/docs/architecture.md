@@ -750,6 +750,13 @@ Feed 项不是论文事实。解析出 doi/arxiv 后仍要经过 paper add gate 
 
 OPML 不是表：导入时把 `outline[@type=rss]/@xmlUrl` 写成 `feed_sources`。
 
+#### store_events
+
+库自己的审计日志（schema v4，[ADR 0026](adr/store-events-are-the-ingest-audit-log.md)）：ingest 批次、
+feed 轮询、改名、批注的 append-only 记录；字段与索引以那份 ADR 为准，此处不重复。与 `run_events` 的分工：
+`run_events` 记录**被接受的工作**（Run）的过程，`store_events` 记录**库自己做的事**——index / rename /
+annotate / typeahead 都不是 Run。归档走 `VACUUM INTO`，永不 `DELETE`（D30）。
+
 ### 8.2 Derived data
 
 可删除后重建：

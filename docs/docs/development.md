@@ -86,7 +86,7 @@ momotaro/
 
 分类以 [Architecture](architecture.md) §8.1/§8.2 为准，本文件不复制清单：
 
-- canonical：sessions、projects、source_revisions、annotations、sparks、runs、run_events、history_items、retrievals、retrieval_hits、run_context_items、tool_calls、llm_turns、answers、answer_citations、verifications、feed_sources、feed_items；
+- canonical：sessions、projects、source_revisions、annotations、sparks、runs、run_events、history_items、retrievals、retrieval_hits、run_context_items、tool_calls、llm_turns、answers、answer_citations、verifications、feed_sources、feed_items，以及库自己的审计日志 `store_events`（[ADR 0026](adr/store-events-are-the-ingest-audit-log.md)：只追加、归档走 `VACUUM INTO`）；
 - 第三态（保留型投影）：chunks —— 见 [ADR 0022](adr/chunks-are-a-retained-projection.md)，既不是 canonical 也不是可随手丢弃的 derived；
 - derived：Tantivy 段、embeddings / BM42 / SPLADE、graph_links、graph_layout、usage_projections。
 

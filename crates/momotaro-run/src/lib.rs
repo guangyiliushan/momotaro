@@ -1116,6 +1116,29 @@ mod tests {
             events.iter().all(|event| event.batch_id == report.batch_id),
             "the report and the rows agree on the batch"
         );
+
+        // Write order, not only `seq`: a mutant that appends `started` after the
+        // loop keeps the seq vector identical, so the batch is read back through
+        // insertion order (`latest_store_events` returns newest first) and its
+        // first row must be the beginning.
+        let by_id: Vec<String> = store
+            .latest_store_events(100)
+            .expect("read latest")
+            .into_iter()
+            .filter(|event| event.batch_id == report.batch_id)
+            .map(|event| event.event_type)
+            .rev()
+            .collect();
+        assert_eq!(
+            by_id.first().map(String::as_str),
+            Some("ingest.started"),
+            "the first row written is the batch's beginning: {by_id:?}"
+        );
+        assert_eq!(
+            by_id.last().map(String::as_str),
+            Some("ingest.finished"),
+            "…and the last is its end"
+        );
     }
 
     #[test]

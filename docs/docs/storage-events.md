@@ -71,6 +71,10 @@ FTS5 索引；`~/.hermes/sessions/*.jsonl` 是 gateway transcript 和请求 brea
 
 ### 1. 会话管理：事件日志留在 SQLite
 
+> 库自己的 ingest 审计日志是另一张表：`store_events`（只追加、只搬移不删除），
+> 见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 与 Architecture §8.1。
+> 下面的规则针对**会话**那张面（`run_events` / `history_items`），两者不混用。
+
 现有模型已经是逻辑上的 event sourcing：
 
 ```text
