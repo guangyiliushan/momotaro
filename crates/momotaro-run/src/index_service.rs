@@ -8,8 +8,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use momotaro_contracts::{
-    Chunk, CoverageFailure, CoverageReport, IndexFileError, IndexFileErrorKind, IndexPolicy,
-    IndexReport, OriginClass, RetrievalHit, SourceKind, WorkspaceStatus,
+    Chunk, CoverageFailure, CoverageReport, Degradation, IndexFileError, IndexFileErrorKind,
+    IndexPolicy, IndexReport, OriginClass, RetrievalHit, SourceKind, WorkspaceStatus,
 };
 use momotaro_ingest::frontmatter::{self, FrontmatterParse};
 use momotaro_ingest::{
@@ -479,14 +479,13 @@ fn record_coverage(
 
 /// What one degradation code means.
 ///
-/// The code and its sentence are paired here rather than at the call site: a
-/// hardcoded sentence would keep saying "frontmatter" for every code D41 adds.
-fn degradation_message(code: &str) -> &'static str {
+/// Exhaustive on purpose: a code with no sentence is a compile error, so adding
+/// D41's next nine cannot silently inherit the frontmatter wording.
+fn degradation_message(code: Degradation) -> &'static str {
     match code {
-        "frontmatter_parse_error" => {
+        Degradation::FrontmatterParseError => {
             "the file was indexed; its frontmatter block could not be read (D41.5)"
         }
-        _ => "the file was indexed with a degradation this build does not describe",
     }
 }
 
@@ -681,6 +680,7 @@ pub fn index_workspace(
         ) {
             Ok(outcome) => {
                 let degraded = outcome.reason_code();
+                let sentence = outcome.degradation().map(degradation_message);
                 record_coverage(
                     &mut store,
                     &mut report,
@@ -689,7 +689,7 @@ pub fn index_workspace(
                     Some(source_key.as_str()),
                     outcome.as_str(),
                     degraded,
-                    degraded.map(degradation_message),
+                    sentence,
                     None,
                 )?;
             }
@@ -777,11 +777,11 @@ enum FileOutcome {
     Skipped,
     /// Same bytes under a new path or spelling: the mutable columns moved.
     MetadataRefreshed,
-    /// A revision and its chunks were written. `degraded` carries the stable
-    /// code of anything the file lost on the way in (today: a frontmatter block
-    /// that could not be read, D41.5) — the file *was* indexed, so the outcome
-    /// stays `indexed` and the code rides alongside it.
-    Indexed { degraded: Option<&'static str> },
+    /// A revision and its chunks were written. `degraded` carries whatever the
+    /// file lost on the way in (today: a frontmatter block that could not be
+    /// read, D41.5) — the file *was* indexed, so the outcome stays `indexed` and
+    /// the code rides alongside it.
+    Indexed { degraded: Option<Degradation> },
 }
 
 impl FileOutcome {
@@ -801,6 +801,15 @@ impl FileOutcome {
 
     /// The stable code the coverage row carries, when the file was indexed anyway.
     fn reason_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Indexed { degraded } => degraded.map(Degradation::as_str),
+            Self::Skipped | Self::MetadataRefreshed => None,
+        }
+    }
+
+    /// The same fact as [`FileOutcome::reason_code`], for the callers that need
+    /// the code's sentence rather than its spelling.
+    fn degradation(&self) -> Option<Degradation> {
         match self {
             Self::Indexed { degraded } => *degraded,
             Self::Skipped | Self::MetadataRefreshed => None,
@@ -918,7 +927,7 @@ fn process_file(
     // A block that could not be read does not stop the file: the body is indexed
     // and the failure becomes a code on the coverage row (`frontmatter_parse_error`).
     let degraded = match &frontmatter {
-        FrontmatterParse::Failed { .. } => Some("frontmatter_parse_error"),
+        FrontmatterParse::Failed { .. } => Some(Degradation::FrontmatterParseError),
         FrontmatterParse::Absent | FrontmatterParse::Parsed(_) => None,
     };
     Ok(FileOutcome::Indexed { degraded })

@@ -1740,6 +1740,45 @@ mod tests {
             Some("frontmatter_parse_error"),
             "the degradation is recorded beside the outcome, not instead of it"
         );
+        assert_eq!(
+            row.message.as_deref(),
+            Some("the file was indexed; its frontmatter block could not be read (D41.5)"),
+            "and the sentence is paired with the code where the code is produced"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_file_reports_the_kind_it_had() {
+        // The one production-reachable branch in this area that nothing else
+        // drives: a file whose bytes are not valid UTF-8. The row's code and the
+        // report's kind must be the same spelling — today both are `other`, and
+        // they flip to `invalid_utf8` together when the error type lands (R-11),
+        // so the assertion is written as that joint invariant, not as a literal.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("bad.md"), [0xff, 0xfe, 0x00, 0x41]).expect("write invalid utf-8");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        assert_eq!(
+            report.errors.len(),
+            1,
+            "one bad file, one error: {report:?}"
+        );
+        let row = store_of(dir.path())
+            .store_events_for_batch(&report.batch_id)
+            .expect("read the batch")
+            .into_iter()
+            .find(|event| event.source_key.as_deref() == Some("note:bad.md"))
+            .expect("a coverage row for the file");
+        assert_eq!(row.outcome.as_deref(), Some("error"));
+        assert_eq!(
+            row.reason_code.as_deref(),
+            Some(report.errors[0].kind.to_string().as_str()),
+            "the row and the report spell the same code"
+        );
     }
 
     fn store_of(root: &Path) -> Store {
