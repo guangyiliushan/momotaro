@@ -439,10 +439,14 @@ fn frontmatter_json(parse: &FrontmatterParse) -> serde_json::Value {
 
 /// Appends one `ingest.coverage` row, and records the failure when there is one.
 ///
-/// Five call sites used to spell these four steps out — bump `seq`, render the
-/// code, append the row, push the failure — with the "the code is the typed
-/// spelling, never a literal" rule copied into each. One entry point keeps that
-/// rule in one place before the remaining nine degradation codes land here.
+/// Three steps live here — bump `seq`, append the row, push the failure — and so
+/// do both renderings: a refusal's `reason_code` is the typed kind's spelling and
+/// its message is the very string the report carries. No call site re-types
+/// either, the row cannot disagree with the report, and no clone is needed to
+/// keep them equal.
+// Nine arguments. The alternative a review measured is a parameter struct: +22
+// lines, one fewer allow, nothing else fixed. The rule this function exists for
+// is one home per rendering, not fewer parameters.
 #[allow(clippy::too_many_arguments)]
 fn record_coverage(
     store: &mut Store,
@@ -455,6 +459,9 @@ fn record_coverage(
     message: Option<&str>,
     failure: Option<(IndexFileErrorKind, String)>,
 ) -> Result<(), RunError> {
+    let refusal = failure.as_ref().map(|(kind, _)| kind.to_string());
+    let reason_code = refusal.as_deref().or(reason_code);
+    let message = failure.as_ref().map(|(_, text)| text.as_str()).or(message);
     *seq += 1;
     store.append_store_event(&coverage_event(
         batch_id,
@@ -602,7 +609,6 @@ pub fn index_workspace(
                 // name cannot be created on Windows, so no portable test drives
                 // this arm; it stays correct by construction because the row's
                 // code is the typed kind's spelling, never a literal.
-                let reason = error.kind().to_string();
                 let message = error.to_string();
                 record_coverage(
                     &mut store,
@@ -611,7 +617,7 @@ pub fn index_workspace(
                     &mut seq,
                     None,
                     "error",
-                    Some(reason.as_str()),
+                    None,
                     Some(message.as_str()),
                     Some((error.kind(), message.clone())),
                 )?;
@@ -622,7 +628,6 @@ pub fn index_workspace(
         let raw_name = match raw_name_for(&vault_root, &file) {
             Ok(name) => name,
             Err(error) => {
-                let reason = error.kind().to_string();
                 let message = error.to_string();
                 record_coverage(
                     &mut store,
@@ -631,9 +636,9 @@ pub fn index_workspace(
                     &mut seq,
                     Some(source_key.as_str()),
                     "error",
-                    Some(reason.as_str()),
-                    Some(message.as_str()),
-                    Some((error.kind(), message.clone())),
+                    None,
+                    None,
+                    Some((error.kind(), message)),
                 )?;
                 continue;
             }
@@ -655,9 +660,9 @@ pub fn index_workspace(
                 &mut seq,
                 Some(source_key.as_str()),
                 "error",
-                Some(&kind.to_string()),
-                Some(message.as_str()),
-                Some((kind, message.clone())),
+                None,
+                None,
+                Some((kind, message)),
             )?;
             continue;
         }
@@ -696,9 +701,9 @@ pub fn index_workspace(
                     &mut seq,
                     Some(source_key.as_str()),
                     "error",
-                    Some(&IndexFileErrorKind::Other.to_string()),
-                    Some(message.as_str()),
-                    Some((IndexFileErrorKind::Other, message.clone())),
+                    None,
+                    None,
+                    Some((IndexFileErrorKind::Other, message)),
                 )?;
             }
         }
