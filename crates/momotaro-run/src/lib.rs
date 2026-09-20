@@ -1862,6 +1862,23 @@ mod tests {
             frontmatter["line"], 2,
             "the source line is recorded: {blob}"
         );
+
+        // The count a reader actually sees, read back out of the store. Deleting
+        // `summarize_coverage`'s counting branch used to keep the whole suite
+        // green, so the report could call a degraded file clean with nothing
+        // noticing — the disease this whole series has been treating.
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(
+            coverage
+                .degradations
+                .get(&momotaro_contracts::Degradation::FrontmatterParseError),
+            Some(&1),
+            "the batch knows the file lost its block: {coverage:?}"
+        );
+        assert_eq!(
+            coverage.indexed, 1,
+            "and it is still an indexed file, not a failure: {coverage:?}"
+        );
     }
 
     fn store_of(root: &Path) -> Store {
