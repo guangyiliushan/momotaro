@@ -354,6 +354,58 @@ mod tests {
     }
 
     #[test]
+    fn an_indented_delimiter_is_not_a_block() {
+        // The first line has to be exactly `---`. Obsidian asks for the very
+        // beginning of the file, and guessing would eat the first paragraph of a
+        // note whose author meant an indented rule.
+        let source = "  ---\ntitle: still body\n  ---\n";
+        let (frontmatter, body) = split(source);
+        assert!(
+            matches!(frontmatter, FrontmatterParse::Absent),
+            "an indented delimiter is a rule: {frontmatter:?}"
+        );
+        assert_eq!(
+            body, source,
+            "nothing is stripped when no block is recognised"
+        );
+    }
+
+    #[test]
+    fn a_second_document_stays_body_text() {
+        // YAML allows several documents in one stream; this crate reads the first
+        // and does not look ahead, so the second `---` is ordinary text. Stated as
+        // a contract in `ingest-interop.md` §5.5.
+        let source = "---\ntitle: one\n---\nbody\n\n---\ntitle: two\n---\n";
+        let (frontmatter, body) = split(source);
+        assert!(
+            matches!(frontmatter, FrontmatterParse::Parsed(_)),
+            "the first document is the block: {frontmatter:?}"
+        );
+        assert!(
+            body.starts_with("body"),
+            "the block ends at the first closer: {body:?}"
+        );
+        assert!(
+            body.contains("---\ntitle: two\n---"),
+            "the second document is body text, not a block: {body:?}"
+        );
+    }
+
+    #[test]
+    fn prose_between_two_rules_is_a_block_that_fails() {
+        // The shape a reader is most likely to file as a bug: two rules with prose
+        // between them. It is a block whose lines are not fields, so the block
+        // fails as a whole and the body is whatever follows the closing rule.
+        let source = "---\nThis is prose, not a field.\n---\nBody after.\n";
+        let (frontmatter, body) = split(source);
+        assert!(
+            matches!(frontmatter, FrontmatterParse::Failed { .. }),
+            "prose is not a field, so the block fails as a whole: {frontmatter:?}"
+        );
+        assert_eq!(body, "Body after.\n");
+    }
+
+    #[test]
     fn trailing_spaces_on_a_delimiter_do_not_hide_the_block() {
         let source = "--- \ntitle: A\n--- \nbody\n";
         let (frontmatter, body) = split(source);
