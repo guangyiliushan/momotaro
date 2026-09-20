@@ -513,6 +513,20 @@ pub enum Degradation {
 }
 
 impl Degradation {
+    /// Every code, in the order a file's degradations are reported and counted.
+    ///
+    /// One list, iterated by `from_code` and by the tests. `the_variant_list_is_
+    /// complete` matches every variant without a wildcard, so a seventh code
+    /// cannot be added to `as_str` alone — which was the hole: the writer knew a
+    /// code the reader's array did not, and the row's code was dropped silently.
+    pub const ALL: [Self; 6] = [
+        Self::FrontmatterParseError,
+        Self::UnresolvedWikilink,
+        Self::AmbiguousWikilink,
+        Self::StaleAnchor,
+        Self::MarkdownLinkDecodeError,
+        Self::UnknownLinkSyntax,
+    ];
     /// The wire spelling written to `store_events.reason_code`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -533,16 +547,9 @@ impl Degradation {
     /// only writer, so the two cannot drift apart silently.
     #[must_use]
     pub fn from_code(code: &str) -> Option<Self> {
-        [
-            Self::FrontmatterParseError,
-            Self::UnresolvedWikilink,
-            Self::AmbiguousWikilink,
-            Self::StaleAnchor,
-            Self::MarkdownLinkDecodeError,
-            Self::UnknownLinkSyntax,
-        ]
-        .into_iter()
-        .find(|candidate| candidate.as_str() == code)
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == code)
     }
 }
 
@@ -660,17 +667,27 @@ mod tests {
     }
 
     #[test]
+    fn the_variant_list_is_complete() {
+        // No wildcard in this match: adding a seventh variant fails to compile
+        // here, and the count assertion then forces it into `ALL`.
+        for code in Degradation::ALL {
+            match code {
+                Degradation::FrontmatterParseError => {}
+                Degradation::UnresolvedWikilink => {}
+                Degradation::AmbiguousWikilink => {}
+                Degradation::StaleAnchor => {}
+                Degradation::MarkdownLinkDecodeError => {}
+                Degradation::UnknownLinkSyntax => {}
+            }
+        }
+        assert_eq!(Degradation::ALL.len(), 6, "extend ALL, not just as_str");
+    }
+
+    #[test]
     fn a_degradation_code_parses_back_to_its_variant() {
         // `from_code` is how a reader turns a stored row back into a code; the
         // spelling is the only contract, so it is the only thing to check.
-        for code in [
-            Degradation::FrontmatterParseError,
-            Degradation::UnresolvedWikilink,
-            Degradation::AmbiguousWikilink,
-            Degradation::StaleAnchor,
-            Degradation::MarkdownLinkDecodeError,
-            Degradation::UnknownLinkSyntax,
-        ] {
+        for code in Degradation::ALL {
             assert_eq!(Degradation::from_code(code.as_str()), Some(code));
         }
         assert_eq!(
@@ -684,14 +701,7 @@ mod tests {
     fn every_degradation_spells_the_same_on_the_wire() {
         // Same rule as the failure kinds above, same caveat: the list is written by
         // hand, so a seventh code means adding it here as well.
-        for code in [
-            Degradation::FrontmatterParseError,
-            Degradation::UnresolvedWikilink,
-            Degradation::AmbiguousWikilink,
-            Degradation::StaleAnchor,
-            Degradation::MarkdownLinkDecodeError,
-            Degradation::UnknownLinkSyntax,
-        ] {
+        for code in Degradation::ALL {
             assert_eq!(
                 serde_json::to_string(&code).expect("serialize"),
                 format!("\"{}\"", code.as_str()),

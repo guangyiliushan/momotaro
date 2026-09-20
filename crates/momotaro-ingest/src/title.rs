@@ -62,6 +62,33 @@ fn strip_md_extension(name: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_wikilink_in_a_heading_is_consumed_by_the_parser() {
+        // The witness for `Options::ENABLE_WIKILINKS`: with the switch on the
+        // parser hands back the link's visible text instead of the raw brackets.
+        // The switch was on before this test existed and nothing noticed either
+        // way, so this pins the observable side — the title. Chunk boundaries are
+        // left to the chunker: a reviewer measured them byte-invariant under the
+        // switch, and the golden set would catch a move.
+        assert_eq!(
+            derive_title(
+                "# See [[Alpha]] now
+",
+                "note:a.md"
+            ),
+            "See Alpha now"
+        );
+        assert_eq!(
+            derive_title(
+                "# [[a|b]]
+",
+                "note:a.md"
+            ),
+            "b",
+            "the alias is the visible text"
+        );
+    }
+
     use super::*;
 
     #[test]

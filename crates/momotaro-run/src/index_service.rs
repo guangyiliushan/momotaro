@@ -169,12 +169,21 @@ fn summarize_coverage(batch_id: &str, events: &[momotaro_store::StoreEvent]) -> 
                     // A degraded file is still `indexed`; the code is what says it
                     // lost something, and dropping it here is how `doctor --coverage`
                     // came to call a broken block a clean file.
-                    if let Some(code) = event
-                        .reason_code
-                        .as_deref()
-                        .and_then(Degradation::from_code)
-                    {
-                        *report.degradations.entry(code).or_insert(0) += 1;
+                    // A code this build does not know is a fact about the batch,
+                    // not noise — the same posture as an unreadable outcome below.
+                    // Dropping it would report a degraded file as a clean one.
+                    match event.reason_code.as_deref() {
+                        None | Some("") => {}
+                        Some(code) => match Degradation::from_code(code) {
+                            Some(known) => *report.degradations.entry(known).or_insert(0) += 1,
+                            None => report.failures.push(CoverageFailure {
+                                source_key: event.source_key.clone(),
+                                reason_code: event.reason_code.clone(),
+                                message: Some(format!(
+                                    "an indexed row carries a degradation code this build does not know: {code}"
+                                )),
+                            }),
+                        },
                     }
                 }
                 Some(outcome) if outcome == FileOutcome::Skipped.as_str() => report.skipped += 1,
@@ -605,9 +614,10 @@ fn degradation_message(code: Degradation) -> &'static str {
 /// and-count test below carries that half.
 ///
 /// Still unverified, and said out loud because the instrument is silent about it:
-/// the two `Io` sites and the `local_path_in` kind site have no seam and no test,
-/// so moving either of them to another kind keeps the suite green. They are the
-/// residue of the same review that found the other six.
+/// the two `Io` sites and the `local_path_in` kind site have no seam of their own.
+/// Moving the `path` kind to `Io` or `Other`, or either `Io` to `Other`, keeps the
+/// suite green; moving an `Io` to `Store` or `Index` is caught by the and-count
+/// test below, since those two spellings are watched.
 fn store_step<T>(
     source_key: &str,
     step: impl FnOnce() -> Result<T, StoreError>,
