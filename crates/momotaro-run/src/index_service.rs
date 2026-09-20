@@ -432,7 +432,7 @@ fn frontmatter_json(parse: &FrontmatterParse) -> serde_json::Value {
             "state": "failed",
             "raw": raw,
             "line": line,
-            "reason": reason.to_string(),
+            "reason": reason.as_str(),
         }),
     }
 }

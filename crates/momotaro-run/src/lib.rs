@@ -1750,10 +1750,12 @@ mod tests {
     #[test]
     fn an_unreadable_file_reports_the_kind_it_had() {
         // The one production-reachable branch in this area that nothing else
-        // drives: a file whose bytes are not valid UTF-8. The row's code and the
-        // report's kind must be the same spelling — today both are `other`, and
-        // they flip to `invalid_utf8` together when the error type lands (R-11),
-        // so the assertion is written as that joint invariant, not as a literal.
+        // drives: a file whose bytes are not valid UTF-8. Both halves are here on
+        // purpose — the literal pins the spelling a reader would branch on, and
+        // the joint invariant pins the row and the report to each other. A review
+        // measured that neither half covers the other: without the literal, a
+        // renamed kind stays green; without the invariant, the row may be hard
+        // coded while the report is right.
         let dir = tempfile::tempdir().expect("temp dir");
         let vault = dir.path().join("vault");
         fs::create_dir_all(&vault).expect("create vault");
@@ -1775,14 +1777,19 @@ mod tests {
             .expect("a coverage row for the file");
         assert_eq!(row.outcome.as_deref(), Some("error"));
         assert_eq!(
+            row.reason_code.as_deref(),
+            Some("invalid_utf8"),
+            "the row carries the spelling a reader branches on"
+        );
+        assert_eq!(
             report.errors[0].kind,
             IndexFileErrorKind::InvalidUtf8,
-            "the content was not valid UTF-8, and the kind now says so (R-11)"
+            "the content was not valid UTF-8, and the kind says so (R-11)"
         );
         assert_eq!(
             row.reason_code.as_deref(),
             Some(report.errors[0].kind.to_string().as_str()),
-            "the row and the report spell the same code"
+            "and the row cannot disagree with the report that produced it"
         );
     }
 

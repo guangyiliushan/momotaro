@@ -68,6 +68,21 @@ pub enum Reason {
     EmptyFieldName,
 }
 
+impl Reason {
+    /// The stable spelling written into `metadata_json.frontmatter.reason`.
+    ///
+    /// The sentence below is for humans; a reader that has to tell the three
+    /// apart must branch on this, not on prose.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAField => "not_a_field",
+            Self::OrphanListItem => "orphan_list_item",
+            Self::EmptyFieldName => "empty_field_name",
+        }
+    }
+}
+
 impl fmt::Display for Reason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

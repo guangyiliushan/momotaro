@@ -622,8 +622,10 @@ mod tests {
 
     #[test]
     fn every_failure_kind_spells_the_same_on_the_wire() {
-        // `reason_code` rows carry `kind.to_string()`; the JSON report carries
-        // whatever serde writes. A new variant must not make those disagree.
+        // The terminal reads Display, the JSON reads serde; if they drift, "branch
+        // on the kind" silently means two different things. The list below is
+        // hand-written: a review measured that a ninth variant IS NOT forced into
+        // this loop, so adding one means adding it here too.
         for kind in [
             IndexFileErrorKind::KeyCollision,
             IndexFileErrorKind::InvalidUtf8,
@@ -837,26 +839,6 @@ mod tests {
             note_source_key("a\0b.md"),
             Err(SourceKeyError::Nul)
         ));
-    }
-
-    #[test]
-    fn index_error_kind_display_matches_serde() {
-        // The terminal reads Display, the JSON reads serde; if they drift,
-        // "branch on the kind" silently means two different things.
-        for kind in [
-            IndexFileErrorKind::KeyCollision,
-            IndexFileErrorKind::InvalidUtf8,
-            IndexFileErrorKind::OutsideVault,
-            IndexFileErrorKind::InvalidSourceKey,
-            IndexFileErrorKind::Other,
-        ] {
-            let json = serde_json::to_value(kind).expect("serialize kind");
-            assert_eq!(
-                kind.to_string(),
-                json.as_str().expect("kind serializes to a string"),
-                "Display and serde must agree for {kind:?}"
-            );
-        }
     }
 
     #[test]

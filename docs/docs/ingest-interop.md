@@ -156,7 +156,9 @@ parse_error。
    孤儿列表项；空字段名）——那时整块原文保留 + `frontmatter_parse_error`
    事件，正文照常索引；两道 `---` 夹住的散文正是这种形状：整块 `Failed`、
    **不进 FTS**（也不进 title/heading_path），原块连行号与原因留在
-   `metadata_json.frontmatter` 的 `raw`/`line`/`reason`，重解析即恢复。
+   `metadata_json.frontmatter` 的 `raw`/`line`/`reason`，重解析即恢复（`reason`
+   是**稳定码** `not_a_field` / `orphan_list_item` / `empty_field_name`，人话在
+   Display 里——下游要分支就读码，不要去匹配句子）。
    `chunks.text` 仍是原文切片，locator 必须把切掉的字节/行加回（见
    [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 同层的口径）——
    注意解析基座不这么看（CommonMark 把 `---`+散文+`---` 读成 hr + 第二道 `---`

@@ -5,7 +5,7 @@ use super::IngestError;
 /// Decode bytes to UTF-8, strip a leading BOM, and normalize CRLF/CR to LF.
 pub fn normalize_markdown(bytes: &[u8]) -> Result<String, IngestError> {
     let decoded = std::str::from_utf8(bytes)
-        .map_err(|_| IngestError::InvalidUtf8("source bytes are not valid utf-8".to_string()))?;
+        .map_err(|_| IngestError::InvalidUtf8("source bytes".to_string()))?;
     let stripped = decoded.strip_prefix('\u{feff}').unwrap_or(decoded);
     // Fast path: already LF-only.
     if !stripped.contains('\r') {
