@@ -176,6 +176,16 @@ parse_error。
    unknown_link_syntax / excalidraw_detected / canvas_parse_error /
    symlink_encountered / attachment_unindexed——每条「没索引/没建边」的决定
    都留可审计事件，ingest 汇总报告回答「覆盖了多少、漏了什么、为什么」。
+8. **一个文件可以同时丢好几样**（降级槽的形状，2026-09-20 定）：W2.4 起，
+   「三条悬挂 + 一条歧义」是常态，所以**不许**用单槽表示。取值形状如下——
+   ① `FileOutcome::Indexed` 携带**一个列表**（`degradations: Vec<Degradation>`），
+   顺序 = 枚举声明顺序（确定性，重跑同结果）；② coverage 行的
+   `reason_code` 是这份列表的**第一个**（主码，既有读者与计数语义都不动）；
+   ③ **完整列表进同一行的 `data_json`**（`{"degradations":[…]}`）——
+   `data_json` 列已存在，**不需要 schema 迁移**；④ `CoverageReport` 按码**计数**
+   暴露（`doctor --coverage` 因此不再把带码的行只算作 `indexed` 而把码吞掉）。
+   两条被否的替代：**每码一行**（破坏「每个走到的文件恰好一行」的计数不变量）
+   与 **`reason_code` 里拼分隔串**（列是稳定码，编码串会诱使下游做字符串匹配）。
 
 **不做**：MFT/USN Journal 方案（10k 规模复杂度收益比为负）；键层折叠或 NFKC；
 改写用户 vault 文件（Foam 教训）；读 placeholder 内容；跟随符号链接（首版）。
