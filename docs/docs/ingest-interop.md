@@ -143,12 +143,25 @@ parse_error。
    保留原始锚点串（ingest 规则升级后可离线重放重建边）；锚点校验失败记
    `stale_anchor` 不静默丢边；
 5. **frontmatter**：全量结构化解析（未知字段是 Obsidian 一等数据）；正文 FTS
-   排除 frontmatter 块。失败降到**字段级**：块里某个字段的形状没被建模（`|`/`>`
-   块标量、嵌套 map、混着续行的列表）→ **该字段**按源行保留（`Raw`），其余字段照常
-   解析；整块失败只留给块本身读不出来的情况（既不是 `key: value`、也不是任何字段
-   的续行；孤儿列表项；空字段名）——那时整块原文保留 + `frontmatter_parse_error`
-   事件，正文照常索引。未闭合的 `---` 是水平线、整篇即正文；`chunks.text` 仍是
-   原文切片，locator 必须把切掉的字节/行加回（见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 同层的口径）；
+   排除 frontmatter 块。块的身份只认**第一行**、且必须有**闭合**：只有首行恰为
+   `---`（行尾空白除外）且其后存在列 0 的 `---` 或 `...` 时才成块；首行之前有
+   任何东西（BOM、缩进、空行、正文）或找不到闭合时，整篇即正文——那里的 `---`
+   只是水平线，一个字都不吞（Obsidian 同此要求："Type `---` at the very
+   beginning of a file."）。**只读第一个文档、不向前看**：块内第一个列 0 的
+   `---` 之后一律是正文，后面的 `---` 不会改写块边界——YAML 允许多文档流
+   （spec §9.1），我们取第一个；`...` 作闭合是我们的**扩展**（Obsidian 未定义）。
+   失败降到**字段级**：块里某个字段的形状没被建模（`|`/`>` 块标量、嵌套 map、
+   混着续行的列表）→ **该字段**按源行保留（`Raw`），其余字段照常解析；整块
+   失败只留给块本身读不出来的情况（既不是 `key: value`、也不是任何字段的续行；
+   孤儿列表项；空字段名）——那时整块原文保留 + `frontmatter_parse_error`
+   事件，正文照常索引；两道 `---` 夹住的散文正是这种形状：整块 `Failed`、
+   **不进 FTS**（也不进 title/heading_path），原块连行号与原因留在
+   `metadata_json.frontmatter` 的 `raw`/`line`/`reason`，重解析即恢复。
+   `chunks.text` 仍是原文切片，locator 必须把切掉的字节/行加回（见
+   [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 同层的口径）——
+   注意解析基座不这么看（CommonMark 把 `---`+散文+`---` 读成 hr + 第二道 `---`
+   作散文的 setext H2 下划线），所以**剥离必须先于解析**：先切块、再 desugar、
+   建 index；
    **现状（2026-09-18）**：解析、接线与排除**已落地**（字段进
    `source_revisions.metadata_json` 的 `frontmatter` 键、正文进 chunker 且 locator
    按原 note 计、失败发 `frontmatter_parse_error` 且 `outcome` 仍为 `indexed`）；

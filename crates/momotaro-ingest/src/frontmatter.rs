@@ -105,7 +105,10 @@ pub enum FrontmatterParse {
 /// whitespace aside): a note that merely starts with a horizontal rule is not
 /// frontmatter, and guessing would eat its first paragraph. The block ends at
 /// the first line that is `---` or `...` under the same rule; without one there
-/// is no block at all (that `---` was a rule).
+/// is no block at all (that `---` was a rule). Only the first document is read —
+/// nothing is looked ahead for a later `---`, so a second YAML document stays
+/// body text. `...` is this crate's extension: YAML uses it as the document-end
+/// marker, but Obsidian's own format has no such closer.
 ///
 /// The returned body is a slice of `source`, so byte and line offsets can be
 /// recovered from it — see the module documentation.
