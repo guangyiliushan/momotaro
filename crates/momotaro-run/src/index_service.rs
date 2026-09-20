@@ -693,7 +693,7 @@ pub fn index_workspace(
                     None,
                 )?;
             }
-            Err(message) => {
+            Err(IndexFileError { kind, message, .. }) => {
                 record_coverage(
                     &mut store,
                     &mut report,
@@ -703,7 +703,7 @@ pub fn index_workspace(
                     "error",
                     None,
                     None,
-                    Some((IndexFileErrorKind::Other, message)),
+                    Some((kind, message)),
                 )?;
             }
         }
@@ -819,8 +819,8 @@ impl FileOutcome {
 
 /// Ingests one file into the store and the search index.
 ///
-/// `Err` carries the per-file failure message; the caller records it, writes
-/// the matching `ingest.coverage` row and moves on. Only batch-level failures
+/// `Err` carries the typed per-file failure; the caller records it, writes the
+/// matching `ingest.coverage` row and moves on. Only batch-level failures
 /// (config, store open, walk, commit) bubble up to [`index_workspace`].
 #[allow(clippy::too_many_arguments)]
 fn process_file(
@@ -833,18 +833,19 @@ fn process_file(
     raw_name: &str,
     policy: &IndexPolicy,
     report: &mut IndexReport,
-) -> Result<FileOutcome, String> {
-    let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
+) -> Result<FileOutcome, IndexFileError> {
+    let metadata = fs::metadata(file)
+        .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Io, error))?;
     let fingerprint = fingerprint_json(&metadata);
     // Workspace-relative and `/`-joined (ADR 0024). Computed before the skip
     // check on purpose: a directory move preserves the fingerprint, so a stored
     // path may only be assumed correct if it is compared.
-    let local_path =
-        momotaro_ingest::local_path_in(workspace_root, file).map_err(|error| error.to_string())?;
+    let local_path = momotaro_ingest::local_path_in(workspace_root, file)
+        .map_err(|error| file_error(Some(source_key), error.kind(), error))?;
 
     let current = store
         .current_revision(source_key)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Store, error))?;
 
     if let Some(revision) = &current
         && fingerprint_matches(&revision.metadata_json, &metadata)
@@ -855,8 +856,10 @@ fn process_file(
         return Ok(FileOutcome::Skipped);
     }
 
-    let bytes = fs::read(file).map_err(|error| error.to_string())?;
-    let normalized = normalize_markdown(&bytes).map_err(|error| error.to_string())?;
+    let bytes = fs::read(file)
+        .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Io, error))?;
+    let normalized = normalize_markdown(&bytes)
+        .map_err(|error| file_error(Some(source_key), error.kind(), error))?;
     let hash = revision_hash(&normalized);
 
     if let Some(revision) = &current
@@ -875,7 +878,7 @@ fn process_file(
                 &local_path,
                 raw_name,
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Store, error))?;
         report.files_indexed += 1;
         return Ok(FileOutcome::MetadataRefreshed);
     }
@@ -906,10 +909,10 @@ fn process_file(
             metadata_json: &metadata_json,
             ingested_at: now_epoch_secs(),
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Store, error))?;
     store
         .replace_chunks(source_key, &hash, &chunks)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Store, error))?;
 
     SearchIndex::upsert_source(
         writer,
@@ -919,7 +922,7 @@ fn process_file(
         origin,
         &chunks,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Index, error))?;
 
     report.files_indexed += 1;
     report.revisions_created += 1;

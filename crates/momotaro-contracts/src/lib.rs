@@ -621,6 +621,28 @@ mod tests {
     }
 
     #[test]
+    fn every_failure_kind_spells_the_same_on_the_wire() {
+        // `reason_code` rows carry `kind.to_string()`; the JSON report carries
+        // whatever serde writes. A new variant must not make those disagree.
+        for kind in [
+            IndexFileErrorKind::KeyCollision,
+            IndexFileErrorKind::InvalidUtf8,
+            IndexFileErrorKind::OutsideVault,
+            IndexFileErrorKind::InvalidSourceKey,
+            IndexFileErrorKind::Io,
+            IndexFileErrorKind::Store,
+            IndexFileErrorKind::Index,
+            IndexFileErrorKind::Other,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&kind).expect("serialize"),
+                format!("\"{kind}\""),
+                "{kind:?} spells differently in JSON and in Display"
+            );
+        }
+    }
+
+    #[test]
     fn source_kind_uses_stable_names() {
         assert_eq!(
             serde_json::to_string(&SourceKind::Note).unwrap(),

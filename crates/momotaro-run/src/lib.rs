@@ -1775,6 +1775,11 @@ mod tests {
             .expect("a coverage row for the file");
         assert_eq!(row.outcome.as_deref(), Some("error"));
         assert_eq!(
+            report.errors[0].kind,
+            IndexFileErrorKind::InvalidUtf8,
+            "the content was not valid UTF-8, and the kind now says so (R-11)"
+        );
+        assert_eq!(
             row.reason_code.as_deref(),
             Some(report.errors[0].kind.to_string().as_str()),
             "the row and the report spell the same code"
