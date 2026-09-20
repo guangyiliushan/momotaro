@@ -768,6 +768,9 @@ embeddings
 bm42 / splade indexes
 graph_links
 
+
+graph_layout
+usage_projections
 ```
 
 #### `graph_links` (derived, W2.4)
@@ -790,9 +793,6 @@ frontmatter link) and `link_source` (`wikilink`, `markdown`, `embed`, `canvas`,
 they close when W2.4 lands, and until then this table exists only here. The row
 is derived: `rm graph_links` and a rebuild must reproduce it, which is what the
 W2.4 acceptance check runs.
-
-graph_layout
-usage_projections
 
 
 MVP 只实现 Tantivy BM25。中文用 CJK tokenizer，不要把 SQLite FTS5 当主引擎。SQLite 留下做关系事实。
@@ -1147,7 +1147,7 @@ cargo test --workspace
 
 `index` / lexical `search` / Tantivy。重建索引不丢 canonical 数据。1,000 个 Markdown 可完成。
 
-已做：`source_key` NFC 身份键、vault ⊆ workspace、origin 乘性权重、`store_events` 审计日志、`doctor --coverage`。本波剩余：frontmatter 接线与十类降级事件、D42 的碰撞消歧后缀策略（两条目都保留 + 消歧后缀 + 事件，ADR 0002 与 ADR 0026 都指向它）、wikilink → `graph_links`、watcher + 对账四触发、平台测试矩阵、D24 的多链头暴露。D40 的「单文件 = 恰好一个事务」见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 的诚实口径，**不是已交付**。
+已做：`source_key` NFC 身份键、vault ⊆ workspace、origin 乘性权重、`store_events` 审计日志、`doctor --coverage`。本波剩余：其余四类降级事件、D42 的碰撞消歧后缀策略（两条目都保留 + 消歧后缀 + 事件，ADR 0002 与 ADR 0026 都指向它）、wikilink → `graph_links`、watcher + 对账四触发、平台测试矩阵、D24 的多链头暴露。D40 的「单文件 = 恰好一个事务」见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 的诚实口径，**不是已交付**。
 
 ### v0.3 可追溯问答
 

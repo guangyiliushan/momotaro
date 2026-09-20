@@ -546,12 +546,6 @@ impl Degradation {
     }
 }
 
-impl std::fmt::Display for Degradation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
 /// What the most recent ingest batch did, read back out of `store_events`
 /// (ADR 0026). `None` comes back from `momotaro_run::coverage_report` when no
 /// batch was ever recorded — never because one failed.
@@ -700,7 +694,7 @@ mod tests {
         ] {
             assert_eq!(
                 serde_json::to_string(&code).expect("serialize"),
-                format!("\"{code}\""),
+                format!("\"{}\"", code.as_str()),
                 "{code:?} spells differently in JSON and in Display (as_str)"
             );
         }

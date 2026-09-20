@@ -158,7 +158,7 @@ parse_error。
    **不进 FTS**（也不进 title/heading_path），原块连行号与原因留在
    `metadata_json.frontmatter` 的 `raw`/`line`/`reason`，重解析即恢复（`reason`
    是**稳定码** `not_a_field` / `orphan_list_item` / `empty_field_name`——下游要分支
-   就读码，不要去匹配句子（那句话随码落盘一同删除，原文块仍在 `raw` 里））。**迁移注记**：早于该码写入
+   就读码，不要去匹配句子。那句话随码落盘一同删除；原文块仍在 `raw` 里）。**迁移注记**：早于该码写入
    的行里 `reason` 仍是句子；指纹未变的文件不会重写 blob（`skipped`），
    `rebuild-index` 也只重建 tantivy，所以那些行会一直带着旧词表——重解析即恢复，
    今天没有读者，故不做迁移。
