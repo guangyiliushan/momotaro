@@ -557,6 +557,10 @@ pub fn format_coverage(report: &CoverageReport) -> String {
             " (no ingest.finished yet: still running, or the process died)"
         },
     );
+    for (code, count) in &report.degradations {
+        line.push('\n');
+        line.push_str(&format!("  {count} x {} (indexed anyway)", code.as_str()));
+    }
     for failure in &report.failures {
         line.push('\n');
         line.push_str(&format!(
@@ -1506,6 +1510,7 @@ mod tests {
             batch_id: "index-1".to_owned(),
             indexed: 0,
             skipped: 0,
+            degradations: std::collections::BTreeMap::new(),
             refreshed: 0,
             failures: vec![momotaro_contracts::CoverageFailure {
                 source_key: Some("note:\u{1b}[31mred\u{1b}[0m".to_owned()),
@@ -1790,6 +1795,29 @@ mod tests {
             row.reason_code.as_deref(),
             Some(report.errors[0].kind.to_string().as_str()),
             "and the row cannot disagree with the report that produced it"
+        );
+    }
+
+    #[test]
+    fn the_coverage_line_names_what_was_lost() {
+        // `format_coverage` is pure, so the rendering can be checked without a
+        // vault: a report that recorded a degradation must not read as a clean one.
+        let report = CoverageReport {
+            batch_id: "index-1".to_owned(),
+            indexed: 1,
+            skipped: 0,
+            refreshed: 0,
+            degradations: [(momotaro_contracts::Degradation::FrontmatterParseError, 1)]
+                .into_iter()
+                .collect(),
+            failures: Vec::new(),
+            events: 3,
+            finished: true,
+        };
+        let line = format_coverage(&report);
+        assert!(
+            line.contains("1 x frontmatter_parse_error (indexed anyway)"),
+            "the count is what stops a degraded file reading as clean: {line}"
         );
     }
 

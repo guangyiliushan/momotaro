@@ -19,6 +19,7 @@ use momotaro_ingest::{
 use momotaro_retrieve::{IndexWriterHandle, RetrieveError, SearchIndex};
 use momotaro_store::{NewSourceRevision, NewStoreEvent, Store, StoreError};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::{RunError, WorkspaceConfig, database_path, load_config, validate_policy, vault_scope};
 
@@ -154,6 +155,7 @@ fn summarize_coverage(batch_id: &str, events: &[momotaro_store::StoreEvent]) -> 
         indexed: 0,
         skipped: 0,
         refreshed: 0,
+        degradations: BTreeMap::new(),
         failures: Vec::new(),
         events: events.len() as u64,
         finished: false,
@@ -162,7 +164,19 @@ fn summarize_coverage(batch_id: &str, events: &[momotaro_store::StoreEvent]) -> 
         match event.event_type.as_str() {
             "ingest.finished" => report.finished = true,
             "ingest.coverage" => match event.outcome.as_deref() {
-                Some(outcome) if outcome == FileOutcome::INDEXED => report.indexed += 1,
+                Some(outcome) if outcome == FileOutcome::INDEXED => {
+                    report.indexed += 1;
+                    // A degraded file is still `indexed`; the code is what says it
+                    // lost something, and dropping it here is how `doctor --coverage`
+                    // came to call a broken block a clean file.
+                    if let Some(code) = event
+                        .reason_code
+                        .as_deref()
+                        .and_then(Degradation::from_code)
+                    {
+                        *report.degradations.entry(code).or_insert(0) += 1;
+                    }
+                }
                 Some(outcome) if outcome == FileOutcome::Skipped.as_str() => report.skipped += 1,
                 Some(outcome) if outcome == FileOutcome::MetadataRefreshed.as_str() => {
                     report.refreshed += 1;

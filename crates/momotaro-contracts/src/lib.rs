@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
@@ -492,7 +494,7 @@ pub struct IndexFileError {
 /// nine arrive with the vault-syntax work — and having it typed is what keeps
 /// `degradation_message` exhaustive and stops a sentence from claiming to be about
 /// the wrong code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Degradation {
     /// The frontmatter block could not be read (D41.5); the body was indexed.
@@ -522,6 +524,25 @@ impl Degradation {
             Self::UnknownLinkSyntax => "unknown_link_syntax",
         }
     }
+
+    /// The code back as a variant, for the readers of stored rows.
+    ///
+    /// `None` is a row written by a version that knows a code this one does not;
+    /// the caller decides whether that is worth saying, and [`Self::as_str`] is the
+    /// only writer, so the two cannot drift apart silently.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        [
+            Self::FrontmatterParseError,
+            Self::UnresolvedWikilink,
+            Self::AmbiguousWikilink,
+            Self::StaleAnchor,
+            Self::MarkdownLinkDecodeError,
+            Self::UnknownLinkSyntax,
+        ]
+        .into_iter()
+        .find(|candidate| candidate.as_str() == code)
+    }
 }
 
 impl std::fmt::Display for Degradation {
@@ -543,6 +564,12 @@ pub struct CoverageReport {
     pub skipped: u64,
     /// Rows whose file only moved or was re-spelled.
     pub refreshed: u64,
+    /// What the **`indexed`** rows lost on the way in, counted per code (D41).
+    ///
+    /// Without this, a note whose block could not be read is indistinguishable
+    /// from a clean one in this report: the row says `indexed` and the code was
+    /// only in the event table.
+    pub degradations: BTreeMap<Degradation, u64>,
     /// Rows that failed, in the batch's own order (`seq`, not `id`).
     pub failures: Vec<CoverageFailure>,
     /// Every row in the batch, including its beginning and its end.
@@ -635,6 +662,27 @@ mod tests {
         let encoded =
             serde_json::to_string(&WorkspaceStatus::Uninitialized).expect("encode status");
         assert_eq!(encoded, r#""uninitialized""#);
+    }
+
+    #[test]
+    fn a_degradation_code_parses_back_to_its_variant() {
+        // `from_code` is how a reader turns a stored row back into a code; the
+        // spelling is the only contract, so it is the only thing to check.
+        for code in [
+            Degradation::FrontmatterParseError,
+            Degradation::UnresolvedWikilink,
+            Degradation::AmbiguousWikilink,
+            Degradation::StaleAnchor,
+            Degradation::MarkdownLinkDecodeError,
+            Degradation::UnknownLinkSyntax,
+        ] {
+            assert_eq!(Degradation::from_code(code.as_str()), Some(code));
+        }
+        assert_eq!(
+            Degradation::from_code("a_code_from_the_future"),
+            None,
+            "an unknown code is none of our business, not a panic"
+        );
     }
 
     #[test]
