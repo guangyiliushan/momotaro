@@ -53,7 +53,10 @@ impl IngestError {
             Self::InvalidUtf8(_) => IndexFileErrorKind::InvalidUtf8,
             Self::OutsideVault(_) | Self::OutsideWorkspace(_) => IndexFileErrorKind::OutsideVault,
             Self::InvalidSourceKey(_) => IndexFileErrorKind::InvalidSourceKey,
-            Self::Io(_) | Self::VaultMissing(_) => IndexFileErrorKind::Other,
+            Self::Io(_) => IndexFileErrorKind::Io,
+            // A missing vault root is a workspace problem, not a read failure of
+            // one file; it keeps the catch-all until a kind of its own is needed.
+            Self::VaultMissing(_) => IndexFileErrorKind::Other,
         }
     }
 }
@@ -82,7 +85,7 @@ mod tests {
         );
         assert_eq!(
             IngestError::Io(std::io::Error::other("x")).kind(),
-            IndexFileErrorKind::Other
+            IndexFileErrorKind::Io
         );
     }
 }

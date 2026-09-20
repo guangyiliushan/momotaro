@@ -446,7 +446,13 @@ pub enum IndexFileErrorKind {
     OutsideVault,
     /// The derived source key violated the key contract.
     InvalidSourceKey,
-    /// Anything else: IO, store, chunking.
+    /// Reading the file failed (IO).
+    Io,
+    /// Writing or reading the canonical store failed.
+    Store,
+    /// The search index refused the document.
+    Index,
+    /// Anything else.
     Other,
 }
 
@@ -457,6 +463,9 @@ impl std::fmt::Display for IndexFileErrorKind {
             Self::InvalidUtf8 => "invalid_utf8",
             Self::OutsideVault => "outside_vault",
             Self::InvalidSourceKey => "invalid_source_key",
+            Self::Io => "io",
+            Self::Store => "store",
+            Self::Index => "index",
             Self::Other => "other",
         };
         formatter.write_str(text)
