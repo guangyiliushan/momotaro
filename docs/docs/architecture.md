@@ -768,6 +768,8 @@ embeddings
 bm42 / splade indexes
 graph_links
 
+```
+
 #### `graph_links` (derived, W2.4)
 
 | column | notes |
@@ -791,7 +793,7 @@ W2.4 acceptance check runs.
 
 graph_layout
 usage_projections
-```
+
 
 MVP 只实现 Tantivy BM25。中文用 CJK tokenizer，不要把 SQLite FTS5 当主引擎。SQLite 留下做关系事实。
 

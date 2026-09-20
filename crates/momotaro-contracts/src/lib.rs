@@ -490,8 +490,9 @@ pub struct IndexFileError {
 /// What a file lost on the way into the index (D41).
 ///
 /// These ride on **`indexed`** rows: the file *was* indexed, so the outcome stays
-/// `indexed` and this code says what it lost. One variant so far — D41's remaining
-/// nine arrive with the vault-syntax work — and having it typed is what keeps
+/// `indexed` and this code says what it lost. Six of D41's ten are here (the
+/// frontmatter block and the five wikilink classes); the rest arrive with the
+/// vault-syntax work. Having them typed is what keeps
 /// `degradation_message` exhaustive and stops a sentence from claiming to be about
 /// the wrong code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
