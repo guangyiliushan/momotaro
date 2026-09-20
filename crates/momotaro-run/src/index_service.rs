@@ -16,8 +16,8 @@ use momotaro_ingest::{
     SourceOffset, chunk_markdown_with, derive_title, normalize_markdown, raw_name_for,
     revision_hash, source_key_for, walk_markdown_files,
 };
-use momotaro_retrieve::{IndexWriterHandle, SearchIndex};
-use momotaro_store::{NewSourceRevision, NewStoreEvent, Store};
+use momotaro_retrieve::{IndexWriterHandle, RetrieveError, SearchIndex};
+use momotaro_store::{NewSourceRevision, NewStoreEvent, Store, StoreError};
 use serde::{Deserialize, Serialize};
 
 use crate::{RunError, WorkspaceConfig, database_path, load_config, validate_policy, vault_scope};
@@ -257,6 +257,53 @@ pub(crate) fn index_dir(root: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_store_refusal_keeps_its_kind() {
+        let error = store_step::<()>("note:a.md", || {
+            Err(StoreError::RevisionMissing {
+                source_key: "note:a.md".to_owned(),
+                revision_hash: "deadbeef".to_owned(),
+            })
+        })
+        .expect_err("a refusal is an error");
+        assert_eq!(
+            error.kind,
+            IndexFileErrorKind::Store,
+            "Store, and not Io or Other"
+        );
+        assert_eq!(error.source_key.as_deref(), Some("note:a.md"));
+    }
+
+    #[test]
+    fn an_index_refusal_keeps_its_kind() {
+        let error = index_step("note:a.md", || {
+            Err(RetrieveError::SchemaMismatch("origin_class".to_owned()))
+        })
+        .expect_err("a refusal is an error");
+        assert_eq!(
+            error.kind,
+            IndexFileErrorKind::Index,
+            "Index, and not Store or Io"
+        );
+        assert!(
+            error.message.contains("origin_class"),
+            "the refused field passes through: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn the_two_steps_do_not_borrow_each_others_kind() {
+        // A copy-pasted seam would map both resources onto one kind.
+        let store = store_step::<()>("k", || {
+            Err(StoreError::InvalidSchemaVersion("x".to_owned()))
+        })
+        .expect_err("a refusal is an error");
+        let index = index_step("k", || Err(RetrieveError::IndexMissing("x".to_owned())))
+            .expect_err("a refusal is an error");
+        assert_ne!(store.kind, index.kind, "two resources, two kinds");
+    }
+
     use std::cell::Cell;
 
     /// Drives the loop with a fake remover: the real drain shapes are timing
@@ -487,6 +534,34 @@ fn degradation_message(code: Degradation) -> &'static str {
             "the file was indexed; its frontmatter block could not be read (D41.5)"
         }
     }
+}
+
+/// One file's store step, with the call injected.
+///
+/// A store refusal here is engine state a test cannot portably provoke — the file
+/// is a real file, the database real and healthy — so the shape is replayed
+/// rather than provoked, on the `discard_with` precedent. The kind is written once,
+/// here, so the four store calls one pass makes cannot drift apart.
+///
+/// What this pins is the classification: which resource refused, which kind that
+/// maps to, which `source_key` it is attributed to, and that the message passes
+/// through unchanged. That each store call in `process_file` is routed through
+/// here is not provable by a test (production passes the real closure) — the
+/// single-occurrence grep rule in the module tests carries that half.
+fn store_step<T>(
+    source_key: &str,
+    step: impl FnOnce() -> Result<T, StoreError>,
+) -> Result<T, IndexFileError> {
+    step().map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Store, error))
+}
+
+/// One file's search-index step, with the call injected (same reason as
+/// [`store_step`]; `upsert_source` is where a tantivy refusal lands).
+fn index_step(
+    source_key: &str,
+    step: impl FnOnce() -> Result<(), RetrieveError>,
+) -> Result<(), IndexFileError> {
+    step().map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Index, error))
 }
 
 fn file_error(
@@ -843,9 +918,7 @@ fn process_file(
     let local_path = momotaro_ingest::local_path_in(workspace_root, file)
         .map_err(|error| file_error(Some(source_key), error.kind(), error))?;
 
-    let current = store
-        .current_revision(source_key)
-        .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Store, error))?;
+    let current = store_step(source_key, || store.current_revision(source_key))?;
 
     if let Some(revision) = &current
         && fingerprint_matches(&revision.metadata_json, &metadata)
@@ -870,15 +943,15 @@ fn process_file(
         // re-derived from the very text that hashed equal — one blob builder, and
         // a workspace indexed before the `frontmatter` key existed gets it here.
         let (frontmatter, _) = frontmatter::split(&normalized);
-        store
-            .update_revision_fingerprint(
+        store_step(source_key, || {
+            store.update_revision_fingerprint(
                 source_key,
                 &revision.revision_hash,
                 &revision_metadata(&fingerprint, &frontmatter),
                 &local_path,
                 raw_name,
             )
-            .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Store, error))?;
+        })?;
         report.files_indexed += 1;
         return Ok(FileOutcome::MetadataRefreshed);
     }
@@ -896,8 +969,8 @@ fn process_file(
     // the index document alike, so the two can never disagree.
     let origin = OriginClass::Owner;
 
-    store
-        .append_revision(&NewSourceRevision {
+    store_step(source_key, || {
+        store.append_revision(&NewSourceRevision {
             source_key,
             revision_hash: &hash,
             kind: SourceKind::Note,
@@ -909,20 +982,21 @@ fn process_file(
             metadata_json: &metadata_json,
             ingested_at: now_epoch_secs(),
         })
-        .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Store, error))?;
-    store
-        .replace_chunks(source_key, &hash, &chunks)
-        .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Store, error))?;
+    })?;
+    store_step(source_key, || {
+        store.replace_chunks(source_key, &hash, &chunks)
+    })?;
 
-    SearchIndex::upsert_source(
-        writer,
-        search_index.fields(),
-        source_key,
-        &title,
-        origin,
-        &chunks,
-    )
-    .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Index, error))?;
+    index_step(source_key, || {
+        SearchIndex::upsert_source(
+            writer,
+            search_index.fields(),
+            source_key,
+            &title,
+            origin,
+            &chunks,
+        )
+    })?;
 
     report.files_indexed += 1;
     report.revisions_created += 1;
