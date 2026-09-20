@@ -767,6 +767,28 @@ tantivy index directory
 embeddings
 bm42 / splade indexes
 graph_links
+
+#### `graph_links` (derived, W2.4)
+
+| column | notes |
+|---|---|
+| `from_source_key` | the note the link is written in |
+| `to_source_key` | `NULL` for a **dangling** link — a first-class row, not a discard |
+| `raw_target` | the target exactly as written, kept so a later resolve can backfill |
+| `edge_kind` | how the edge was expressed |
+| `link_source` | which syntax produced it |
+| `anchor_kind` | what the anchor points at, when the link has one |
+| `anchor_raw` | the anchor as written |
+| `created_at` | when the row was built |
+
+Columns and their order come from the plan's D41. The two vocabularies the D41
+build matrix implies are `edge_kind` (a link, an embed, a canvas edge, a
+frontmatter link) and `link_source` (`wikilink`, `markdown`, `embed`, `canvas`,
+`frontmatter`), with `anchor_kind` covering a heading anchor and a block anchor;
+they close when W2.4 lands, and until then this table exists only here. The row
+is derived: `rm graph_links` and a rebuild must reproduce it, which is what the
+W2.4 acceptance check runs.
+
 graph_layout
 usage_projections
 ```

@@ -11,7 +11,10 @@ pub fn derive_title(normalized: &str, source_key: &str) -> String {
 }
 
 fn first_h1(normalized: &str) -> Option<String> {
-    let parser = Parser::new_ext(normalized, Options::ENABLE_TABLES);
+    let parser = Parser::new_ext(
+        normalized,
+        Options::ENABLE_TABLES | Options::ENABLE_WIKILINKS,
+    );
     let mut in_h1 = false;
     let mut text = String::new();
     for event in parser {

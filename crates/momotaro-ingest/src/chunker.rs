@@ -40,7 +40,10 @@ impl BlockKind {
 /// stack at each block. Headings are boundaries only; their text feeds the
 /// stack for subsequent blocks.
 fn collect_blocks(normalized: &str) -> Vec<Block> {
-    let parser = Parser::new_ext(normalized, Options::ENABLE_TABLES);
+    let parser = Parser::new_ext(
+        normalized,
+        Options::ENABLE_TABLES | Options::ENABLE_WIKILINKS,
+    );
     let mut blocks: Vec<Block> = Vec::new();
     let mut stack: Vec<(u8, String)> = Vec::new();
     let mut heading_text = String::new();
