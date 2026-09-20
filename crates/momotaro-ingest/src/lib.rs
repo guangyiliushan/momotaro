@@ -29,7 +29,8 @@ pub enum IngestError {
     /// Underlying filesystem failure.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    /// A source file is not valid UTF-8.
+    /// A string that must be UTF-8 is not: a name, a path component, or the
+    /// file's bytes.
     #[error("invalid utf-8 in {0}")]
     InvalidUtf8(String),
     /// A path argument is not beneath the vault root.

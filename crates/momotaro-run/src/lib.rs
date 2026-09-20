@@ -1793,6 +1793,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_failed_block_records_a_stable_reason_code() {
+        // §5.5 promises `metadata_json.frontmatter.reason` is a stable code rather
+        // than a sentence. Reverting `reason.as_str()` to `reason.to_string()` used
+        // to keep the whole suite green, because no test read a `failed` blob: the
+        // only blob assertion in the repo looked at `state == "parsed"`.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(
+            vault.join("prose.md"),
+            "---\nThis is prose, not a field.\n---\nBody after.\n",
+        )
+        .expect("write the note");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        index_workspace(dir.path(), None).expect("index");
+
+        let revision = store_of(dir.path())
+            .current_revision("note:prose.md")
+            .expect("read")
+            .expect("the note was indexed");
+        let blob: serde_json::Value =
+            serde_json::from_str(&revision.metadata_json).expect("the blob is JSON");
+        let frontmatter = &blob["frontmatter"];
+        assert_eq!(
+            frontmatter["state"], "failed",
+            "prose between two rules fails as a whole: {blob}"
+        );
+        let reason = frontmatter["reason"].as_str().expect("reason is a string");
+        assert!(
+            matches!(
+                reason,
+                "not_a_field" | "orphan_list_item" | "empty_field_name"
+            ),
+            "a stable code, not a sentence: {reason:?}"
+        );
+        assert_eq!(
+            frontmatter["line"], 2,
+            "the source line is recorded: {blob}"
+        );
+    }
+
     fn store_of(root: &Path) -> Store {
         Store::open(database_path(root)).expect("open store")
     }

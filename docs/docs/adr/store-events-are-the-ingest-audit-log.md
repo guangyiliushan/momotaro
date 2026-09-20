@@ -65,15 +65,16 @@ and each **domain** owns its set:
 
 | domain | `outcome` | `reason_code` |
 |---|---|---|
-| `ingest` | `indexed` \| `skipped` \| `metadata_refreshed` \| `error` | the `IndexFileErrorKind` spelling (`key_collision`, `invalid_utf8`, `outside_vault`, `invalid_source_key`, `other`) — or, on an **`indexed`** row, a degradation code (`frontmatter_parse_error`; the rest of D41's ten arrive with the vault-syntax work) |
+| `ingest` | `indexed` \| `skipped` \| `metadata_refreshed` \| `error` | the `IndexFileErrorKind` spelling (`key_collision`, `invalid_utf8`, `outside_vault`, `invalid_source_key`, `io`, `store`, `index`, `other`) — or, on an **`indexed`** row, a degradation code (`frontmatter_parse_error`; the rest of D41's ten arrive with the vault-syntax work) |
 | `feed` | `success` \| `no_results` \| `upstream_error` \| `parse_error` | provider codes (`response_too_large`, `empty_feed`, …) |
 | `vault` / `annotate` | not implemented | not implemented |
 
 The column cannot catch a third spelling; the writers keep the vocabularies
 closed instead — `FileOutcome` renders the outcome, `IndexFileErrorKind` renders
 the error kinds, and a **degradation code is not an error kind**: it rides on an
-`indexed` row, and today it is a literal at its one writer (`index_service.rs`)
-with no enum home. D41's ten get one when the remaining nine land.
+`indexed` row, and it is `momotaro_contracts::Degradation`, whose `as_str` is the
+one writer. A file can lose more than one thing at once, and the shape of that
+lives in `ingest-interop.md` §5.5.
 
 The `ingest.finished` payload carries the report's counters, and they do **not**
 map one-to-one onto the rows: `files_indexed` counts both `indexed` and

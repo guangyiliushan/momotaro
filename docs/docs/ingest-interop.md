@@ -158,7 +158,10 @@ parse_error。
    **不进 FTS**（也不进 title/heading_path），原块连行号与原因留在
    `metadata_json.frontmatter` 的 `raw`/`line`/`reason`，重解析即恢复（`reason`
    是**稳定码** `not_a_field` / `orphan_list_item` / `empty_field_name`，人话在
-   Display 里——下游要分支就读码，不要去匹配句子）。
+   Display 里——下游要分支就读码，不要去匹配句子）。**迁移注记**：早于该码写入
+   的行里 `reason` 仍是句子；指纹未变的文件不会重写 blob（`skipped`），
+   `rebuild-index` 也只重建 tantivy，所以那些行会一直带着旧词表——重解析即恢复，
+   今天没有读者，故不做迁移。
    `chunks.text` 仍是原文切片，locator 必须把切掉的字节/行加回（见
    [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 同层的口径）——
    注意解析基座不这么看（CommonMark 把 `---`+散文+`---` 读成 hr + 第二道 `---`

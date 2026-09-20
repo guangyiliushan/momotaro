@@ -437,7 +437,9 @@ impl Default for IndexPolicy {
 pub enum IndexFileErrorKind {
     /// Two distinct files in one batch derived the same source key.
     KeyCollision,
-    /// The file name is not valid UTF-8.
+    /// A string that must be UTF-8 is not: a file name, a path component, or a
+    /// file's bytes. This arrived as "not a valid file name"; the index run also
+    /// reports it for content, so the narrower wording was wrong.
     InvalidUtf8,
     /// The path is not a name inside the vault root. Covers the wider
     /// workspace case too: since ADR 0024 every stored path is

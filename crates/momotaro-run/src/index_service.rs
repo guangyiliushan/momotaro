@@ -258,6 +258,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_two_kinds_are_written_in_exactly_one_place_each() {
+        // The seams pin the classification; that every store and index call is
+        // routed through them cannot be driven by a test (production passes the
+        // real closure), so it is counted instead. A call site that hand-writes its
+        // own `map_err(.. IndexFileErrorKind::Store ..)` raises these numbers, and
+        // so does a second test that names a kind — extend the count deliberately.
+        let source = include_str!("index_service.rs");
+        // The needle is composed rather than written, because a literal needle is
+        // itself an occurrence in the file being counted (this test counted itself
+        // twice before this line existed). The form `.. Store, error)` only a call
+        // site has, so prose mentioning the kind cannot inflate the number either.
+        let store = concat!("IndexFileErrorKind::", "Store, error)");
+        let index = concat!("IndexFileErrorKind::", "Index, error)");
+        assert_eq!(
+            source.matches(store).count(),
+            1,
+            "exactly the store seam names this kind"
+        );
+        assert_eq!(
+            source.matches(index).count(),
+            1,
+            "exactly the index seam names this kind"
+        );
+    }
+
+    #[test]
     fn a_store_refusal_keeps_its_kind() {
         let error = store_step::<()>("note:a.md", || {
             Err(StoreError::RevisionMissing {
