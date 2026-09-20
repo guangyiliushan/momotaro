@@ -559,6 +559,21 @@ fn degradation_message(code: Degradation) -> &'static str {
         Degradation::FrontmatterParseError => {
             "the file was indexed; its frontmatter block could not be read (D41.5)"
         }
+        Degradation::UnresolvedWikilink => {
+            "the file was indexed; a wikilink points at a note that is not here (D41.1)"
+        }
+        Degradation::AmbiguousWikilink => {
+            "the file was indexed; a wikilink matches more than one note, so no edge was built (D41.2)"
+        }
+        Degradation::StaleAnchor => {
+            "the file was indexed; a heading anchor does not exist in its target (D41.3)"
+        }
+        Degradation::MarkdownLinkDecodeError => {
+            "the file was indexed; a markdown link's target could not be decoded (D41.4)"
+        }
+        Degradation::UnknownLinkSyntax => {
+            "the file was indexed; a link uses a syntax this build does not know (D41.6)"
+        }
     }
 }
 
@@ -573,7 +588,12 @@ fn degradation_message(code: Degradation) -> &'static str {
 /// maps to, which `source_key` it is attributed to, and that the message passes
 /// through unchanged. That each store call in `process_file` is routed through
 /// here is not provable by a test (production passes the real closure) — the
-/// single-occurrence grep rule in the module tests carries that half.
+/// and-count test below carries that half.
+///
+/// Still unverified, and said out loud because the instrument is silent about it:
+/// the two `Io` sites and the `local_path_in` kind site have no seam and no test,
+/// so moving either of them to another kind keeps the suite green. They are the
+/// residue of the same review that found the other six.
 fn store_step<T>(
     source_key: &str,
     step: impl FnOnce() -> Result<T, StoreError>,

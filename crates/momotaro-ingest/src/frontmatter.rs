@@ -22,8 +22,6 @@
 //!   that slices the *file* must normalise first; `metadata_json.size_bytes` is the
 //!   raw size when the two differ.
 
-use std::fmt;
-
 /// A parsed `---` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frontmatter {
@@ -71,24 +69,16 @@ pub enum Reason {
 impl Reason {
     /// The stable spelling written into `metadata_json.frontmatter.reason`.
     ///
-    /// The sentence below is for humans; a reader that has to tell the three
-    /// apart must branch on this, not on prose.
+    /// This is the only rendering: a reader that has to tell the three apart
+    /// branches on it. The human sentence that used to sit beside it had no reader
+    /// once the code was persisted, and the block's text is kept verbatim in the
+    /// same blob for anyone who wants to see what the author wrote.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NotAField => "not_a_field",
             Self::OrphanListItem => "orphan_list_item",
             Self::EmptyFieldName => "empty_field_name",
-        }
-    }
-}
-
-impl fmt::Display for Reason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Reason::NotAField => write!(f, "not a `key: value` line and not a continuation"),
-            Reason::OrphanListItem => write!(f, "a list item outside any field"),
-            Reason::EmptyFieldName => write!(f, "a field with an empty name"),
         }
     }
 }

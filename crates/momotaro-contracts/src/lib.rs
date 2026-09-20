@@ -497,6 +497,16 @@ pub struct IndexFileError {
 pub enum Degradation {
     /// The frontmatter block could not be read (D41.5); the body was indexed.
     FrontmatterParseError,
+    /// A `[[wikilink]]` points at a note that is not in the vault (D41.1).
+    UnresolvedWikilink,
+    /// A `[[wikilink]]` matches more than one note, so no edge is built (D41.2).
+    AmbiguousWikilink,
+    /// A `#heading` anchor does not exist in the target (D41.3); the edge is kept.
+    StaleAnchor,
+    /// A markdown link's target could not be percent-decoded (D41.4).
+    MarkdownLinkDecodeError,
+    /// A private link syntax this build does not know (D41.6), e.g. Dendron's.
+    UnknownLinkSyntax,
 }
 
 impl Degradation {
@@ -505,6 +515,11 @@ impl Degradation {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::FrontmatterParseError => "frontmatter_parse_error",
+            Self::UnresolvedWikilink => "unresolved_wikilink",
+            Self::AmbiguousWikilink => "ambiguous_wikilink",
+            Self::StaleAnchor => "stale_anchor",
+            Self::MarkdownLinkDecodeError => "markdown_link_decode_error",
+            Self::UnknownLinkSyntax => "unknown_link_syntax",
         }
     }
 }
@@ -620,6 +635,26 @@ mod tests {
         let encoded =
             serde_json::to_string(&WorkspaceStatus::Uninitialized).expect("encode status");
         assert_eq!(encoded, r#""uninitialized""#);
+    }
+
+    #[test]
+    fn every_degradation_spells_the_same_on_the_wire() {
+        // Same rule as the failure kinds above, same caveat: the list is written by
+        // hand, so a seventh code means adding it here as well.
+        for code in [
+            Degradation::FrontmatterParseError,
+            Degradation::UnresolvedWikilink,
+            Degradation::AmbiguousWikilink,
+            Degradation::StaleAnchor,
+            Degradation::MarkdownLinkDecodeError,
+            Degradation::UnknownLinkSyntax,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&code).expect("serialize"),
+                format!("\"{code}\""),
+                "{code:?} spells differently in JSON and in Display (as_str)"
+            );
+        }
     }
 
     #[test]
