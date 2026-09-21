@@ -689,6 +689,18 @@ fn degradation_message(code: Degradation) -> &'static str {
         Degradation::UnknownLinkSyntax => {
             "the file was indexed; a link uses a syntax this build does not know (D41.6)"
         }
+        Degradation::CanvasParseError => {
+            "the file was indexed; its canvas block could not be read as JSON (D41.8)"
+        }
+        Degradation::ExcalidrawDetected => {
+            "the file was indexed; its Excalidraw scene stays out of the index (D41.7)"
+        }
+        Degradation::SymlinkEncountered => {
+            "the file was indexed; a symlink under the vault was recorded, not followed (D41.9)"
+        }
+        Degradation::AttachmentUnindexed => {
+            "the file was registered; its bytes are not searchable on purpose (D41.10)"
+        }
     }
 }
 

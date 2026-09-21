@@ -490,9 +490,10 @@ pub struct IndexFileError {
 /// What a file lost on the way into the index (D41).
 ///
 /// These ride on **`indexed`** rows: the file *was* indexed, so the outcome stays
-/// `indexed` and this code says what it lost. Six of D41's ten are here (the
-/// frontmatter block and the five wikilink classes); the rest arrive with the
-/// vault-syntax work. Having them typed is what keeps
+/// `indexed` and this code says what it lost. All ten of D41's are here; the
+/// features that raise the last four (canvas, Excalidraw, symlinks, attachments)
+/// land with the vault-syntax work, and each one wires its code when it does.
+/// Having them typed is what keeps
 /// `degradation_message` exhaustive and stops a sentence from claiming to be about
 /// the wrong code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -510,6 +511,19 @@ pub enum Degradation {
     MarkdownLinkDecodeError,
     /// A private link syntax this build does not know (D41.6), e.g. Dendron's.
     UnknownLinkSyntax,
+    /// A `.canvas` block that is not readable as JSON (D41.8); the file keeps its
+    /// bytes and still gets indexed.
+    CanvasParseError,
+    /// A note that is an Excalidraw drawing (D41.7): the compressed scene stays
+    /// out of the index while the note's other sections are indexed normally.
+    ExcalidrawDetected,
+    /// A symlink under the vault (D41.9). The first version does not follow them,
+    /// so the link is recorded rather than read.
+    SymlinkEncountered,
+    /// A file that is registered rather than indexed (D41.10): images, audio,
+    /// video and PDFs get a revision with no chunks, so the vault's coverage is
+    /// answerable even though their bytes are not searchable.
+    AttachmentUnindexed,
 }
 
 impl Degradation {
@@ -519,13 +533,17 @@ impl Degradation {
     /// complete` matches every variant without a wildcard, so a seventh code
     /// cannot be added to `as_str` alone — which was the hole: the writer knew a
     /// code the reader's array did not, and the row's code was dropped silently.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 10] = [
         Self::FrontmatterParseError,
         Self::UnresolvedWikilink,
         Self::AmbiguousWikilink,
         Self::StaleAnchor,
         Self::MarkdownLinkDecodeError,
         Self::UnknownLinkSyntax,
+        Self::CanvasParseError,
+        Self::ExcalidrawDetected,
+        Self::SymlinkEncountered,
+        Self::AttachmentUnindexed,
     ];
     /// The wire spelling written to `store_events.reason_code`.
     #[must_use]
@@ -537,6 +555,10 @@ impl Degradation {
             Self::StaleAnchor => "stale_anchor",
             Self::MarkdownLinkDecodeError => "markdown_link_decode_error",
             Self::UnknownLinkSyntax => "unknown_link_syntax",
+            Self::CanvasParseError => "canvas_parse_error",
+            Self::ExcalidrawDetected => "excalidraw_detected",
+            Self::SymlinkEncountered => "symlink_encountered",
+            Self::AttachmentUnindexed => "attachment_unindexed",
         }
     }
 
@@ -678,9 +700,13 @@ mod tests {
                 Degradation::StaleAnchor => {}
                 Degradation::MarkdownLinkDecodeError => {}
                 Degradation::UnknownLinkSyntax => {}
+                Degradation::CanvasParseError => {}
+                Degradation::ExcalidrawDetected => {}
+                Degradation::SymlinkEncountered => {}
+                Degradation::AttachmentUnindexed => {}
             }
         }
-        assert_eq!(Degradation::ALL.len(), 6, "extend ALL, not just as_str");
+        assert_eq!(Degradation::ALL.len(), 10, "extend ALL, not just as_str");
     }
 
     #[test]
