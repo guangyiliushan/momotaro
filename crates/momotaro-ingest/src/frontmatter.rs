@@ -239,6 +239,16 @@ fn parse_block(block: &str) -> Result<Vec<Field>, (usize, Reason)> {
             // and inside a block scalar, and Obsidian's properties use exactly
             // those shapes. The next `key:` line (or the end of the block) is
             // what ends a field.
+            //
+            // Inside a field this parser has already declared raw, they are also
+            // *content* — a blank line is a line break in a literal scalar and a
+            // `#` line is data, not a comment — so they are kept with the field's
+            // own lines ("nothing is dropped", `Value::Raw`).
+            if let Some(open) = pending.as_mut()
+                && open.unmodelled
+            {
+                open.source.push(bare.to_owned());
+            }
             continue;
         }
         if let Some(item) = bare.trim_start().strip_prefix("- ") {
@@ -472,6 +482,30 @@ mod tests {
         assert_eq!(fields(&frontmatter).len(), 4);
     }
 
+    /// Every `Reason` spelling, pinned on the value itself.
+    ///
+    /// The three codes are what a downstream reader branches on (5.5), so each
+    /// one gets its own literal here. The previous witness was a `matches!` over
+    /// the three of them, which cannot tell them apart: swapping two arms of
+    /// `as_str` left the whole suite green.
+    #[test]
+    fn every_reason_spells_itself_the_way_the_contract_says() {
+        for reason in [
+            Reason::NotAField,
+            Reason::OrphanListItem,
+            Reason::EmptyFieldName,
+        ] {
+            // No `_` arm: a fourth variant fails to compile right here, which is
+            // what keeps this table in step with the enum.
+            let expected = match reason {
+                Reason::NotAField => "not_a_field",
+                Reason::OrphanListItem => "orphan_list_item",
+                Reason::EmptyFieldName => "empty_field_name",
+            };
+            assert_eq!(reason.as_str(), expected, "spelling of {reason:?}");
+        }
+    }
+
     #[test]
     fn a_list_does_not_leak_into_the_next_field() {
         // The shape that made this parser wrong: a field whose content stops
@@ -597,8 +631,8 @@ mod tests {
 
         assert_eq!(
             field(&frontmatter, "description").value,
-            Value::Raw("description: |\n  line one\n  line two".to_owned()),
-            "a comment inside a field is not the field's end"
+            Value::Raw("description: |\n  line one\n# a comment\n  line two\n".to_owned()),
+            "a comment inside a field is not the field's end, nor a dropped line"
         );
         assert_eq!(
             field(&frontmatter, "tags").value,

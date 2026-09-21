@@ -294,7 +294,14 @@ pub fn chunk_markdown_with(
         if close {
             let open = current.take().expect("close implies open chunk");
             let seed = if seed_overlap && open.last_is_text && block.kind.is_text_kind() {
-                overlap_suffix(&normalized[open.last_range.clone()], overlap_tokens)
+                // The seed is the *front* of a chunk the packing loop then stops
+                // checking: `joined > max_tokens` above only decides to close the
+                // old chunk. Leave room for the joining separator and for the
+                // block that comes with it, or the chunk opens over budget —
+                // measured at 685 tokens for a configured 512 with overlap 256.
+                let tail = estimate_tokens(&format!("\n\n{block_text}"));
+                let budget = overlap_tokens.min(max_tokens.saturating_sub(tail));
+                overlap_suffix(&normalized[open.last_range.clone()], budget)
             } else {
                 String::new()
             };

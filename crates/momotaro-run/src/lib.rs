@@ -1851,12 +1851,13 @@ mod tests {
             "prose between two rules fails as a whole: {blob}"
         );
         let reason = frontmatter["reason"].as_str().expect("reason is a string");
-        assert!(
-            matches!(
-                reason,
-                "not_a_field" | "orphan_list_item" | "empty_field_name"
-            ),
-            "a stable code, not a sentence: {reason:?}"
+        // One answer, one literal: prose between two rules is not a field, so
+        // `not_a_field` is the code this note must carry. The three-code
+        // alternation that used to stand here stayed green when two of the
+        // spellings were swapped, which is not a witness for any of them.
+        assert_eq!(
+            reason, "not_a_field",
+            "the code a reader branches on, spelled out: {blob}"
         );
         assert_eq!(
             frontmatter["line"], 2,
