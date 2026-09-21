@@ -149,6 +149,36 @@ pub fn coverage_report(root: impl AsRef<Path>) -> Result<Option<CoverageReport>,
 /// A coverage row whose outcome is neither `indexed`, `skipped` nor
 /// `metadata_refreshed` counts as a failure rather than being dropped: a row the
 /// reader does not understand is a fact about the batch, not noise.
+/// Counts one row's degradations, from its whole list when it carries one and
+/// from its primary code otherwise.
+///
+/// The fallback is for rows written before the list existed (and for the refusal
+/// rows, which never carry one). A code this build does not know is a fact about
+/// the batch, not noise — the same posture as an unreadable outcome below.
+fn count_degradations(report: &mut CoverageReport, event: &momotaro_store::StoreEvent) {
+    let codes: Vec<String> = serde_json::from_str::<serde_json::Value>(&event.data_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("degradations")
+                .and_then(|list| serde_json::from_value::<Vec<String>>(list.clone()).ok())
+        })
+        .filter(|list| !list.is_empty())
+        .unwrap_or_else(|| event.reason_code.iter().cloned().collect());
+    for code in &codes {
+        match Degradation::from_code(code) {
+            Some(known) => *report.degradations.entry(known).or_insert(0) += 1,
+            None => report.failures.push(CoverageFailure {
+                source_key: event.source_key.clone(),
+                reason_code: Some(code.clone()),
+                message: Some(format!(
+                    "an indexed row carries a degradation code this build does not know: {code}"
+                )),
+            }),
+        }
+    }
+}
+
 fn summarize_coverage(batch_id: &str, events: &[momotaro_store::StoreEvent]) -> CoverageReport {
     let mut report = CoverageReport {
         batch_id: batch_id.to_owned(),
@@ -166,29 +196,14 @@ fn summarize_coverage(batch_id: &str, events: &[momotaro_store::StoreEvent]) -> 
             "ingest.coverage" => match event.outcome.as_deref() {
                 Some(outcome) if outcome == FileOutcome::INDEXED => {
                     report.indexed += 1;
-                    // A degraded file is still `indexed`; the code is what says it
-                    // lost something, and dropping it here is how `doctor --coverage`
-                    // came to call a broken block a clean file.
-                    // A code this build does not know is a fact about the batch,
-                    // not noise — the same posture as an unreadable outcome below.
-                    // Dropping it would report a degraded file as a clean one.
-                    match event.reason_code.as_deref() {
-                        None | Some("") => {}
-                        Some(code) => match Degradation::from_code(code) {
-                            Some(known) => *report.degradations.entry(known).or_insert(0) += 1,
-                            None => report.failures.push(CoverageFailure {
-                                source_key: event.source_key.clone(),
-                                reason_code: event.reason_code.clone(),
-                                message: Some(format!(
-                                    "an indexed row carries a degradation code this build does not know: {code}"
-                                )),
-                            }),
-                        },
-                    }
+                    count_degradations(&mut report, event);
                 }
                 Some(outcome) if outcome == FileOutcome::Skipped.as_str() => report.skipped += 1,
-                Some(outcome) if outcome == FileOutcome::MetadataRefreshed.as_str() => {
+                Some(outcome) if outcome == FileOutcome::METADATA_REFRESHED => {
                     report.refreshed += 1;
+                    // A refreshed file lost whatever the re-derived block says it
+                    // lost: this path used to keep the blob's answer to itself.
+                    count_degradations(&mut report, event);
                 }
                 _ => report.failures.push(CoverageFailure {
                     source_key: event.source_key.clone(),
@@ -625,6 +640,40 @@ fn frontmatter_json(parse: &FrontmatterParse) -> serde_json::Value {
     }
 }
 
+/// What a frontmatter block lost, in the enum's declaration order.
+///
+/// One home for the rule, because two paths need it: the indexing path and the
+/// refreshed path, which used to re-derive the block and then throw the answer
+/// away — a refreshed file with a broken block read as clean.
+fn degradations_of(frontmatter: &FrontmatterParse) -> Vec<Degradation> {
+    match frontmatter {
+        // A JSON block that does not read is the same loss as a YAML block that
+        // does not read, and the row says so.
+        FrontmatterParse::Failed { .. } => vec![Degradation::FrontmatterParseError],
+        FrontmatterParse::Json(raw) if json_frontmatter(raw).is_none() => {
+            vec![Degradation::FrontmatterParseError]
+        }
+        FrontmatterParse::Absent | FrontmatterParse::Parsed(_) | FrontmatterParse::Json(_) => {
+            Vec::new()
+        }
+    }
+}
+
+/// The `data_json` payload for one coverage row: the whole list, or `{}`.
+///
+/// Pure, so the shape has a test without a store: a row that lost several things
+/// must carry several, and a row that lost none carries no list at all.
+fn degradations_json(degradations: &[Degradation]) -> String {
+    if degradations.is_empty() {
+        return "{}".to_owned();
+    }
+    let codes = degradations
+        .iter()
+        .map(|code| code.as_str())
+        .collect::<Vec<_>>();
+    serde_json::json!({ "degradations": codes }).to_string()
+}
+
 /// Appends one `ingest.coverage` row, and records the failure when there is one.
 ///
 /// Three steps live here — bump `seq`, append the row, push the failure — and so
@@ -645,12 +694,14 @@ fn record_coverage(
     outcome: &str,
     reason_code: Option<&str>,
     message: Option<&str>,
+    degradations: &[Degradation],
     failure: Option<(IndexFileErrorKind, String)>,
 ) -> Result<(), RunError> {
     let refusal = failure.as_ref().map(|(kind, _)| kind.to_string());
     let reason_code = refusal.as_deref().or(reason_code);
     let message = failure.as_ref().map(|(_, text)| text.as_str()).or(message);
     *seq += 1;
+    let data_json = degradations_json(degradations);
     store.append_store_event(&coverage_event(
         batch_id,
         *seq,
@@ -658,6 +709,7 @@ fn record_coverage(
         outcome,
         reason_code,
         message,
+        &data_json,
     ))?;
     if let Some((kind, message)) = failure {
         report.errors.push(file_error(source_key, kind, message));
@@ -867,6 +919,7 @@ pub fn index_workspace(
                     "error",
                     None,
                     Some(message.as_str()),
+                    &[],
                     Some((error.kind(), message.clone())),
                 )?;
                 continue;
@@ -886,6 +939,7 @@ pub fn index_workspace(
                     "error",
                     None,
                     None,
+                    &[],
                     Some((error.kind(), message)),
                 )?;
                 continue;
@@ -910,6 +964,7 @@ pub fn index_workspace(
                 "error",
                 None,
                 None,
+                &[],
                 Some((kind, message)),
             )?;
             continue;
@@ -939,6 +994,7 @@ pub fn index_workspace(
                     outcome.as_str(),
                     degraded,
                     sentence,
+                    outcome.degradations(),
                     None,
                 )?;
             }
@@ -952,6 +1008,7 @@ pub fn index_workspace(
                     "error",
                     None,
                     None,
+                    &[],
                     Some((kind, message)),
                 )?;
             }
@@ -1003,6 +1060,7 @@ fn coverage_event<'a>(
     outcome: &'a str,
     reason_code: Option<&'a str>,
     message: Option<&'a str>,
+    data_json: &'a str,
 ) -> NewStoreEvent<'a> {
     NewStoreEvent {
         occurred_at: now_epoch_secs(),
@@ -1014,7 +1072,7 @@ fn coverage_event<'a>(
         outcome: Some(outcome),
         reason_code,
         message,
-        data_json: "{}",
+        data_json,
         external_id: None,
     }
 }
@@ -1024,13 +1082,16 @@ fn coverage_event<'a>(
 enum FileOutcome {
     /// Unchanged: same fingerprint, stored path and raw name.
     Skipped,
-    /// Same bytes under a new path or spelling: the mutable columns moved.
-    MetadataRefreshed,
-    /// A revision and its chunks were written. `degraded` carries whatever the
-    /// file lost on the way in (today: a frontmatter block that could not be
-    /// read, D41.5) — the file *was* indexed, so the outcome stays `indexed` and
-    /// the code rides alongside it.
-    Indexed { degraded: Option<Degradation> },
+    /// Same bytes under a new path or spelling: the mutable columns moved. The
+    /// list is re-derived on this path too, or a file whose block cannot be read
+    /// would read as clean here (D41.8).
+    MetadataRefreshed { degradations: Vec<Degradation> },
+    /// A revision and its chunks were written. `degradations` carries whatever the
+    /// file lost on the way in, in the enum's declaration order — the file *was*
+    /// indexed, so the outcome stays `indexed` and the codes ride alongside it. A
+    /// file can lose several things at once (D41.8), so it is a list: the row's
+    /// `reason_code` is its first element and its `data_json` carries all of it.
+    Indexed { degradations: Vec<Degradation> },
 }
 
 impl FileOutcome {
@@ -1039,30 +1100,44 @@ impl FileOutcome {
     /// code beside the outcome.
     const INDEXED: &'static str = "indexed";
 
+    /// The wire spelling of the `metadata_refreshed` outcome, for the same reason
+    /// the indexed one exists: a struct variant is not a value to compare against.
+    const METADATA_REFRESHED: &'static str = "metadata_refreshed";
+
     /// The wire spelling written to `store_events.outcome` (ADR 0026).
     fn as_str(&self) -> &'static str {
         match self {
             Self::Skipped => "skipped",
-            Self::MetadataRefreshed => "metadata_refreshed",
+            Self::MetadataRefreshed { .. } => "metadata_refreshed",
             Self::Indexed { .. } => Self::INDEXED,
         }
     }
 
-    /// The stable code the coverage row carries, when the file was indexed anyway.
+    /// The stable code the coverage row carries, when the file was indexed anyway:
+    /// the first of the list, so existing readers and the counting semantics do not
+    /// move (D41.8 ②).
     fn reason_code(&self) -> Option<&'static str> {
+        self.degradations()
+            .first()
+            .copied()
+            .map(Degradation::as_str)
+    }
+
+    /// The whole list: the row's `data_json` and the per-code counts read it
+    /// (D41.8 ③④).
+    fn degradations(&self) -> &[Degradation] {
         match self {
-            Self::Indexed { degraded } => degraded.map(Degradation::as_str),
-            Self::Skipped | Self::MetadataRefreshed => None,
+            Self::Skipped => &[],
+            Self::MetadataRefreshed { degradations } | Self::Indexed { degradations } => {
+                degradations
+            }
         }
     }
 
-    /// The same fact as [`FileOutcome::reason_code`], for the callers that need
-    /// the code's sentence rather than its spelling.
+    /// The first code of the list, for callers that need its sentence rather than
+    /// its spelling — the same fact as [`FileOutcome::reason_code`].
     fn degradation(&self) -> Option<Degradation> {
-        match self {
-            Self::Indexed { degraded } => *degraded,
-            Self::Skipped | Self::MetadataRefreshed => None,
-        }
+        self.degradations().first().copied()
     }
 }
 
@@ -1127,7 +1202,11 @@ fn process_file(
             )
         })?;
         report.files_indexed += 1;
-        return Ok(FileOutcome::MetadataRefreshed);
+        // The block was re-derived above for the blob; the same answer rides on
+        // the row, or this path reports a broken block as a clean file.
+        return Ok(FileOutcome::MetadataRefreshed {
+            degradations: degradations_of(&frontmatter),
+        });
     }
 
     let (frontmatter, body) = frontmatter::split(&normalized);
@@ -1177,16 +1256,9 @@ fn process_file(
     report.chunks_written += chunks.len() as u64;
     // A block that could not be read does not stop the file: the body is indexed
     // and the failure becomes a code on the coverage row (`frontmatter_parse_error`).
-    let degraded = match &frontmatter {
-        FrontmatterParse::Failed { .. } => Some(Degradation::FrontmatterParseError),
-        // A JSON block that does not read is the same loss as a YAML block that
-        // does not read, and the row says so.
-        FrontmatterParse::Json(raw) if json_frontmatter(raw).is_none() => {
-            Some(Degradation::FrontmatterParseError)
-        }
-        FrontmatterParse::Absent | FrontmatterParse::Parsed(_) | FrontmatterParse::Json(_) => None,
-    };
-    Ok(FileOutcome::Indexed { degraded })
+    Ok(FileOutcome::Indexed {
+        degradations: degradations_of(&frontmatter),
+    })
 }
 
 /// Rebuilds the tantivy index from canonical store chunks.
