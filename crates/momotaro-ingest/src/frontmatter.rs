@@ -345,6 +345,22 @@ fn parse_block(block: &str) -> Result<Vec<Field>, (usize, Reason)> {
         if name.is_empty() {
             return Err((line_number, Reason::EmptyFieldName));
         }
+        if name.starts_with(['"', '\'']) {
+            // A key that opens with a quote is not a plain key: its `: ` sits
+            // after the closing quote (YAML 1.2.2 §7.4.2), so splitting on the
+            // first one gives `"a` and `"b": value` — a wrong but well-formed
+            // answer, which is worse than raw, because nothing downstream can
+            // tell. The field keeps its line and the head as written.
+            fields.extend(pending.take().map(Pending::settle));
+            pending = Some(Pending {
+                key: name.to_owned(),
+                inline: None,
+                source: vec![bare.to_owned()],
+                unmodelled: true,
+                ..Pending::default()
+            });
+            continue;
+        }
         fields.extend(pending.take().map(Pending::settle));
         let value = value.trim();
         pending = Some(Pending {
@@ -695,6 +711,21 @@ mod tests {
             field(&frontmatter, "title").value,
             Value::Scalar("A".to_owned()),
             "and the next field is untouched"
+        );
+    }
+
+    #[test]
+    fn a_quoted_key_is_not_split_at_its_inner_colon() {
+        // YAML 1.2.2 §7.4.2: with a quoted key the `: ` sits after the closing
+        // quote. Splitting at the first colon produced a key of `"a` beside a
+        // value of `"b": value` — wrong, well-formed, and undetectable downstream.
+        let source = "---\n\"a: b\": value\n---\nbody\n";
+        let (frontmatter, _) = split(source);
+        let field = field(&frontmatter, "\"a");
+        assert!(
+            matches!(field.value, Value::Raw(_)),
+            "kept as source, not split: {:?}",
+            field.value
         );
     }
 
