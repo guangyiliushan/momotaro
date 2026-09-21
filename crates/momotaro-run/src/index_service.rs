@@ -540,6 +540,46 @@ fn revision_metadata(fingerprint: &str, frontmatter: &FrontmatterParse) -> Strin
 /// tell "there was no block" from "the block could not be read" from "here are
 /// the fields" without guessing, and the failure keeps its raw text and line so
 /// a later pass can retry the parse (`frontmatter_parse_error`).
+/// Reads a JSON property block into the same field shape a YAML block produces.
+///
+/// `None` is "this build could not read it", not "it was empty". Values mirror the
+/// YAML arms — a string, number or bool becomes `scalar`, an array becomes `list`,
+/// anything else keeps `raw` — because a reader branching on the value shape must
+/// not have to learn a second one for JSON.
+fn json_frontmatter(raw: &str) -> Option<Vec<serde_json::Value>> {
+    let serde_json::Value::Object(map) = serde_json::from_str::<serde_json::Value>(raw).ok()?
+    else {
+        return None;
+    };
+    Some(
+        map.iter()
+            .map(|(key, value)| {
+                let value = match value {
+                    serde_json::Value::String(text) => serde_json::json!({ "scalar": text }),
+                    serde_json::Value::Number(number) => {
+                        serde_json::json!({ "scalar": number.to_string() })
+                    }
+                    serde_json::Value::Bool(flag) => {
+                        serde_json::json!({ "scalar": flag.to_string() })
+                    }
+                    serde_json::Value::Array(items) => {
+                        let scalars = items
+                            .iter()
+                            .map(|item| match item {
+                                serde_json::Value::String(text) => text.clone(),
+                                other => other.to_string(),
+                            })
+                            .collect::<Vec<_>>();
+                        serde_json::json!({ "list": scalars })
+                    }
+                    other => serde_json::json!({ "raw": other.to_string() }),
+                };
+                serde_json::json!({ "key": key, "value": value })
+            })
+            .collect(),
+    )
+}
+
 fn frontmatter_json(parse: &FrontmatterParse) -> serde_json::Value {
     match parse {
         FrontmatterParse::Absent => serde_json::json!({ "state": "absent" }),
@@ -559,6 +599,23 @@ fn frontmatter_json(parse: &FrontmatterParse) -> serde_json::Value {
                 }))
                 .collect::<Vec<_>>(),
         }),
+        FrontmatterParse::Json(raw) => match json_frontmatter(raw) {
+            Some(fields) => serde_json::json!({
+                "state": "parsed",
+                "source": "json",
+                "raw": raw,
+                "fields": fields,
+            }),
+            // A JSON block this build cannot read is a block it cannot read: the
+            // same state and the same reason spelling as any other unreadable
+            // block, so nothing downstream learns a second vocabulary.
+            None => serde_json::json!({
+                "state": "failed",
+                "raw": raw,
+                "line": 1,
+                "reason": "not_a_field",
+            }),
+        },
         FrontmatterParse::Failed { raw, line, reason } => serde_json::json!({
             "state": "failed",
             "raw": raw,
@@ -1110,7 +1167,12 @@ fn process_file(
     // and the failure becomes a code on the coverage row (`frontmatter_parse_error`).
     let degraded = match &frontmatter {
         FrontmatterParse::Failed { .. } => Some(Degradation::FrontmatterParseError),
-        FrontmatterParse::Absent | FrontmatterParse::Parsed(_) => None,
+        // A JSON block that does not read is the same loss as a YAML block that
+        // does not read, and the row says so.
+        FrontmatterParse::Json(raw) if json_frontmatter(raw).is_none() => {
+            Some(Degradation::FrontmatterParseError)
+        }
+        FrontmatterParse::Absent | FrontmatterParse::Parsed(_) | FrontmatterParse::Json(_) => None,
     };
     Ok(FileOutcome::Indexed { degraded })
 }

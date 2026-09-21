@@ -90,6 +90,15 @@ pub enum FrontmatterParse {
     Absent,
     /// A block that parsed.
     Parsed(Frontmatter),
+    /// A block written as JSON, kept as its text.
+    ///
+    /// Obsidian documents this on purpose ("you can also define properties using
+    /// JSON … the JSON block will be read, interpreted, and saved as YAML"), so a
+    /// block whose first non-empty line opens with `{` is not a failed block: it
+    /// is a second syntax whose shape this crate recognises and leaves to the
+    /// layer that already speaks JSON. No reader for it here — this crate's
+    /// dependency list stays as it is.
+    Json(String),
     /// A block that was there but could not be read: kept verbatim, with the
     /// line and the reason, and the body still indexed
     /// (`frontmatter_parse_error`, D41.5).
@@ -121,6 +130,15 @@ pub fn split(source: &str) -> (FrontmatterParse, &str) {
     let Some((block, body)) = take_block(source) else {
         return (FrontmatterParse::Absent, source);
     };
+    // A block whose first non-empty line opens with `{` is Obsidian's JSON form:
+    // recognised here as a shape, read in the layer that has a JSON reader.
+    if block
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.trim_start().starts_with('{'))
+    {
+        return (FrontmatterParse::Json(block.to_owned()), body);
+    }
     match parse_block(block) {
         Ok(fields) => (
             FrontmatterParse::Parsed(Frontmatter {
@@ -345,12 +363,13 @@ fn parse_block(block: &str) -> Result<Vec<Field>, (usize, Reason)> {
         if name.is_empty() {
             return Err((line_number, Reason::EmptyFieldName));
         }
-        if name.starts_with(['"', '\'']) {
-            // A key that opens with a quote is not a plain key: its `: ` sits
-            // after the closing quote (YAML 1.2.2 §7.4.2), so splitting on the
-            // first one gives `"a` and `"b": value` — a wrong but well-formed
-            // answer, which is worse than raw, because nothing downstream can
-            // tell. The field keeps its line and the head as written.
+        if name.starts_with(['"', '\'', '{', '[']) {
+            // A head that opens with a quote, `{` or `[` is not a plain key: a
+            // quoted key's `: ` sits after the closing quote (YAML 1.2.2 §7.4.2),
+            // and a brace or bracket opens a collection, so splitting at the first
+            // colon gives something like `{ "publish` beside ` false }` — wrong
+            // but well-formed, which is worse than raw, because nothing downstream
+            // can tell. The field keeps its line and the head as it was written.
             fields.extend(pending.take().map(Pending::settle));
             pending = Some(Pending {
                 key: name.to_owned(),
@@ -711,6 +730,41 @@ mod tests {
             field(&frontmatter, "title").value,
             Value::Scalar("A".to_owned()),
             "and the next field is untouched"
+        );
+    }
+
+    #[test]
+    fn a_json_block_is_recognised_as_such() {
+        // Obsidian's documented second syntax. This layer only has to see the
+        // shape; turning it into fields is the run layer's business.
+        let source = "---\n{\n  \"tags\": [\"journal\"],\n  \"publish\": false\n}\n---\nbody\n";
+        let (frontmatter, body) = split(source);
+        match frontmatter {
+            FrontmatterParse::Json(raw) => {
+                assert!(
+                    raw.contains("\"tags\""),
+                    "the block's text, verbatim: {raw}"
+                );
+            }
+            other => panic!("a JSON block is its own shape, got {other:?}"),
+        }
+        assert_eq!(body, "body\n");
+    }
+
+    #[test]
+    fn a_comment_before_the_brace_is_not_the_json_form_but_is_not_guessed_either() {
+        // The documented form opens with `{`, so a comment in front is not it —
+        // and this crate does not invent a third form. It falls back to the
+        // ordinary path, where the brace-led head must make the *field*
+        // free-form rather than a field named `{ "publish`: a wrong key is the
+        // failure mode the quoted-key rule exists for.
+        let source = "---\n# a note to self\n{ \"publish\": false }\n---\nbody\n";
+        let (frontmatter, _) = split(source);
+        let field = field(&frontmatter, "{ \"publish\"");
+        assert!(
+            matches!(field.value, Value::Raw(_)),
+            "kept as source: {:?}",
+            field.value
         );
     }
 

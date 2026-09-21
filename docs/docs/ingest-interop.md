@@ -157,7 +157,12 @@ parse_error。
    事件，正文照常索引；**未建模 ≠ 猜**：带引号的键头（`: ` 在闭引号之后，§7.4.2）、
    除简单一行 `[a, b]` 以外的花括号/嵌套/引号内含逗号的值、`|`/`>` 标量头下的
    任何行（含 `- ` 开头的，它们是内容，§8.1.2）——一律落到**该字段**的 `Raw`，
-   原文逐字保留，下游按 `Value` 形状分支即可，不要去猜；两道 `---` 夹住的散文正是这种形状：整块 `Failed`、
+   原文逐字保留，下游按 `Value` 形状分支即可，不要去猜。**JSON 属性块是第三种形态**：
+   Obsidian 官方文档明确支持（"you can also define properties using JSON … read,
+   interpreted, and saved as YAML"），所以首行为 `{` 的块按 JSON 建模 —— ingest 只认
+   形状、原文交出去（本 crate 不引 JSON 依赖），`run` 用已有解析器读成与 YAML 相同的
+   字段形状（`state: "parsed"` + `source: "json"`）；读不出来的 JSON 块与读不出来的
+   YAML 块走**同一条失败路径**（同码、同状态），下游不必学第二套词汇；两道 `---` 夹住的散文正是这种形状：整块 `Failed`、
    **不进 FTS**（也不进 title/heading_path），原块连行号与原因留在
    `metadata_json.frontmatter` 的 `raw`/`line`/`reason`，重解析即恢复（`reason`
    是**稳定码** `not_a_field` / `orphan_list_item` / `empty_field_name`——下游要分支
