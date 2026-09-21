@@ -192,6 +192,50 @@ fn split_ending(line: &str) -> (&str, &str) {
     line.split_at(end)
 }
 
+/// Whether a key's inline text opens a block scalar (`|` or `>`).
+///
+/// YAML 1.2.2 §8.1.1: the header is the only thing that gives the lines under a
+/// key the meaning of content, so this is the precondition for treating them as
+/// such — without it a column-0 `#` line after `title: A` would be read as
+/// title text, which it is not.
+fn is_block_scalar_header(inline: &str) -> bool {
+    matches!(inline.trim_start().chars().next(), Some('|' | '>'))
+}
+
+/// A one-line `[a, b]` with only plain or quoted scalars inside, as a list.
+///
+/// The shape the official property types actually use for `tags` and friends
+/// (YAML 1.2.2 §7.4.1, and Obsidian's own JSON properties use the same array).
+/// `None` means "not this shape", including anything nested, multi-line, or
+/// carrying a comma inside a quoted element: this parser does not model those,
+/// and guessing them is what the `Raw` fallback exists to avoid.
+fn simple_flow_sequence(inline: &str) -> Option<Vec<String>> {
+    let trimmed = inline.trim();
+    if !looks_like_flow(trimmed) {
+        return None;
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let mut items = Vec::new();
+    for raw in inner.split(',') {
+        let item = raw.trim();
+        let balanced = !item.is_empty()
+            && (item.starts_with('"') == item.ends_with('"'))
+            && (item.starts_with('\'') == item.ends_with('\''));
+        let bare = item.trim_matches(['"', '\'']);
+        if !balanced || bare.is_empty() || bare.contains(['[', ']', '{', '}']) {
+            return None;
+        }
+        items.push(bare.to_owned());
+    }
+    (!items.is_empty()).then_some(items)
+}
+
+/// Whether a value even looks like a flow collection: `[ … ]`.
+fn looks_like_flow(inline: &str) -> bool {
+    let trimmed = inline.trim();
+    trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2
+}
+
 /// What has been read of the field currently open, if any.
 #[derive(Default)]
 struct Pending {
@@ -214,7 +258,16 @@ impl Pending {
         } else if !self.list.is_empty() {
             Value::List(self.list)
         } else if let Some(inline) = self.inline {
-            Value::Scalar(inline)
+            if let Some(items) = simple_flow_sequence(&inline) {
+                Value::List(items)
+            } else if looks_like_flow(&inline) {
+                // Nested, multi-line, or carrying a comma inside a quoted element:
+                // a shape this parser does not model, so the field keeps its source
+                // lines instead of being handed downstream as a one-line string.
+                Value::Raw(self.source.join("\n"))
+            } else {
+                Value::Scalar(inline)
+            }
         } else {
             Value::Raw(String::new())
         };
@@ -254,12 +307,26 @@ fn parse_block(block: &str) -> Result<Vec<Field>, (usize, Reason)> {
         if let Some(item) = bare.trim_start().strip_prefix("- ") {
             match pending.as_mut() {
                 Some(open) if !open.unmodelled => {
-                    open.list.push(item.trim().to_owned());
-                    open.source.push(bare.to_owned());
+                    if open.inline.as_deref().is_some_and(is_block_scalar_header) {
+                        // A `- ` line under a block-scalar header is the scalar's
+                        // content, not a list item: YAML 1.2.2 §8.1.2 makes every
+                        // indented character content, and the reference engines
+                        // read `description: |` + `  - first` as the text
+                        // `- first`. The field goes raw rather than dropping the
+                        // header, which is what it used to do.
+                        open.source.push(bare.to_owned());
+                        open.unmodelled = true;
+                    } else {
+                        open.list.push(item.trim().to_owned());
+                        open.source.push(bare.to_owned());
+                    }
                 }
-                // An item below a field that is already something else (or with
-                // no field at all) is a shape this parser will not guess at.
-                _ => return Err((line_number, Reason::OrphanListItem)),
+                // A field this parser has already declared raw owns every line
+                // under it, bullets included -- including the second and later
+                // ones, which is what the first version of this fix missed.
+                Some(open) => open.source.push(bare.to_owned()),
+                // Only an item with no field to belong to is an orphan.
+                None => return Err((line_number, Reason::OrphanListItem)),
             }
             continue;
         }
@@ -611,6 +678,51 @@ mod tests {
         let fields = fields(&frontmatter);
         assert_eq!(fields.len(), 2, "{fields:?}");
         assert_eq!(fields[1].value, Value::Scalar("two".to_owned()));
+    }
+
+    #[test]
+    fn a_bullet_under_a_block_scalar_header_is_content() {
+        // YAML 1.2.2 §8.1.2: inside a literal scalar every indented character is
+        // content. The reference engines read this as the text "- first\n- second".
+        let source = "---\ndescription: |\n  - first\n  - second\ntitle: A\n---\nbody\n";
+        let (frontmatter, _) = split(source);
+        assert_eq!(
+            field(&frontmatter, "description").value,
+            Value::Raw("description: |\n  - first\n  - second".to_owned()),
+            "content, not a list, and the header is kept"
+        );
+        assert_eq!(
+            field(&frontmatter, "title").value,
+            Value::Scalar("A".to_owned()),
+            "and the next field is untouched"
+        );
+    }
+
+    #[test]
+    fn a_simple_flow_sequence_is_the_list_it_is() {
+        let source = "---\ntags: [project, active]\n---\nbody\n";
+        let (frontmatter, _) = split(source);
+        assert_eq!(
+            field(&frontmatter, "tags").value,
+            Value::List(vec!["project".to_owned(), "active".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_flow_sequence_this_parser_does_not_model_goes_raw() {
+        // Nested, and a comma inside a quoted element: both are shapes the
+        // simple reader above must refuse rather than half-read.
+        for source in [
+            "---\ntags: [a, {k: v}]\n---\nbody\n",
+            "---\ntags: [a, \"b, c\"]\n---\nbody\n",
+        ] {
+            let (frontmatter, _) = split(source);
+            let value = &field(&frontmatter, "tags").value;
+            assert!(
+                matches!(value, Value::Raw(_)),
+                "not modelled, so raw: {value:?} for {source:?}"
+            );
+        }
     }
 
     #[test]
