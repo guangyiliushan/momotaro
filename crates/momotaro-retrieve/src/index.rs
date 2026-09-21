@@ -40,6 +40,20 @@ impl IndexWriterHandle {
         self.inner.commit()?;
         Ok(())
     }
+
+    /// Waits for every worker and merge thread, then drops the writer.
+    ///
+    /// Dropping a writer is not joining it: tantivy keeps workers and merges
+    /// running after the value goes out of scope, and on Windows a directory one
+    /// of them still has open cannot be renamed. A rebuild that swaps its staging
+    /// directory in failed with a bare `os error 5` at ten thousand notes for
+    /// exactly that reason; the handle was dropped at the end of a block and the
+    /// merge was still ~1.4 s from finishing. Consumes the handle, as
+    /// `wait_merging_threads` itself does.
+    pub fn finish(self) -> Result<(), RetrieveError> {
+        self.inner.wait_merging_threads()?;
+        Ok(())
+    }
 }
 
 /// One scored document pulled from the store, before rank assignment.

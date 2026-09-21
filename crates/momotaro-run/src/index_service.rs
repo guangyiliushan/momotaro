@@ -264,6 +264,14 @@ pub(crate) fn index_unusable_message(root: &Path) -> Option<String> {
 }
 
 /// Where a replacement index is built before it is swapped in.
+/// Where the previous index waits while a rebuild swaps the new one in.
+///
+/// Only for the moment between the two renames: a successful swap discards it,
+/// and a failed one renames it back.
+fn retired_dir(root: &Path) -> PathBuf {
+    root.join(".momotaro").join("index.retired")
+}
+
 pub(crate) fn staging_dir(root: &Path) -> PathBuf {
     root.join(".momotaro").join("index.rebuilding")
 }
@@ -279,6 +287,33 @@ pub(crate) fn index_dir(root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rebuild_joins_the_writer_and_retires_the_index_before_it_swaps() {
+        // What this pins: dropping a writer is not joining it, so tantivy keeps
+        // merging into the staging directory and the rename fails with `os error
+        // 5` on Windows once the corpus is big enough to merge (measured: ~1.4 s
+        // of busy directory; 200 notes pass, 10k fail). A true 10k end-to-end run
+        // is a minutes-long, Windows-only instrument, so the *order* is the thing
+        // under test: join, then retire the live index, then swap. The needles are
+        // composed so this test does not count its own text.
+        let source = include_str!("index_service.rs");
+        let join = concat!("writer.finish()", "?;");
+        let retire = concat!("fs::rename(&dir, ", "&retired)");
+        let swap = concat!("fs::rename(&staging, ", "&dir)");
+        let join_at = source.find(join).expect("the join call");
+        let retire_at = source.find(retire).expect("the retire rename");
+        let swap_at = source.find(swap).expect("the swap rename");
+        assert!(
+            join_at < retire_at,
+            "the writer is joined before the retire"
+        );
+        assert!(retire_at < swap_at, "the index is retired before the swap");
+        assert!(
+            source.contains(concat!("discard(&", "retired)?")),
+            "a successful swap unlinks the retired index"
+        );
+    }
 
     #[test]
     fn the_two_kinds_are_written_in_exactly_one_place_each() {
@@ -1123,13 +1158,31 @@ pub fn rebuild_index(root: impl AsRef<Path>) -> Result<RebuildReport, RunError> 
             &origins,
         )?;
         writer.commit()?;
+        // Dropping the writer is not joining it: without this, the merge it was
+        // still running keeps the staging directory open, and the rename below
+        // fails with `os error 5` on Windows once the corpus is big enough to
+        // merge (measured: 1.4 s of busy directory; 200 notes pass, 10k fail).
+        writer.finish()?;
         indexed
     };
-    // Every handle is released above: the rename below needs the directory closed.
-    // Nothing has touched `dir` up to this point — the build failing anywhere
-    // above leaves the index that is answering queries exactly as it was.
-    discard(&dir)?;
-    fs::rename(&staging, &dir).map_err(|source| RunError::Io { source })?;
+    // Retire, swap, then unlink: the index answering queries never stops
+    // existing before the new one is in place, so a swap that fails leaves the
+    // old index to rename back instead of a workspace with no live index at all.
+    // Nothing has touched `dir` before this point — a build failing above leaves
+    // it exactly as it was.
+    let retired = retired_dir(root);
+    if dir.exists() {
+        fs::rename(&dir, &retired).map_err(|source| RunError::Io { source })?;
+    }
+    if let Err(source) = fs::rename(&staging, &dir) {
+        // Put the live index back before reporting: the rebuild failed, and the
+        // workspace should not have to.
+        if !dir.exists() && retired.exists() {
+            let _ = fs::rename(&retired, &dir);
+        }
+        return Err(RunError::Io { source });
+    }
+    discard(&retired)?;
 
     Ok(RebuildReport {
         chunks: indexed,
