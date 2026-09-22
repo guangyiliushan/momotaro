@@ -1,8 +1,10 @@
 //! Indexing, rebuilding, and searching the local vault.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,8 +15,8 @@ use momotaro_contracts::{
 };
 use momotaro_ingest::frontmatter::{self, FrontmatterParse};
 use momotaro_ingest::{
-    SourceOffset, chunk_markdown_with, derive_title, normalize_markdown, raw_name_for,
-    revision_hash, source_key_for, walk_markdown_files,
+    SourceOffset, chunk_markdown_with, derive_title, is_canvas_path, normalize_markdown,
+    raw_name_for, revision_hash, scene_spans, source_key_for, walk_note_files,
 };
 use momotaro_retrieve::{IndexWriterHandle, RetrieveError, SearchIndex};
 use momotaro_store::{NewSourceRevision, NewStoreEvent, Store, StoreError};
@@ -144,11 +146,6 @@ pub fn coverage_report(root: impl AsRef<Path>) -> Result<Option<CoverageReport>,
     Ok(Some(summarize_coverage(&latest.batch_id, &events)))
 }
 
-/// Folds one batch's rows into the counts [`coverage_report`] reports.
-///
-/// A coverage row whose outcome is neither `indexed`, `skipped` nor
-/// `metadata_refreshed` counts as a failure rather than being dropped: a row the
-/// reader does not understand is a fact about the batch, not noise.
 /// Counts one row's degradations, from its whole list when it carries one and
 /// from its primary code otherwise.
 ///
@@ -179,6 +176,11 @@ fn count_degradations(report: &mut CoverageReport, event: &momotaro_store::Store
     }
 }
 
+/// Folds one batch's rows into the counts [`coverage_report`] reports.
+///
+/// A coverage row whose outcome is neither `indexed`, `skipped` nor
+/// `metadata_refreshed` counts as a failure rather than being dropped: a row the
+/// reader does not understand is a fact about the batch, not noise.
 fn summarize_coverage(batch_id: &str, events: &[momotaro_store::StoreEvent]) -> CoverageReport {
     let mut report = CoverageReport {
         batch_id: batch_id.to_owned(),
@@ -302,6 +304,72 @@ pub(crate) fn index_dir(root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_row_payload_spells_a_degradation_list_and_nothing_for_an_empty_one() {
+        // The shape the coverage row's `data_json` carries, pinned on the pure
+        // function that builds it — so "the shape has a test" is a fact about this
+        // change rather than a claim about it: an empty list is `{}`, and a list is
+        // the codes in the order the caller derived them (§5 第 8 条).
+        assert_eq!(degradations_json(&[]), "{}");
+        assert_eq!(
+            degradations_json(&[
+                Degradation::FrontmatterParseError,
+                Degradation::ExcalidrawDetected,
+            ]),
+            "{\"degradations\":[\"frontmatter_parse_error\",\"excalidraw_detected\"]}"
+        );
+    }
+
+    #[test]
+    fn a_canvas_becomes_exactly_the_text_its_fields_spell_out() {
+        // One literal, so the whole rendering is pinned: which fields become text,
+        // that a `group` with no `label` contributes no segment, that a node type
+        // this build does not know contributes none, and that the order is the
+        // arrays' own (in JSON Canvas, array order is the z-index).
+        // `contains` assertions cannot see a placeholder or a reordering — a
+        // reviewer measured that both survive them; this cannot.
+        let canvas = r##"{
+  "nodes": [
+    {"id": "8f1a", "type": "text", "text": "alphatoken card", "x": 1, "y": 2, "width": 3, "height": 4, "color": "4"},
+    {"id": "1122", "type": "file", "file": "readme.md", "subpath": "#Headingtoken"},
+    {"id": "99aa", "type": "link", "url": "https://example.com/linktoken"},
+    {"id": "0011", "type": "group", "label": "grouptoken"},
+    {"id": "dead", "type": "group"},
+    {"id": "cafe", "type": "no-such-kind", "text": "shouldnotappear"}
+  ],
+  "edges": [
+    {"id": "e1", "fromNode": "8f1a", "toNode": "1122", "label": "edgelabel"},
+    {"id": "e2", "fromNode": "8f1a", "toNode": "not-an-id"}
+  ]
+}"##;
+        assert_eq!(
+            canvas_text(canvas).expect("a readable canvas"),
+            "alphatoken card\n\nreadme.md#Headingtoken\n\nhttps://example.com/linktoken\n\ngrouptoken\n\nalphatoken card -> readme.md#Headingtoken: edgelabel\n\nalphatoken card -> not-an-id",
+            "the segments, in order, and nothing invented"
+        );
+    }
+
+    #[test]
+    fn a_canvas_that_does_not_read_as_an_object_is_the_failure_case() {
+        // The spec has no rules for unreadable JSON, so the rule is ours (§5.9):
+        // text that does not read as a canvas object is kept verbatim and reported,
+        // rather than quietly indexed as JSON noise. An empty object is not that
+        // case — it is a canvas with nothing in it.
+        assert!(canvas_text("[1,2,3]").is_none());
+        assert!(canvas_text("null").is_none());
+        assert!(canvas_text("not json at all").is_none());
+        // Present but not an array: the file claims to be a canvas and is not one,
+        // so it must not come out looking like an empty canvas.
+        assert!(canvas_text("{\"nodes\": 5}").is_none());
+        assert!(canvas_text("{\"nodes\": null}").is_none());
+        assert!(canvas_text("{\"edges\": \"x\"}").is_none());
+        assert_eq!(
+            canvas_text("{}"),
+            Some(String::new()),
+            "an empty canvas is empty, not failed"
+        );
+    }
 
     #[test]
     fn the_rebuild_joins_the_writer_and_retires_the_index_before_it_swaps() {
@@ -858,7 +926,7 @@ pub fn index_workspace(
     let search_index = SearchIndex::open_or_create(&index_dir(root))?;
     let mut writer = search_index.writer(WRITER_HEAP_BYTES)?;
 
-    let files = walk_markdown_files(&vault_root)?;
+    let files = walk_note_files(&vault_root)?;
 
     // One batch per run (ADR 0026). Unique without a new dependency: the
     // millisecond is for a human reading the table, the nanosecond half makes
@@ -1084,12 +1152,12 @@ enum FileOutcome {
     Skipped,
     /// Same bytes under a new path or spelling: the mutable columns moved. The
     /// list is re-derived on this path too, or a file whose block cannot be read
-    /// would read as clean here (D41.8).
+    /// would read as clean here (§5 第 8 条).
     MetadataRefreshed { degradations: Vec<Degradation> },
     /// A revision and its chunks were written. `degradations` carries whatever the
     /// file lost on the way in, in the enum's declaration order — the file *was*
     /// indexed, so the outcome stays `indexed` and the codes ride alongside it. A
-    /// file can lose several things at once (D41.8), so it is a list: the row's
+    /// file can lose several things at once (§5 第 8 条), so it is a list: the row's
     /// `reason_code` is its first element and its `data_json` carries all of it.
     Indexed { degradations: Vec<Degradation> },
 }
@@ -1115,7 +1183,7 @@ impl FileOutcome {
 
     /// The stable code the coverage row carries, when the file was indexed anyway:
     /// the first of the list, so existing readers and the counting semantics do not
-    /// move (D41.8 ②).
+    /// move (§5 第 8 条 ②).
     fn reason_code(&self) -> Option<&'static str> {
         self.degradations()
             .first()
@@ -1124,7 +1192,7 @@ impl FileOutcome {
     }
 
     /// The whole list: the row's `data_json` and the per-code counts read it
-    /// (D41.8 ③④).
+    /// (§5 第 8 条 ③④).
     fn degradations(&self) -> &[Degradation] {
         match self {
             Self::Skipped => &[],
@@ -1188,36 +1256,43 @@ fn process_file(
         && revision.revision_hash == hash
     {
         // Same bytes, moved or re-spelled: refresh the mutable columns in place
-        // instead of appending a revision that would say nothing new. The block is
-        // re-derived from the very text that hashed equal — one blob builder, and
-        // a workspace indexed before the `frontmatter` key existed gets it here.
-        let (frontmatter, _) = frontmatter::split(&normalized);
+        // instead of appending a revision that would say nothing new. What the file
+        // lost is re-derived from the very text that hashed equal — one derivation,
+        // and a workspace indexed before the `frontmatter` key existed gets it here.
+        let input = chunk_input(&normalized, file);
         store_step(source_key, || {
             store.update_revision_fingerprint(
                 source_key,
                 &revision.revision_hash,
-                &revision_metadata(&fingerprint, &frontmatter),
+                &revision_metadata(&fingerprint, &input.frontmatter),
                 &local_path,
                 raw_name,
             )
         })?;
         report.files_indexed += 1;
-        // The block was re-derived above for the blob; the same answer rides on
-        // the row, or this path reports a broken block as a clean file.
+        // The codes were derived above for the blob; the same answer rides on the
+        // row, or this path reports a broken block as a clean file.
         return Ok(FileOutcome::MetadataRefreshed {
-            degradations: degradations_of(&frontmatter),
+            degradations: input.degradations,
         });
     }
 
-    let (frontmatter, body) = frontmatter::split(&normalized);
-    let offset = SourceOffset::before_body(&normalized, body);
-    let chunks = chunk_markdown_with(source_key, &hash, body, policy, offset);
-    // The title comes from the body: a `#` inside a frontmatter block is a YAML
-    // comment, not a heading.
-    let title = derive_title(body, source_key);
+    let input = chunk_input(&normalized, file);
+    let chunks = chunk_markdown_with(
+        source_key,
+        &hash,
+        &input.text,
+        policy,
+        input.offset,
+        &input.excluded,
+        input.rendered_from,
+    );
+    // The title comes from the indexed text: a `#` inside a frontmatter block is a
+    // YAML comment, not a heading.
+    let title = derive_title(&input.text, source_key);
     // The parsed block rides in the revision blob (D41.5: unknown fields are
     // Obsidian's data, so the whole block is kept rather than modelled further).
-    let metadata_json = revision_metadata(&fingerprint, &frontmatter);
+    let metadata_json = revision_metadata(&fingerprint, &input.frontmatter);
     // Vault content is owner content — stated once, used by the revision row and
     // the index document alike, so the two can never disagree.
     let origin = OriginClass::Owner;
@@ -1254,11 +1329,174 @@ fn process_file(
     report.files_indexed += 1;
     report.revisions_created += 1;
     report.chunks_written += chunks.len() as u64;
-    // A block that could not be read does not stop the file: the body is indexed
-    // and the failure becomes a code on the coverage row (`frontmatter_parse_error`).
+    // What a file lost never stops the file: its text is indexed and each loss
+    // becomes a code on the coverage row (`frontmatter_parse_error`,
+    // `canvas_parse_error`, `excalidraw_detected`).
     Ok(FileOutcome::Indexed {
-        degradations: degradations_of(&frontmatter),
+        degradations: input.degradations,
     })
+}
+
+/// What one file hands the chunker, and what it lost on the way.
+struct ChunkInput<'a> {
+    /// The parsed `---` block; `Absent` for a canvas, which is not Markdown.
+    frontmatter: FrontmatterParse,
+    /// The text to chunk: a Markdown note's body slice, or the text a canvas spells
+    /// out through its fields.
+    text: Cow<'a, str>,
+    /// Where `text` starts in the note (zero for a canvas: its text is rendered).
+    offset: SourceOffset,
+    /// Spans of `text` that must not become chunk text (the Excalidraw scene, §5 第 9 条).
+    excluded: Vec<Range<usize>>,
+    /// What this file lost, in enum order (§5 第 8 条).
+    degradations: Vec<Degradation>,
+    /// The file a *rendered* text was built from, when it was not cut out of one (a
+    /// readable `.canvas`): its chunk locators then name the file itself.
+    rendered_from: Option<&'a str>,
+}
+
+/// Derives the chunker's input, and the code list that goes with it.
+///
+/// One derivation for both paths (indexing and refresh): a file that lost
+/// something must not report clean on one of them.
+fn chunk_input<'a>(normalized: &'a str, file: &Path) -> ChunkInput<'a> {
+    // A `.canvas` is not Markdown — no `---` block, no headings — and the text it
+    // contributes is the one JSON Canvas assigns a meaning to (§5 第 9 条). Text that
+    // cannot be read as a canvas object keeps the file's own text as the body and
+    // reports the code, so the file is never silently empty.
+    if is_canvas_path(file) {
+        return match canvas_text(normalized) {
+            Some(text) => ChunkInput {
+                frontmatter: FrontmatterParse::Absent,
+                text: Cow::Owned(text),
+                offset: SourceOffset::default(),
+                excluded: Vec::new(),
+                degradations: Vec::new(),
+                rendered_from: Some(normalized),
+            },
+            None => ChunkInput {
+                frontmatter: FrontmatterParse::Absent,
+                text: Cow::Borrowed(normalized),
+                offset: SourceOffset::default(),
+                excluded: Vec::new(),
+                degradations: vec![Degradation::CanvasParseError],
+                rendered_from: None,
+            },
+        };
+    }
+
+    let (frontmatter, body) = frontmatter::split(normalized);
+    let excluded = scene_spans(body);
+    let mut degradations = degradations_of(&frontmatter);
+    if !excluded.is_empty() {
+        degradations.push(Degradation::ExcalidrawDetected);
+    }
+    ChunkInput {
+        frontmatter,
+        text: Cow::Borrowed(body),
+        offset: SourceOffset::before_body(normalized, body),
+        excluded,
+        degradations,
+        rendered_from: None,
+    }
+}
+
+/// The text a JSON Canvas contributes, or `None` when the file is not one.
+///
+/// Only the fields the spec gives a text meaning become text (§5 第 9 条): `text` nodes
+/// verbatim (the spec says it is Markdown), `file` nodes with their `subpath`
+/// appended, `link` nodes by URL, `group` nodes by `label` when they have one — and
+/// then one `<from text> -> <to text>` line per edge. Nodes keep their array order
+/// (the spec's own: array order is the z-index), `id`/geometry/colors never become
+/// text, and a node whose type this build does not know contributes nothing while
+/// the rest of the file is still indexed. `Some("")` is a canvas with nothing in
+/// it: zero segments, not a failure.
+fn canvas_text(raw: &str) -> Option<String> {
+    let serde_json::Value::Object(root) = serde_json::from_str::<serde_json::Value>(raw).ok()?
+    else {
+        return None;
+    };
+    let mut blocks: Vec<String> = Vec::new();
+    // Edge ends are named by id; the id is unique only inside this canvas and is
+    // never text, so it is used here and nowhere else.
+    let mut named: HashMap<&str, usize> = HashMap::new();
+    // A `nodes` that is present but is not an array is not a canvas either: reading
+    // it as "nothing to index" would make an unreadable file look like an empty
+    // one, and it is the failure path that keeps a file from going silently empty.
+    let nodes: &[serde_json::Value] = match root.get("nodes") {
+        Some(value) => value.as_array()?.as_slice(),
+        None => &[],
+    };
+    {
+        for node in nodes {
+            let Some(node) = node.as_object() else {
+                continue;
+            };
+            let text = match node.get("type").and_then(serde_json::Value::as_str) {
+                Some("text") => string_field(node, "text"),
+                Some("file") => {
+                    string_field(node, "file").map(|file| match string_field(node, "subpath") {
+                        Some(subpath) => format!("{file}{subpath}"),
+                        None => file,
+                    })
+                }
+                Some("link") => string_field(node, "url"),
+                // A group without a label has no text of its own: an empty group is
+                // normal, and a placeholder would be a word we invented.
+                Some("group") => string_field(node, "label"),
+                _ => None,
+            };
+            let Some(text) = text else {
+                continue;
+            };
+            if let Some(id) = node.get("id").and_then(serde_json::Value::as_str) {
+                named.insert(id, blocks.len());
+            }
+            blocks.push(text);
+        }
+    }
+    let edges: &[serde_json::Value] = match root.get("edges") {
+        Some(value) => value.as_array()?.as_slice(),
+        None => &[],
+    };
+    {
+        for edge in edges {
+            let Some(edge) = edge.as_object() else {
+                continue;
+            };
+            let (Some(from), Some(to)) = (
+                edge.get("fromNode").and_then(serde_json::Value::as_str),
+                edge.get("toNode").and_then(serde_json::Value::as_str),
+            ) else {
+                continue;
+            };
+            let mut line = format!(
+                "{} -> {}",
+                endpoint(from, &named, &blocks),
+                endpoint(to, &named, &blocks)
+            );
+            if let Some(label) = string_field(edge, "label") {
+                line.push_str(": ");
+                line.push_str(&label);
+            }
+            blocks.push(line);
+        }
+    }
+    Some(blocks.join("\n\n"))
+}
+
+/// A string field of a JSON object, if it is there and is a string.
+fn string_field(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// What an edge names: the text its end contributed, or the id as written when
+/// that node contributed no text (a dangling end is kept, never dropped).
+fn endpoint<'a>(id: &'a str, named: &HashMap<&str, usize>, blocks: &'a [String]) -> &'a str {
+    named.get(id).map_or(id, |index| blocks[*index].as_str())
 }
 
 /// Rebuilds the tantivy index from canonical store chunks.

@@ -8,7 +8,9 @@
 
 use momotaro_contracts::IndexFileErrorKind;
 
+pub mod canvas;
 mod chunker;
+pub mod excalidraw;
 pub mod frontmatter;
 mod hash;
 mod normalize;
@@ -16,12 +18,14 @@ mod path;
 mod title;
 mod walk;
 
+pub use canvas::is_canvas_path;
 pub use chunker::{SourceOffset, chunk_markdown, chunk_markdown_with};
+pub use excalidraw::scene_spans;
 pub use hash::{chunk_hash, chunk_id, revision_hash};
 pub use normalize::normalize_markdown;
 pub use path::{canonical_workspace_root, is_within, local_path_in, resolve_local_path};
 pub use title::derive_title;
-pub use walk::{raw_name_for, source_key_for, walk_markdown_files};
+pub use walk::{raw_name_for, source_key_for, walk_note_files};
 
 /// Failures raised while turning vault files into chunks.
 #[derive(Debug, thiserror::Error)]

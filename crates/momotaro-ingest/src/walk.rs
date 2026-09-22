@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 use super::IngestError;
+use super::canvas::is_canvas_path;
 
 fn is_hidden(file_name: &std::ffi::OsStr) -> bool {
     file_name
@@ -18,12 +19,13 @@ fn is_markdown(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
 }
 
-/// Walk `vault_root` and return all Markdown file paths, sorted.
+/// Walk `vault_root` and return all note file paths (Markdown and `.canvas`),
+/// sorted.
 ///
 /// Hidden directories (any component starting with `.`) are skipped, so
 /// `.git`, `.obsidian`, and `.momotaro` never contribute files. The root
 /// itself is exempt from the hidden check so dot-prefixed temp roots work.
-pub fn walk_markdown_files(vault_root: &Path) -> Result<Vec<PathBuf>, IngestError> {
+pub fn walk_note_files(vault_root: &Path) -> Result<Vec<PathBuf>, IngestError> {
     let metadata = fs::metadata(vault_root).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             IngestError::VaultMissing(vault_root.display().to_string())
@@ -44,7 +46,14 @@ pub fn walk_markdown_files(vault_root: &Path) -> Result<Vec<PathBuf>, IngestErro
         // Symlink entries are skipped: `file_type()` does not follow links,
         // so a vault-supplied `link.md` pointing outside the root can never
         // pull external content into the index.
-        .filter(|entry| entry.file_type().is_file() && is_markdown(entry.path()))
+        // Both arms are notes in the key contract's sense (`note:` + vault-relative
+        // path) and both are recognised by their extension alone. The indexing path
+        // branches on the same `is_canvas_path`, so a file cannot be walked in as a
+        // canvas and then read as Markdown.
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && (is_markdown(entry.path()) || is_canvas_path(entry.path()))
+        })
         .map(|entry| entry.into_path())
         .collect();
     files.sort();
@@ -130,13 +139,24 @@ mod tests {
         write(root, ".git/hooks.md", "hidden");
         write(root, ".momotaro/db.md", "hidden");
         write(root, "notes.txt", "not md");
+        write(root, "board.canvas", "{}");
+        write(root, "board.canvas.md", "a markdown note");
 
-        let found = walk_markdown_files(root).unwrap();
+        let found = walk_note_files(root).unwrap();
         let keys: Vec<String> = found
             .iter()
             .map(|p| source_key_for(root, p).unwrap())
             .collect();
-        assert_eq!(keys, vec!["note:a/c.md", "note:a/inner.MD", "note:b.md"]);
+        assert_eq!(
+            keys,
+            vec![
+                "note:a/c.md",
+                "note:a/inner.MD",
+                "note:b.md",
+                "note:board.canvas",
+                "note:board.canvas.md",
+            ]
+        );
     }
 
     #[test]
@@ -144,7 +164,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("nope");
         assert!(matches!(
-            walk_markdown_files(&missing),
+            walk_note_files(&missing),
             Err(IngestError::VaultMissing(_))
         ));
     }
@@ -181,7 +201,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("cafe\u{0301}.md"), "x").unwrap();
 
-        let found = walk_markdown_files(tmp.path()).unwrap();
+        let found = walk_note_files(tmp.path()).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(
             source_key_for(tmp.path(), &found[0]).unwrap(),
@@ -273,7 +293,7 @@ mod tests {
             std::os::unix::fs::symlink(&secret, vault.path().join("link.md")).unwrap();
             fs::write(vault.path().join("real.md"), "real").unwrap();
 
-            let found = walk_markdown_files(vault.path()).unwrap();
+            let found = walk_note_files(vault.path()).unwrap();
             let names: Vec<String> = found
                 .iter()
                 .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
@@ -287,7 +307,7 @@ mod tests {
         {
             let vault = tempfile::tempdir().unwrap();
             fs::write(vault.path().join("real.md"), "real").unwrap();
-            let found = walk_markdown_files(vault.path()).unwrap();
+            let found = walk_note_files(vault.path()).unwrap();
             assert_eq!(found.len(), 1);
         }
     }

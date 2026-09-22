@@ -46,16 +46,25 @@ fn file_stem_of(source_key: &str) -> &str {
         .strip_prefix(momotaro_contracts::NOTE_SCHEME)
         .unwrap_or(source_key);
     let base = key.rsplit('/').next().unwrap_or(key);
-    strip_md_extension(base)
+    strip_note_extension(base)
 }
 
-/// Strips a trailing `.md`, ignoring ASCII case (the walker accepts `.MD`).
+/// Strips a note's trailing extension — `.md` or `.canvas`, ASCII-case
+/// insensitive (the walker's whitelist accepts `.MD` and `.CANVAS`).
+///
+/// Both kinds are notes here, and a title is the note's name without its
+/// extension whichever kind it is; only one trailing extension goes, so
+/// `board.canvas.md` is a Markdown note called `board.canvas`.
 ///
 /// Never splits a multi-byte character: `rsplit_once` works on characters,
 /// and a name with no dot is returned unchanged.
-fn strip_md_extension(name: &str) -> &str {
+fn strip_note_extension(name: &str) -> &str {
     match name.rsplit_once('.') {
-        Some((stem, extension)) if extension.eq_ignore_ascii_case("md") => stem,
+        Some((stem, extension))
+            if extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("canvas") =>
+        {
+            stem
+        }
         _ => name,
     }
 }
@@ -123,6 +132,22 @@ mod tests {
     #[test]
     fn falls_back_to_file_stem_for_uppercase_extension() {
         assert_eq!(derive_title("no heading\n", "note:Notes/Inner.MD"), "Inner");
+    }
+
+    /// A `.canvas` is a note too, so its title drops the extension the same way —
+    /// only one trailing extension, so a Markdown note named `board.canvas.md`
+    /// keeps the `.canvas` that is part of its name.
+    #[test]
+    fn falls_back_to_file_stem_for_a_canvas() {
+        assert_eq!(derive_title("no heading\n", "note:board.canvas"), "board");
+        assert_eq!(
+            derive_title("no heading\n", "note:deep/Board.CANVAS"),
+            "Board"
+        );
+        assert_eq!(
+            derive_title("no heading\n", "note:board.canvas.md"),
+            "board.canvas"
+        );
     }
 
     /// Names shorter than the extension, and a cut that would land inside a

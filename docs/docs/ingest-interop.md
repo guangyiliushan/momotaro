@@ -178,8 +178,10 @@ parse_error。
    **现状（2026-09-18）**：解析、接线与排除**已落地**（字段进
    `source_revisions.metadata_json` 的 `frontmatter` 键、正文进 chunker 且 locator
    按原 note 计、失败发 `frontmatter_parse_error` 且 `outcome` 仍为 `indexed`）；
-   **未做**的是其余九类降级（wikilink 五类属 W2.4）、`.canvas` 解析、附件登记与
-   同步盘三条（OneDrive/iCloud/Windows 非法名）——它们随本波剩余任务落地；
+   **未做**的是其余七类降级（wikilink 五类属 W2.4、附件登记、`symlink_encountered`）与
+   同步盘三条（OneDrive/iCloud/Windows 非法名，都是**预警**而非十类之一）——它们随本波
+   剩余任务落地；十类里**已有生产者的三类**是 `frontmatter_parse_error`、
+   `canvas_parse_error`、`excalidraw_detected`（口径见第 9 条）；
 6. **解析基座**：pulldown-cmark ≥ 0.13.3 + `ENABLE_WIKILINKS`（官方内置、
    Obsidian 兼容目标）；私有语法（Dendron 式）当 `unknown_link_syntax` 降级；
 7. **降级事件十类**：frontmatter_parse_error / unresolved_wikilink /
@@ -197,6 +199,54 @@ parse_error。
    暴露（`doctor --coverage` 因此不再把带码的行只算作 `indexed` 而把码吞掉）。
    两条被否的替代：**每码一行**（破坏「每个走到的文件恰好一行」的计数不变量）
    与 **`reason_code` 里拼分隔串**（列是稳定码，编码串会诱使下游做字符串匹配）。
+9. **`.canvas` 的文本口径，与 Excalidraw 场景段（2026-09-21 定，随 W2.3 落地）**：
+   `.canvas` 是 JSON Canvas 1.0（顶层只有 `nodes`/`edges` 两个数组，规范里**两个都是
+   optional**），进索引的只有规范**赋予了文本语义**的字段——`text` 节点取 `text`
+   （逐字；规范说它是 Markdown）、`file` 节点取 `file` 且 `subpath` 存在时**直接拼接**
+   （`readme.md#Heading`，规范保证 subpath 以 `#` 开头）、`link` 节点取 `url`、`group`
+   节点**只在 `label` 存在时**输出该段（缺省即无段，**不产占位串**）。**不进文本**：
+   `id`（随机 hex，且只在单个画布内唯一）、`type`、`x`/`y`/`width`/`height`、
+   `color`/`background`/`backgroundStyle`、`fromSide`/`toSide`/`fromEnd`/`toEnd`——
+   规范对颜色语义**故意不定义**、位置尺寸只是像素，任何由它们派生的 token 按构造就是
+   噪声。顺序 = `nodes` 数组序（规范里数组序即升序 z-index）后接 `edges` 数组序；段间
+   以空行分隔（`chunks.text` 里见到的多余换行来自 chunker 打包的既有行为，不是自造
+   串），**不插自造分隔串**（`---` 会被 frontmatter/标题语义吃掉）。**边**输出一行
+   `<from 节点的文本> -> <to 节点的文本>`，`label` 存在时追加 `: <label>`；
+   `fromNode`/`toNode` 指向的节点没产出文本时**保留该 id 字面**，不因一条悬空边判死整
+   文件。**空画布**（`nodes: []`、无 `edges`、或两键都缺）产出**零段且不是失败**。
+   **失败只有一种**：这份文本**读不成一个 JSON Canvas 对象**——不是 JSON、顶层不是
+   对象，或 `nodes`/`edges` 存在却不是数组（规范对非法 JSON / 缺字段 / 未知 `type`
+   **零规定**：全文对 invalid/unknown/reject/fail 0 匹配，也没有 schema）——那时整文件
+   原文照常进 `chunks`、`outcome` 仍 `indexed`、行上带 `canvas_parse_error`；单节点缺
+   `type` 或类型未知只跳过**该节点**，几何字段缺失不影响取文本；`{}`（空对象）与
+   `{"nodes": []}` 不是失败，是零段。**读 JSON 的层**：
+   ingest 只认**形状**（扩展名与形状识别），JSON 解析在 `run`——本 crate 不引 JSON
+   依赖，与 JSON 属性块同一条口径；源键仍是 `note:`（不新增 scheme），`SourceKind`
+   仍是 `Note`（不扩枚举）。
+   **Excalidraw 场景段不进索引**：`.excalidraw.md`（插件默认也写裸 `.md`）把整幅图存成
+   一个围栏代码块（压缩态 info string 为 `compressed-json`、非压缩态为 `json`，整段被
+   `%%` 包住——`%%` 只是渲染层隐藏，**字节全在**），今天它会被当正文切块并进 FTS。
+   判据**照 Excalidraw 插件自己的正则**（`src/shared/excalidrawMarkdownParsing.ts` 的
+   `DRAWING_COMPRESSED_REG` / `DRAWING_REG`；该文件的逐字文本在仓库外，本仓未引，故这里
+   写的是**口径**而不是逐字照抄）：段头 `##? Drawing` 必须在**列 0 且其后无别的字符**
+   （正则锚在 `\n##? Drawing\n`），段头与围栏之间允许任意**非反引号**字符（正则里的
+   `[^`]*`）——空行、散文、`%%` 都不会让判据失效；**第一个**带反引号的行决定其余：它的
+   info string 为 `compressed-json` 或 `json` 才算命中（别的语言在这里就不是它的布局，
+   句子中间的行内反引号同样如此）。排除区间 = 该围栏的整段（含起止两行），粒度是**块**：
+   与该区间**相交**的块整块丢弃（插件布局下那个块就是围栏本身），其余内容一个字节都不动、
+   locator 不做位移（Markdown 路径下 `chunks.text` 仍是原文切片）。`## Text Elements` 段
+   与其余正文**照常索引**（真正的可索引文本在那儿；不解压 LZString）。我们知道的一处
+   **放宽**：不要求笔记带 `%%` / `# Excalidraw Data` 前言。**已知边界**：手写笔记里若真有
+   一个列 0 的 `## Drawing` 标题紧跟 `json` 围栏，我们与插件的真实布局**分不出来**；别的
+   标题下的 `json` 块不受影响。命中时该文件带 `excalidraw_detected`。
+   **迁移注记**：本次落地之前索引过的 Excalidraw 笔记，场景字节仍在 canonical `chunks`
+   里——指纹未变的文件会被 `skipped`，而 `rebuild-index` 只从既有 chunks 重建（不重切），
+   所以那些库不会自己变干净；让场景出库要么让文件指纹变化（例如 `touch` 后重跑 `index`），
+   要么清库重建。**仪器**：这一面目前**没有带外仪器**（黄金集夹具里没有 `.canvas` 与
+   `.excalidraw` 笔记）——只有 `cargo test` 守着它。
+   **`.canvas` 的 locator**：渲染文本不是文件的字节切片，所以它的 chunk 指向**整份画布
+   文件**（`start_byte = 0`、坐标同样是**归一化文本**的坐标，与全仓一致）——引用仍能落到
+   文档本身；节点级精度是后续任务。
 
 **不做**：MFT/USN Journal 方案（10k 规模复杂度收益比为负）；键层折叠或 NFKC；
 改写用户 vault 文件（Foam 教训）；读 placeholder 内容；跟随符号链接（首版）。

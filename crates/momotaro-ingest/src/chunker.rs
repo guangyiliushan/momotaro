@@ -38,8 +38,9 @@ impl BlockKind {
 
 /// Fold parsed events into ordered blocks, snapshotting the h1-h6 heading
 /// stack at each block. Headings are boundaries only; their text feeds the
-/// stack for subsequent blocks.
-fn collect_blocks(normalized: &str) -> Vec<Block> {
+/// stack for subsequent blocks. A block that intersects an excluded span is
+/// dropped whole: the text itself is never rewritten, so no locator moves.
+fn collect_blocks(normalized: &str, excluded: &[Range<usize>]) -> Vec<Block> {
     let parser = Parser::new_ext(
         normalized,
         Options::ENABLE_TABLES | Options::ENABLE_WIKILINKS,
@@ -78,6 +79,11 @@ fn collect_blocks(normalized: &str) -> Vec<Block> {
             _ => {}
         }
     }
+    blocks.retain(|block| {
+        !excluded
+            .iter()
+            .any(|span| block.range.start < span.end && span.start < block.range.end)
+    });
     blocks
 }
 
@@ -169,6 +175,8 @@ pub fn chunk_markdown(
         normalized,
         policy,
         SourceOffset::default(),
+        &[],
+        None,
     )
 }
 
@@ -202,23 +210,39 @@ impl SourceOffset {
     }
 }
 
-/// [`chunk_markdown`] for a slice of a larger note: locators are shifted by `offset`.
+/// [`chunk_markdown`] for a slice of a larger note: locators are shifted by `offset`,
+/// and the byte spans in `excluded` never become chunk text.
+///
+/// `excluded` is how a span the caller knows is noise — the Excalidraw scene
+/// fence, thousands of bytes of compressed drawing data (§5 第 9 条) — stays out of the
+/// index without rewriting a single byte of the note: a block that intersects such
+/// a span is dropped whole, so every other chunk keeps the locator it would have
+/// had on its own. A chunk built from blocks on both sides of an excluded span has
+/// a locator that spans the window between them (an exclusion shifts nothing).
+///
+/// `rendered_from` names the file a *rendered* text was built from — a `.canvas`,
+/// whose text comes from its JSON fields (§5 第 9 条). No byte range inside that file
+/// spells the text out, so its chunks carry the file's own axes as a whole and a
+/// citation still resolves to the document; `offset` does not apply to them.
 pub fn chunk_markdown_with(
     source_key: &str,
     revision_hash: &str,
     normalized: &str,
     policy: &IndexPolicy,
     offset: SourceOffset,
+    excluded: &[Range<usize>],
+    rendered_from: Option<&str>,
 ) -> Vec<Chunk> {
     if normalized.trim().is_empty() {
         return Vec::new();
     }
-    let blocks = collect_blocks(normalized);
+    let blocks = collect_blocks(normalized, excluded);
     if blocks.is_empty() {
         return Vec::new();
     }
 
     let starts = line_starts(normalized);
+    let rendered_axes = rendered_from.map(whole_file_axes);
     let max_tokens = policy.max_chunk_tokens;
     let overlap_tokens = policy.chunk_overlap_tokens;
 
@@ -251,11 +275,18 @@ pub fn chunk_markdown_with(
         // Within that text, `open.text` may be longer than `last_range` (packed
         // blocks insert "\n\n" where the source has one "\n"), so end_byte/end_line
         // come from the last block's own span, never from the joined text length.
-        // `offset` shifts both axes back into the note when this text is a body slice.
-        let start_byte = offset.bytes + open.first_range.start;
-        let end_byte = offset.bytes + open.last_range.end;
-        let start_line = offset.lines + line_number_for(&starts, open.first_range.start as u32);
-        let end_line = offset.lines + line_number_for(&starts, open.last_range.end as u32);
+        // `offset` shifts both axes back into the note when this text is a body
+        // slice; a rendered text has no slice to point into, so it carries the
+        // axes of the file it was rendered from instead (§5 第 9 条). `truncated`
+        // describes the text either way, so it stays the packing loop's flag.
+        let (start_byte, end_byte, start_line, end_line) = rendered_axes.unwrap_or_else(|| {
+            (
+                offset.bytes + open.first_range.start,
+                offset.bytes + open.last_range.end,
+                offset.lines + line_number_for(&starts, open.first_range.start as u32),
+                offset.lines + line_number_for(&starts, open.last_range.end as u32),
+            )
+        });
         chunks.push(Chunk {
             chunk_id,
             source_key: source_key.to_string(),
@@ -360,6 +391,18 @@ pub fn chunk_markdown_with(
     chunks
 }
 
+/// The axes a rendered text's chunks carry: the file it was rendered from, whole.
+///
+/// A `.canvas`'s text comes from its JSON fields, so no byte range inside the file
+/// spells it out; pointing at the file keeps a citation resolvable — a consumer
+/// slices the document and gets the document. Node-level precision inside a canvas
+/// is a separate, later job.
+fn whole_file_axes(normalized: &str) -> (usize, usize, u32, u32) {
+    let starts = line_starts(normalized);
+    let end_line = line_number_for(&starts, normalized.len() as u32);
+    (0, normalized.len(), 1, end_line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,7 +426,15 @@ mod tests {
         ));
 
         let offset = SourceOffset::before_body(note, body);
-        let chunks = chunk_markdown_with("note:a.md", "rh", body, &IndexPolicy::default(), offset);
+        let chunks = chunk_markdown_with(
+            "note:a.md",
+            "rh",
+            body,
+            &IndexPolicy::default(),
+            offset,
+            &[],
+            None,
+        );
         assert_eq!(chunks.len(), 1, "{chunks:?}");
 
         // The chunk's first block is the paragraph (the heading is structure, and
@@ -562,5 +613,124 @@ mod tests {
                 "locator span does not address the chunk body (probe {probe:?})"
             );
         }
+    }
+
+    /// An excluded span is dropped whole and nothing around it moves: the note's
+    /// bytes are never rewritten, so a chunk's locator still addresses the note
+    /// (§5 第 9 条 — the Excalidraw scene fence).
+    #[test]
+    fn an_excluded_span_leaves_the_locators_around_it_alone() {
+        let doc = "beforetoken\n\n```compressed-json\nDRAWINGNOISE\n```\n\naftertoken\n";
+        let opener = doc.find("```compressed-json").expect("the fence");
+        let closer = doc.find("\n```\n").expect("the closing fence");
+        let span = opener..closer + 4;
+        assert_eq!(&doc[span.clone()], "```compressed-json\nDRAWINGNOISE\n```");
+
+        let chunks = chunk_markdown_with(
+            "scene.md",
+            "rh",
+            doc,
+            &IndexPolicy::default(),
+            SourceOffset::default(),
+            &[span],
+            None,
+        );
+        let text: String = chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("beforetoken"), "{text:?}");
+        assert!(text.contains("aftertoken"), "{text:?}");
+        assert!(!text.contains("DRAWINGNOISE"), "the span is out: {text:?}");
+
+        // The window still ends where the note's own last block ends: an
+        // implementation that deleted the bytes would end it earlier.
+        let survivor = chunks
+            .iter()
+            .find(|chunk| chunk.text.contains("aftertoken"))
+            .expect("a chunk with the text after the fence");
+        let locator: serde_json::Value =
+            serde_json::from_str(&survivor.locator_json).expect("locator is valid JSON");
+        let after_at = doc.find("aftertoken").expect("the text after the fence");
+        assert_eq!(
+            locator["end_byte"].as_u64(),
+            // The paragraph's span runs through the newline that ends it — the
+            // parser's own end offset — so the window closes just past that byte.
+            Some((after_at + "aftertoken\n".len()) as u64),
+            "the locator addresses the note: {}",
+            survivor.locator_json
+        );
+    }
+
+    #[test]
+    fn an_excluded_span_that_covers_everything_yields_no_chunks() {
+        let doc = "```compressed-json\nDRAWINGNOISE\n```\n";
+        let span = 0..doc.trim_end_matches('\n').len();
+        let chunks = chunk_markdown_with(
+            "only.md",
+            "rh",
+            doc,
+            &IndexPolicy::default(),
+            SourceOffset::default(),
+            &[span],
+            None,
+        );
+        assert!(chunks.is_empty(), "{chunks:?}");
+    }
+
+    /// A rendered text's chunks point at the file it was rendered from, whatever
+    /// the text itself says: the byte span is the whole document, so a citation
+    /// resolves to the document (§5 第 9 条).
+    #[test]
+    fn a_rendered_text_points_at_the_file_it_came_from() {
+        let doc = "# Title\n\nbody\n";
+        let rendered = "card one\n\ncard two\n";
+        let chunks = chunk_markdown_with(
+            "board.canvas",
+            "rh",
+            rendered,
+            &IndexPolicy::default(),
+            SourceOffset::default(),
+            &[],
+            Some(doc),
+        );
+        assert!(!chunks.is_empty(), "the rendered text is chunked");
+        for chunk in &chunks {
+            let value: serde_json::Value =
+                serde_json::from_str(&chunk.locator_json).expect("locator is valid JSON");
+            assert_eq!(value["start_byte"].as_u64(), Some(0), "{value}");
+            assert_eq!(
+                value["end_byte"].as_u64(),
+                Some(doc.len() as u64),
+                "{value}"
+            );
+            assert_eq!(value["start_line"].as_u64(), Some(1), "{value}");
+            // The file ends in a newline, so its last line is empty — the counting
+            // the chunker does for every other chunk too.
+            assert_eq!(value["end_line"].as_u64(), Some(4), "{value}");
+        }
+    }
+
+    /// Only the coordinate axes come from the file: `truncated` describes the
+    /// rendered text (a block too big for the budget), so it must survive.
+    #[test]
+    fn a_rendered_chunk_keeps_its_truncation_flag() {
+        let rendered = format!("{}\n", "很长的卡片文本".repeat(200));
+        let chunks = chunk_markdown_with(
+            "big.canvas",
+            "rh",
+            &rendered,
+            &policy_with(10, 0),
+            SourceOffset::default(),
+            &[],
+            Some("{}"),
+        );
+        assert_eq!(chunks.len(), 1, "{chunks:?}");
+        assert!(
+            chunks[0].locator_json.contains("\"truncated\":true"),
+            "{}",
+            chunks[0].locator_json
+        );
     }
 }

@@ -530,8 +530,8 @@ impl Degradation {
     /// Every code, in the order a file's degradations are reported and counted.
     ///
     /// One list, iterated by `from_code` and by the tests. `the_variant_list_is_
-    /// complete` matches every variant without a wildcard, so a seventh code
-    /// cannot be added to `as_str` alone — which was the hole: the writer knew a
+    /// complete` matches every variant without a wildcard, so a code cannot be
+    /// added to `as_str` alone — which was the hole: the writer knew a
     /// code the reader's array did not, and the row's code was dropped silently.
     pub const ALL: [Self; 10] = [
         Self::FrontmatterParseError,

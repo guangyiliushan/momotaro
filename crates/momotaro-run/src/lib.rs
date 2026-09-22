@@ -2766,4 +2766,389 @@ mod tests {
             report.duration_ms
         );
     }
+
+    #[test]
+    fn a_canvas_contributes_its_text_and_not_its_ids() {
+        // §5 第 9 条: only the fields the spec gives a text meaning reach the index. A
+        // node's `id` is a random hex string that is unique only inside its own
+        // canvas, so indexing it would add tokens no query can mean.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        let canvas = r##"{
+  "nodes": [
+    {"id": "8f1a2b3c4d5e6f70", "type": "text", "text": "alphatoken card", "x": 10, "y": 20, "width": 100, "height": 50, "color": "4"},
+    {"id": "1122334455667788", "type": "file", "file": "readme.md", "subpath": "#Headingtoken", "x": 0, "y": 0},
+    {"id": "99aabbccddeeff00", "type": "link", "url": "https://example.com/linktoken"},
+    {"id": "0011223344556677", "type": "group", "label": "grouptoken", "x": 0, "y": 0},
+    {"id": "deadbeefdeadbeef", "type": "group"},
+    {"id": "cafebabecafebabe", "type": "no-such-kind", "text": "shouldnotappear"}
+  ],
+  "edges": [
+    {"id": "e1", "fromNode": "8f1a2b3c4d5e6f70", "toNode": "1122334455667788", "label": "edgelabel"},
+    {"id": "e2", "fromNode": "8f1a2b3c4d5e6f70", "toNode": "not-an-id"}
+  ]
+}"##;
+        fs::write(vault.join("board.canvas"), canvas).expect("write canvas");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+        assert_eq!(
+            report.revisions_created, 1,
+            "the canvas is a source: {report:?}"
+        );
+
+        // What the file is about is searchable, and points at the canvas.
+        for query in ["alphatoken", "linktoken", "grouptoken"] {
+            let hits = search_workspace(dir.path(), query, 10).expect("search");
+            assert!(
+                hits.hits
+                    .iter()
+                    .any(|hit| hit.hit.source_key == "note:board.canvas"),
+                "{query} must be findable: {hits:?}"
+            );
+        }
+        // What the file is *not* about is not: ids, geometry and colors stay out.
+        for absent in ["cafebabecafebabe", "8f1a2b3c4d5e6f70", "shouldnotappear"] {
+            let hits = search_workspace(dir.path(), absent, 10).expect("search");
+            assert!(hits.hits.is_empty(), "{absent} reached the index: {hits:?}");
+        }
+
+        // The text the node fields spell out, read back out of the store.
+        let chunks = store_of(dir.path()).all_current_chunks().expect("chunks");
+        let text: String = chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        assert!(text.contains("readme.md#Headingtoken"), "{text:?}");
+        assert!(
+            text.contains("alphatoken card -> readme.md#Headingtoken: edgelabel"),
+            "the edge names its ends by their text, with the label: {text:?}"
+        );
+        assert!(
+            text.contains("alphatoken card -> not-an-id"),
+            "a dangling end keeps the id as written: {text:?}"
+        );
+        // Order is the spec's own (array order is the z-index), and the edges come
+        // after the nodes. `contains` alone cannot see a reordering — the token set
+        // is the same — so the positions are compared instead. Whether a node with
+        // no text produced a segment at all is pinned where the text is built
+        // (`canvas_text`'s own test), because that is the only level where a
+        // placeholder can be seen for what it is.
+        let order: Vec<usize> = [
+            "alphatoken card",
+            "readme.md#Headingtoken",
+            "https://example.com/linktoken",
+            "grouptoken",
+            "alphatoken card -> readme.md#Headingtoken: edgelabel",
+            "alphatoken card -> not-an-id",
+        ]
+        .iter()
+        .map(|needle| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing: {text:?}"))
+        })
+        .collect();
+        assert!(
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "the segments follow the arrays' order: {order:?} in {text:?}"
+        );
+
+        // A canvas's chunks point at the file: no byte range inside it spells the
+        // rendered text out, and a citation still has to resolve to the document.
+        // The axes are the *normalised* text's (BOM off, CRLF to LF) — the rule
+        // every locator in this crate follows — so the expectation is the
+        // normalised length rather than the file's byte count.
+        let canvas_bytes = fs::read(vault.join("board.canvas")).expect("read canvas");
+        let canvas_normalized =
+            momotaro_ingest::normalize_markdown(&canvas_bytes).expect("the canvas normalises");
+        for chunk in &chunks {
+            let locator: serde_json::Value =
+                serde_json::from_str(&chunk.locator_json).expect("locator is valid JSON");
+            assert_eq!(locator["start_byte"].as_u64(), Some(0), "{locator}");
+            assert_eq!(locator["start_line"].as_u64(), Some(1), "{locator}");
+            assert_eq!(
+                locator["end_byte"].as_u64(),
+                Some(canvas_normalized.len() as u64),
+                "the window is the file, not the rendered text: {locator}"
+            );
+        }
+
+        // A CRLF canvas is where the two numbers part company: the window follows
+        // the normalised text, so it is shorter than the file by one byte per line —
+        // a consumer that slices the file must normalise first.
+        let crlf = canvas.replace('\n', "\r\n");
+        fs::write(vault.join("crlf.canvas"), &crlf).expect("write the CRLF canvas");
+        index_workspace(dir.path(), None).expect("index the CRLF canvas");
+        let crlf_bytes = fs::read(vault.join("crlf.canvas")).expect("read the CRLF canvas");
+        assert!(
+            crlf_bytes.len() > canvas_normalized.len(),
+            "the fixture really is CRLF: {}",
+            crlf_bytes.len()
+        );
+        let crlf_chunk = store_of(dir.path())
+            .all_current_chunks()
+            .expect("chunks")
+            .into_iter()
+            .find(|chunk| chunk.source_key == "note:crlf.canvas")
+            .expect("the CRLF canvas is indexed");
+        let locator: serde_json::Value =
+            serde_json::from_str(&crlf_chunk.locator_json).expect("locator is valid JSON");
+        let crlf_normalized =
+            momotaro_ingest::normalize_markdown(&crlf_bytes).expect("the canvas normalises");
+        assert_eq!(
+            locator["end_byte"].as_u64(),
+            Some(crlf_normalized.len() as u64),
+            "the window is the normalised text, not the file's bytes: {locator}"
+        );
+    }
+
+    #[test]
+    fn an_empty_canvas_is_indexed_without_a_code() {
+        // Both arrays are optional in the spec, so a canvas with nothing in it is
+        // zero segments — not a failure, and not a placeholder line either.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("empty.canvas"), "{}").expect("write canvas");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        index_workspace(dir.path(), None).expect("index");
+
+        assert!(
+            store_of(dir.path())
+                .current_revision("note:empty.canvas")
+                .expect("read")
+                .is_some(),
+            "the file is a source even when it says nothing"
+        );
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert!(
+            coverage.degradations.is_empty(),
+            "an empty canvas lost nothing: {coverage:?}"
+        );
+        assert_eq!(coverage.indexed, 1, "{coverage:?}");
+    }
+
+    #[test]
+    fn a_broken_canvas_keeps_its_own_text_and_reports_the_code() {
+        // The spec says nothing about unreadable JSON (no schema, no error chapter),
+        // so our own rule applies: keep the content, report the code, never drop the
+        // file (plan trap ②, §5 第 9 条).
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        let broken =
+            "{\"nodes\": [{\"id\": \"a\", \"type\": \"text\", \"text\": \"brokenmarker\"},]}";
+        fs::write(vault.join("broken.canvas"), broken).expect("write canvas");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        // Kept: the file's own text is what gets indexed, and it is findable.
+        let hits = search_workspace(dir.path(), "brokenmarker", 10).expect("search");
+        assert!(
+            hits.hits
+                .iter()
+                .any(|hit| hit.hit.source_key == "note:broken.canvas"),
+            "the content is not lost: {hits:?}"
+        );
+        // Reported: the row still says the file was indexed, and carries the code.
+        let row = store_of(dir.path())
+            .store_events_for_batch(&report.batch_id)
+            .expect("read the batch")
+            .into_iter()
+            .find(|event| event.source_key.as_deref() == Some("note:broken.canvas"))
+            .expect("a coverage row for the canvas");
+        assert_eq!(row.outcome.as_deref(), Some("indexed"), "{row:?}");
+        assert_eq!(
+            row.reason_code.as_deref(),
+            Some("canvas_parse_error"),
+            "the spelling a reader branches on: {row:?}"
+        );
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(
+            coverage
+                .degradations
+                .get(&momotaro_contracts::Degradation::CanvasParseError),
+            Some(&1),
+            "{coverage:?}"
+        );
+    }
+
+    #[test]
+    fn an_excalidraw_scene_stays_out_of_the_index() {
+        // The plugin stores the drawing as a fenced block; `%%` only hides it when
+        // the note is rendered, so every byte of the compressed scene used to reach
+        // the full-text index while the note's real text sat next to it (§5 第 9 条).
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        let note = "---\nexcalidraw-plugin: parsed\ntags: [excalidraw]\n---\n\n# Excalidraw Data\n\n## Text Elements\ncardtoken\n\n%%\n## Drawing\n```compressed-json\nSCENENOISEtoken\n```\n%%\n";
+        fs::write(vault.join("drawing.md"), note).expect("write the drawing");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        // The note's own text is still indexed…
+        let hits = search_workspace(dir.path(), "cardtoken", 10).expect("search");
+        assert!(
+            hits.hits
+                .iter()
+                .any(|hit| hit.hit.source_key == "note:drawing.md"),
+            "the text elements are the note's content: {hits:?}"
+        );
+        // …and the scene is not, in the index or in a chunk.
+        let scene = search_workspace(dir.path(), "SCENENOISEtoken", 10).expect("search");
+        assert!(
+            scene.hits.is_empty(),
+            "the scene reached the index: {scene:?}"
+        );
+        let chunks = store_of(dir.path()).all_current_chunks().expect("chunks");
+        for chunk in &chunks {
+            assert!(
+                !chunk.text.contains("SCENENOISEtoken"),
+                "the scene reached a chunk: {:?}",
+                chunk.text
+            );
+        }
+
+        // The file was indexed, and it says what it lost.
+        let row = store_of(dir.path())
+            .store_events_for_batch(&report.batch_id)
+            .expect("read the batch")
+            .into_iter()
+            .find(|event| event.source_key.as_deref() == Some("note:drawing.md"))
+            .expect("a coverage row for the drawing");
+        assert_eq!(row.outcome.as_deref(), Some("indexed"), "{row:?}");
+        assert_eq!(
+            row.reason_code.as_deref(),
+            Some("excalidraw_detected"),
+            "the spelling a reader branches on: {row:?}"
+        );
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(
+            coverage
+                .degradations
+                .get(&momotaro_contracts::Degradation::ExcalidrawDetected),
+            Some(&1),
+            "{coverage:?}"
+        );
+    }
+
+    /// One file can lose more than one thing, and its row has to say so: this is the
+    /// case the list-shaped slot exists for (§5 第 8 条), and the row's `data_json` is
+    /// what a reader counts from. A reviewer measured three surviving mutants with no
+    /// such case in the suite — counting from the primary code alone, emptying the
+    /// list, and the refresh path falling back to an empty one.
+    #[test]
+    fn a_file_that_loses_two_things_carries_both_on_its_row() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        // A block that cannot be read (prose between two rules) *and* a scene fence:
+        // both are losses, and neither stops the file from being indexed.
+        let note = "---\nThis is prose, not a field.\n---\n\n## Drawing\n```compressed-json\nSCENENOISEtoken\n```\n";
+        fs::write(vault.join("drawing.md"), note).expect("write the note");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        let store = store_of(dir.path());
+        let row = |batch: &str| {
+            store
+                .store_events_for_batch(batch)
+                .expect("read the batch")
+                .into_iter()
+                .find(|event| event.source_key.as_deref() == Some("note:drawing.md"))
+                .expect("a coverage row for the note")
+        };
+        let first = row(&report.batch_id);
+        assert_eq!(first.outcome.as_deref(), Some("indexed"), "{first:?}");
+        assert_eq!(
+            first.reason_code.as_deref(),
+            Some("frontmatter_parse_error"),
+            "the row's code is the list's first, in enum order: {first:?}"
+        );
+        let data: serde_json::Value =
+            serde_json::from_str(&first.data_json).expect("the row's data is JSON");
+        assert_eq!(
+            data["degradations"],
+            serde_json::json!(["frontmatter_parse_error", "excalidraw_detected"]),
+            "both losses, in enum order: {first:?}"
+        );
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(
+            coverage
+                .degradations
+                .get(&momotaro_contracts::Degradation::FrontmatterParseError),
+            Some(&1),
+            "{coverage:?}"
+        );
+        assert_eq!(
+            coverage
+                .degradations
+                .get(&momotaro_contracts::Degradation::ExcalidrawDetected),
+            Some(&1),
+            "counted from the whole list, not from the first code: {coverage:?}"
+        );
+
+        // The refresh path derives the same list: moving the vault keeps every byte
+        // (the mtime included), so the file is refreshed rather than re-indexed.
+        let moved = dir.path().join("notes").join("vault");
+        fs::create_dir_all(moved.parent().expect("parent path")).expect("create parent");
+        fs::rename(&vault, &moved).expect("move the vault");
+        write_config(dir.path(), &moved);
+        let report = index_workspace(dir.path(), None).expect("reindex");
+        let refreshed = row(&report.batch_id);
+        assert_eq!(
+            refreshed.outcome.as_deref(),
+            Some("metadata_refreshed"),
+            "a moved file is a refresh: {refreshed:?}"
+        );
+        assert_eq!(
+            refreshed.reason_code.as_deref(),
+            Some("frontmatter_parse_error"),
+            "{refreshed:?}"
+        );
+        let data: serde_json::Value =
+            serde_json::from_str(&refreshed.data_json).expect("the row's data is JSON");
+        assert_eq!(
+            data["degradations"],
+            serde_json::json!(["frontmatter_parse_error", "excalidraw_detected"]),
+            "the refresh reports what the indexing path would: {refreshed:?}"
+        );
+    }
+
+    #[test]
+    fn a_json_block_under_another_heading_is_still_indexed() {
+        // The counterexample that keeps the scene rule anchored: the plugin's own
+        // regex reads the first fence after a `##? Drawing` heading, so a JSON block
+        // anywhere else is ordinary note text and must stay searchable.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(
+            vault.join("appendix.md"),
+            "# Notes\n\n## Appendix\n\n```json\n{\"plain\": \"keepthisjson\"}\n```\n",
+        )
+        .expect("write the note");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        index_workspace(dir.path(), None).expect("index");
+
+        let hits = search_workspace(dir.path(), "keepthisjson", 10).expect("search");
+        assert!(
+            hits.hits
+                .iter()
+                .any(|hit| hit.hit.source_key == "note:appendix.md"),
+            "a JSON block outside the drawing section is content: {hits:?}"
+        );
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert!(
+            coverage.degradations.is_empty(),
+            "and nothing was kept out of the index: {coverage:?}"
+        );
+    }
 }
