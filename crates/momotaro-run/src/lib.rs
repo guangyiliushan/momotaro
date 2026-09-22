@@ -559,7 +559,11 @@ pub fn format_coverage(report: &CoverageReport) -> String {
     );
     for (code, count) in &report.degradations {
         line.push('\n');
-        line.push_str(&format!("  {count} x {} (indexed anyway)", code.as_str()));
+        line.push_str(&format!(
+            "  {count} x {} {}",
+            code.as_str(),
+            degradation_row_state(*code)
+        ));
     }
     for failure in &report.failures {
         line.push('\n');
@@ -581,6 +585,31 @@ pub fn format_coverage(report: &CoverageReport) -> String {
 pub fn format_index_error(error: &IndexFileError) -> String {
     let key = error.source_key.as_deref().unwrap_or("<no key>");
     format!("{key:?}: {}: {}", error.kind, sanitize(&error.message))
+}
+
+/// How a degradation code's rows read in the human coverage line.
+///
+/// The code decides, because this report counts codes rather than row states: a
+/// link is the one code that rides a `skipped` row (nothing was read), and the
+/// other nine ride rows that went into the index one way or another. Printing one
+/// parenthetical for all of them made `symlink_encountered (indexed anyway)` a
+/// sentence the same report contradicts — it says one skipped row. Exhaustive on
+/// purpose: a new code has to decide how it reads.
+fn degradation_row_state(code: momotaro_contracts::Degradation) -> &'static str {
+    match code {
+        momotaro_contracts::Degradation::SymlinkEncountered => {
+            "(skipped: the link is not followed)"
+        }
+        momotaro_contracts::Degradation::FrontmatterParseError
+        | momotaro_contracts::Degradation::UnresolvedWikilink
+        | momotaro_contracts::Degradation::AmbiguousWikilink
+        | momotaro_contracts::Degradation::StaleAnchor
+        | momotaro_contracts::Degradation::MarkdownLinkDecodeError
+        | momotaro_contracts::Degradation::UnknownLinkSyntax
+        | momotaro_contracts::Degradation::CanvasParseError
+        | momotaro_contracts::Degradation::ExcalidrawDetected
+        | momotaro_contracts::Degradation::AttachmentUnindexed => "(indexed anyway)",
+    }
 }
 
 #[cfg(test)]
@@ -839,8 +868,21 @@ mod tests {
 
         init_workspace(&root).expect("init accepts vault == root");
         let report = index_workspace(&root, None).expect("index accepts vault == root");
-        assert_eq!(report.files_indexed, 1, "{report:?}");
+        // The config file sits in the vault here, so it is a vault file: the walker
+        // registers it as an attachment rather than pretending it is not there
+        // (§5 第 10 条). One note, one registered file, one chunk.
+        assert_eq!(report.files_scanned, 2, "{report:?}");
+        assert_eq!(report.files_indexed, 2, "{report:?}");
+        assert_eq!(report.chunks_written, 1, "{report:?}");
         assert_eq!(report.errors.len(), 0, "{report:?}");
+        let coverage = coverage_report(&root).expect("read").expect("a batch");
+        assert_eq!(
+            coverage
+                .degradations
+                .get(&momotaro_contracts::Degradation::AttachmentUnindexed),
+            Some(&1),
+            "the config file is registered, and the report says so: {coverage:?}"
+        );
 
         let health = doctor(&root).expect("doctor accepts vault == root");
         assert_eq!(health.status, WorkspaceStatus::Ready, "{health:?}");
@@ -1805,19 +1847,33 @@ mod tests {
         let report = CoverageReport {
             batch_id: "index-1".to_owned(),
             indexed: 1,
-            skipped: 0,
+            skipped: 1,
             refreshed: 0,
-            degradations: [(momotaro_contracts::Degradation::FrontmatterParseError, 1)]
-                .into_iter()
-                .collect(),
+            degradations: [
+                (momotaro_contracts::Degradation::FrontmatterParseError, 1),
+                (momotaro_contracts::Degradation::SymlinkEncountered, 1),
+            ]
+            .into_iter()
+            .collect(),
             failures: Vec::new(),
-            events: 3,
+            events: 4,
             finished: true,
         };
         let line = format_coverage(&report);
         assert!(
             line.contains("1 x frontmatter_parse_error (indexed anyway)"),
             "the count is what stops a degraded file reading as clean: {line}"
+        );
+        // The row state follows the code, not one parenthetical for all of them: a
+        // link is skipped, and printing "indexed anyway" beside it made the line
+        // contradict its own skipped count.
+        assert!(
+            line.contains("1 x symlink_encountered (skipped: the link is not followed)"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("symlink_encountered (indexed anyway)"),
+            "{line}"
         );
     }
 
@@ -3119,6 +3175,301 @@ mod tests {
             serde_json::json!(["frontmatter_parse_error", "excalidraw_detected"]),
             "the refresh reports what the indexing path would: {refreshed:?}"
         );
+    }
+
+    #[test]
+    fn an_attachment_is_registered_without_becoming_searchable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(vault.join("attach")).expect("create vault");
+        // Not valid UTF-8: an attachment's bytes are not text, and nothing may
+        // pretend to normalize them.
+        fs::write(
+            vault.join("attach/pic.png"),
+            [0x89, b'P', b'N', b'G', 0xff, 0xfe, 0x00],
+        )
+        .expect("write the attachment");
+        fs::write(vault.join("note.md"), "# Note\n\nbody\n").expect("write the note");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        let store = store_of(dir.path());
+        let revision = store
+            .current_revision("note:attach/pic.png")
+            .expect("read")
+            .expect("the attachment is a source");
+        assert_eq!(revision.kind, momotaro_contracts::SourceKind::Attachment);
+        assert_eq!(
+            revision.origin_class,
+            momotaro_contracts::OriginClass::Owner
+        );
+        assert_eq!(
+            revision.title.as_deref(),
+            Some("pic"),
+            "the title is the file's name without its extension"
+        );
+        assert!(
+            revision
+                .local_path
+                .as_deref()
+                .is_some_and(|path| path.ends_with("attach/pic.png")),
+            "{revision:?}"
+        );
+        assert!(
+            revision.metadata_json.contains("size_bytes"),
+            "the fingerprint is the blob: {}",
+            revision.metadata_json
+        );
+        // Zero chunks, and the file's name is not a hit.
+        assert!(
+            store
+                .all_current_chunks()
+                .expect("chunks")
+                .iter()
+                .all(|chunk| chunk.source_key != "note:attach/pic.png")
+        );
+        assert!(
+            search_workspace(dir.path(), "pic", 10)
+                .expect("search")
+                .hits
+                .iter()
+                .all(|hit| hit.hit.source_key != "note:attach/pic.png"),
+            "nothing was indexed for the attachment"
+        );
+        // The row says what happened, and the report counts it.
+        let row = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read the batch")
+            .into_iter()
+            .find(|event| event.source_key.as_deref() == Some("note:attach/pic.png"))
+            .expect("a coverage row for the attachment");
+        assert_eq!(row.outcome.as_deref(), Some("indexed"), "{row:?}");
+        assert_eq!(
+            row.reason_code.as_deref(),
+            Some("attachment_unindexed"),
+            "{row:?}"
+        );
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(
+            coverage
+                .degradations
+                .get(&momotaro_contracts::Degradation::AttachmentUnindexed),
+            Some(&1),
+            "{coverage:?}"
+        );
+
+        // Re-indexing skips it by fingerprint like any other unchanged source — the
+        // note is unchanged too, so both are skipped, and a skipped row still says what
+        // the file is (a reader that only saw the counts would not know).
+        let report = index_workspace(dir.path(), None).expect("reindex");
+        assert_eq!(report.files_skipped, 2, "{report:?}");
+        assert_eq!(report.revisions_created, 0, "{report:?}");
+        let skipped_row = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read the batch")
+            .into_iter()
+            .find(|event| event.source_key.as_deref() == Some("note:attach/pic.png"))
+            .expect("a row for the skipped attachment");
+        assert_eq!(
+            skipped_row.outcome.as_deref(),
+            Some("skipped"),
+            "{skipped_row:?}"
+        );
+        assert_eq!(
+            skipped_row.reason_code.as_deref(),
+            Some("attachment_unindexed"),
+            "a skipped row carries the code too: {skipped_row:?}"
+        );
+        let current = store
+            .current_revision("note:attach/pic.png")
+            .expect("read")
+            .expect("still there");
+        assert_eq!(current.kind, momotaro_contracts::SourceKind::Attachment);
+        let before_hash = current.revision_hash.clone();
+
+        // New bytes are a new revision, not a skip and not a refresh: the file's own
+        // content is the source, so replacing it has to land in the store.
+        fs::write(
+            vault.join("attach/pic.png"),
+            [0x89, b'P', b'N', b'G', 0x00, 0x01, 0x02, 0x03],
+        )
+        .expect("replace the attachment");
+        let report = index_workspace(dir.path(), None).expect("reindex");
+        assert_eq!(report.revisions_created, 1, "{report:?}");
+        let replaced = store
+            .current_revision("note:attach/pic.png")
+            .expect("read")
+            .expect("current");
+        assert_ne!(
+            replaced.revision_hash, before_hash,
+            "new bytes are a new revision"
+        );
+        assert_eq!(replaced.kind, momotaro_contracts::SourceKind::Attachment);
+
+        // Same bytes under a fresh fingerprint (a `touch`, a copy, a sync that rewrote
+        // the mtime) is a refresh: the revision already holds them, so the mutable
+        // columns move and nothing is appended — the count is what a reader believes.
+        {
+            let mut store = store_of(dir.path());
+            store
+                .update_revision_fingerprint(
+                    "note:attach/pic.png",
+                    &replaced.revision_hash,
+                    "{\"mtime_ms\":1}",
+                    "stale/away.png",
+                    "away.png",
+                )
+                .expect("clobber the mutable columns");
+        }
+        let report = index_workspace(dir.path(), None).expect("reindex");
+        assert_eq!(
+            report.revisions_created, 0,
+            "the bytes did not change: {report:?}"
+        );
+        let refreshed = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read the batch")
+            .into_iter()
+            .find(|event| event.source_key.as_deref() == Some("note:attach/pic.png"))
+            .expect("a row for the refreshed attachment");
+        assert_eq!(
+            refreshed.outcome.as_deref(),
+            Some("metadata_refreshed"),
+            "a stale fingerprint is a refresh, not a new revision: {refreshed:?}"
+        );
+        assert_eq!(
+            refreshed.reason_code.as_deref(),
+            Some("attachment_unindexed"),
+            "{refreshed:?}"
+        );
+        let stored = store
+            .current_revision("note:attach/pic.png")
+            .expect("read")
+            .expect("current");
+        assert!(
+            stored
+                .local_path
+                .as_deref()
+                .is_some_and(|path| path.ends_with("attach/pic.png")),
+            "the refresh repairs the stored path: {stored:?}"
+        );
+    }
+
+    /// A link is not content: the row says it was seen, and the bytes behind it
+    /// never enter the index (this version does not follow them).
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_recorded_not_followed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("real.md"), "# Real\n\nrealtoken\n").expect("write");
+        let outside = dir.path().join("outside.md");
+        fs::write(&outside, "# Outside\n\noutsidetoken\n").expect("write outside");
+        std::os::unix::fs::symlink(&outside, vault.join("link.md")).expect("create the symlink");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        let store = store_of(dir.path());
+        assert!(
+            store
+                .current_revision("note:link.md")
+                .expect("read")
+                .is_none(),
+            "a link is not a source"
+        );
+        let row = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read the batch")
+            .into_iter()
+            .find(|event| event.source_key.as_deref() == Some("note:link.md"))
+            .expect("a row for the link");
+        assert_eq!(row.outcome.as_deref(), Some("skipped"), "{row:?}");
+        assert_eq!(
+            row.reason_code.as_deref(),
+            Some("symlink_encountered"),
+            "{row:?}"
+        );
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(
+            coverage
+                .degradations
+                .get(&momotaro_contracts::Degradation::SymlinkEncountered),
+            Some(&1),
+            "a skipped row's code is counted too: {coverage:?}"
+        );
+        // The link points outside the vault, so nothing behind it is indexed.
+        assert!(
+            search_workspace(dir.path(), "outsidetoken", 10)
+                .expect("search")
+                .hits
+                .is_empty()
+        );
+    }
+
+    /// Windows' junction is a symlink to `file_type()`, needs no privilege, and is
+    /// the shape a user actually makes here: it must be recorded, and the walk must
+    /// not descend into it (no file is indexed twice).
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_is_recorded_not_walked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(vault.join("sub")).expect("create vault");
+        fs::write(vault.join("sub/inner.md"), "# Inner\n\ninnertoken\n").expect("write");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(vault.join("link"))
+            .arg(vault.join("sub"))
+            .status()
+            .expect("run mklink");
+        assert!(
+            status.success(),
+            "this test needs a junction; a silent skip would make \"did not run\" \
+             look exactly like \"passed\""
+        );
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        let store = store_of(dir.path());
+        let row = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read the batch")
+            .into_iter()
+            .find(|event| event.source_key.as_deref() == Some("note:link"))
+            .expect("a row for the junction");
+        assert_eq!(row.outcome.as_deref(), Some("skipped"), "{row:?}");
+        assert_eq!(
+            row.reason_code.as_deref(),
+            Some("symlink_encountered"),
+            "{row:?}"
+        );
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(
+            coverage
+                .degradations
+                .get(&momotaro_contracts::Degradation::SymlinkEncountered),
+            Some(&1),
+            "a skipped row's code is counted too: {coverage:?}"
+        );
+        assert!(
+            store
+                .current_revision("note:sub/inner.md")
+                .expect("read")
+                .is_some(),
+            "the note behind the junction is indexed once, under its real path"
+        );
+        assert!(
+            store
+                .current_revision("note:link/inner.md")
+                .expect("read")
+                .is_none(),
+            "the walk does not descend into the junction"
+        );
+        assert_eq!(report.revisions_created, 1, "{report:?}");
     }
 
     #[test]

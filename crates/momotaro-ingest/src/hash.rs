@@ -20,6 +20,26 @@ pub fn revision_hash(normalized: &str) -> String {
     sha256_hex(&[REVISION_DOMAIN, normalized.as_bytes()])
 }
 
+/// [`revision_hash`] for content that is not text — an attachment's bytes.
+///
+/// Same domain as the text form: a revision is a revision, whichever kind of
+/// source it belongs to. Binary content never goes through `normalize_markdown`,
+/// so this hashes exactly what the file holds, and it streams: a vault may hold
+/// a video, and reading one into memory to hash it would be the whole file.
+pub fn revision_hash_reader(reader: &mut impl std::io::Read) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(REVISION_DOMAIN);
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 /// `hex(sha256("momotaro-chunk-id-v1\0" + source_key + "\0" + revision_hash + "\0" + ordinal))`.
 pub fn chunk_id(source_key: &str, revision_hash: &str, ordinal: u32) -> String {
     sha256_hex(&[
@@ -44,6 +64,23 @@ pub fn chunk_hash(chunk_id: &str, text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_streaming_hash_is_the_text_hash_for_the_same_bytes() {
+        // One domain, two entry points: a revision is a revision, and an
+        // attachment hashes its bytes through the reader that never holds them
+        // all. If these two ever disagree, the same content would get two
+        // identities depending on which kind of source it came from.
+        let text = "# note\n\nbody\n";
+        assert_eq!(
+            revision_hash_reader(&mut std::io::Cursor::new(text.as_bytes())).expect("hash"),
+            revision_hash(text)
+        );
+        // Content that is not text at all still hashes — that is the point.
+        let binary = [0x89u8, b'P', b'N', b'G', 0xff];
+        let streamed =
+            revision_hash_reader(&mut std::io::Cursor::new(binary.as_slice())).expect("hash");
+        assert_eq!(streamed.len(), 64, "sha256, hex");
+    }
     use super::*;
 
     fn is_64_lower_hex(s: &str) -> bool {

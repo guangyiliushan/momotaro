@@ -15,8 +15,9 @@ use momotaro_contracts::{
 };
 use momotaro_ingest::frontmatter::{self, FrontmatterParse};
 use momotaro_ingest::{
-    SourceOffset, chunk_markdown_with, derive_title, is_canvas_path, normalize_markdown,
-    raw_name_for, revision_hash, scene_spans, source_key_for, walk_note_files,
+    SourceOffset, VaultFileKind, chunk_markdown_with, derive_title, is_canvas_path,
+    normalize_markdown, raw_name_for, revision_hash, revision_hash_reader, scene_spans,
+    source_key_for, walk_entries,
 };
 use momotaro_retrieve::{IndexWriterHandle, RetrieveError, SearchIndex};
 use momotaro_store::{NewSourceRevision, NewStoreEvent, Store, StoreError};
@@ -200,7 +201,13 @@ fn summarize_coverage(batch_id: &str, events: &[momotaro_store::StoreEvent]) -> 
                     report.indexed += 1;
                     count_degradations(&mut report, event);
                 }
-                Some(outcome) if outcome == FileOutcome::Skipped.as_str() => report.skipped += 1,
+                Some(outcome) if outcome == FileOutcome::SKIPPED => {
+                    report.skipped += 1;
+                    // A skipped row can carry a code too — a link the index does not
+                    // follow says so on its row, and a reader that drops it would
+                    // report the batch as having lost nothing.
+                    count_degradations(&mut report, event);
+                }
                 Some(outcome) if outcome == FileOutcome::METADATA_REFRESHED => {
                     report.refreshed += 1;
                     // A refreshed file lost whatever the re-derived block says it
@@ -816,7 +823,7 @@ fn degradation_message(code: Degradation) -> &'static str {
             "the file was indexed; its Excalidraw scene stays out of the index (D41.7)"
         }
         Degradation::SymlinkEncountered => {
-            "the file was indexed; a symlink under the vault was recorded, not followed (D41.9)"
+            "the path is a symlink; it was recorded, not followed (D41.9)"
         }
         Degradation::AttachmentUnindexed => {
             "the file was registered; its bytes are not searchable on purpose (D41.10)"
@@ -926,7 +933,7 @@ pub fn index_workspace(
     let search_index = SearchIndex::open_or_create(&index_dir(root))?;
     let mut writer = search_index.writer(WRITER_HEAP_BYTES)?;
 
-    let files = walk_note_files(&vault_root)?;
+    let entries = walk_entries(&vault_root)?;
 
     // One batch per run (ADR 0026). Unique without a new dependency: the
     // millisecond is for a human reading the table, the nanosecond half makes
@@ -938,7 +945,7 @@ pub fn index_workspace(
 
     let mut report = IndexReport {
         batch_id: batch_id.clone(),
-        files_scanned: files.len() as u64,
+        files_scanned: entries.len() as u64,
         files_skipped: 0,
         files_indexed: 0,
         revisions_created: 0,
@@ -962,14 +969,15 @@ pub fn index_workspace(
         outcome: None,
         reason_code: None,
         message: None,
-        data_json: &serde_json::json!({ "files_scanned": files.len() }).to_string(),
+        data_json: &serde_json::json!({ "files_scanned": entries.len() }).to_string(),
         external_id: None,
     })?;
 
     let mut claimed: HashMap<String, String> = HashMap::new();
 
-    for file in files {
-        let source_key = match source_key_for(&vault_root, &file) {
+    for entry in entries {
+        let file = &entry.path;
+        let source_key = match source_key_for(&vault_root, file) {
             Ok(key) => key,
             Err(error) => {
                 // Reachable codes here: `invalid_utf8`, `outside_vault`,
@@ -994,7 +1002,7 @@ pub fn index_workspace(
             }
         };
 
-        let raw_name = match raw_name_for(&vault_root, &file) {
+        let raw_name = match raw_name_for(&vault_root, file) {
             Ok(name) => name,
             Err(error) => {
                 let message = error.to_string();
@@ -1039,17 +1047,41 @@ pub fn index_workspace(
         }
         claimed.insert(source_key.clone(), raw_name.clone());
 
-        match process_file(
-            &mut store,
-            &search_index,
-            &mut writer,
-            &workspace_root,
-            &file,
-            &source_key,
-            &raw_name,
-            policy,
-            &mut report,
-        ) {
+        let outcome = match entry.kind {
+            // A link is not content: this version does not follow them (the vault
+            // layer says so by kind), so the row is the whole record — no revision,
+            // no chunks, and nothing is ever read through the link (§5 第 10 条).
+            VaultFileKind::Symlink => {
+                report.files_skipped += 1;
+                Ok(FileOutcome::Skipped {
+                    degradations: vec![Degradation::SymlinkEncountered],
+                })
+            }
+            // Everything that is not a note is registered rather than read: the
+            // vault's inventory is complete without pretending binary bytes are
+            // searchable (§5 第 10 条).
+            VaultFileKind::Attachment => register_attachment(
+                &mut store,
+                &workspace_root,
+                file,
+                &source_key,
+                &raw_name,
+                &mut report,
+            ),
+            VaultFileKind::Note | VaultFileKind::Canvas => process_file(
+                &mut store,
+                &search_index,
+                &mut writer,
+                &workspace_root,
+                file,
+                &source_key,
+                &raw_name,
+                policy,
+                &mut report,
+            ),
+        };
+
+        match outcome {
             Ok(outcome) => {
                 let degraded = outcome.reason_code();
                 let sentence = outcome.degradation().map(degradation_message);
@@ -1116,11 +1148,12 @@ pub fn index_workspace(
 ///
 /// `outcome` is one of `indexed | skipped | metadata_refreshed | error`.
 ///
-/// `reason_code` is set in two cases, and a reader must branch on the pair, never
-/// on the outcome alone: an `error` row carries the stable spelling of the error
-/// kind, and an `indexed` row carries the degradation code of something the file
-/// lost on the way in (`frontmatter_parse_error`, D41.5) — the file was indexed
-/// anyway, so the outcome stays `indexed`.
+/// `reason_code` is set in three cases, and a reader must branch on the pair,
+/// never on the outcome alone: an `error` row carries the stable spelling of the
+/// error kind; an `indexed` or `metadata_refreshed` row carries the degradation
+/// code of something the file lost on the way in (`frontmatter_parse_error`,
+/// D41.5) — it is in the index anyway; and a `skipped` row carries the code of
+/// what kept it out (`symlink_encountered`, §5 第 10 条).
 fn coverage_event<'a>(
     batch_id: &'a str,
     seq: i64,
@@ -1148,8 +1181,10 @@ fn coverage_event<'a>(
 /// What one file's pass through [`process_file`] did (ADR 0026's outcomes).
 #[derive(Debug)]
 enum FileOutcome {
-    /// Unchanged: same fingerprint, stored path and raw name.
-    Skipped,
+    /// Nothing was read: the fingerprint, stored path and raw name all match, or
+    /// the file is a link the index does not follow. `degradations` carries what
+    /// that decision cost the file, so a link's row says why it is not searchable.
+    Skipped { degradations: Vec<Degradation> },
     /// Same bytes under a new path or spelling: the mutable columns moved. The
     /// list is re-derived on this path too, or a file whose block cannot be read
     /// would read as clean here (§5 第 8 条).
@@ -1172,10 +1207,13 @@ impl FileOutcome {
     /// the indexed one exists: a struct variant is not a value to compare against.
     const METADATA_REFRESHED: &'static str = "metadata_refreshed";
 
+    /// The wire spelling of `skipped`, for the same reason again.
+    const SKIPPED: &'static str = "skipped";
+
     /// The wire spelling written to `store_events.outcome` (ADR 0026).
     fn as_str(&self) -> &'static str {
         match self {
-            Self::Skipped => "skipped",
+            Self::Skipped { .. } => Self::SKIPPED,
             Self::MetadataRefreshed { .. } => "metadata_refreshed",
             Self::Indexed { .. } => Self::INDEXED,
         }
@@ -1195,10 +1233,9 @@ impl FileOutcome {
     /// (§5 第 8 条 ③④).
     fn degradations(&self) -> &[Degradation] {
         match self {
-            Self::Skipped => &[],
-            Self::MetadataRefreshed { degradations } | Self::Indexed { degradations } => {
-                degradations
-            }
+            Self::Skipped { degradations }
+            | Self::MetadataRefreshed { degradations }
+            | Self::Indexed { degradations } => degradations,
         }
     }
 
@@ -1243,7 +1280,11 @@ fn process_file(
         && revision.raw_name.as_deref() == Some(raw_name)
     {
         report.files_skipped += 1;
-        return Ok(FileOutcome::Skipped);
+        // Nothing was read, so nothing was lost: the list is empty here, and the
+        // variant carries it so every outcome has the same shape.
+        return Ok(FileOutcome::Skipped {
+            degradations: Vec::new(),
+        });
     }
 
     let bytes = fs::read(file)
@@ -1497,6 +1538,97 @@ fn string_field(object: &serde_json::Map<String, serde_json::Value>, key: &str) 
 /// that node contributed no text (a dangling end is kept, never dropped).
 fn endpoint<'a>(id: &'a str, named: &HashMap<&str, usize>, blocks: &'a [String]) -> &'a str {
     named.get(id).map_or(id, |index| blocks[*index].as_str())
+}
+
+/// Registers a vault file the index does not read: one revision, no chunks.
+///
+/// The file is a source — it has a key, a revision and a coverage row — and its
+/// bytes are deliberately not searchable, which is what the row's
+/// `attachment_unindexed` says (§5 第 10 条). Two things it must not do: run
+/// `normalize_markdown` over binary (that is Markdown's BOM/CRLF pass), and read
+/// the file into memory to hash it — a vault may hold a video, so the hash
+/// streams and the file's own bytes are never held whole.
+fn register_attachment(
+    store: &mut Store,
+    workspace_root: &Path,
+    file: &Path,
+    source_key: &str,
+    raw_name: &str,
+    report: &mut IndexReport,
+) -> Result<FileOutcome, IndexFileError> {
+    let metadata = fs::metadata(file)
+        .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Io, error))?;
+    let fingerprint = fingerprint_json(&metadata);
+    let local_path = momotaro_ingest::local_path_in(workspace_root, file)
+        .map_err(|error| file_error(Some(source_key), error.kind(), error))?;
+
+    let current = store_step(source_key, || store.current_revision(source_key))?;
+    if let Some(revision) = &current
+        && fingerprint_matches(&revision.metadata_json, &metadata)
+        && revision.local_path.as_deref() == Some(local_path.as_str())
+        && revision.raw_name.as_deref() == Some(raw_name)
+    {
+        report.files_skipped += 1;
+        return Ok(FileOutcome::Skipped {
+            degradations: vec![Degradation::AttachmentUnindexed],
+        });
+    }
+
+    let hash = {
+        let mut reader = fs::File::open(file)
+            .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Io, error))?;
+        revision_hash_reader(&mut reader)
+            .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Io, error))?
+    };
+
+    // Same bytes under a fresh fingerprint (a `touch`, a copy, a sync that rewrote
+    // the mtime): the revision already holds them, so only the mutable columns move.
+    // Without this branch every such run appended a revision, reported one created
+    // and left the store with a single row — the count and the truth parted ways,
+    // which is the shape `process_file` handles for notes for the same reason.
+    if let Some(revision) = &current
+        && revision.revision_hash == hash
+    {
+        store_step(source_key, || {
+            store.update_revision_fingerprint(
+                source_key,
+                &revision.revision_hash,
+                &fingerprint,
+                &local_path,
+                raw_name,
+            )
+        })?;
+        report.files_indexed += 1;
+        return Ok(FileOutcome::MetadataRefreshed {
+            degradations: vec![Degradation::AttachmentUnindexed],
+        });
+    }
+
+    // No H1 to find and no frontmatter to record: the fingerprint is the whole
+    // blob, and the title is the file's name without its extension.
+    let title = derive_title("", source_key);
+    store_step(source_key, || {
+        store.append_revision(&NewSourceRevision {
+            source_key,
+            revision_hash: &hash,
+            kind: SourceKind::Attachment,
+            title: Some(&title),
+            uri: None,
+            local_path: Some(&local_path),
+            raw_name: Some(raw_name),
+            origin_class: OriginClass::Owner,
+            metadata_json: &fingerprint,
+            ingested_at: now_epoch_secs(),
+        })
+    })?;
+    // No chunk call at all: the kind is decided by the extension, so a key that is
+    // an attachment never had chunks to replace.
+
+    report.files_indexed += 1;
+    report.revisions_created += 1;
+    Ok(FileOutcome::Indexed {
+        degradations: vec![Degradation::AttachmentUnindexed],
+    })
 }
 
 /// Rebuilds the tantivy index from canonical store chunks.

@@ -21,11 +21,11 @@ mod walk;
 pub use canvas::is_canvas_path;
 pub use chunker::{SourceOffset, chunk_markdown, chunk_markdown_with};
 pub use excalidraw::scene_spans;
-pub use hash::{chunk_hash, chunk_id, revision_hash};
+pub use hash::{chunk_hash, chunk_id, revision_hash, revision_hash_reader};
 pub use normalize::normalize_markdown;
 pub use path::{canonical_workspace_root, is_within, local_path_in, resolve_local_path};
 pub use title::derive_title;
-pub use walk::{raw_name_for, source_key_for, walk_note_files};
+pub use walk::{VaultEntry, VaultFileKind, raw_name_for, source_key_for, walk_entries};
 
 /// Failures raised while turning vault files into chunks.
 #[derive(Debug, thiserror::Error)]

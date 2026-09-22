@@ -215,6 +215,12 @@ pub enum SourceKind {
     Paper,
     /// Web page captures.
     Web,
+    /// A vault file that is registered rather than indexed: images, audio,
+    /// video, PDFs and anything else the whitelist does not read. It is a
+    /// source (it has a key and a revision) with no chunks — `docs/docs/
+    /// ingest-interop.md` §5 第 10 条 says which files these are, and why the
+    /// index never pretends its bytes are searchable.
+    Attachment,
 }
 
 impl SourceKind {
@@ -227,6 +233,7 @@ impl SourceKind {
             Self::Note => "note",
             Self::Paper => "paper",
             Self::Web => "web",
+            Self::Attachment => "attachment",
         }
     }
 }
@@ -244,6 +251,7 @@ impl std::str::FromStr for SourceKind {
             "note" => Ok(Self::Note),
             "paper" => Ok(Self::Paper),
             "web" => Ok(Self::Web),
+            "attachment" => Ok(Self::Attachment),
             other => Err(UnknownSourceKind(other.to_owned())),
         }
     }
@@ -588,11 +596,13 @@ pub struct CoverageReport {
     pub skipped: u64,
     /// Rows whose file only moved or was re-spelled.
     pub refreshed: u64,
-    /// What the **`indexed`** rows lost on the way in, counted per code (D41).
+    /// What the rows carrying a code lost on the way in, counted per code (D41).
     ///
-    /// Without this, a note whose block could not be read is indistinguishable
-    /// from a clean one in this report: the row says `indexed` and the code was
-    /// only in the event table.
+    /// The count is per code across states: an `indexed` or `metadata_refreshed`
+    /// row lost something and is in the index anyway, while a `skipped` row's code
+    /// says what kept it out (`symlink_encountered`, §5 第 10 条). Without this, a
+    /// note whose block could not be read is indistinguishable from a clean one in
+    /// this report: the row says `indexed` and the code was only in the event table.
     pub degradations: BTreeMap<Degradation, u64>,
     /// Rows that failed, in the batch's own order (`seq`, not `id`).
     pub failures: Vec<CoverageFailure>,
@@ -619,9 +629,11 @@ pub struct IndexReport {
     /// Identifier of this indexing batch, as written to `store_events`
     /// (ADR 0026): one `index` run, one batch.
     pub batch_id: String,
-    /// Markdown files discovered under the vault root.
+    /// Files the vault walk kept — notes and attachments alike, since both are
+    /// sources now (§5 第 10 条).
     pub files_scanned: u64,
-    /// Files skipped because the fingerprint was unchanged.
+    /// Files nothing was read for: the fingerprint was unchanged, or the walk saw a
+    /// link it does not follow. Both are skips, and the row's code says which.
     pub files_skipped: u64,
     /// Files that produced a new revision or refresh.
     pub files_indexed: u64,
@@ -882,7 +894,12 @@ mod tests {
     fn the_kind_spelling_matches_serde() {
         // The column value, the JSON form and `FromStr` are one spelling; the
         // store decodes through `FromStr` and writes through `as_str`.
-        for kind in [SourceKind::Note, SourceKind::Paper, SourceKind::Web] {
+        for kind in [
+            SourceKind::Note,
+            SourceKind::Paper,
+            SourceKind::Web,
+            SourceKind::Attachment,
+        ] {
             assert_eq!(kind.as_str().parse::<SourceKind>(), Ok(kind));
             assert_eq!(
                 serde_json::to_string(&kind).expect("serialize"),

@@ -46,26 +46,20 @@ fn file_stem_of(source_key: &str) -> &str {
         .strip_prefix(momotaro_contracts::NOTE_SCHEME)
         .unwrap_or(source_key);
     let base = key.rsplit('/').next().unwrap_or(key);
-    strip_note_extension(base)
+    strip_extension(base)
 }
 
-/// Strips a note's trailing extension — `.md` or `.canvas`, ASCII-case
-/// insensitive (the walker's whitelist accepts `.MD` and `.CANVAS`).
+/// Strips a file's single trailing extension, whatever it is: a title is the
+/// name without it, for notes (`.md`, `.canvas`) and attachments (`.png`) alike,
+/// and only one goes — `board.canvas.md` is a Markdown note called
+/// `board.canvas`.
 ///
-/// Both kinds are notes here, and a title is the note's name without its
-/// extension whichever kind it is; only one trailing extension goes, so
-/// `board.canvas.md` is a Markdown note called `board.canvas`.
-///
-/// Never splits a multi-byte character: `rsplit_once` works on characters,
-/// and a name with no dot is returned unchanged.
-fn strip_note_extension(name: &str) -> &str {
+/// Never splits a multi-byte character: `rsplit_once` works on characters, and a
+/// name with no dot is returned unchanged.
+fn strip_extension(name: &str) -> &str {
     match name.rsplit_once('.') {
-        Some((stem, extension))
-            if extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("canvas") =>
-        {
-            stem
-        }
-        _ => name,
+        Some((stem, _extension)) => stem,
+        None => name,
     }
 }
 

@@ -129,8 +129,9 @@ parse_error。
 
 ## 5. vault 语法边界与建边矩阵（D41）
 
-1. **索引范围**：白名单 = `*.md`（正文 + frontmatter 结构化剥离）、`*.canvas`
-   （JSON Canvas）；附件层（图片/音视频/PDF）登记不进 FTS；`.base` 只记清单。
+1. **索引范围**：**索引白名单** = `*.md`（正文 + frontmatter 结构化剥离）、`*.canvas`
+   （JSON Canvas）；其余普通文件按**附件层**登记、不进 FTS（图片/音视频/PDF 等，`.base`
+   同样只记清单——成员口径见第 10 条）。
    黑名单 = **一切点开头目录与文件**，watcher 对黑名单静默；
 2. **建边规则**：wikilink 全形态建边（含 heading/block/别名/markdown 标准链接
    等价）；`[[#heading]]` 自环不建边；embed 建边但 `edge_kind='embed'` 单列；
@@ -178,10 +179,10 @@ parse_error。
    **现状（2026-09-18）**：解析、接线与排除**已落地**（字段进
    `source_revisions.metadata_json` 的 `frontmatter` 键、正文进 chunker 且 locator
    按原 note 计、失败发 `frontmatter_parse_error` 且 `outcome` 仍为 `indexed`）；
-   **未做**的是其余七类降级（wikilink 五类属 W2.4、附件登记、`symlink_encountered`）与
-   同步盘三条（OneDrive/iCloud/Windows 非法名，都是**预警**而非十类之一）——它们随本波
-   剩余任务落地；十类里**已有生产者的三类**是 `frontmatter_parse_error`、
-   `canvas_parse_error`、`excalidraw_detected`（口径见第 9 条）；
+   **未做**的是 wikilink 五类降级（随 W2.4 建边）与同步盘三条（OneDrive/iCloud/Windows
+   非法名，都是**预警**而非十类之一）——它们随本波剩余任务落地；十类里**已有生产者的
+   五类**是 `frontmatter_parse_error`、`canvas_parse_error`、`excalidraw_detected`
+   （第 9 条）、`attachment_unindexed`、`symlink_encountered`（第 10 条）；
 6. **解析基座**：pulldown-cmark ≥ 0.13.3 + `ENABLE_WIKILINKS`（官方内置、
    Obsidian 兼容目标）；私有语法（Dendron 式）当 `unknown_link_syntax` 降级；
 7. **降级事件十类**：frontmatter_parse_error / unresolved_wikilink /
@@ -247,6 +248,33 @@ parse_error。
    **`.canvas` 的 locator**：渲染文本不是文件的字节切片，所以它的 chunk 指向**整份画布
    文件**（`start_byte = 0`、坐标同样是**归一化文本**的坐标，与全仓一致）——引用仍能落到
    文档本身；节点级精度是后续任务。
+
+10. **附件登记与符号链接（2026-09-22 定，随 W2.3 单位 B 落地）**：白名单的**第三类**是
+    附件。清单的参照是 **Obsidian 官方《Accepted file formats》**（Markdown / Bases `.base` /
+    JSON Canvas / Images `.avif .bmp .gif .jpeg .jpg .png .svg .webp` / Audio `.flac .m4a
+    .mp3 .ogg .wav .webm .3gp` / Video `.mkv .mov .mp4 .ogv .webm` / PDF `.pdf`）——它是唯一
+    给出这些扩展名的官方来源（IANA 只登记媒体类型，不认 `.md`/`.canvas`/`.base`）。**实现口径比
+    那份清单宽一格**：walker 把**每一个不是 `.md`/`.canvas` 的普通文件**归为附件
+    （`VaultFileKind::Attachment`）——读不了的文件仍是 vault 里的事实，D41 的「每条『没索引』的
+    决定都留可审计事件」不接受静默；官方清单在这里是**描述**（附件层覆盖什么），不是封闭集合。
+    **登记写法**：复用 `source_revisions`（`Source → Revision → Chunk` 的第三段为空，不另立表）——
+    `kind = SourceKind::Attachment`（`kind` 列是 TEXT、没有 CHECK ⇒ **零迁移**）、
+    `origin_class = owner`、`metadata_json` = 指纹（`mtime_ms`/`size_bytes`/`tool`）、**0 chunk**
+    （`chunks` 与 Tantivy 都不写）、`local_path`/`raw_name` 与笔记同形。`revision_hash` 走
+    `revision_hash_reader`：**流式**哈希原始字节、同一个 `REVISION_DOMAIN`（二进制不过
+    `normalize_markdown`、不整读进内存）——同一文件的两个字节版本因此仍是两个 revision。指纹
+    不变的重复 `index` 与笔记一样报 `skipped`；指纹变了而字节没变（例如 `touch`）报
+    `metadata_refreshed` 并把指纹刷进库；字节变了则是一条**新 revision**。**coverage 行**：`outcome = indexed`、
+    `reason_code = attachment_unindexed`（十类之一）；写下了 revision 就是做过了事，"不进 FTS"
+    由码说明。**符号链接（含 Windows junction）不跟随**：`file_type().is_symlink()` 在**发现层**
+    分类（`VaultFileKind::Symlink`），walk 不下降进链接目录、**不读目标内容、不写 revision**；
+    它的行是 `outcome = skipped` + `reason_code = symlink_encountered`，而 **`skipped` 行同样
+    计数降级码**（只数 `indexed` 行的读者会把链接的码丢掉）。目标在 vault 内时按它自己的真实
+    路径索引一次——链接是路径，不是第二份内容。**`.base` 与裸 `.excalidraw`** 同样落附件层
+    （前者是官方 Bases 行，后者是插件私有格式）；将来有自己的 reader 再分出去。**`vault` 等于
+    工作区根时**，`momotaro.toml` 自己也在 vault 里 ⇒ 同样被登记为附件（诚实描述 vault 的内容；
+    若将来要把附件列给用户看，再单独决定是否排除工作区自己的配置文件）。**仪器**：这一面只有
+    `cargo test`（黄金集夹具里没有附件）。
 
 **不做**：MFT/USN Journal 方案（10k 规模复杂度收益比为负）；键层折叠或 NFKC；
 改写用户 vault 文件（Foam 教训）；读 placeholder 内容；跟随符号链接（首版）。
