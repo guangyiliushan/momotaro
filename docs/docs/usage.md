@@ -73,7 +73,9 @@ momotaro doctor --coverage --json   # CoverageReport，字段同上有事件计�
 还没索引过时它会说 `no ingest batch recorded yet` 并**成功退出**（"没有批次"是事实，不是故障；
 `--json` 下 stdout 给 `null`）。未结束的批次会标成 `no ingest.finished yet: still running, or the
 process died`——日志分不出这两者，所以它不假装能分。`ingest.coverage` 的三种结果分别计数；
-任何看不懂的 outcome 都会**归入 failures** 而不是被丢掉。库不可用时（版本过新、外来库）退 1，
+降级（D41）与同步盘预警（D42）各按码计数（`degradations` / `warnings` 两个清单，人类行逐行渲染）；
+**预警不是失败**——只有两个词表都不认识的码才计入 failures。任何看不懂的 outcome 都会**归入 failures**
+而不是被丢掉。库不可用时（版本过新、外来库）退 1，
 报的是与 `doctor` **同一句拒绝文本**（`doctor` 自己那行还会带引擎版本）。
 
 ## Search
@@ -153,10 +155,11 @@ workspace**: SQLite's WAL does not work on network filesystems
 to corrupt it. Sync the notes; leave `.momotaro/` alone.
 
 `index` reports what the run did: `indexed N of M files (X new revisions,
-Y unchanged), C chunks, 0 errors`. `unchanged` counts files whose fingerprint
-**and** stored path both match; a pure directory move refreshes the stored path
-and shows up as `indexed` with `0 new revisions`, because no new content
-revision was created.
+Y skipped), C chunks, 0 errors`. `skipped` counts files nothing was read for:
+a fingerprint **and** stored path that both still match, a link the walk does
+not follow, an iCloud eviction stub, or a cloud placeholder. A pure directory
+move refreshes the stored path and shows up as `indexed` with `0 new
+revisions`, because no new content revision was created.
 
 ## Exit codes
 

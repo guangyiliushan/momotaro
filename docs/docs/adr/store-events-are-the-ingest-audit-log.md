@@ -65,7 +65,7 @@ and each **domain** owns its set:
 
 | domain | `outcome` | `reason_code` |
 |---|---|---|
-| `ingest` | `indexed` \| `skipped` \| `metadata_refreshed` \| `error` | the `IndexFileErrorKind` spelling (`key_collision`, `invalid_utf8`, `outside_vault`, `invalid_source_key`, `io`, `store`, `index`, `other`) — or, on a non-`error` row (`indexed` / `metadata_refreshed` / `skipped`), a degradation code (D41's ten; five have a producer today, the wikilink five arrive with W2.4's edges) |
+| `ingest` | `indexed` \| `skipped` \| `metadata_refreshed` \| `error` | the `IndexFileErrorKind` spelling (`key_collision`, `invalid_utf8`, `outside_vault`, `invalid_source_key`, `io`, `store`, `index`, `other`) — or, on a non-`error` row (`indexed` / `metadata_refreshed` / `skipped`), a degradation code (D41's ten; five have a producer today, the wikilink five arrive with W2.4's edges) — or a warning code (`onedrive_placeholder` / `icloud_placeholder` / `windows_incompatible_name`; `momotaro_contracts::Warning`, the section below says why) |
 | `feed` | `success` \| `no_results` \| `upstream_error` \| `parse_error` | provider codes (`response_too_large`, `empty_feed`, …) |
 | `vault` / `annotate` | not implemented | not implemented |
 
@@ -81,6 +81,33 @@ map one-to-one onto the rows: `files_indexed` counts both `indexed` and
 `metadata_refreshed` rows, `files_skipped` counts `skipped`, and `errors` counts
 `error`. An outcome breakdown is deliberately absent from the payload — the rows
 are the breakdown.
+
+### A warning is not a degradation
+
+D41's ten codes say what a file **lost** on the way into the index. D42's three
+warnings say what will not survive **another platform**: a cloud placeholder
+whose bytes are not on this device (`onedrive_placeholder`), an iCloud eviction
+stub standing in for a note that is not here (`icloud_placeholder`), and a name
+an ordinary Windows machine will not accept (`windows_incompatible_name`). They
+are `momotaro_contracts::Warning`, not more `Degradation` variants: nothing was
+lost by the file, the ten stay ten, and a reader counting degradations is not
+silently taught a fourth kind of loss.
+
+A warning rides the same `reason_code` column and the same rows, with the two
+homes `ingest-interop.md` §5.5 第 8 条 gives a degradation list: `reason_code`
+carries the first degradation when the row has one, and the first warning when
+it does not; `data_json` carries `{"degradations": […], "warnings": […]}` and,
+for a `windows_incompatible_name` row, `{"windows_incompatible_names": […]}` —
+the components the warning is about, so the row witnesses what this build
+flagged (each key only when its list is non-empty). A reader that meets a code
+on a non-`error` row must consult **both** vocabularies before calling it
+unknown: an unknown code is still reported as a failure, and a known warning is
+not — it is counted into `CoverageReport.warnings`, per code and per row state
+exactly as `CoverageReport.degradations` counts, and rendered by
+`doctor --coverage`. The warning rides every read-state of a file's row
+(`indexed` / `metadata_refreshed` / `skipped`): the name is a fact about the
+file whether or not this run read its bytes, and a report that dropped it on a
+no-op re-run would call the vault clean.
 
 ### A collision is refused, and the refusal is a row
 

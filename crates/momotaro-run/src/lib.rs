@@ -6,8 +6,8 @@
 mod index_service;
 
 pub use index_service::{
-    RebuildReport, SearchHit, SearchOutput, coverage_report, index_workspace, rebuild_index,
-    search_workspace,
+    RebuildReport, SearchHit, SearchOutput, coverage_report, index_workspace, index_workspace_with,
+    rebuild_index, search_workspace,
 };
 
 use std::fs;
@@ -396,7 +396,7 @@ pub fn format_index_summary(report: &IndexReport) -> String {
         .filter(|error| error.kind == IndexFileErrorKind::KeyCollision)
         .count();
     format!(
-        "indexed {} of {} files ({} new revisions, {} unchanged), {} chunks, {} errors ({} key collisions) in {} ms",
+        "indexed {} of {} files ({} new revisions, {} skipped), {} chunks, {} errors ({} key collisions) in {} ms",
         report.files_indexed,
         report.files_scanned,
         report.revisions_created,
@@ -557,11 +557,22 @@ pub fn format_coverage(report: &CoverageReport) -> String {
             " (no ingest.finished yet: still running, or the process died)"
         },
     );
-    for (code, counts) in &report.degradations {
+    // Both vocabularies, one rendering: the state is the rows', never the
+    // code's — the same code rides rows that are in the index anyway and rows
+    // nothing was read for, so one parenthetical for all of them would
+    // contradict the counts printed above it.
+    for (code, counts) in report
+        .degradations
+        .iter()
+        .map(|(code, counts)| (code.as_str(), counts))
+        .chain(
+            report
+                .warnings
+                .iter()
+                .map(|(code, counts)| (code.as_str(), counts)),
+        )
+    {
         line.push('\n');
-        // The state is the rows', never the code's: the same code rides rows that are
-        // in the index anyway and rows nothing was read for, so one parenthetical for
-        // all of them would contradict the counts printed above it.
         let state = match (counts.in_index, counts.skipped) {
             (in_index, 0) => format!("({in_index} indexed anyway)"),
             (0, skipped) => format!("({skipped} skipped: nothing was read)"),
@@ -569,12 +580,7 @@ pub fn format_coverage(report: &CoverageReport) -> String {
                 format!("({in_index} indexed anyway, {skipped} skipped)")
             }
         };
-        line.push_str(&format!(
-            "  {} x {} {}",
-            counts.total(),
-            code.as_str(),
-            state
-        ));
+        line.push_str(&format!("  {} x {} {}", counts.total(), code, state));
     }
     for failure in &report.failures {
         line.push('\n');
@@ -1540,6 +1546,7 @@ mod tests {
             indexed: 0,
             skipped: 0,
             degradations: std::collections::BTreeMap::new(),
+            warnings: std::collections::BTreeMap::new(),
             refreshed: 0,
             failures: vec![momotaro_contracts::CoverageFailure {
                 source_key: Some("note:\u{1b}[31mred\u{1b}[0m".to_owned()),
@@ -1830,7 +1837,8 @@ mod tests {
     #[test]
     fn the_coverage_line_names_what_was_lost() {
         // `format_coverage` is pure, so the rendering can be checked without a
-        // vault: a report that recorded a degradation must not read as a clean one.
+        // vault: a report that recorded a degradation must not read as a clean one,
+        // and a warning (D42) must be rendered beside the degradations.
         let report = CoverageReport {
             batch_id: "index-1".to_owned(),
             indexed: 1,
@@ -1839,23 +1847,41 @@ mod tests {
             degradations: [
                 (
                     momotaro_contracts::Degradation::FrontmatterParseError,
-                    momotaro_contracts::DegradationCounts {
+                    momotaro_contracts::CoverageCounts {
                         in_index: 1,
                         skipped: 0,
                     },
                 ),
                 (
                     momotaro_contracts::Degradation::SymlinkEncountered,
-                    momotaro_contracts::DegradationCounts {
+                    momotaro_contracts::CoverageCounts {
                         in_index: 0,
                         skipped: 1,
                     },
                 ),
                 (
                     momotaro_contracts::Degradation::AttachmentUnindexed,
-                    momotaro_contracts::DegradationCounts {
+                    momotaro_contracts::CoverageCounts {
                         in_index: 1,
                         skipped: 2,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            warnings: [
+                (
+                    momotaro_contracts::Warning::WindowsIncompatibleName,
+                    momotaro_contracts::CoverageCounts {
+                        in_index: 2,
+                        skipped: 1,
+                    },
+                ),
+                (
+                    momotaro_contracts::Warning::IcloudPlaceholder,
+                    momotaro_contracts::CoverageCounts {
+                        in_index: 0,
+                        skipped: 1,
                     },
                 ),
             ]
@@ -1885,6 +1911,16 @@ mod tests {
         // was read and skipped when it was not — shows both, and the total is the sum.
         assert!(
             line.contains("3 x attachment_unindexed (1 indexed anyway, 2 skipped)"),
+            "{line}"
+        );
+        // Warnings render through the same loop, from their own vocabulary: both
+        // row states show, and the codes are the warning spellings.
+        assert!(
+            line.contains("3 x windows_incompatible_name (2 indexed anyway, 1 skipped)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("1 x icloud_placeholder (1 skipped: nothing was read)"),
             "{line}"
         );
     }
@@ -3539,5 +3575,586 @@ mod tests {
             coverage.degradations.is_empty(),
             "and nothing was kept out of the index: {coverage:?}"
         );
+    }
+
+    /// `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`, the one bit every cloud
+    /// placeholder carries (pinned by the pure predicate test in
+    /// `momotaro-ingest`, and set by kernel-mode callers only — which is why
+    /// these fixtures are injected rather than built).
+    const RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+
+    #[test]
+    fn a_cloud_placeholder_is_never_read_and_gets_a_skipped_row() {
+        // D42, driven through the seam `index_workspace_with` exists for: no
+        // platform here can fabricate a real placeholder, so the attributes are
+        // injected and the assertions pin what being one means — nothing is
+        // read, no revision appears, the row says why, and the very next run
+        // (with the files readable) indexes them.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("note.md"), "# Note\n\nPLACEHOLDERTOKEN body\n").expect("write");
+        fs::write(vault.join("pic.png"), "not really a png").expect("write");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report =
+            index_workspace_with(dir.path(), None, |_| Ok(RECALL_ON_DATA_ACCESS)).expect("index");
+
+        assert_eq!(report.files_scanned, 2, "{report:?}");
+        assert_eq!(report.files_skipped, 2, "{report:?}");
+        assert_eq!(report.files_indexed, 0, "{report:?}");
+        assert_eq!(report.revisions_created, 0, "{report:?}");
+        let store = store_of(dir.path());
+        for key in ["note:note.md", "note:pic.png"] {
+            assert!(
+                store.current_revision(key).expect("read").is_none(),
+                "{key} must have no revision: nothing was read"
+            );
+            let row = store
+                .store_events_for_batch(&report.batch_id)
+                .expect("read the batch")
+                .into_iter()
+                .find(|event| event.source_key.as_deref() == Some(key))
+                .expect("a coverage row");
+            assert_eq!(row.outcome.as_deref(), Some("skipped"), "{row:?}");
+            assert_eq!(
+                row.reason_code.as_deref(),
+                Some("onedrive_placeholder"),
+                "{row:?}"
+            );
+        }
+        assert!(
+            store.all_current_chunks().expect("chunks").is_empty(),
+            "a placeholder leaves no chunks behind"
+        );
+        let hits = search_workspace(dir.path(), "PLACEHOLDERTOKEN", 10).expect("search");
+        assert!(
+            hits.hits.is_empty(),
+            "its bytes are not searchable: {hits:?}"
+        );
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(
+            coverage
+                .warnings
+                .get(&momotaro_contracts::Warning::OneDrivePlaceholder)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((0, 2)),
+            "{coverage:?}"
+        );
+
+        // Once the bytes are here (no attributes, plain run), the same files go
+        // through the ordinary path: the check runs every time, so nothing had
+        // to be cached or un-done.
+        let report = index_workspace(dir.path(), None).expect("index again");
+        assert_eq!(report.files_indexed, 2, "{report:?}");
+        assert_eq!(report.files_skipped, 0, "{report:?}");
+        let hits = search_workspace(dir.path(), "PLACEHOLDERTOKEN", 10).expect("search");
+        assert!(
+            hits.hits
+                .iter()
+                .any(|hit| hit.hit.source_key == "note:note.md"),
+            "the note is searchable once its bytes are on the device: {hits:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_placeholder_is_not_read_even_when_reading_would_fail() {
+        // The fixture no attribute injection can fake: metadata is readable but
+        // the content is not (mode 000), so an implementation that read before
+        // checking would turn this row into an error. CI's ubuntu runners are
+        // not root; a root build cannot deny itself the read and has nothing
+        // this fixture could prove.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        let file = vault.join("guard.md");
+        fs::write(&file, "# Guard\n\nbody\n").expect("write");
+        let mut perms = fs::metadata(&file).expect("stat").permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&file, perms).expect("chmod 000");
+        if fs::read(&file).is_ok() {
+            return;
+        }
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report =
+            index_workspace_with(dir.path(), None, |_| Ok(RECALL_ON_DATA_ACCESS)).expect("index");
+        assert_eq!(report.errors.len(), 0, "{report:?}");
+        assert_eq!(report.files_skipped, 1, "{report:?}");
+        let store = store_of(dir.path());
+        let row = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read the batch")
+            .into_iter()
+            .find(|event| event.source_key.as_deref() == Some("note:guard.md"))
+            .expect("a coverage row");
+        assert_eq!(row.outcome.as_deref(), Some("skipped"), "{row:?}");
+        assert_eq!(
+            row.reason_code.as_deref(),
+            Some("onedrive_placeholder"),
+            "{row:?}"
+        );
+    }
+
+    #[test]
+    fn an_icloud_stub_is_reported_skipped_and_never_read() {
+        // D42: the stub is not content — the note it stands for is not on this
+        // device. It stayed out of the index all along (it is a dot file); what
+        // is new is the row, and the row is the whole deliverable.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("note.md"), "# Note\n\nZEBRATOKEN body\n").expect("write");
+        fs::write(vault.join(".note.md.icloud"), "ZEBRATOKEN from the stub\n").expect("write");
+        fs::write(vault.join("x.icloud.md"), "# Guard\n\nGUARDTOKEN note\n").expect("write");
+        fs::write(vault.join(".x.icloud.md"), "a hidden note\n").expect("write");
+        fs::write(vault.join(".hidden.md"), "a hidden note\n").expect("write");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        let store = store_of(dir.path());
+        let rows = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read the batch");
+        let row = rows
+            .iter()
+            .find(|event| event.source_key.as_deref() == Some("note:.note.md.icloud"))
+            .expect("a coverage row for the stub");
+        assert_eq!(row.outcome.as_deref(), Some("skipped"), "{row:?}");
+        assert_eq!(
+            row.reason_code.as_deref(),
+            Some("icloud_placeholder"),
+            "{row:?}"
+        );
+        assert!(
+            row.data_json.contains("\"warnings\""),
+            "the code list rides the payload: {}",
+            row.data_json
+        );
+        // The hidden notes produce no rows at all — a stub is the only dot file
+        // the walk keeps.
+        for key in ["note:.x.icloud.md", "note:.hidden.md"] {
+            assert!(
+                !rows
+                    .iter()
+                    .any(|event| event.source_key.as_deref() == Some(key)),
+                "{key} is not vault content"
+            );
+        }
+
+        // The stub's bytes are not searchable; the note it stands beside is, and
+        // a note whose *name* contains `.icloud` is still a note.
+        let hits = search_workspace(dir.path(), "ZEBRATOKEN", 10).expect("search");
+        assert!(
+            hits.hits
+                .iter()
+                .all(|hit| hit.hit.source_key != "note:.note.md.icloud"),
+            "{hits:?}"
+        );
+        assert!(
+            hits.hits
+                .iter()
+                .any(|hit| hit.hit.source_key == "note:note.md"),
+            "the real note answers the same token: {hits:?}"
+        );
+        assert!(
+            search_workspace(dir.path(), "GUARDTOKEN", 10)
+                .expect("search")
+                .hits
+                .iter()
+                .any(|hit| hit.hit.source_key == "note:x.icloud.md"),
+            "a name containing .icloud is not a stub"
+        );
+
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(
+            coverage
+                .warnings
+                .get(&momotaro_contracts::Warning::IcloudPlaceholder)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((0, 1)),
+            "{coverage:?}"
+        );
+        // And the human line says it, without borrowing the other state's words.
+        let line = format_coverage(&coverage);
+        assert!(line.contains("1 x icloud_placeholder"), "{line}");
+        assert!(
+            !line.contains("icloud_placeholder (1 indexed anyway)"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_name_windows_will_not_accept_is_indexed_with_a_warning() {
+        // D42: the name is what syncs, so the warning is platform-independent.
+        // The reserved device names here are creatable on both legs through
+        // std (measured), and the negatives are exactly the false positives a
+        // prefix rule would produce.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        for name in ["con.md", "aux.md", "nul.txt"] {
+            fs::write(vault.join(name), format!("# {name}\n\nWINDOWSATOKEN\n")).expect("write");
+        }
+        // A component that is not the file name: only a nested path can tell
+        // "every component of the vault-relative name" apart from "the file
+        // name alone". `con` is creatable as a directory through std on both
+        // legs (measured).
+        fs::create_dir_all(vault.join("con")).expect("create the con dir");
+        fs::write(vault.join("con/note.md"), "# inner\n\nNESTEDTOKEN\n").expect("write");
+        for name in [
+            "constitution.md",
+            "console.md",
+            "aux2.md",
+            "com10.md",
+            "trail .md",
+        ] {
+            fs::write(vault.join(name), format!("# {name}\n\nCLEANTOKEN\n")).expect("write");
+        }
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+        assert!(report.errors.is_empty(), "{report:?}");
+
+        let store = store_of(dir.path());
+        let rows = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read the batch");
+        for name in ["con.md", "aux.md"] {
+            let key = format!("note:{name}");
+            let row = rows
+                .iter()
+                .find(|event| event.source_key.as_deref() == Some(key.as_str()))
+                .expect("a row");
+            assert_eq!(row.outcome.as_deref(), Some("indexed"), "{row:?}");
+            assert_eq!(
+                row.reason_code.as_deref(),
+                Some("windows_incompatible_name"),
+                "{row:?}"
+            );
+            assert_eq!(
+                row.data_json,
+                format!(
+                    "{{\"warnings\":[\"windows_incompatible_name\"],\"windows_incompatible_names\":[\"{name}\"]}}"
+                ),
+                "the row names exactly the offending component: {row:?}"
+            );
+        }
+        // The attachment takes the other path — registered, code says so — and
+        // its row carries both vocabularies at once: the degradation first in
+        // the column, the warning beside it in the payload.
+        let row = rows
+            .iter()
+            .find(|event| event.source_key.as_deref() == Some("note:nul.txt"))
+            .expect("a row");
+        assert_eq!(
+            row.reason_code.as_deref(),
+            Some("attachment_unindexed"),
+            "a degradation outranks a warning in the column: {row:?}"
+        );
+        assert!(
+            row.data_json.contains("\"warnings\"")
+                && row.data_json.contains("windows_incompatible_names"),
+            "{row:?}"
+        );
+        assert_eq!(
+            row.data_json,
+            "{\"degradations\":[\"attachment_unindexed\"],\"warnings\":[\"windows_incompatible_name\"],\"windows_incompatible_names\":[\"nul.txt\"]}",
+            "both vocabularies and the component, exactly: {row:?}"
+        );
+        // The nested row names the directory component, not the file name.
+        let row = rows
+            .iter()
+            .find(|event| event.source_key.as_deref() == Some("note:con/note.md"))
+            .expect("a row for the nested file");
+        assert_eq!(row.outcome.as_deref(), Some("indexed"), "{row:?}");
+        assert_eq!(
+            row.reason_code.as_deref(),
+            Some("windows_incompatible_name"),
+            "{row:?}"
+        );
+        assert_eq!(
+            row.data_json,
+            "{\"warnings\":[\"windows_incompatible_name\"],\"windows_incompatible_names\":[\"con\"]}",
+            "the offending component is the directory: {row:?}"
+        );
+        assert!(
+            search_workspace(dir.path(), "NESTEDTOKEN", 10)
+                .expect("search")
+                .hits
+                .iter()
+                .any(|hit| hit.hit.source_key == "note:con/note.md"),
+            "a nested file is indexed despite its directory's name"
+        );
+        for name in [
+            "constitution.md",
+            "console.md",
+            "aux2.md",
+            "com10.md",
+            "trail .md",
+        ] {
+            let key = format!("note:{name}");
+            let row = rows
+                .iter()
+                .find(|event| event.source_key.as_deref() == Some(key.as_str()))
+                .expect("a row");
+            assert_eq!(row.reason_code.as_deref(), None, "{row:?}");
+            assert_eq!(row.data_json, "{}", "{row:?}");
+        }
+        // The flagged notes are still indexed and searchable: the warning does
+        // not change the outcome. (`nul.txt`'s bytes are not searchable for the
+        // other reason — it is an attachment, and its row says so.)
+        let hits = search_workspace(dir.path(), "WINDOWSATOKEN", 10).expect("search");
+        for key in ["note:con.md", "note:aux.md"] {
+            assert!(
+                hits.hits.iter().any(|hit| hit.hit.source_key == key),
+                "{key} is searchable despite its name: {hits:?}"
+            );
+        }
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(
+            coverage
+                .warnings
+                .get(&momotaro_contracts::Warning::WindowsIncompatibleName)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((4, 0)),
+            "{coverage:?}"
+        );
+        assert!(coverage.failures.is_empty(), "{coverage:?}");
+
+        // A no-op re-run keeps the warning on the skipped rows — the name is a
+        // fact about the file whether or not this run read its bytes.
+        let report = index_workspace(dir.path(), None).expect("reindex");
+        assert_eq!(report.files_skipped, 9, "{report:?}");
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(
+            coverage
+                .warnings
+                .get(&momotaro_contracts::Warning::WindowsIncompatibleName)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((0, 4)),
+            "{coverage:?}"
+        );
+        let rows = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read the batch");
+        let row = rows
+            .iter()
+            .find(|event| event.source_key.as_deref() == Some("note:con.md"))
+            .expect("a row");
+        assert_eq!(row.outcome.as_deref(), Some("skipped"), "{row:?}");
+        assert_eq!(
+            row.reason_code.as_deref(),
+            Some("windows_incompatible_name"),
+            "{row:?}"
+        );
+
+        // The third read-state: a warning must ride a `metadata_refreshed` row
+        // too. Rewriting the same bytes with a fresh mtime fails the fingerprint
+        // check but not the hash check — that is the refresh path — and the
+        // warning has to survive it. (A move *within* the vault is not this
+        // case: the key is the path, so that is a new source.)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(vault.join("aux.md"), "# aux.md\n\nWINDOWSATOKEN\n").expect("rewrite");
+        let report = index_workspace(dir.path(), None).expect("index after the rewrite");
+        assert_eq!(report.files_indexed, 1, "{report:?}");
+        assert_eq!(report.files_skipped, 8, "{report:?}");
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(
+            coverage
+                .warnings
+                .get(&momotaro_contracts::Warning::WindowsIncompatibleName)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((1, 3)),
+            "a refreshed row is in the index, and its name warning rides it: {coverage:?}"
+        );
+        let rows = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read the batch");
+        let row = rows
+            .iter()
+            .find(|event| event.source_key.as_deref() == Some("note:aux.md"))
+            .expect("a row for the rewritten file");
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some("metadata_refreshed"),
+            "{row:?}"
+        );
+        assert_eq!(
+            row.reason_code.as_deref(),
+            Some("windows_incompatible_name"),
+            "{row:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn illegal_characters_and_trailing_marks_survive_a_real_filesystem() {
+        // Names only POSIX file systems hold at all — Win32 refuses `|` and
+        // silently strips a trailing dot or space — so this half of the
+        // predicate's story runs where those names are real: CI's ubuntu leg
+        // (a machine that cannot create them also cannot compile this test).
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(vault.join("dir.")).expect("create dir.");
+        fs::create_dir_all(vault.join("dir ")).expect("create dir ");
+        fs::write(vault.join("a|b.md"), "# pipe\n\nPIPETOKEN\n").expect("write");
+        fs::write(vault.join("dir./note.md"), "# dot\n\nDOTTOKEN\n").expect("write");
+        fs::write(vault.join("dir /note.md"), "# space\n\nSPACETOKEN\n").expect("write");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+        assert!(report.errors.is_empty(), "{report:?}");
+
+        let store = store_of(dir.path());
+        let rows = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read the batch");
+        for (key, component) in [
+            ("note:a|b.md", "a|b.md"),
+            ("note:dir./note.md", "dir."),
+            ("note:dir /note.md", "dir "),
+        ] {
+            let row = rows
+                .iter()
+                .find(|event| event.source_key.as_deref() == Some(key))
+                .expect("a row");
+            assert_eq!(row.outcome.as_deref(), Some("indexed"), "{row:?}");
+            assert_eq!(
+                row.reason_code.as_deref(),
+                Some("windows_incompatible_name"),
+                "{row:?}"
+            );
+            assert_eq!(
+                row.data_json,
+                format!(
+                    "{{\"warnings\":[\"windows_incompatible_name\"],\"windows_incompatible_names\":[\"{component}\"]}}"
+                ),
+                "the offending component, exactly: {row:?}"
+            );
+        }
+        for (token, key) in [
+            ("PIPETOKEN", "note:a|b.md"),
+            ("DOTTOKEN", "note:dir./note.md"),
+            ("SPACETOKEN", "note:dir /note.md"),
+        ] {
+            assert!(
+                search_workspace(dir.path(), token, 10)
+                    .expect("search")
+                    .hits
+                    .iter()
+                    .any(|hit| hit.hit.source_key == key),
+                "{key} is indexed despite its name"
+            );
+        }
+    }
+
+    #[test]
+    fn a_warning_code_written_only_to_the_column_is_counted_not_failed() {
+        // The trap this unit had to land with: a row from a writer that filled
+        // no payload lists — the shape every row had before the lists existed —
+        // carries its code in `reason_code` alone, and the reader must know the
+        // warning vocabulary before it calls anything unknown. Reverting the
+        // two-vocabulary fallback reports a warning as a failure.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("note.md"), "# Note\n\nbody\n").expect("write");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        let mut store = store_of(dir.path());
+        store
+            .append_store_event(&momotaro_store::NewStoreEvent {
+                occurred_at: 2,
+                batch_id: &report.batch_id,
+                seq: 98,
+                domain: "ingest",
+                event_type: "ingest.coverage",
+                source_key: Some("note:from-a-writer.md"),
+                outcome: Some("indexed"),
+                reason_code: Some("windows_incompatible_name"),
+                message: None,
+                data_json: "{}",
+                external_id: None,
+            })
+            .expect("append a column-only row");
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(
+            coverage
+                .warnings
+                .get(&momotaro_contracts::Warning::WindowsIncompatibleName)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((1, 0)),
+            "a known warning in the column is counted, not failed: {coverage:?}"
+        );
+        assert!(coverage.failures.is_empty(), "{coverage:?}");
+
+        // A code neither vocabulary knows is still a failure: only the set of
+        // known vocabularies grew, the posture did not change.
+        store
+            .append_store_event(&momotaro_store::NewStoreEvent {
+                occurred_at: 3,
+                batch_id: &report.batch_id,
+                seq: 99,
+                domain: "ingest",
+                event_type: "ingest.coverage",
+                source_key: Some("note:from-the-future.md"),
+                outcome: Some("indexed"),
+                reason_code: Some("a_code_from_the_future"),
+                message: None,
+                data_json: "{}",
+                external_id: None,
+            })
+            .expect("append a foreign row");
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(coverage.failures.len(), 1, "{coverage:?}");
+        assert_eq!(
+            coverage.failures[0].reason_code.as_deref(),
+            Some("a_code_from_the_future"),
+            "{coverage:?}"
+        );
+        assert_eq!(
+            coverage
+                .warnings
+                .get(&momotaro_contracts::Warning::WindowsIncompatibleName)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((1, 0)),
+            "{coverage:?}"
+        );
+
+        // The other half of the fallback: a column-only row whose code is a
+        // DEGRADATION must land in the degradation bucket — a reader that
+        // tried the warning vocabulary first would count it as a failure.
+        store
+            .append_store_event(&momotaro_store::NewStoreEvent {
+                occurred_at: 4,
+                batch_id: &report.batch_id,
+                seq: 100,
+                domain: "ingest",
+                event_type: "ingest.coverage",
+                source_key: Some("note:older-writer.md"),
+                outcome: Some("indexed"),
+                reason_code: Some("frontmatter_parse_error"),
+                message: None,
+                data_json: "{}",
+                external_id: None,
+            })
+            .expect("append a degradation column-only row");
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(
+            coverage
+                .degradations
+                .get(&momotaro_contracts::Degradation::FrontmatterParseError)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((1, 0)),
+            "a known degradation in the column is counted, not failed: {coverage:?}"
+        );
+        assert_eq!(coverage.failures.len(), 1, "{coverage:?}");
     }
 }

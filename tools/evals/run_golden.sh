@@ -45,6 +45,10 @@ rm -rf "$scratch"
 mkdir -p "$scratch/vault"
 cp -r crates/momotaro-run/tests/fixtures/vault/. "$scratch/vault/"
 printf '[vault]\npath = "vault"\n' > "$scratch/momotaro.toml"
+# D42: an iCloud eviction stub is not content — it never enters the index, so
+# the retrieval numbers below cannot move because of it — and its audit row is
+# the only reason a report can say a note was evicted on some other device.
+printf 'stub text\n' > "$scratch/vault/.note.md.icloud"
 
 # The binary, the workspace and the eval script all reach native subprocesses, so
 # MSYS/Git Bash needs native spellings for them (`/d/...` arrives as `D:\d\...`).
@@ -78,12 +82,19 @@ done
 "$python" - "$scratch" <<'PY'
 import sqlite3, sys
 db = sys.argv[1].rstrip("/\\") + "/.momotaro/momotaro.db"
-counts = dict(sqlite3.connect(db).execute("select type, count(*) from store_events group by type"))
-expected = {"ingest.started": 1, "ingest.finished": 1, "ingest.coverage": 5}
+connection = sqlite3.connect(db)
+counts = dict(connection.execute("select type, count(*) from store_events group by type"))
+expected = {"ingest.started": 1, "ingest.finished": 1, "ingest.coverage": 6}
 if counts != expected:
     print(f"FAIL: store_events {counts!r}, expected {expected!r}")
     sys.exit(1)
-print(f"store_events ok: {counts}")
+stub = connection.execute(
+    "select count(*) from store_events where reason_code = 'icloud_placeholder'"
+).fetchone()[0]
+if stub != 1:
+    print(f"FAIL: icloud_placeholder rows {stub!r}, expected 1 (D42)")
+    sys.exit(1)
+print(f"store_events ok: {counts} (+1 icloud_placeholder row)")
 PY
 "$python" "$repo/tools/evals/eval_search.py" \
   --workspace "$scratch" \

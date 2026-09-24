@@ -179,8 +179,8 @@ parse_error。
    **现状（2026-09-18）**：解析、接线与排除**已落地**（字段进
    `source_revisions.metadata_json` 的 `frontmatter` 键、正文进 chunker 且 locator
    按原 note 计、失败发 `frontmatter_parse_error` 且 `outcome` 仍为 `indexed`）；
-   **未做**的是 wikilink 五类降级（随 W2.4 建边）与同步盘三条（OneDrive/iCloud/Windows
-   非法名，都是**预警**而非十类之一）——它们随本波剩余任务落地；十类里**已有生产者的
+   **未做**的是 wikilink 五类降级（随 W2.4 建边）；同步盘三条（OneDrive/iCloud/Windows
+   非法名）**已落**，是 `Warning` 而非十类之一（口径见 §6 第 5 条与第 8 条 ⑤）；十类里**已有生产者的
    五类**是 `frontmatter_parse_error`、`canvas_parse_error`、`excalidraw_detected`
    （第 9 条）、`attachment_unindexed`、`symlink_encountered`（第 10 条）；
 6. **解析基座**：pulldown-cmark ≥ 0.13.3 + `ENABLE_WIKILINKS`（官方内置、
@@ -198,6 +198,15 @@ parse_error。
    ③ **完整列表进同一行的 `data_json`**（`{"degradations":[…]}`）——
    `data_json` 列已存在，**不需要 schema 迁移**；④ `CoverageReport` 按码**计数**
    暴露（`doctor --coverage` 因此不再把带码的行只算作 `indexed` 而把码吞掉）。
+   ⑤ **预警与降级是两个词表、同一行**（2026-09-24）：同步盘三条（`onedrive_placeholder` /
+   `icloud_placeholder` / `windows_incompatible_name`）是 `Warning` 而不是
+   `Degradation`——十类仍是十类（预警不是「丢了什么」，是「换一台平台活不下去」）。
+   承载与降级同形：`reason_code` = 降级的首个，**无降级时才轮到**预警的首个；
+   `data_json` 增 `"warnings"` 键、非法名行另有 `"windows_incompatible_names"` 键
+   （各自非空才写）。读者（`doctor --coverage` 与任何读行的人）必须**先查两个词表再判未知**——
+   已知预警**不是** failure；两个词表都不认识的码照旧计入 failures。
+   `CoverageReport.warnings` 按码 × 行状态计数（与 `degradations` 同形），
+   `doctor --coverage` 两个清单都渲染。
    两条被否的替代：**每码一行**（破坏「每个走到的文件恰好一行」的计数不变量）
    与 **`reason_code` 里拼分隔串**（列是稳定码，编码串会诱使下游做字符串匹配）。
 9. **`.canvas` 的文本口径，与 Excalidraw 场景段（2026-09-21 定，随 W2.3 落地）**：
@@ -292,13 +301,29 @@ parse_error。
 4. **碰撞策略**：NFC 键相同而原始字节不同 → 两条目都保留 + 消歧后缀 +
    `key_collision` 警告事件；**「绝不静默合并」只作用于身份键**（内容寻址的
    revision 集与同策略幂等替换的 chunk 集允许静默并）；
-5. **同步盘预警**：OneDrive placeholder 检查属性位（RECALL_*）→ 只建元数据
-   条目 + 事件，绝不默认读内容；iCloud `*.icloud` 跳过 + 事件；Windows 非法名
-   （保留名/尾随空格点）在非 Windows 端照常索引但发 `windows_incompatible_name`
-   预警（会经同步盘毒化 Windows 端）；长路径 manifest 声明 longPathAware +
-   文档明示 LongPathsEnabled；
-6. **平台测试矩阵（11 项进 CI）**：大小写双写/仅大小写改名/NFD/NFC+NFD
-   双写/260 长路径/保留名与尾随字符/OneDrive placeholder/iCloud placeholder/
+5. **同步盘预警（D42 三条，词表 `Warning`）**：
+   - **OneDrive placeholder**：判据**只认** `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`——
+     官方要求所有 Cloud Files 占位必须置位；`OFFLINE`（普通文件上也能置位，实测）、
+     `PINNED`/`UNPINNED`（用户意图）、`REPARSE_POINT`（链接）一律**不作判据**；
+     `RECALL_ON_OPEN` 只在列目录类查询里出现、句柄读看不到，故不进判据。检查点在
+     `fs::metadata`（不读内容）之后、一切读取之前：命中即**不读内容、不建 revision**
+     （内容不可寻址时没有诚实的散列），行 = `skipped` + `onedrive_placeholder`；本地化后
+     下一次 `index` 正常读入——每次运行重查属性位，状态翻转立刻跟上（行本身就是那条
+     元数据条目）。
+   - **iCloud 驱逐占位**：判据**两端锚定**（`starts_with('.') && ends_with(".icloud")`）；
+     `x.icloud.md`、`.x.icloud.md` 这类名字里含 `.icloud` 的真笔记不受影响。点文件本就
+     不入 vault，这条只把占位**报出来**：行 = `skipped` + `icloud_placeholder`，其内容
+     永不进 FTS。
+   - **Windows 非法名**：判据**逐组件**——第一个 `.` 之前的第一段与 28 个保留名
+     （CON/PRN/AUX/NUL、COM1–9/LPT1–9、COM¹²³/LPT¹²³；ASCII 不敏感）**全等**
+     （`constitution.md`/`com10.md`/`aux2.md` 合法）、出现保留字符 `<` `>` `:` `"` `/`
+     `\` `|` `?` `*` 或 NUL/1–31 控制字符、末字符是点或空格。命中即发
+     `windows_incompatible_name`（`outcome` 不变、照常索引，命中组件列表随行）；判据
+     **与平台无关**（名字过一次盘就可能毒化 Windows 端，任何平台都如实预警）。
+   - 长路径 manifest 声明 longPathAware + 文档明示 LongPathsEnabled；
+6. **平台测试矩阵（11 项；随 W2.6 的 `path_matrix.rs` 进 CI）**：大小写双写/仅大小写改名/NFD/NFC+NFD
+   双写/260 长路径/保留名与尾随字符/OneDrive placeholder（**真样本只能手工一次**——该属性位
+   只有内核/云引擎能置，CI 造不出；仓里是 `#[ignore]` 的手工测试）/iCloud placeholder/
    三种路径表述同一键/折叠陷阱字符（İ、Σ、Maße、者/者）/exFAT 移动盘。
 
 source_key 是主键，**P0 级正确**——现在定错以后改不动。

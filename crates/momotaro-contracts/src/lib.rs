@@ -586,20 +586,90 @@ impl Degradation {
     }
 }
 
-/// How the rows carrying one degradation code were handled.
+/// What will not survive another platform, though nothing was lost here (D42).
 ///
-/// Two axes, because that is what the log holds: a `indexed`/`metadata_refreshed`
-/// row is in the index anyway, a `skipped` row was not read (a link is not followed;
-/// an unchanged attachment is not read again), and both can carry the same code.
+/// A warning is not a [`Degradation`]: the ten degradations say what a file
+/// lost on the way into the index, while a warning is a standing fact about
+/// the file — a cloud placeholder whose bytes are not on this device, an iCloud
+/// eviction stub in a note's place, a name an ordinary Windows machine will not
+/// accept. Nothing was lost by the file, the ten stay ten, and a reader that
+/// counts degradations is not taught a fourth kind of loss. The two
+/// vocabularies share the `reason_code` column and a row's `data_json`; a
+/// reader must consult both before calling a code unknown (ADR 0026, "A
+/// warning is not a degradation").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Warning {
+    /// A cloud placeholder (`FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`): its bytes
+    /// are not on this device, so it was not read (D42).
+    ///
+    /// The explicit rename is load-bearing: `snake_case` alone would split the
+    /// product name into `one_drive_placeholder`, and the witness test pins the
+    /// two spellings together.
+    #[serde(rename = "onedrive_placeholder")]
+    OneDrivePlaceholder,
+    /// An iCloud eviction stub (`.name.icloud`): the note it stands for is not
+    /// here; the stub itself is skipped and never read (D42).
+    IcloudPlaceholder,
+    /// A name an ordinary Windows machine will not accept (reserved device
+    /// name, reserved character, trailing dot or space): indexed here, poisoned
+    /// by the first sync that meets Windows (D42).
+    WindowsIncompatibleName,
+}
+
+impl Warning {
+    /// Every warning, in the order a row's warnings are reported and counted.
+    ///
+    /// One list, iterated by `from_code` and by the tests:
+    /// `the_warning_list_is_complete` matches every variant without a
+    /// wildcard, so a code cannot be added to `as_str` alone.
+    pub const ALL: [Self; 3] = [
+        Self::OneDrivePlaceholder,
+        Self::IcloudPlaceholder,
+        Self::WindowsIncompatibleName,
+    ];
+
+    /// The wire spelling written to `store_events.reason_code` and to the
+    /// row's `warnings` payload.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OneDrivePlaceholder => "onedrive_placeholder",
+            Self::IcloudPlaceholder => "icloud_placeholder",
+            Self::WindowsIncompatibleName => "windows_incompatible_name",
+        }
+    }
+
+    /// The code back as a variant, for the readers of stored rows.
+    ///
+    /// `None` is a code from a vocabulary this build does not know (or one from
+    /// the other vocabulary); the caller decides, and [`Self::as_str`] is the
+    /// only writer, so the two cannot drift apart silently.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == code)
+    }
+}
+
+/// How the rows carrying one code were handled.
+///
+/// Two axes, because that is what the log holds: an `indexed`/`metadata_refreshed`
+/// row is in the index anyway, a `skipped` row was not read (a link is not
+/// followed; an unchanged attachment is not read again; an eviction stub or a
+/// cloud placeholder is not read at all), and both can carry the same code —
+/// whether it is a [`Degradation`] or a [`Warning`], which is why this type
+/// carries no vocabulary of its own.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DegradationCounts {
+pub struct CoverageCounts {
     /// Rows that went into the index anyway.
     pub in_index: u64,
     /// Rows nothing was read for.
     pub skipped: u64,
 }
 
-impl DegradationCounts {
+impl CoverageCounts {
     /// Both axes, for a reader that only wants the total.
     #[must_use]
     pub fn total(self) -> u64 {
@@ -630,7 +700,15 @@ pub struct CoverageReport {
     /// Without this, a note whose block could not be read is indistinguishable from a
     /// clean one in this report: the row says `indexed` and the code was only in the
     /// event table.
-    pub degradations: BTreeMap<Degradation, DegradationCounts>,
+    pub degradations: BTreeMap<Degradation, CoverageCounts>,
+    /// What the rows carrying a warning said (D42), counted like [`Self::degradations`].
+    ///
+    /// A warning is not a loss: the file is in the index, or was skipped, and the
+    /// code says what will not survive another platform — a name no ordinary
+    /// Windows machine accepts, a placeholder whose bytes are not here, an
+    /// eviction stub where a note used to be. Same two axes, same rule: the
+    /// state is the row's, never the code's.
+    pub warnings: BTreeMap<Warning, CoverageCounts>,
     /// Rows that failed, in the batch's own order (`seq`, not `id`).
     pub failures: Vec<CoverageFailure>,
     /// Every row in the batch, including its beginning and its end.
@@ -771,6 +849,48 @@ mod tests {
                 serde_json::to_string(&code).expect("serialize"),
                 format!("\"{}\"", code.as_str()),
                 "{code:?} spells differently in JSON and in Display (as_str)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_warning_list_is_complete() {
+        // Same rule as the degradation list above: no wildcard here, so a fourth
+        // warning fails to compile, and the count then forces it into `ALL`.
+        for warning in Warning::ALL {
+            match warning {
+                Warning::OneDrivePlaceholder => {}
+                Warning::IcloudPlaceholder => {}
+                Warning::WindowsIncompatibleName => {}
+            }
+        }
+        assert_eq!(Warning::ALL.len(), 3, "extend ALL, not just as_str");
+    }
+
+    #[test]
+    fn a_warning_code_parses_back_to_its_variant() {
+        for warning in Warning::ALL {
+            assert_eq!(Warning::from_code(warning.as_str()), Some(warning));
+        }
+        assert_eq!(
+            Warning::from_code("a_code_from_the_future"),
+            None,
+            "an unknown code is none of our business, not a panic"
+        );
+        assert_eq!(
+            Warning::from_code("frontmatter_parse_error"),
+            None,
+            "the vocabularies are separate: a degradation is not a warning"
+        );
+    }
+
+    #[test]
+    fn every_warning_spells_the_same_on_the_wire() {
+        for warning in Warning::ALL {
+            assert_eq!(
+                serde_json::to_string(&warning).expect("serialize"),
+                format!("\"{}\"", warning.as_str()),
+                "{warning:?} spells differently in JSON and in Display (as_str)"
             );
         }
     }

@@ -15,6 +15,7 @@ pub mod frontmatter;
 mod hash;
 mod normalize;
 mod path;
+mod portability;
 mod title;
 mod walk;
 
@@ -23,6 +24,7 @@ pub use excalidraw::scene_spans;
 pub use hash::{chunk_hash, chunk_id, revision_hash, revision_hash_reader};
 pub use normalize::normalize_markdown;
 pub use path::{canonical_workspace_root, is_within, local_path_in, resolve_local_path};
+pub use portability::{attributes_of, is_cloud_placeholder, windows_incompatible_components};
 pub use title::derive_title;
 pub use walk::{VaultEntry, VaultFileKind, raw_name_for, source_key_for, walk_entries};
 

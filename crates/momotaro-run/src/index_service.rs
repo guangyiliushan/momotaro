@@ -10,13 +10,15 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use momotaro_contracts::{
-    Chunk, CoverageFailure, CoverageReport, Degradation, IndexFileError, IndexFileErrorKind,
-    IndexPolicy, IndexReport, OriginClass, RetrievalHit, SourceKind, WorkspaceStatus,
+    Chunk, CoverageCounts, CoverageFailure, CoverageReport, Degradation, IndexFileError,
+    IndexFileErrorKind, IndexPolicy, IndexReport, OriginClass, RetrievalHit, SourceKind, Warning,
+    WorkspaceStatus,
 };
 use momotaro_ingest::frontmatter::{self, FrontmatterParse};
 use momotaro_ingest::{
-    SourceOffset, VaultFileKind, chunk_markdown_with, derive_title, normalize_markdown,
-    raw_name_for, revision_hash, revision_hash_reader, scene_spans, source_key_for, walk_entries,
+    SourceOffset, VaultFileKind, attributes_of, chunk_markdown_with, derive_title,
+    is_cloud_placeholder, normalize_markdown, raw_name_for, revision_hash, revision_hash_reader,
+    scene_spans, source_key_for, walk_entries, windows_incompatible_components,
 };
 use momotaro_retrieve::{IndexWriterHandle, RetrieveError, SearchIndex};
 use momotaro_store::{NewSourceRevision, NewStoreEvent, Store, StoreError};
@@ -146,38 +148,46 @@ pub fn coverage_report(root: impl AsRef<Path>) -> Result<Option<CoverageReport>,
     Ok(Some(summarize_coverage(&latest.batch_id, &events)))
 }
 
-/// Counts one row's degradations, from its whole list when it carries one and
-/// from its primary code otherwise.
+/// Counts one row's codes, from its whole lists when it carries them and from
+/// its primary code otherwise.
 ///
-/// The fallback is for rows written before the list existed (and for the refusal
-/// rows, which never carry one). A code this build does not know is a fact about
-/// the batch, not noise — the same posture as an unreadable outcome below.
-fn count_degradations(report: &mut CoverageReport, event: &momotaro_store::StoreEvent) {
-    let codes: Vec<String> = serde_json::from_str::<serde_json::Value>(&event.data_json)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("degradations")
-                .and_then(|list| serde_json::from_value::<Vec<String>>(list.clone()).ok())
-        })
-        .filter(|list| !list.is_empty())
-        .unwrap_or_else(|| event.reason_code.iter().cloned().collect());
+/// The fallback is for rows written before the lists existed (and for the
+/// refusal rows, which never carry one), and it consults **both** vocabularies:
+/// `reason_code` holds the first degradation, or the first warning on a row
+/// with no degradation (§5 第 8 条 ⑤), and a reader that tried only one
+/// vocabulary would report a warning as a failure. A code neither vocabulary
+/// knows is a fact about the batch, not noise — the same posture as an
+/// unreadable outcome below.
+fn count_codes(report: &mut CoverageReport, event: &momotaro_store::StoreEvent) {
+    let value = serde_json::from_str::<serde_json::Value>(&event.data_json).ok();
+    let list = |key: &str| -> Vec<String> {
+        value
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(|list| serde_json::from_value::<Vec<String>>(list.clone()).ok())
+            .unwrap_or_default()
+    };
+    let mut degradation_codes = list("degradations");
+    let mut warning_codes = list("warnings");
+    if degradation_codes.is_empty()
+        && warning_codes.is_empty()
+        && let Some(code) = event.reason_code.as_deref()
+    {
+        if Warning::from_code(code).is_some() {
+            warning_codes.push(code.to_owned());
+        } else {
+            degradation_codes.push(code.to_owned());
+        }
+    }
     // The axis is the row's, not the code's: the same code rides rows that are in
     // the index anyway and rows nothing was read for.
     let in_index = matches!(
         event.outcome.as_deref(),
         Some(FileOutcome::INDEXED) | Some(FileOutcome::METADATA_REFRESHED)
     );
-    for code in &codes {
+    for code in &degradation_codes {
         match Degradation::from_code(code) {
-            Some(known) => {
-                let counts = report.degradations.entry(known).or_default();
-                if in_index {
-                    counts.in_index += 1;
-                } else {
-                    counts.skipped += 1;
-                }
-            }
+            Some(known) => count_row(&mut report.degradations, known, in_index),
             None => report.failures.push(CoverageFailure {
                 source_key: event.source_key.clone(),
                 reason_code: Some(code.clone()),
@@ -186,6 +196,29 @@ fn count_degradations(report: &mut CoverageReport, event: &momotaro_store::Store
                 )),
             }),
         }
+    }
+    for code in &warning_codes {
+        match Warning::from_code(code) {
+            Some(known) => count_row(&mut report.warnings, known, in_index),
+            None => report.failures.push(CoverageFailure {
+                source_key: event.source_key.clone(),
+                reason_code: Some(code.clone()),
+                message: Some(format!(
+                    "a row carries a warning code this build does not know: {code}"
+                )),
+            }),
+        }
+    }
+}
+
+/// Adds one row's verdict to a code's counts: `in_index` means the row went
+/// into the index anyway, and anything else means nothing was read for it.
+fn count_row<T: Ord>(map: &mut BTreeMap<T, CoverageCounts>, code: T, in_index: bool) {
+    let counts = map.entry(code).or_default();
+    if in_index {
+        counts.in_index += 1;
+    } else {
+        counts.skipped += 1;
     }
 }
 
@@ -201,6 +234,7 @@ fn summarize_coverage(batch_id: &str, events: &[momotaro_store::StoreEvent]) -> 
         skipped: 0,
         refreshed: 0,
         degradations: BTreeMap::new(),
+        warnings: BTreeMap::new(),
         failures: Vec::new(),
         events: events.len() as u64,
         finished: false,
@@ -211,20 +245,20 @@ fn summarize_coverage(batch_id: &str, events: &[momotaro_store::StoreEvent]) -> 
             "ingest.coverage" => match event.outcome.as_deref() {
                 Some(outcome) if outcome == FileOutcome::INDEXED => {
                     report.indexed += 1;
-                    count_degradations(&mut report, event);
+                    count_codes(&mut report, event);
                 }
                 Some(outcome) if outcome == FileOutcome::SKIPPED => {
                     report.skipped += 1;
                     // A skipped row can carry a code too — a link the index does not
                     // follow says so on its row, and a reader that drops it would
                     // report the batch as having lost nothing.
-                    count_degradations(&mut report, event);
+                    count_codes(&mut report, event);
                 }
                 Some(outcome) if outcome == FileOutcome::METADATA_REFRESHED => {
                     report.refreshed += 1;
                     // A refreshed file lost whatever the re-derived block says it
                     // lost: this path used to keep the blob's answer to itself.
-                    count_degradations(&mut report, event);
+                    count_codes(&mut report, event);
                 }
                 _ => report.failures.push(CoverageFailure {
                     source_key: event.source_key.clone(),
@@ -325,19 +359,112 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_row_payload_spells_a_degradation_list_and_nothing_for_an_empty_one() {
+    fn the_row_payload_carries_each_list_only_when_it_has_one() {
         // The shape the coverage row's `data_json` carries, pinned on the pure
-        // function that builds it — so "the shape has a test" is a fact about this
-        // change rather than a claim about it: an empty list is `{}`, and a list is
-        // the codes in the order the caller derived them (§5 第 8 条).
-        assert_eq!(degradations_json(&[]), "{}");
+        // function that builds it — the empty payload is exactly `{}`, each list
+        // is written only when it is non-empty, and a row can carry both
+        // vocabularies at once (§5 第 8 条).
+        assert_eq!(payload_json(&RowPayload::NONE), "{}");
         assert_eq!(
-            degradations_json(&[
-                Degradation::FrontmatterParseError,
-                Degradation::ExcalidrawDetected,
-            ]),
+            payload_json(&RowPayload {
+                degradations: &[
+                    Degradation::FrontmatterParseError,
+                    Degradation::ExcalidrawDetected,
+                ],
+                warnings: &[],
+                windows_names: &[],
+            }),
             "{\"degradations\":[\"frontmatter_parse_error\",\"excalidraw_detected\"]}"
         );
+        assert_eq!(
+            payload_json(&RowPayload {
+                degradations: &[Degradation::FrontmatterParseError],
+                warnings: &[Warning::WindowsIncompatibleName],
+                windows_names: &["dir.".to_owned()],
+            }),
+            "{\"degradations\":[\"frontmatter_parse_error\"],\"warnings\":[\"windows_incompatible_name\"],\"windows_incompatible_names\":[\"dir.\"]}"
+        );
+        assert_eq!(
+            payload_json(&RowPayload {
+                degradations: &[],
+                warnings: &[Warning::IcloudPlaceholder],
+                windows_names: &[],
+            }),
+            "{\"warnings\":[\"icloud_placeholder\"]}"
+        );
+    }
+
+    #[test]
+    fn every_code_carries_the_sentence_this_table_pins() {
+        // The two match blocks below are written by hand, and what a row's
+        // reader sees is their output — a review's probe swapped two sentences
+        // and no assertion noticed. The whole table is pinned here: a swap
+        // fails, and the enums' exhaustiveness keeps a new code from having no
+        // sentence at all.
+        for (code, sentence) in [
+            (
+                Degradation::FrontmatterParseError,
+                "the file was indexed; its frontmatter block could not be read (D41.5)",
+            ),
+            (
+                Degradation::UnresolvedWikilink,
+                "the file was indexed; a wikilink points at a note that is not here (D41.1)",
+            ),
+            (
+                Degradation::AmbiguousWikilink,
+                "the file was indexed; a wikilink matches more than one note, so no edge was built (D41.2)",
+            ),
+            (
+                Degradation::StaleAnchor,
+                "the file was indexed; a heading anchor does not exist in its target (D41.3)",
+            ),
+            (
+                Degradation::MarkdownLinkDecodeError,
+                "the file was indexed; a markdown link's target could not be decoded (D41.4)",
+            ),
+            (
+                Degradation::UnknownLinkSyntax,
+                "the file was indexed; a link uses a syntax this build does not know (D41.6)",
+            ),
+            (
+                Degradation::CanvasParseError,
+                "the file was indexed; its canvas block could not be read as JSON (D41.8)",
+            ),
+            (
+                Degradation::ExcalidrawDetected,
+                "the file was indexed; its Excalidraw scene stays out of the index (D41.7)",
+            ),
+            (
+                Degradation::SymlinkEncountered,
+                "the path is a symlink; it was recorded, not followed (D41.9)",
+            ),
+            (
+                Degradation::AttachmentUnindexed,
+                "the file was registered; its bytes are not searchable on purpose (D41.10)",
+            ),
+        ] {
+            assert_eq!(
+                degradation_message(code),
+                sentence,
+                "{code:?} must carry the sentence its row shows"
+            );
+        }
+        for (warning, sentence) in [
+            (
+                Warning::OneDrivePlaceholder,
+                "the file is a cloud placeholder; its bytes are not on this device, so nothing was read (D42)",
+            ),
+            (
+                Warning::IcloudPlaceholder,
+                "the file is an iCloud eviction stub; the note it stands for is not on this device (D42)",
+            ),
+            (
+                Warning::WindowsIncompatibleName,
+                "the name is not one an ordinary Windows machine accepts; the first sync there will not carry it (D42)",
+            ),
+        ] {
+            assert_eq!(warning_message(warning), sentence, "{warning:?}");
+        }
     }
 
     #[test]
@@ -746,19 +873,64 @@ fn degradations_of(frontmatter: &FrontmatterParse) -> Vec<Degradation> {
     }
 }
 
-/// The `data_json` payload for one coverage row: the whole list, or `{}`.
+/// The code lists one coverage row carries (`ingest-interop.md` §5 第 8 条):
+/// what the file lost, the warnings it earned (D42), and — for a
+/// `windows_incompatible_name` row — the components the warning is about. One
+/// bundle, so the row writer takes one payload argument instead of three, and
+/// a third vocabulary would not grow its parameter list again.
+struct RowPayload<'a> {
+    degradations: &'a [Degradation],
+    warnings: &'a [Warning],
+    windows_names: &'a [String],
+}
+
+impl RowPayload<'_> {
+    /// A row that carries no codes at all (refusals, and errors).
+    const NONE: RowPayload<'static> = RowPayload {
+        degradations: &[],
+        warnings: &[],
+        windows_names: &[],
+    };
+}
+
+/// The `data_json` payload for one coverage row, or `{}` when it carries none.
 ///
-/// Pure, so the shape has a test without a store: a row that lost several things
-/// must carry several, and a row that lost none carries no list at all.
-fn degradations_json(degradations: &[Degradation]) -> String {
-    if degradations.is_empty() {
-        return "{}".to_owned();
+/// Pure, so the shape has a test without a store: each list is written only
+/// when it is non-empty, and a row that lost and earned nothing is exactly
+/// `{}`.
+fn payload_json(payload: &RowPayload<'_>) -> String {
+    let mut object = serde_json::Map::new();
+    if !payload.degradations.is_empty() {
+        object.insert(
+            "degradations".to_owned(),
+            serde_json::json!(
+                payload
+                    .degradations
+                    .iter()
+                    .map(|code| code.as_str())
+                    .collect::<Vec<_>>()
+            ),
+        );
     }
-    let codes = degradations
-        .iter()
-        .map(|code| code.as_str())
-        .collect::<Vec<_>>();
-    serde_json::json!({ "degradations": codes }).to_string()
+    if !payload.warnings.is_empty() {
+        object.insert(
+            "warnings".to_owned(),
+            serde_json::json!(
+                payload
+                    .warnings
+                    .iter()
+                    .map(|code| code.as_str())
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    if !payload.windows_names.is_empty() {
+        object.insert(
+            "windows_incompatible_names".to_owned(),
+            serde_json::json!(payload.windows_names),
+        );
+    }
+    serde_json::Value::Object(object).to_string()
 }
 
 /// Appends one `ingest.coverage` row, and records the failure when there is one.
@@ -768,9 +940,11 @@ fn degradations_json(degradations: &[Degradation]) -> String {
 /// its message is the very string the report carries. No call site re-types
 /// either, the row cannot disagree with the report, and no clone is needed to
 /// keep them equal.
-// Nine arguments. The alternative a review measured is a parameter struct: +22
-// lines, one fewer allow, nothing else fixed. The rule this function exists for
-// is one home per rendering, not fewer parameters.
+// Ten arguments, the same count as before the warnings landed: the three code
+// lists ride the one `RowPayload` bundle (one more explicit list would have
+// made twelve). The wider context struct a review measured was +22 lines and
+// fixed nothing; the rule this function exists for is one home per rendering,
+// not fewer parameters.
 #[allow(clippy::too_many_arguments)]
 fn record_coverage(
     store: &mut Store,
@@ -781,14 +955,14 @@ fn record_coverage(
     outcome: &str,
     reason_code: Option<&str>,
     message: Option<&str>,
-    degradations: &[Degradation],
+    payload: &RowPayload<'_>,
     failure: Option<(IndexFileErrorKind, String)>,
 ) -> Result<(), RunError> {
     let refusal = failure.as_ref().map(|(kind, _)| kind.to_string());
     let reason_code = refusal.as_deref().or(reason_code);
     let message = failure.as_ref().map(|(_, text)| text.as_str()).or(message);
     *seq += 1;
-    let data_json = degradations_json(degradations);
+    let data_json = payload_json(payload);
     store.append_store_event(&coverage_event(
         batch_id,
         *seq,
@@ -802,6 +976,76 @@ fn record_coverage(
         report.errors.push(file_error(source_key, kind, message));
     }
     Ok(())
+}
+
+/// Writes one file's coverage row: the outcome's own codes, plus what the
+/// file's name is worth saying (D42).
+///
+/// One home for the merge, so the placeholder path and the ordinary path
+/// cannot disagree about what rides a row: `windows_incompatible_name` (with
+/// the components it is about) rides every non-error row — the name is a fact
+/// about the file whether or not this run read its bytes, and a report that
+/// dropped it on a no-op re-run would call the vault clean.
+fn record_file_row(
+    store: &mut Store,
+    report: &mut IndexReport,
+    batch_id: &str,
+    seq: &mut i64,
+    source_key: &str,
+    raw_name: &str,
+    outcome: Result<FileOutcome, IndexFileError>,
+) -> Result<(), RunError> {
+    match outcome {
+        Err(IndexFileError { kind, message, .. }) => record_coverage(
+            store,
+            report,
+            batch_id,
+            seq,
+            Some(source_key),
+            "error",
+            None,
+            None,
+            &RowPayload::NONE,
+            Some((kind, message)),
+        ),
+        Ok(outcome) => {
+            let windows_names = windows_incompatible_components(raw_name);
+            let mut warnings = outcome.warnings().to_vec();
+            if !windows_names.is_empty() {
+                warnings.push(Warning::WindowsIncompatibleName);
+            }
+            // Enum declaration order, so a re-run reports the same list.
+            warnings.sort_unstable();
+            warnings.dedup();
+            // The row's primary code and its message: the first degradation
+            // when the file lost something, the first warning when it did not
+            // (§5 第 8 条 ②⑤).
+            let (primary, sentence) = match (outcome.degradation(), warnings.first().copied()) {
+                (Some(code), _) => (
+                    Some(Degradation::as_str(code)),
+                    Some(degradation_message(code)),
+                ),
+                (None, Some(code)) => (Some(Warning::as_str(code)), Some(warning_message(code))),
+                (None, None) => (None, None),
+            };
+            record_coverage(
+                store,
+                report,
+                batch_id,
+                seq,
+                Some(source_key),
+                outcome.as_str(),
+                primary,
+                sentence,
+                &RowPayload {
+                    degradations: outcome.degradations(),
+                    warnings: &warnings,
+                    windows_names: &windows_names,
+                },
+                None,
+            )
+        }
+    }
 }
 
 /// What one degradation code means.
@@ -839,6 +1083,25 @@ fn degradation_message(code: Degradation) -> &'static str {
         }
         Degradation::AttachmentUnindexed => {
             "the file was registered; its bytes are not searchable on purpose (D41.10)"
+        }
+    }
+}
+
+/// What one warning code means, as the row's message.
+///
+/// Exhaustive on purpose, like [`degradation_message`]: a warning with no
+/// sentence is a compile error. The sentences describe the fact, not the row
+/// state — the same code rides an `indexed` row and a `skipped` one (§5 第 8 条 ⑤).
+fn warning_message(code: Warning) -> &'static str {
+    match code {
+        Warning::OneDrivePlaceholder => {
+            "the file is a cloud placeholder; its bytes are not on this device, so nothing was read (D42)"
+        }
+        Warning::IcloudPlaceholder => {
+            "the file is an iCloud eviction stub; the note it stands for is not on this device (D42)"
+        }
+        Warning::WindowsIncompatibleName => {
+            "the name is not one an ordinary Windows machine accepts; the first sync there will not carry it (D42)"
         }
     }
 }
@@ -899,6 +1162,23 @@ fn file_error(
 pub fn index_workspace(
     root: impl AsRef<Path>,
     path_override: Option<&Path>,
+) -> Result<IndexReport, RunError> {
+    index_workspace_with(root, path_override, attributes_of)
+}
+
+/// [`index_workspace`], with the file-attribute reader injected.
+///
+/// The one fact this process cannot obtain on most machines is the Windows
+/// placeholder bit, and no test on any platform can fabricate a real one (only
+/// kernel-mode callers can set it). This parameter is the seam that keeps the
+/// branch honest anyway, on the `doctor_with_facts` precedent: production
+/// passes `momotaro_ingest::attributes_of` (the real attribute word on
+/// Windows, a constant zero elsewhere), and the tests inject facts to drive
+/// what no machine here can build.
+pub fn index_workspace_with(
+    root: impl AsRef<Path>,
+    path_override: Option<&Path>,
+    attributes_of: impl Fn(&Path) -> io::Result<u32>,
 ) -> Result<IndexReport, RunError> {
     let root = root.as_ref();
     let config: WorkspaceConfig = load_config(root)?;
@@ -1006,9 +1286,11 @@ pub fn index_workspace(
                     None,
                     "error",
                     None,
-                    Some(message.as_str()),
-                    &[],
-                    Some((error.kind(), message.clone())),
+                    // The failure tuple below carries the text; passing it here
+                    // as well would be dead — the writer prefers the failure.
+                    None,
+                    &RowPayload::NONE,
+                    Some((error.kind(), message)),
                 )?;
                 continue;
             }
@@ -1027,7 +1309,7 @@ pub fn index_workspace(
                     "error",
                     None,
                     None,
-                    &[],
+                    &RowPayload::NONE,
                     Some((error.kind(), message)),
                 )?;
                 continue;
@@ -1052,12 +1334,58 @@ pub fn index_workspace(
                 "error",
                 None,
                 None,
-                &[],
+                &RowPayload::NONE,
                 Some((kind, message)),
             )?;
             continue;
         }
         claimed.insert(source_key.clone(), raw_name.clone());
+
+        // D42: a cloud placeholder's bytes are not on this device, and nothing
+        // may read them. The attributes come through the injected reader
+        // (production: the real word on Windows, a constant zero elsewhere),
+        // and the question runs before any content read of any kind that has
+        // content.
+        if matches!(
+            entry.kind,
+            VaultFileKind::Attachment | VaultFileKind::Note | VaultFileKind::Canvas
+        ) {
+            match attributes_of(file) {
+                Ok(attrs) if is_cloud_placeholder(attrs) => {
+                    report.files_skipped += 1;
+                    record_file_row(
+                        &mut store,
+                        &mut report,
+                        &batch_id,
+                        &mut seq,
+                        &source_key,
+                        &raw_name,
+                        Ok(FileOutcome::Skipped {
+                            degradations: Vec::new(),
+                            warnings: vec![Warning::OneDrivePlaceholder],
+                        }),
+                    )?;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let message = error.to_string();
+                    record_coverage(
+                        &mut store,
+                        &mut report,
+                        &batch_id,
+                        &mut seq,
+                        Some(source_key.as_str()),
+                        "error",
+                        None,
+                        None,
+                        &RowPayload::NONE,
+                        Some((IndexFileErrorKind::Io, message)),
+                    )?;
+                    continue;
+                }
+            }
+        }
 
         let outcome = match entry.kind {
             // A link is not content: this version does not follow them (the vault
@@ -1067,6 +1395,17 @@ pub fn index_workspace(
                 report.files_skipped += 1;
                 Ok(FileOutcome::Skipped {
                     degradations: vec![Degradation::SymlinkEncountered],
+                    warnings: Vec::new(),
+                })
+            }
+            // An iCloud eviction stub is not content either: the note it stands
+            // for is not on this device, so the row is the whole record and the
+            // warning says why (D42).
+            VaultFileKind::IcloudPlaceholder => {
+                report.files_skipped += 1;
+                Ok(FileOutcome::Skipped {
+                    degradations: Vec::new(),
+                    warnings: vec![Warning::IcloudPlaceholder],
                 })
             }
             // Everything that is not a note is registered rather than read: the
@@ -1094,38 +1433,15 @@ pub fn index_workspace(
             ),
         };
 
-        match outcome {
-            Ok(outcome) => {
-                let degraded = outcome.reason_code();
-                let sentence = outcome.degradation().map(degradation_message);
-                record_coverage(
-                    &mut store,
-                    &mut report,
-                    &batch_id,
-                    &mut seq,
-                    Some(source_key.as_str()),
-                    outcome.as_str(),
-                    degraded,
-                    sentence,
-                    outcome.degradations(),
-                    None,
-                )?;
-            }
-            Err(IndexFileError { kind, message, .. }) => {
-                record_coverage(
-                    &mut store,
-                    &mut report,
-                    &batch_id,
-                    &mut seq,
-                    Some(source_key.as_str()),
-                    "error",
-                    None,
-                    None,
-                    &[],
-                    Some((kind, message)),
-                )?;
-            }
-        }
+        record_file_row(
+            &mut store,
+            &mut report,
+            &batch_id,
+            &mut seq,
+            &source_key,
+            &raw_name,
+            outcome,
+        )?;
     }
 
     writer.commit()?;
@@ -1161,12 +1477,15 @@ pub fn index_workspace(
 ///
 /// `outcome` is one of `indexed | skipped | metadata_refreshed | error`.
 ///
-/// `reason_code` is set in three cases, and a reader must branch on the pair,
+/// `reason_code` is set in four cases, and a reader must branch on the pair,
 /// never on the outcome alone: an `error` row carries the stable spelling of the
 /// error kind; an `indexed` or `metadata_refreshed` row carries the degradation
 /// code of something the file lost on the way in (`frontmatter_parse_error`,
-/// D41.5) — it is in the index anyway; and a `skipped` row carries the code of
-/// what kept it out (`symlink_encountered`, §5 第 10 条).
+/// D41.5) — it is in the index anyway; a `skipped` row carries the code of what
+/// kept it out (`symlink_encountered`, §5 第 10 条); and any non-`error` row
+/// whose file earned a D42 warning carries it when no degradation outranks it
+/// (`onedrive_placeholder` and `icloud_placeholder` on `skipped` rows,
+/// `windows_incompatible_name` on every read-state — §5 第 8 条 ⑤).
 fn coverage_event<'a>(
     batch_id: &'a str,
     seq: i64,
@@ -1195,19 +1514,30 @@ fn coverage_event<'a>(
 #[derive(Debug)]
 enum FileOutcome {
     /// Nothing was read: the fingerprint, stored path and raw name all match, or
-    /// the file is a link the index does not follow. `degradations` carries what
-    /// that decision cost the file, so a link's row says why it is not searchable.
-    Skipped { degradations: Vec<Degradation> },
+    /// the file is a link the index does not follow, an eviction stub it does not
+    /// read, or a placeholder whose bytes are not on this device. `degradations`
+    /// and `warnings` carry what that decision cost the file, so a link's row
+    /// says why it is not searchable.
+    Skipped {
+        degradations: Vec<Degradation>,
+        warnings: Vec<Warning>,
+    },
     /// Same bytes under a new path or spelling: the mutable columns moved. The
     /// list is re-derived on this path too, or a file whose block cannot be read
     /// would read as clean here (§5 第 8 条).
-    MetadataRefreshed { degradations: Vec<Degradation> },
+    MetadataRefreshed {
+        degradations: Vec<Degradation>,
+        warnings: Vec<Warning>,
+    },
     /// A revision and its chunks were written. `degradations` carries whatever the
     /// file lost on the way in, in the enum's declaration order — the file *was*
     /// indexed, so the outcome stays `indexed` and the codes ride alongside it. A
     /// file can lose several things at once (§5 第 8 条), so it is a list: the row's
     /// `reason_code` is its first element and its `data_json` carries all of it.
-    Indexed { degradations: Vec<Degradation> },
+    Indexed {
+        degradations: Vec<Degradation>,
+        warnings: Vec<Warning>,
+    },
 }
 
 impl FileOutcome {
@@ -1232,28 +1562,29 @@ impl FileOutcome {
         }
     }
 
-    /// The stable code the coverage row carries, when the file was indexed anyway:
-    /// the first of the list, so existing readers and the counting semantics do not
-    /// move (§5 第 8 条 ②).
-    fn reason_code(&self) -> Option<&'static str> {
-        self.degradations()
-            .first()
-            .copied()
-            .map(Degradation::as_str)
-    }
-
-    /// The whole list: the row's `data_json` and the per-code counts read it
-    /// (§5 第 8 条 ③④).
+    /// The whole degradation list: the row's `data_json` and the per-code
+    /// counts read it (§5 第 8 条 ③④).
     fn degradations(&self) -> &[Degradation] {
         match self {
-            Self::Skipped { degradations }
-            | Self::MetadataRefreshed { degradations }
-            | Self::Indexed { degradations } => degradations,
+            Self::Skipped { degradations, .. }
+            | Self::MetadataRefreshed { degradations, .. }
+            | Self::Indexed { degradations, .. } => degradations,
         }
     }
 
-    /// The first code of the list, for callers that need its sentence rather than
-    /// its spelling — the same fact as [`FileOutcome::reason_code`].
+    /// The whole warning list (D42), in the enum's declaration order: the row's
+    /// `data_json` and the per-code counts read it, the same way they read the
+    /// degradations.
+    fn warnings(&self) -> &[Warning] {
+        match self {
+            Self::Skipped { warnings, .. }
+            | Self::MetadataRefreshed { warnings, .. }
+            | Self::Indexed { warnings, .. } => warnings,
+        }
+    }
+
+    /// The first degradation, for callers that need its sentence rather than its
+    /// spelling — the row's primary code when the file lost something.
     fn degradation(&self) -> Option<Degradation> {
         self.degradations().first().copied()
     }
@@ -1264,6 +1595,10 @@ impl FileOutcome {
 /// `Err` carries the typed per-file failure; the caller records it, writes the
 /// matching `ingest.coverage` row and moves on. Only batch-level failures
 /// (config, store open, walk, commit) bubble up to [`index_workspace`].
+///
+/// A cloud placeholder never reaches here: the loop asks the attribute
+/// question of every readable kind before dispatch (D42), and this function
+/// reads bytes.
 #[allow(clippy::too_many_arguments)]
 fn process_file(
     kind: VaultFileKind,
@@ -1294,10 +1629,11 @@ fn process_file(
         && revision.raw_name.as_deref() == Some(raw_name)
     {
         report.files_skipped += 1;
-        // Nothing was read, so nothing was lost: the list is empty here, and the
-        // variant carries it so every outcome has the same shape.
+        // Nothing was read, so nothing was lost: the lists are empty here, and
+        // the variant carries them so every outcome has the same shape.
         return Ok(FileOutcome::Skipped {
             degradations: Vec::new(),
+            warnings: Vec::new(),
         });
     }
 
@@ -1329,6 +1665,7 @@ fn process_file(
         // row, or this path reports a broken block as a clean file.
         return Ok(FileOutcome::MetadataRefreshed {
             degradations: input.degradations,
+            warnings: Vec::new(),
         });
     }
 
@@ -1389,6 +1726,7 @@ fn process_file(
     // `canvas_parse_error`, `excalidraw_detected`).
     Ok(FileOutcome::Indexed {
         degradations: input.degradations,
+        warnings: Vec::new(),
     })
 }
 
@@ -1585,6 +1923,7 @@ fn register_attachment(
         report.files_skipped += 1;
         return Ok(FileOutcome::Skipped {
             degradations: vec![Degradation::AttachmentUnindexed],
+            warnings: Vec::new(),
         });
     }
 
@@ -1615,6 +1954,7 @@ fn register_attachment(
         report.files_indexed += 1;
         return Ok(FileOutcome::MetadataRefreshed {
             degradations: vec![Degradation::AttachmentUnindexed],
+            warnings: Vec::new(),
         });
     }
 
@@ -1642,6 +1982,7 @@ fn register_attachment(
     report.revisions_created += 1;
     Ok(FileOutcome::Indexed {
         degradations: vec![Degradation::AttachmentUnindexed],
+        warnings: Vec::new(),
     })
 }
 

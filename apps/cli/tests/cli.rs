@@ -269,3 +269,55 @@ fn control_characters_in_names_never_reach_stderr_raw() {
         "stdout leaked a raw ESC: {stdout:?}"
     );
 }
+
+#[test]
+fn doctor_coverage_renders_sync_drive_warnings() {
+    // D42: an eviction stub and a Windows-illegal name are facts
+    // `doctor --coverage` must show — and they are warnings, not failures, in
+    // both exits.
+    let workspace = tempfile::tempdir().expect("workspace");
+    stage_vault(workspace.path());
+    write_config(workspace.path());
+    let vault = workspace.path().join("vault");
+    std::fs::write(vault.join(".note.md.icloud"), "stub text\n").expect("write the stub");
+    std::fs::write(vault.join("con.md"), "# con\n\nbody\n").expect("write con.md");
+
+    let (_, stderr, ok) = run_cli(workspace.path(), &["init"]);
+    assert!(ok, "init: {stderr}");
+    let (stdout, stderr, ok) = run_cli(workspace.path(), &["index"]);
+    assert!(ok, "index: {stderr}");
+    assert!(
+        stdout.contains("indexed 6 of 7 files"),
+        "six of the seven files are content: {stdout}"
+    );
+    assert!(stdout.contains("1 skipped"), "{stdout}");
+
+    let (stdout, stderr, ok) = run_cli(workspace.path(), &["doctor", "--coverage"]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("0 failed"),
+        "a warning is not a failure: {stdout}"
+    );
+    assert!(stdout.contains("icloud_placeholder"), "{stdout}");
+    assert!(stdout.contains("windows_incompatible_name"), "{stdout}");
+
+    let (stdout, _, ok) = run_cli(workspace.path(), &["doctor", "--coverage", "--json"]);
+    assert!(ok, "{stdout}");
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|error| panic!("json: {error}\n{stdout}"));
+    assert_eq!(value["indexed"], 6);
+    assert_eq!(value["skipped"], 1);
+    assert_eq!(
+        value["warnings"]["icloud_placeholder"]["skipped"], 1,
+        "{value}"
+    );
+    assert_eq!(
+        value["warnings"]["windows_incompatible_name"]["in_index"], 1,
+        "{value}"
+    );
+    assert_eq!(
+        value["failures"].as_array().map(Vec::len),
+        Some(0),
+        "{value}"
+    );
+}
