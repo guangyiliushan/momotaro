@@ -15,9 +15,8 @@ use momotaro_contracts::{
 };
 use momotaro_ingest::frontmatter::{self, FrontmatterParse};
 use momotaro_ingest::{
-    SourceOffset, VaultFileKind, chunk_markdown_with, derive_title, is_canvas_path,
-    normalize_markdown, raw_name_for, revision_hash, revision_hash_reader, scene_spans,
-    source_key_for, walk_entries,
+    SourceOffset, VaultFileKind, chunk_markdown_with, derive_title, normalize_markdown,
+    raw_name_for, revision_hash, revision_hash_reader, scene_spans, source_key_for, walk_entries,
 };
 use momotaro_retrieve::{IndexWriterHandle, RetrieveError, SearchIndex};
 use momotaro_store::{NewSourceRevision, NewStoreEvent, Store, StoreError};
@@ -163,9 +162,22 @@ fn count_degradations(report: &mut CoverageReport, event: &momotaro_store::Store
         })
         .filter(|list| !list.is_empty())
         .unwrap_or_else(|| event.reason_code.iter().cloned().collect());
+    // The axis is the row's, not the code's: the same code rides rows that are in
+    // the index anyway and rows nothing was read for.
+    let in_index = matches!(
+        event.outcome.as_deref(),
+        Some(FileOutcome::INDEXED) | Some(FileOutcome::METADATA_REFRESHED)
+    );
     for code in &codes {
         match Degradation::from_code(code) {
-            Some(known) => *report.degradations.entry(known).or_insert(0) += 1,
+            Some(known) => {
+                let counts = report.degradations.entry(known).or_default();
+                if in_index {
+                    counts.in_index += 1;
+                } else {
+                    counts.skipped += 1;
+                }
+            }
             None => report.failures.push(CoverageFailure {
                 source_key: event.source_key.clone(),
                 reason_code: Some(code.clone()),
@@ -1069,6 +1081,7 @@ pub fn index_workspace(
                 &mut report,
             ),
             VaultFileKind::Note | VaultFileKind::Canvas => process_file(
+                entry.kind,
                 &mut store,
                 &search_index,
                 &mut writer,
@@ -1253,6 +1266,7 @@ impl FileOutcome {
 /// (config, store open, walk, commit) bubble up to [`index_workspace`].
 #[allow(clippy::too_many_arguments)]
 fn process_file(
+    kind: VaultFileKind,
     store: &mut Store,
     search_index: &SearchIndex,
     writer: &mut IndexWriterHandle,
@@ -1300,7 +1314,7 @@ fn process_file(
         // instead of appending a revision that would say nothing new. What the file
         // lost is re-derived from the very text that hashed equal — one derivation,
         // and a workspace indexed before the `frontmatter` key existed gets it here.
-        let input = chunk_input(&normalized, file);
+        let input = chunk_input(&normalized, kind);
         store_step(source_key, || {
             store.update_revision_fingerprint(
                 source_key,
@@ -1318,7 +1332,7 @@ fn process_file(
         });
     }
 
-    let input = chunk_input(&normalized, file);
+    let input = chunk_input(&normalized, kind);
     let chunks = chunk_markdown_with(
         source_key,
         &hash,
@@ -1400,12 +1414,12 @@ struct ChunkInput<'a> {
 ///
 /// One derivation for both paths (indexing and refresh): a file that lost
 /// something must not report clean on one of them.
-fn chunk_input<'a>(normalized: &'a str, file: &Path) -> ChunkInput<'a> {
+fn chunk_input<'a>(normalized: &'a str, kind: VaultFileKind) -> ChunkInput<'a> {
     // A `.canvas` is not Markdown — no `---` block, no headings — and the text it
     // contributes is the one JSON Canvas assigns a meaning to (§5 第 9 条). Text that
     // cannot be read as a canvas object keeps the file's own text as the body and
     // reports the code, so the file is never silently empty.
-    if is_canvas_path(file) {
+    if kind == VaultFileKind::Canvas {
         return match canvas_text(normalized) {
             Some(text) => ChunkInput {
                 frontmatter: FrontmatterParse::Absent,

@@ -224,6 +224,9 @@ pub enum SourceKind {
 }
 
 impl SourceKind {
+    /// Every kind, for readers and tests that must not miss a new one.
+    pub const ALL: [Self; 4] = [Self::Note, Self::Paper, Self::Web, Self::Attachment];
+
     /// The wire spelling, as stored in SQLite.
     ///
     /// One source of truth for the column value; `serde`'s `snake_case` renaming
@@ -583,6 +586,27 @@ impl Degradation {
     }
 }
 
+/// How the rows carrying one degradation code were handled.
+///
+/// Two axes, because that is what the log holds: a `indexed`/`metadata_refreshed`
+/// row is in the index anyway, a `skipped` row was not read (a link is not followed;
+/// an unchanged attachment is not read again), and both can carry the same code.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DegradationCounts {
+    /// Rows that went into the index anyway.
+    pub in_index: u64,
+    /// Rows nothing was read for.
+    pub skipped: u64,
+}
+
+impl DegradationCounts {
+    /// Both axes, for a reader that only wants the total.
+    #[must_use]
+    pub fn total(self) -> u64 {
+        self.in_index + self.skipped
+    }
+}
+
 /// What the most recent ingest batch did, read back out of `store_events`
 /// (ADR 0026). `None` comes back from `momotaro_run::coverage_report` when no
 /// batch was ever recorded — never because one failed.
@@ -596,14 +620,17 @@ pub struct CoverageReport {
     pub skipped: u64,
     /// Rows whose file only moved or was re-spelled.
     pub refreshed: u64,
-    /// What the rows carrying a code lost on the way in, counted per code (D41).
+    /// What the rows carrying a code lost on the way in, counted per code **and per
+    /// row state** (D41).
     ///
-    /// The count is per code across states: an `indexed` or `metadata_refreshed`
-    /// row lost something and is in the index anyway, while a `skipped` row's code
-    /// says what kept it out (`symlink_encountered`, §5 第 10 条). Without this, a
-    /// note whose block could not be read is indistinguishable from a clean one in
-    /// this report: the row says `indexed` and the code was only in the event table.
-    pub degradations: BTreeMap<Degradation, u64>,
+    /// The state is the row's, never the code's: the same code rides rows that are in
+    /// the index anyway and rows nothing was read for (`symlink_encountered` on a
+    /// `skipped` link, `attachment_unindexed` on an attachment that was not read
+    /// again), and a summary that guessed from the code contradicted its own counts.
+    /// Without this, a note whose block could not be read is indistinguishable from a
+    /// clean one in this report: the row says `indexed` and the code was only in the
+    /// event table.
+    pub degradations: BTreeMap<Degradation, DegradationCounts>,
     /// Rows that failed, in the batch's own order (`seq`, not `id`).
     pub failures: Vec<CoverageFailure>,
     /// Every row in the batch, including its beginning and its end.
@@ -891,15 +918,25 @@ mod tests {
     // --- source-key contract (ADR 0002 / D42) ---
 
     #[test]
+    fn every_source_kind_is_in_all() {
+        // A no-wildcard match, the same guard `Degradation` has: a new kind cannot be
+        // added to `as_str` alone, and the list cannot quietly lose one either.
+        for kind in SourceKind::ALL {
+            match kind {
+                SourceKind::Note | SourceKind::Paper | SourceKind::Web | SourceKind::Attachment => {
+                }
+            }
+        }
+        assert_eq!(SourceKind::ALL.len(), 4, "extend ALL, not just as_str");
+    }
+
+    #[test]
     fn the_kind_spelling_matches_serde() {
         // The column value, the JSON form and `FromStr` are one spelling; the
         // store decodes through `FromStr` and writes through `as_str`.
-        for kind in [
-            SourceKind::Note,
-            SourceKind::Paper,
-            SourceKind::Web,
-            SourceKind::Attachment,
-        ] {
+        // Iterates `ALL`, so a new kind cannot be added to `as_str` alone: the same
+        // guard `Degradation` has, for the same hole.
+        for kind in SourceKind::ALL {
             assert_eq!(kind.as_str().parse::<SourceKind>(), Ok(kind));
             assert_eq!(
                 serde_json::to_string(&kind).expect("serialize"),

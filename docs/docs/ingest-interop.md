@@ -240,10 +240,12 @@ parse_error。
    **放宽**：不要求笔记带 `%%` / `# Excalidraw Data` 前言。**已知边界**：手写笔记里若真有
    一个列 0 的 `## Drawing` 标题紧跟 `json` 围栏，我们与插件的真实布局**分不出来**；别的
    标题下的 `json` 块不受影响。命中时该文件带 `excalidraw_detected`。
-   **迁移注记**：本次落地之前索引过的 Excalidraw 笔记，场景字节仍在 canonical `chunks`
-   里——指纹未变的文件会被 `skipped`，而 `rebuild-index` 只从既有 chunks 重建（不重切），
-   所以那些库不会自己变干净；让场景出库要么让文件指纹变化（例如 `touch` 后重跑 `index`），
-   要么清库重建。**仪器**：这一面目前**没有带外仪器**（黄金集夹具里没有 `.canvas` 与
+   **迁移注记**：本次落地之前索引过的 Excalidraw 笔记，场景字节仍在 canonical `chunks` 里，
+   而**没有任何路径会替旧库重切一遍**：指纹未变的文件报 `skipped`（不读文件、也就没有码）；
+   `touch` 后重跑 `index` 走的是 `metadata_refreshed`——**只刷指纹，不重切、不替换 chunks、
+   也不碰 tantivy**，所以场景同时留在 canonical **与搜索结果里**；`rebuild-index` 更会把它
+   从 canonical 重新灌进索引（那一行只说本次运行做了什么）。要让场景真正出库，只能让文件的
+   **内容**变化（改一下再存回）或清库重建。**仪器**：这一面目前**没有带外仪器**（黄金集夹具里没有 `.canvas` 与
    `.excalidraw` 笔记）——只有 `cargo test` 守着它。
    **`.canvas` 的 locator**：渲染文本不是文件的字节切片，所以它的 chunk 指向**整份画布
    文件**（`start_byte = 0`、坐标同样是**归一化文本**的坐标，与全仓一致）——引用仍能落到
@@ -256,7 +258,8 @@ parse_error。
     给出这些扩展名的官方来源（IANA 只登记媒体类型，不认 `.md`/`.canvas`/`.base`）。**实现口径比
     那份清单宽一格**：walker 把**每一个不是 `.md`/`.canvas` 的普通文件**归为附件
     （`VaultFileKind::Attachment`）——读不了的文件仍是 vault 里的事实，D41 的「每条『没索引』的
-    决定都留可审计事件」不接受静默；官方清单在这里是**描述**（附件层覆盖什么），不是封闭集合。
+    决定都留可审计事件」对**walker 走到的每个条目**成立（列不出来的目录里有什么，今天仍答不出来，
+    见剩余面）；官方清单在这里是**描述**（附件层覆盖什么），不是封闭集合。
     **登记写法**：复用 `source_revisions`（`Source → Revision → Chunk` 的第三段为空，不另立表）——
     `kind = SourceKind::Attachment`（`kind` 列是 TEXT、没有 CHECK ⇒ **零迁移**）、
     `origin_class = owner`、`metadata_json` = 指纹（`mtime_ms`/`size_bytes`/`tool`）、**0 chunk**
@@ -264,9 +267,10 @@ parse_error。
     `revision_hash_reader`：**流式**哈希原始字节、同一个 `REVISION_DOMAIN`（二进制不过
     `normalize_markdown`、不整读进内存）——同一文件的两个字节版本因此仍是两个 revision。指纹
     不变的重复 `index` 与笔记一样报 `skipped`；指纹变了而字节没变（例如 `touch`）报
-    `metadata_refreshed` 并把指纹刷进库；字节变了则是一条**新 revision**。**coverage 行**：`outcome = indexed`、
-    `reason_code = attachment_unindexed`（十类之一）；写下了 revision 就是做过了事，"不进 FTS"
-    由码说明。**符号链接（含 Windows junction）不跟随**：`file_type().is_symlink()` 在**发现层**
+    `metadata_refreshed` 并把指纹刷进库；字节变了则是一条**新 revision**。**coverage 行**：**码随行状态走**——首次登记（写下了 revision）是
+    `indexed`，只刷指纹的是 `metadata_refreshed`，未变的重复 `index` 是 `skipped`，三种行都带
+    `reason_code = attachment_unindexed`（十类之一）：「不进 FTS」由码说明，「这次读了没有」
+    由行状态说明。**符号链接（含 Windows junction）不跟随**：`file_type().is_symlink()` 在**发现层**
     分类（`VaultFileKind::Symlink`），walk 不下降进链接目录、**不读目标内容、不写 revision**；
     它的行是 `outcome = skipped` + `reason_code = symlink_encountered`，而 **`skipped` 行同样
     计数降级码**（只数 `indexed` 行的读者会把链接的码丢掉）。目标在 vault 内时按它自己的真实

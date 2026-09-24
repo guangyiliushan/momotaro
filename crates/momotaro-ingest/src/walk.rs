@@ -429,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn walk_skips_symlink_entries() {
+    fn the_indexable_view_excludes_link_entries() {
         #[cfg(unix)]
         {
             let outside = tempfile::tempdir().unwrap();

@@ -8,7 +8,7 @@
 
 use momotaro_contracts::IndexFileErrorKind;
 
-pub mod canvas;
+mod canvas;
 mod chunker;
 pub mod excalidraw;
 pub mod frontmatter;
@@ -18,7 +18,6 @@ mod path;
 mod title;
 mod walk;
 
-pub use canvas::is_canvas_path;
 pub use chunker::{SourceOffset, chunk_markdown, chunk_markdown_with};
 pub use excalidraw::scene_spans;
 pub use hash::{chunk_hash, chunk_id, revision_hash, revision_hash_reader};

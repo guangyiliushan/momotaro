@@ -557,12 +557,23 @@ pub fn format_coverage(report: &CoverageReport) -> String {
             " (no ingest.finished yet: still running, or the process died)"
         },
     );
-    for (code, count) in &report.degradations {
+    for (code, counts) in &report.degradations {
         line.push('\n');
+        // The state is the rows', never the code's: the same code rides rows that are
+        // in the index anyway and rows nothing was read for, so one parenthetical for
+        // all of them would contradict the counts printed above it.
+        let state = match (counts.in_index, counts.skipped) {
+            (in_index, 0) => format!("({in_index} indexed anyway)"),
+            (0, skipped) => format!("({skipped} skipped: nothing was read)"),
+            (in_index, skipped) => {
+                format!("({in_index} indexed anyway, {skipped} skipped)")
+            }
+        };
         line.push_str(&format!(
-            "  {count} x {} {}",
+            "  {} x {} {}",
+            counts.total(),
             code.as_str(),
-            degradation_row_state(*code)
+            state
         ));
     }
     for failure in &report.failures {
@@ -585,31 +596,6 @@ pub fn format_coverage(report: &CoverageReport) -> String {
 pub fn format_index_error(error: &IndexFileError) -> String {
     let key = error.source_key.as_deref().unwrap_or("<no key>");
     format!("{key:?}: {}: {}", error.kind, sanitize(&error.message))
-}
-
-/// How a degradation code's rows read in the human coverage line.
-///
-/// The code decides, because this report counts codes rather than row states: a
-/// link is the one code that rides a `skipped` row (nothing was read), and the
-/// other nine ride rows that went into the index one way or another. Printing one
-/// parenthetical for all of them made `symlink_encountered (indexed anyway)` a
-/// sentence the same report contradicts — it says one skipped row. Exhaustive on
-/// purpose: a new code has to decide how it reads.
-fn degradation_row_state(code: momotaro_contracts::Degradation) -> &'static str {
-    match code {
-        momotaro_contracts::Degradation::SymlinkEncountered => {
-            "(skipped: the link is not followed)"
-        }
-        momotaro_contracts::Degradation::FrontmatterParseError
-        | momotaro_contracts::Degradation::UnresolvedWikilink
-        | momotaro_contracts::Degradation::AmbiguousWikilink
-        | momotaro_contracts::Degradation::StaleAnchor
-        | momotaro_contracts::Degradation::MarkdownLinkDecodeError
-        | momotaro_contracts::Degradation::UnknownLinkSyntax
-        | momotaro_contracts::Degradation::CanvasParseError
-        | momotaro_contracts::Degradation::ExcalidrawDetected
-        | momotaro_contracts::Degradation::AttachmentUnindexed => "(indexed anyway)",
-    }
 }
 
 #[cfg(test)]
@@ -879,8 +865,9 @@ mod tests {
         assert_eq!(
             coverage
                 .degradations
-                .get(&momotaro_contracts::Degradation::AttachmentUnindexed),
-            Some(&1),
+                .get(&momotaro_contracts::Degradation::AttachmentUnindexed)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((1, 0)),
             "the config file is registered, and the report says so: {coverage:?}"
         );
 
@@ -1850,8 +1837,27 @@ mod tests {
             skipped: 1,
             refreshed: 0,
             degradations: [
-                (momotaro_contracts::Degradation::FrontmatterParseError, 1),
-                (momotaro_contracts::Degradation::SymlinkEncountered, 1),
+                (
+                    momotaro_contracts::Degradation::FrontmatterParseError,
+                    momotaro_contracts::DegradationCounts {
+                        in_index: 1,
+                        skipped: 0,
+                    },
+                ),
+                (
+                    momotaro_contracts::Degradation::SymlinkEncountered,
+                    momotaro_contracts::DegradationCounts {
+                        in_index: 0,
+                        skipped: 1,
+                    },
+                ),
+                (
+                    momotaro_contracts::Degradation::AttachmentUnindexed,
+                    momotaro_contracts::DegradationCounts {
+                        in_index: 1,
+                        skipped: 2,
+                    },
+                ),
             ]
             .into_iter()
             .collect(),
@@ -1861,18 +1867,24 @@ mod tests {
         };
         let line = format_coverage(&report);
         assert!(
-            line.contains("1 x frontmatter_parse_error (indexed anyway)"),
+            line.contains("1 x frontmatter_parse_error (1 indexed anyway)"),
             "the count is what stops a degraded file reading as clean: {line}"
         );
         // The row state follows the code, not one parenthetical for all of them: a
         // link is skipped, and printing "indexed anyway" beside it made the line
         // contradict its own skipped count.
         assert!(
-            line.contains("1 x symlink_encountered (skipped: the link is not followed)"),
+            line.contains("1 x symlink_encountered (1 skipped: nothing was read)"),
             "{line}"
         );
         assert!(
             !line.contains("symlink_encountered (indexed anyway)"),
+            "{line}"
+        );
+        // A code that rides both kinds of row — an attachment is in the index when it
+        // was read and skipped when it was not — shows both, and the total is the sum.
+        assert!(
+            line.contains("3 x attachment_unindexed (1 indexed anyway, 2 skipped)"),
             "{line}"
         );
     }
@@ -1928,8 +1940,9 @@ mod tests {
         assert_eq!(
             coverage
                 .degradations
-                .get(&momotaro_contracts::Degradation::FrontmatterParseError),
-            Some(&1),
+                .get(&momotaro_contracts::Degradation::FrontmatterParseError)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((1, 0)),
             "the batch knows the file lost its block: {coverage:?}"
         );
         assert_eq!(
@@ -3027,8 +3040,9 @@ mod tests {
         assert_eq!(
             coverage
                 .degradations
-                .get(&momotaro_contracts::Degradation::CanvasParseError),
-            Some(&1),
+                .get(&momotaro_contracts::Degradation::CanvasParseError)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((1, 0)),
             "{coverage:?}"
         );
     }
@@ -3087,8 +3101,9 @@ mod tests {
         assert_eq!(
             coverage
                 .degradations
-                .get(&momotaro_contracts::Degradation::ExcalidrawDetected),
-            Some(&1),
+                .get(&momotaro_contracts::Degradation::ExcalidrawDetected)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((1, 0)),
             "{coverage:?}"
         );
     }
@@ -3138,15 +3153,17 @@ mod tests {
         assert_eq!(
             coverage
                 .degradations
-                .get(&momotaro_contracts::Degradation::FrontmatterParseError),
-            Some(&1),
+                .get(&momotaro_contracts::Degradation::FrontmatterParseError)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((1, 0)),
             "{coverage:?}"
         );
         assert_eq!(
             coverage
                 .degradations
-                .get(&momotaro_contracts::Degradation::ExcalidrawDetected),
-            Some(&1),
+                .get(&momotaro_contracts::Degradation::ExcalidrawDetected)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((1, 0)),
             "counted from the whole list, not from the first code: {coverage:?}"
         );
 
@@ -3254,8 +3271,9 @@ mod tests {
         assert_eq!(
             coverage
                 .degradations
-                .get(&momotaro_contracts::Degradation::AttachmentUnindexed),
-            Some(&1),
+                .get(&momotaro_contracts::Degradation::AttachmentUnindexed)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((1, 0)),
             "{coverage:?}"
         );
 
@@ -3280,6 +3298,17 @@ mod tests {
             skipped_row.reason_code.as_deref(),
             Some("attachment_unindexed"),
             "a skipped row carries the code too: {skipped_row:?}"
+        );
+        // …and the batch counts it on the skipped axis, which is why the report needs
+        // two: this same code is on the in-index axis for the batch before it.
+        let reindex_coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(
+            reindex_coverage
+                .degradations
+                .get(&momotaro_contracts::Degradation::AttachmentUnindexed)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((0, 1)),
+            "{reindex_coverage:?}"
         );
         let current = store
             .current_revision("note:attach/pic.png")
@@ -3396,8 +3425,9 @@ mod tests {
         assert_eq!(
             coverage
                 .degradations
-                .get(&momotaro_contracts::Degradation::SymlinkEncountered),
-            Some(&1),
+                .get(&momotaro_contracts::Degradation::SymlinkEncountered)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((0, 1)),
             "a skipped row's code is counted too: {coverage:?}"
         );
         // The link points outside the vault, so nothing behind it is indexed.
@@ -3434,6 +3464,13 @@ mod tests {
         init_workspace(dir.path()).expect("init");
         let report = index_workspace(dir.path(), None).expect("index");
 
+        // A link is skipped, and the summary has to say so: without this the counts do
+        // not add up (the note is indexed, the link is nowhere) and a reader of
+        // `indexed 1 of 2 files` has no way to see why.
+        assert_eq!(report.files_scanned, 2, "{report:?}");
+        assert_eq!(report.files_skipped, 1, "{report:?}");
+        assert_eq!(report.files_indexed, 1, "{report:?}");
+
         let store = store_of(dir.path());
         let row = store
             .store_events_for_batch(&report.batch_id)
@@ -3451,8 +3488,9 @@ mod tests {
         assert_eq!(
             coverage
                 .degradations
-                .get(&momotaro_contracts::Degradation::SymlinkEncountered),
-            Some(&1),
+                .get(&momotaro_contracts::Degradation::SymlinkEncountered)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((0, 1)),
             "a skipped row's code is counted too: {coverage:?}"
         );
         assert!(

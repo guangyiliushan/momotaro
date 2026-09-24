@@ -398,6 +398,10 @@ pub fn chunk_markdown_with(
 /// slices the document and gets the document. Node-level precision inside a canvas
 /// is a separate, later job.
 fn whole_file_axes(normalized: &str) -> (usize, usize, u32, u32) {
+    // Its own scan, deliberately: the line count wanted here is the *file's*, and
+    // the text the chunker holds is the rendered one — different strings, so the
+    // starts computed above cannot answer for this (a review read the two scans as
+    // one pass done twice; they are two passes over two texts).
     let starts = line_starts(normalized);
     let end_line = line_number_for(&starts, normalized.len() as u32);
     (0, normalized.len(), 1, end_line)
