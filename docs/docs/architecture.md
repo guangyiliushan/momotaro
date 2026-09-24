@@ -1165,7 +1165,7 @@ PDF 解析按双层策略（2026-09 学术 RAG 调查结论 + D37 安全收紧�
 
 项目 CRUD；来源加入项目；批注钉 revision+locator。删项目不删 source。换版本后旧批注仍打开旧 revision。
 
-零 LLM 治理第一批（2026-09-15 LLM Wiki 调查 P0）：`[[wiki-link]]` 双链确定性解析入 `graph_links`（D22，Link expansion 第一步）；source-coverage 投影（各源被检索/进入上下文/被引用的统计，数据已在 `retrieval_hits`）。建边矩阵全量落地（D41：embed/canvas/frontmatter 链/歧义三级规则/降级十事件）；同步盘预警与平台测试矩阵 11 项进 CI（D42）。
+零 LLM 治理第一批（2026-09-15 LLM Wiki 调查 P0）：`[[wiki-link]]` 双链确定性解析入 `graph_links`（D22，Link expansion 第一步）；source-coverage 投影（各源被检索/进入上下文/被引用的统计，数据已在 `retrieval_hits`）。建边矩阵全量落地（D41：embed/canvas/frontmatter 链/歧义三级规则/降级十事件）；同步盘预警**已落**（D42）；平台测试矩阵 11 项随 W2.6 的 `path_matrix.rs` 进 CI。
 
 ### v0.6 桌面主路径
 
@@ -1578,7 +1578,7 @@ wikilink 全形态建边（pulldown-cmark `ENABLE_WIKILINKS`）；dangling 链�
 
 ### D42：source_key = NFC 身份键，键层永不折叠
 
-`source_key = note:<vault-relative NFC path> | arxiv:<id>`；NFC/不折叠/碰撞规则作用于 scheme 之后的 tail。verbatim 前缀与盘符大小写由解析时的 `canonicalize` 决定（既不是键的一部分，也不是我们做的改写）——用户可见处一律渲染存储的 `local_path`，不渲染解析后的路径（[ADR 0002](adr/source-key-is-scheme-prefixed.md) / [ADR 0024](adr/local-path-is-workspace-relative.md)）。大小写原样保留、`/` 分隔；**禁用 NFKC 与 casefold**（Linux 大小写双写合法并存，折叠 = 数据丢失级事故）；`raw_name` 原始字节另存（事件匹配/显示）；查询层大小写折叠另建 fold 索引列。**「绝不静默合并」作用于身份键**：NFC 碰撞（NFC/NFD 双写）两条目都保留 + 消歧后缀 + 事件，绝不静默合并——唯一性不变量不在并操作下封闭。它不是一条普遍禁令：**内容寻址**的 revision 集、同策略幂等替换的 chunk 集满足 join-semilattice 且不变量在并下封闭，静默并是对的；禁止的是对自由文本、互斥修改、或「取唯一代表」的读函数做静默并。同步盘预警：OneDrive placeholder（`RECALL_ON_DATA_ACCESS` 位）不读内容、不建 revision（行 = `skipped` + `onedrive_placeholder`，下载后下一次 `index` 正常读入）；iCloud 驱逐占位跳过 + `icloud_placeholder`；Windows 非法名照常索引但发 `windows_incompatible_name` 预警（会经同步盘毒化 Windows 端）。平台测试矩阵 11 项进 CI。
+`source_key = note:<vault-relative NFC path> | arxiv:<id>`；NFC/不折叠/碰撞规则作用于 scheme 之后的 tail。verbatim 前缀与盘符大小写由解析时的 `canonicalize` 决定（既不是键的一部分，也不是我们做的改写）——用户可见处一律渲染存储的 `local_path`，不渲染解析后的路径（[ADR 0002](adr/source-key-is-scheme-prefixed.md) / [ADR 0024](adr/local-path-is-workspace-relative.md)）。大小写原样保留、`/` 分隔；**禁用 NFKC 与 casefold**（Linux 大小写双写合法并存，折叠 = 数据丢失级事故）；`raw_name` 原始字节另存（事件匹配/显示）；查询层大小写折叠另建 fold 索引列。**「绝不静默合并」作用于身份键**：NFC 碰撞（NFC/NFD 双写）两条目都保留 + 消歧后缀 + 事件，绝不静默合并——唯一性不变量不在并操作下封闭。它不是一条普遍禁令：**内容寻址**的 revision 集、同策略幂等替换的 chunk 集满足 join-semilattice 且不变量在并下封闭，静默并是对的；禁止的是对自由文本、互斥修改、或「取唯一代表」的读函数做静默并。同步盘预警：OneDrive placeholder（`RECALL_ON_DATA_ACCESS` 位）不读内容、不建 revision（行 = `skipped` + `onedrive_placeholder`，下载后下一次 `index` 正常读入）；iCloud 驱逐占位跳过 + `icloud_placeholder`；Windows 非法名照常索引但发 `windows_incompatible_name` 预警（文档规则是 Explorer／工具／同步端的实际约束——`\\?\` 能建这些名字不代表同步过去还能活）。平台测试矩阵 11 项随 W2.6 的 `path_matrix.rs` 进 CI（OneDrive 项只手工一次）。
 
 ### D43：更新管线——动态薄层 + 通道 endpoint 隔离 + 灰度
 

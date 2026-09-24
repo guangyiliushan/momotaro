@@ -2,8 +2,8 @@
 //!
 //! One home for the three sync-disk boundaries: a Windows cloud placeholder
 //! whose bytes are not on this device, an iCloud eviction stub standing in for
-//! a note that is not here, and a name an ordinary Windows machine will not
-//! accept. The name predicates are pure strings (both platforms compile and
+//! a note that is not here, and a name Windows' own naming rules reserve. The
+//! name predicates are pure strings (both platforms compile and
 //! test them); the attribute read is the one platform-specific piece, and it
 //! comes as a pair of `cfg`-bound functions with one signature, so callers
 //! never branch.
@@ -101,8 +101,8 @@ const RESERVED_NAMES: [&str; 28] = [
 /// inputs are joined with — but the list is the rule as written.
 const RESERVED_CHARS: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
 
-/// The vault-relative components of `raw_name` an ordinary Windows machine
-/// will not accept, in order; empty means the name is fine there.
+/// The vault-relative components of `raw_name` that Windows' naming rules
+/// reserve, in order; empty means the name is fine there.
 ///
 /// Windows rules, applied per component and exactly ("Naming Files, Paths, and
 /// Namespaces"): the segment before the first `.` equals (ASCII
@@ -112,8 +112,11 @@ const RESERVED_CHARS: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
 /// `constitution.md` and comparing the whole name would miss `nul.txt` — both
 /// measured on a real Windows machine while this was designed.
 ///
-/// The verdict is platform-independent: the name is what syncs, and the first
-/// ordinary Windows machine on the other end is where it breaks.
+/// The verdict is platform-independent, and deliberately the conservative
+/// reading of the documented rules: `\\?\`-style API access can create several
+/// of these names even on Windows 11 (measured), but Explorer, shells and sync
+/// engines enforce the rules — the name is what syncs, and the other end is
+/// where it breaks.
 #[must_use]
 pub fn windows_incompatible_components(raw_name: &str) -> Vec<String> {
     raw_name

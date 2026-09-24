@@ -4005,6 +4005,9 @@ mod tests {
         fs::write(vault.join("a|b.md"), "# pipe\n\nPIPETOKEN\n").expect("write");
         fs::write(vault.join("dir./note.md"), "# dot\n\nDOTTOKEN\n").expect("write");
         fs::write(vault.join("dir /note.md"), "# space\n\nSPACETOKEN\n").expect("write");
+        // Two warnings on one row — an eviction stub whose name is also one
+        // Windows reserves — only a POSIX file system can spell this.
+        fs::write(vault.join(".a|b.md.icloud"), "stub text\n").expect("write the stub");
         write_config(dir.path(), &vault);
         init_workspace(dir.path()).expect("init");
         let report = index_workspace(dir.path(), None).expect("index");
@@ -4051,6 +4054,26 @@ mod tests {
                 "{key} is indexed despite its name"
             );
         }
+
+        // The two-warning row: the stub is skipped, and the *declaration*
+        // order decides both the primary code and the payload list (the
+        // contracts test pins `ALL` to that order; this pins what a row does
+        // with it).
+        let row = rows
+            .iter()
+            .find(|event| event.source_key.as_deref() == Some("note:.a|b.md.icloud"))
+            .expect("a row for the two-warning stub");
+        assert_eq!(row.outcome.as_deref(), Some("skipped"), "{row:?}");
+        assert_eq!(
+            row.reason_code.as_deref(),
+            Some("icloud_placeholder"),
+            "the first warning in declaration order is the row's primary: {row:?}"
+        );
+        assert_eq!(
+            row.data_json,
+            "{\"warnings\":[\"icloud_placeholder\",\"windows_incompatible_name\"],\"windows_incompatible_names\":[\".a|b.md.icloud\"]}",
+            "one row, two warnings, in the pinned order: {row:?}"
+        );
     }
 
     #[test]

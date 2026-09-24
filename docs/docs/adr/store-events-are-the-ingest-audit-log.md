@@ -88,7 +88,7 @@ D41's ten codes say what a file **lost** on the way into the index. D42's three
 warnings say what will not survive **another platform**: a cloud placeholder
 whose bytes are not on this device (`onedrive_placeholder`), an iCloud eviction
 stub standing in for a note that is not here (`icloud_placeholder`), and a name
-an ordinary Windows machine will not accept (`windows_incompatible_name`). They
+Windows' naming rules reserve (`windows_incompatible_name`). They
 are `momotaro_contracts::Warning`, not more `Degradation` variants: nothing was
 lost by the file, the ten stay ten, and a reader counting degradations is not
 silently taught a fourth kind of loss.
@@ -96,7 +96,8 @@ silently taught a fourth kind of loss.
 A warning rides the same `reason_code` column and the same rows, with the two
 homes `ingest-interop.md` §5.5 第 8 条 gives a degradation list: `reason_code`
 carries the first degradation when the row has one, and the first warning when
-it does not; `data_json` carries `{"degradations": […], "warnings": […]}` and,
+it does not (each list in its enum's declaration order — the order the payload
+and the counts carry); `data_json` carries `{"degradations": […], "warnings": […]}` and,
 for a `windows_incompatible_name` row, `{"windows_incompatible_names": […]}` —
 the components the warning is about, so the row witnesses what this build
 flagged (each key only when its list is non-empty). A reader that meets a code

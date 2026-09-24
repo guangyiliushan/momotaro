@@ -591,8 +591,8 @@ impl Degradation {
 /// A warning is not a [`Degradation`]: the ten degradations say what a file
 /// lost on the way into the index, while a warning is a standing fact about
 /// the file — a cloud placeholder whose bytes are not on this device, an iCloud
-/// eviction stub in a note's place, a name an ordinary Windows machine will not
-/// accept. Nothing was lost by the file, the ten stay ten, and a reader that
+/// eviction stub in a note's place, a name Windows' own naming rules reserve.
+/// Nothing was lost by the file, the ten stay ten, and a reader that
 /// counts degradations is not taught a fourth kind of loss. The two
 /// vocabularies share the `reason_code` column and a row's `data_json`; a
 /// reader must consult both before calling a code unknown (ADR 0026, "A
@@ -611,18 +611,22 @@ pub enum Warning {
     /// An iCloud eviction stub (`.name.icloud`): the note it stands for is not
     /// here; the stub itself is skipped and never read (D42).
     IcloudPlaceholder,
-    /// A name an ordinary Windows machine will not accept (reserved device
-    /// name, reserved character, trailing dot or space): indexed here, poisoned
-    /// by the first sync that meets Windows (D42).
+    /// A name Windows' own naming rules reserve (reserved device name, reserved
+    /// character, trailing dot or space): indexed here, refused or mangled by
+    /// the tools and sync clients that follow the rules (D42).
     WindowsIncompatibleName,
 }
 
 impl Warning {
-    /// Every warning, in the order a row's warnings are reported and counted.
+    /// Every warning, in the order a row's warnings are reported and counted
+    /// — the declaration order, which is what `Ord` gives the row writer's
+    /// sort and the report's map.
     ///
     /// One list, iterated by `from_code` and by the tests:
     /// `the_warning_list_is_complete` matches every variant without a
-    /// wildcard, so a code cannot be added to `as_str` alone.
+    /// wildcard, so a code cannot be added to `as_str` alone, and
+    /// `the_warning_list_is_in_the_order_rows_are_counted` keeps this array
+    /// and the declaration order agreeing.
     pub const ALL: [Self; 3] = [
         Self::OneDrivePlaceholder,
         Self::IcloudPlaceholder,
@@ -686,7 +690,9 @@ pub struct CoverageReport {
     pub batch_id: String,
     /// Rows that wrote a revision and its chunks.
     pub indexed: u64,
-    /// Rows whose file was unchanged.
+    /// Rows nothing was read for: the file was unchanged, a link was not
+    /// followed, or a stub or placeholder was not read. The row's code says
+    /// which.
     pub skipped: u64,
     /// Rows whose file only moved or was re-spelled.
     pub refreshed: u64,
@@ -734,11 +740,12 @@ pub struct IndexReport {
     /// Identifier of this indexing batch, as written to `store_events`
     /// (ADR 0026): one `index` run, one batch.
     pub batch_id: String,
-    /// Files the vault walk kept — notes and attachments alike, since both are
-    /// sources now (§5 第 10 条).
+    /// Files the vault walk kept — notes, canvases, attachments, links and
+    /// eviction stubs alike, since all of them get rows (§5 第 10 条).
     pub files_scanned: u64,
-    /// Files nothing was read for: the fingerprint was unchanged, or the walk saw a
-    /// link it does not follow. Both are skips, and the row's code says which.
+    /// Files nothing was read for: the fingerprint was unchanged, the walk saw a
+    /// link it does not follow, or the file is an eviction stub or a cloud
+    /// placeholder. All are skips, and the row's code says which.
     pub files_skipped: u64,
     /// Files that produced a new revision or refresh.
     pub files_indexed: u64,
@@ -893,6 +900,22 @@ mod tests {
                 "{warning:?} spells differently in JSON and in Display (as_str)"
             );
         }
+    }
+
+    #[test]
+    fn the_warning_list_is_in_the_order_rows_are_counted() {
+        // `ALL` claims to be "the order a row's warnings are reported and
+        // counted", and the row writer's `sort_unstable` and the report's
+        // `BTreeMap` both read the *declaration* order through `Ord`. Reorder
+        // one side alone and a two-warning row's primary code and payload list
+        // flip silently — `a|b.md.icloud` is exactly such a row.
+        let mut sorted = Warning::ALL;
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            Warning::ALL,
+            "reorder the enum and `ALL` together, or a row's order changes"
+        );
     }
 
     #[test]

@@ -201,7 +201,7 @@ parse_error。
    ⑤ **预警与降级是两个词表、同一行**（2026-09-24）：同步盘三条（`onedrive_placeholder` /
    `icloud_placeholder` / `windows_incompatible_name`）是 `Warning` 而不是
    `Degradation`——十类仍是十类（预警不是「丢了什么」，是「换一台平台活不下去」）。
-   承载与降级同形：`reason_code` = 降级的首个，**无降级时才轮到**预警的首个；
+   承载与降级同形：`reason_code` = 降级的首个，**无降级时才轮到**预警的首个（两份列表都按各自枚举的声明顺序——确定性，重跑同结果，首个即行主码）；
    `data_json` 增 `"warnings"` 键、非法名行另有 `"windows_incompatible_names"` 键
    （各自非空才写）。读者（`doctor --coverage` 与任何读行的人）必须**先查两个词表再判未知**——
    已知预警**不是** failure；两个词表都不认识的码照旧计入 failures。
@@ -319,7 +319,7 @@ parse_error。
      （`constitution.md`/`com10.md`/`aux2.md` 合法）、出现保留字符 `<` `>` `:` `"` `/`
      `\` `|` `?` `*` 或 NUL/1–31 控制字符、末字符是点或空格。命中即发
      `windows_incompatible_name`（`outcome` 不变、照常索引，命中组件列表随行）；判据
-     **与平台无关**（名字过一次盘就可能毒化 Windows 端，任何平台都如实预警）。
+     **与平台无关**（文档规则正是 Explorer 与同步端的实际约束——`\\?\` 路径能建这些名字不代表同步过去还能活；任何平台都如实预警）。
    - 长路径 manifest 声明 longPathAware + 文档明示 LongPathsEnabled；
 6. **平台测试矩阵（11 项；随 W2.6 的 `path_matrix.rs` 进 CI）**：大小写双写/仅大小写改名/NFD/NFC+NFD
    双写/260 长路径/保留名与尾随字符/OneDrive placeholder（**真样本只能手工一次**——该属性位

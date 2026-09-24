@@ -460,7 +460,7 @@ mod tests {
             ),
             (
                 Warning::WindowsIncompatibleName,
-                "the name is not one an ordinary Windows machine accepts; the first sync there will not carry it (D42)",
+                "the name is one Windows' naming rules reserve; tools and sync clients that follow them will refuse it (D42)",
             ),
         ] {
             assert_eq!(warning_message(warning), sentence, "{warning:?}");
@@ -1101,7 +1101,7 @@ fn warning_message(code: Warning) -> &'static str {
             "the file is an iCloud eviction stub; the note it stands for is not on this device (D42)"
         }
         Warning::WindowsIncompatibleName => {
-            "the name is not one an ordinary Windows machine accepts; the first sync there will not carry it (D42)"
+            "the name is one Windows' naming rules reserve; tools and sync clients that follow them will refuse it (D42)"
         }
     }
 }
