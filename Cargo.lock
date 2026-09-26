@@ -722,6 +722,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "momotaro-context"
+version = "0.1.0"
+dependencies = [
+ "momotaro-contracts",
+ "momotaro-retrieve",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "momotaro-contracts"
 version = "0.1.0"
 dependencies = [
@@ -743,6 +755,19 @@ dependencies = [
  "tempfile",
  "thiserror",
  "walkdir",
+]
+
+[[package]]
+name = "momotaro-llm"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "momotaro-contracts",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -777,6 +802,18 @@ version = "0.1.0"
 dependencies = [
  "momotaro-contracts",
  "rusqlite",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "momotaro-verify"
+version = "0.1.0"
+dependencies = [
+ "momotaro-contracts",
+ "momotaro-store",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]
