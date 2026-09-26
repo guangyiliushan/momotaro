@@ -790,9 +790,10 @@ Columns and their order come from the plan's D41. The two vocabularies the D41
 build matrix implies are `edge_kind` (a link, an embed, a canvas edge, a
 frontmatter link) and `link_source` (`wikilink`, `markdown`, `embed`, `canvas`,
 `frontmatter`), with `anchor_kind` covering a heading anchor and a block anchor;
-they close when W2.4 lands, and until then this table exists only here. The row
-is derived: `rm graph_links` and a rebuild must reproduce it, which is what the
-W2.4 acceptance check runs.
+they close when W2.4 lands; the store creates the table empty as of schema v5,
+with row identity and replacement left to W2.4. The row is derived: `rm
+graph_links` and a rebuild must reproduce it, which is what the W2.4 acceptance
+check runs.
 
 
 MVP 只实现 Tantivy BM25。中文用 CJK tokenizer，不要把 SQLite FTS5 当主引擎。SQLite 留下做关系事实。
