@@ -260,8 +260,13 @@ impl Store {
 
     /// Creates the initial schema if missing, then applies pending migrations.
     ///
-    /// Order is the contract (D46): identity check → version read → verified
-    /// backup of an existing store → migrations → key-scheme stamp.
+    /// Order is the contract (D46): identity check → version read →
+    /// `schema_meta` and the file-identity stamp (idempotent writes on every
+    /// store this build can adopt) → verified backup of an existing store →
+    /// migrations → key-scheme stamp. The load-bearing clause is the backup
+    /// strictly before any *migration* DDL
+    /// (`a_blocked_backup_stops_the_migration_before_any_ddl`); the last step
+    /// is pinned by `a_migration_failure_leaves_the_key_scheme_unstamped`.
     pub fn init_schema(&mut self) -> Result<(), StoreError> {
         // Refusals first, writes later — decided by the *same* predicate
         // `Store::open` consults before touching the file header.
@@ -513,7 +518,7 @@ mod tests {
         // One snapshot, every shape: a new refusal path may not be covered for
         // only some of the observable facts. Raw bytes make even a header-level
         // write (a journal-mode switch) visible.
-        let shapes: [(&str, String); 9] = [
+        let shapes: [(&str, String); 11] = [
             (
                 "foreign identity",
                 "PRAGMA application_id = 305419896; CREATE TABLE t(x);".to_owned(),
@@ -552,6 +557,20 @@ mod tests {
             (
                 "version carrier, no identity, foreign objects",
                 "PRAGMA user_version = 3; CREATE TABLE notes (id INTEGER PRIMARY KEY);".to_owned(),
+            ),
+            // v5 names in a file that is not ours: the new tables are no more
+            // adoptable than `chunks` was.
+            (
+                "v5 table names, no identity",
+                "CREATE TABLE answers (answer_id TEXT PRIMARY KEY);
+                 CREATE TABLE graph_links (from_source_key TEXT NOT NULL);"
+                    .to_owned(),
+            ),
+            (
+                "version carrier, no identity, v5 table names",
+                "PRAGMA user_version = 5;
+                 CREATE TABLE graph_links (from_source_key TEXT NOT NULL);"
+                    .to_owned(),
             ),
         ];
 
@@ -865,6 +884,8 @@ mod tests {
             store.user_version().expect("read user_version"),
             CURRENT_SCHEMA_VERSION
         );
+        let artifact = dir.path().join(&backups[0]);
+        backup::verify_artifact(&artifact).expect("the published backup verifies");
 
         // The migration really landed: the column exists afterwards.
         let has_raw_name = {
@@ -879,6 +900,533 @@ mod tests {
                 .any(|column| column == "raw_name")
         };
         assert!(has_raw_name, "v3 adds the raw_name column");
+    }
+
+    #[test]
+    fn a_migration_failure_leaves_the_key_scheme_unstamped() {
+        // The documented order puts the key-scheme stamp AFTER the migrations,
+        // so a migration that fails must not leave the stamp behind. The seed
+        // carries `raw_name` already (the v3 ALTER then fails) and no
+        // `key_scheme` row — stamping first would answer `Some("v2")` here.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("momotaro.db");
+        {
+            let connection = rusqlite::Connection::open(&path).expect("open seeded store");
+            connection
+                .execute_batch(&format!(
+                    "PRAGMA application_id = {APPLICATION_ID};
+                     CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     CREATE TABLE source_revisions (
+                       source_key TEXT NOT NULL,
+                       revision_hash TEXT NOT NULL,
+                       kind TEXT NOT NULL,
+                       title TEXT,
+                       uri TEXT,
+                       local_path TEXT,
+                       raw_name TEXT,
+                       origin_class TEXT NOT NULL,
+                       metadata_json TEXT NOT NULL,
+                       ingested_at INTEGER NOT NULL,
+                       is_current INTEGER NOT NULL,
+                       PRIMARY KEY (source_key, revision_hash)
+                     );
+                     CREATE TABLE chunks (
+                       chunk_id TEXT PRIMARY KEY,
+                       source_key TEXT NOT NULL,
+                       revision_hash TEXT NOT NULL,
+                       ordinal INTEGER NOT NULL,
+                       heading_path TEXT,
+                       text TEXT NOT NULL,
+                       locator_json TEXT NOT NULL,
+                       chunk_hash TEXT NOT NULL,
+                       token_estimate INTEGER NOT NULL
+                     );
+                     PRAGMA user_version = 2;"
+                ))
+                .expect("seed a store whose migration will fail");
+        }
+
+        let mut store = Store::open(&path).expect("open store");
+        store
+            .init_schema()
+            .expect_err("the v3 ALTER fails on the seeded raw_name");
+        assert_eq!(
+            store.metadata("key_scheme").expect("read key_scheme"),
+            None,
+            "a failed migration stamps no key scheme"
+        );
+    }
+
+    /// Seeds a faithful v4 store: the v2 tables and indexes, the v3 `raw_name`
+    /// ALTER (exactly as a migrated store carries it, last in `table_info`),
+    /// the v4 `store_events` table with its two partial indexes, the file
+    /// identity, and the version carrier. The rows in `source_revisions` /
+    /// `chunks` / `store_events` are sentinels: the v5 migration only adds
+    /// tables and must not touch these — not their rows, not their DDL.
+    fn seed_v4_store(path: &Path) {
+        let connection = rusqlite::Connection::open(path).expect("open v4 store");
+        connection
+            .execute_batch(&format!(
+                "PRAGMA application_id = {APPLICATION_ID};
+                 CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE source_revisions (
+                   source_key TEXT NOT NULL,
+                   revision_hash TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   title TEXT,
+                   uri TEXT,
+                   local_path TEXT,
+                   origin_class TEXT NOT NULL,
+                   metadata_json TEXT NOT NULL,
+                   ingested_at INTEGER NOT NULL,
+                   is_current INTEGER NOT NULL,
+                   PRIMARY KEY (source_key, revision_hash)
+                 );
+                 CREATE TABLE chunks (
+                   chunk_id TEXT PRIMARY KEY,
+                   source_key TEXT NOT NULL,
+                   revision_hash TEXT NOT NULL,
+                   ordinal INTEGER NOT NULL,
+                   heading_path TEXT,
+                   text TEXT NOT NULL,
+                   locator_json TEXT NOT NULL,
+                   chunk_hash TEXT NOT NULL,
+                   token_estimate INTEGER NOT NULL
+                 );
+                 CREATE INDEX idx_chunks_rev ON chunks(source_key, revision_hash);
+                 CREATE INDEX idx_revisions_current
+                   ON source_revisions(source_key) WHERE is_current = 1;
+                 ALTER TABLE source_revisions ADD COLUMN raw_name TEXT;
+                 CREATE TABLE store_events (
+                   id INTEGER PRIMARY KEY,
+                   occurred_at INTEGER NOT NULL,
+                   recorded_at INTEGER NOT NULL,
+                   batch_id TEXT NOT NULL,
+                   seq INTEGER NOT NULL,
+                   domain TEXT NOT NULL,
+                   type TEXT NOT NULL,
+                   source_key TEXT,
+                   outcome TEXT,
+                   reason_code TEXT,
+                   message TEXT,
+                   data_json TEXT NOT NULL,
+                   external_id TEXT,
+                   UNIQUE (batch_id, seq)
+                 );
+                 CREATE UNIQUE INDEX idx_store_events_external
+                   ON store_events(domain, external_id) WHERE external_id IS NOT NULL;
+                 CREATE INDEX idx_store_events_source
+                   ON store_events(source_key) WHERE source_key IS NOT NULL;
+                 INSERT INTO schema_meta (key, value) VALUES ('key_scheme', 'v2');
+                 INSERT INTO source_revisions
+                   (source_key, revision_hash, kind, title, uri, local_path, origin_class,
+                    metadata_json, ingested_at, is_current, raw_name)
+                   VALUES ('note:keep.md', 'k1', 'note', 'Keep', NULL, 'keep.md', 'owner',
+                    '{{}}', 1, 1, 'keep.md');
+                 INSERT INTO chunks
+                   (chunk_id, source_key, revision_hash, ordinal, heading_path, text,
+                    locator_json, chunk_hash, token_estimate)
+                   VALUES ('ck1', 'note:keep.md', 'k1', 0, NULL, 'keep me',
+                    '{{}}', 'hk1', 1);
+                 INSERT INTO store_events
+                   (occurred_at, recorded_at, batch_id, seq, domain, type, source_key,
+                    outcome, reason_code, message, data_json, external_id)
+                   VALUES (1, 1, 'b1', 1, 'ingest', 'ingest.started', NULL,
+                    NULL, NULL, NULL, '{{}}', NULL);
+                 PRAGMA user_version = 4;"
+            ))
+            .expect("seed a v4 store");
+    }
+
+    /// One column as `PRAGMA table_info` reports it: name, declared type,
+    /// NOT NULL flag, default expression, primary-key position (`0` = not in
+    /// the key). The whole tuple is asserted, so a column cannot quietly lose
+    /// a constraint.
+    type ColumnShape = (&'static str, &'static str, bool, Option<&'static str>, i32);
+    type OwnedColumnShape = (String, String, bool, Option<String>, i32);
+    type TableShape = (String, Vec<OwnedColumnShape>, Vec<String>);
+
+    fn column_shape(store: &Store, table: &str) -> Vec<OwnedColumnShape> {
+        store
+            .connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, bool>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, i32>(5)?,
+                        ))
+                    })?
+                    .collect()
+            })
+            .expect("read table_info")
+    }
+
+    /// The v5 tables exactly as architecture §8.1 / §8.2 and multi-agent §5.1
+    /// declare them. One list per table, columns in declaration order — a
+    /// column missing from the migration step turns its assertion red.
+    const V5_SHAPES: &[(&str, &[ColumnShape])] = &[
+        (
+            "sessions",
+            &[
+                ("session_id", "TEXT", false, None, 1),
+                ("parent_session_id", "TEXT", false, None, 0),
+                ("project_id", "TEXT", false, None, 0),
+                ("title", "TEXT", true, None, 0),
+                ("title_source", "TEXT", true, Some("'derived'"), 0),
+                ("profile_id", "TEXT", false, None, 0),
+                ("first_user_message", "TEXT", false, None, 0),
+                ("archived", "INTEGER", true, Some("0"), 0),
+                ("archived_at", "INTEGER", false, None, 0),
+                ("pinned", "INTEGER", true, Some("0"), 0),
+                ("created_at", "INTEGER", true, None, 0),
+                ("updated_at", "INTEGER", true, None, 0),
+                ("last_activity_at", "INTEGER", false, None, 0),
+            ],
+        ),
+        (
+            "runs",
+            &[
+                ("run_id", "TEXT", false, None, 1),
+                ("session_id", "TEXT", false, None, 0),
+                ("parent_run_id", "TEXT", false, None, 0),
+                ("project_id", "TEXT", false, None, 0),
+                ("graph_id", "TEXT", false, None, 0),
+                ("node_id", "TEXT", false, None, 0),
+                ("attempt", "INTEGER", true, Some("1"), 0),
+                ("mode", "TEXT", true, None, 0),
+                ("query", "TEXT", true, None, 0),
+                ("status", "TEXT", true, None, 0),
+                ("client_request_id", "TEXT", false, None, 0),
+                ("run_spec_hash", "TEXT", true, None, 0),
+                ("run_spec_json", "TEXT", true, None, 0),
+                ("provider", "TEXT", false, None, 0),
+                ("model", "TEXT", false, None, 0),
+                ("context_window", "INTEGER", false, None, 0),
+                ("max_output_tokens", "INTEGER", false, None, 0),
+                ("result_digest", "TEXT", false, None, 0),
+                ("failure_note", "TEXT", false, None, 0),
+                ("deadline_at", "INTEGER", false, None, 0),
+                ("created_at", "INTEGER", true, None, 0),
+                ("finished_at", "INTEGER", false, None, 0),
+            ],
+        ),
+        (
+            "run_events",
+            &[
+                ("run_id", "TEXT", true, None, 1),
+                ("seq", "INTEGER", true, None, 2),
+                ("type", "TEXT", true, None, 0),
+                ("data_json", "TEXT", true, None, 0),
+                ("created_at", "INTEGER", true, None, 0),
+            ],
+        ),
+        (
+            "history_items",
+            &[
+                ("history_id", "TEXT", false, None, 1),
+                ("session_id", "TEXT", false, None, 0),
+                ("run_id", "TEXT", true, None, 0),
+                ("seq", "INTEGER", true, None, 0),
+                ("kind", "TEXT", true, None, 0),
+                ("role", "TEXT", true, None, 0),
+                ("content_kind", "TEXT", true, None, 0),
+                ("body", "TEXT", true, None, 0),
+                ("payload_json", "TEXT", true, None, 0),
+                ("source_ref_json", "TEXT", false, None, 0),
+                ("token_estimate", "INTEGER", true, None, 0),
+                ("created_at", "INTEGER", true, None, 0),
+                ("occurred_at", "INTEGER", false, None, 0),
+            ],
+        ),
+        (
+            "retrievals",
+            &[
+                ("retrieval_id", "TEXT", false, None, 1),
+                ("run_id", "TEXT", true, None, 0),
+                ("query", "TEXT", true, None, 0),
+                ("normalized_query", "TEXT", true, None, 0),
+                ("strategy_json", "TEXT", true, None, 0),
+                ("created_at", "INTEGER", true, None, 0),
+            ],
+        ),
+        (
+            "retrieval_hits",
+            &[
+                ("retrieval_id", "TEXT", true, None, 1),
+                ("rank", "INTEGER", true, None, 0),
+                ("source_key", "TEXT", true, None, 0),
+                ("revision_hash", "TEXT", true, None, 0),
+                ("chunk_id", "TEXT", true, None, 2),
+                ("chunk_hash", "TEXT", true, None, 0),
+                ("locator_json", "TEXT", true, None, 0),
+                ("score", "REAL", false, None, 0),
+                ("included", "INTEGER", true, None, 0),
+                ("omitted_reason", "TEXT", false, None, 0),
+            ],
+        ),
+        (
+            "run_context_items",
+            &[
+                ("run_id", "TEXT", true, None, 1),
+                ("ordinal", "INTEGER", true, None, 2),
+                ("fragment_id", "TEXT", true, None, 0),
+                ("kind", "TEXT", true, None, 0),
+                ("role", "TEXT", true, None, 0),
+                ("content_kind", "TEXT", true, None, 0),
+                ("body", "TEXT", true, None, 0),
+                ("source_ref_json", "TEXT", false, None, 0),
+                ("token_estimate", "INTEGER", true, None, 0),
+                ("body_hash", "TEXT", true, None, 0),
+                ("decision_rationale", "TEXT", false, None, 0),
+                ("assumptions", "TEXT", false, None, 0),
+                ("supersedes", "TEXT", false, None, 0),
+            ],
+        ),
+        (
+            "llm_turns",
+            &[
+                ("turn_id", "TEXT", false, None, 1),
+                ("run_id", "TEXT", true, None, 0),
+                ("seq", "INTEGER", true, None, 0),
+                ("provider", "TEXT", true, None, 0),
+                ("model", "TEXT", true, None, 0),
+                ("request_hash", "TEXT", true, None, 0),
+                ("status", "TEXT", true, None, 0),
+                ("input_tokens", "INTEGER", false, None, 0),
+                ("output_tokens", "INTEGER", false, None, 0),
+                ("cached_tokens", "INTEGER", false, None, 0),
+                ("billable_tokens", "INTEGER", false, None, 0),
+                ("slot", "TEXT", false, None, 0),
+                ("reasoning_tokens", "INTEGER", false, None, 0),
+                ("raw_ref", "TEXT", false, None, 0),
+                ("created_at", "INTEGER", true, None, 0),
+                ("finished_at", "INTEGER", false, None, 0),
+            ],
+        ),
+        (
+            "answers",
+            &[
+                ("answer_id", "TEXT", false, None, 1),
+                ("run_id", "TEXT", true, None, 0),
+                ("text", "TEXT", true, None, 0),
+                ("prompt_hash", "TEXT", true, None, 0),
+                ("created_at", "INTEGER", true, None, 0),
+                ("decision_rationale", "TEXT", false, None, 0),
+                ("assumptions", "TEXT", false, None, 0),
+                ("supersedes", "TEXT", false, None, 0),
+            ],
+        ),
+        (
+            "answer_citations",
+            &[
+                ("answer_id", "TEXT", true, None, 1),
+                ("citation_index", "INTEGER", true, None, 2),
+                ("source_key", "TEXT", true, None, 0),
+                ("revision_hash", "TEXT", true, None, 0),
+                ("chunk_id", "TEXT", true, None, 0),
+                ("chunk_hash", "TEXT", true, None, 0),
+                ("locator_json", "TEXT", true, None, 0),
+                ("quoted_text", "TEXT", true, None, 0),
+                ("verified", "INTEGER", true, None, 0),
+            ],
+        ),
+        (
+            "verifications",
+            &[
+                ("verification_id", "TEXT", false, None, 1),
+                ("run_id", "TEXT", true, None, 0),
+                ("answer_id", "TEXT", false, None, 0),
+                ("kind", "TEXT", true, None, 0),
+                ("status", "TEXT", true, None, 0),
+                ("details_json", "TEXT", true, None, 0),
+                ("created_at", "INTEGER", true, None, 0),
+            ],
+        ),
+        (
+            "graph_links",
+            &[
+                ("from_source_key", "TEXT", true, None, 0),
+                ("to_source_key", "TEXT", false, None, 0),
+                ("raw_target", "TEXT", true, None, 0),
+                ("edge_kind", "TEXT", true, None, 0),
+                ("link_source", "TEXT", true, None, 0),
+                ("anchor_kind", "TEXT", false, None, 0),
+                ("anchor_raw", "TEXT", false, None, 0),
+                ("created_at", "INTEGER", true, None, 0),
+            ],
+        ),
+    ];
+
+    #[test]
+    fn the_v5_tables_have_their_contract_columns() {
+        let (_dir, mut store) = open_temp_store();
+        store.init_schema().expect("initialize schema");
+
+        for (table, expected) in V5_SHAPES {
+            let expected: Vec<OwnedColumnShape> = expected
+                .iter()
+                .map(|(name, ty, notnull, dflt, pk)| {
+                    (
+                        (*name).to_owned(),
+                        (*ty).to_owned(),
+                        *notnull,
+                        (*dflt).map(str::to_owned),
+                        *pk,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                column_shape(&store, table),
+                expected,
+                "{table} must have exactly its contract columns"
+            );
+        }
+
+        // UNIQUE declarations live in the CREATE text and carry the
+        // autoindexes the access paths rely on — pin the two of them.
+        for (table, needle) in [
+            ("history_items", "UNIQUE (run_id, seq)"),
+            ("runs", "client_request_id TEXT UNIQUE"),
+        ] {
+            let sql: String = store
+                .connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("read create text");
+            assert!(sql.contains(needle), "{table} must declare {needle}: {sql}");
+        }
+    }
+
+    /// Every non-bookkeeping table's columns and index names — the comparable
+    /// skeleton of a schema. Create-text whitespace differs between a seeded
+    /// and a migrated store, so shapes are compared, not SQL text.
+    fn schema_shape(store: &Store) -> Vec<TableShape> {
+        let tables: Vec<String> = store
+            .connection
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .and_then(|mut statement| statement.query_map([], |row| row.get(0))?.collect())
+            .expect("list tables");
+        tables
+            .into_iter()
+            .map(|table| {
+                let indexes: Vec<String> = store
+                    .connection
+                    .prepare(
+                        "SELECT name FROM sqlite_master
+                         WHERE type = 'index' AND tbl_name = ?1 ORDER BY name",
+                    )
+                    .and_then(|mut statement| {
+                        statement
+                            .query_map([&table], |row| row.get::<_, String>(0))?
+                            .collect()
+                    })
+                    .expect("list indexes");
+                let columns = column_shape(store, &table);
+                (table, columns, indexes)
+            })
+            .collect()
+    }
+
+    /// Every row of `table`, values rendered for exact comparison.
+    fn table_rows(connection: &rusqlite::Connection, table: &str) -> Vec<Vec<String>> {
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM {table}"))
+            .expect("select rows");
+        let columns = statement.column_count();
+        let mut rows = statement.query([]).expect("query rows");
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().expect("next row") {
+            let mut values = Vec::with_capacity(columns);
+            for index in 0..columns {
+                let value: rusqlite::types::Value = row.get(index).expect("read value");
+                values.push(format!("{value:?}"));
+            }
+            out.push(values);
+        }
+        out
+    }
+
+    /// DDL text and full row content of the tables v5 must not rebuild.
+    fn existing_tables_facts(path: &Path) -> Vec<(String, String, Vec<Vec<String>>)> {
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open raw");
+        ["source_revisions", "chunks", "store_events"]
+            .into_iter()
+            .map(|table| {
+                let sql: String = connection
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                        [table],
+                        |row| row.get(0),
+                    )
+                    .expect("read create text");
+                let rows = table_rows(&connection, table);
+                (table.to_owned(), sql, rows)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_v4_store_migrates_to_v5_without_touching_the_existing_tables() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("momotaro.db");
+        seed_v4_store(&path);
+        let before = existing_tables_facts(&path);
+
+        let mut store = Store::open(&path).expect("reopen store");
+        store.init_schema().expect("migrate to current");
+
+        assert_eq!(
+            store.user_version().expect("read user_version"),
+            CURRENT_SCHEMA_VERSION
+        );
+        let backups = backup_files(
+            dir.path(),
+            &format!("backup-v4-to-v{CURRENT_SCHEMA_VERSION}-"),
+        );
+        assert_eq!(backups.len(), 1, "one verified backup before migrating");
+
+        drop(store);
+        assert_eq!(
+            existing_tables_facts(&path),
+            before,
+            "the v3/v4 tables keep their DDL and their rows"
+        );
+    }
+
+    #[test]
+    fn a_migrated_v4_store_and_a_fresh_store_land_on_the_same_shape() {
+        // The two supported paths into the current schema — migrating a v4
+        // store and initializing a brand-new file — must arrive at the same
+        // tables, columns and indexes.
+        let fresh_dir = tempfile::tempdir().expect("create temp dir");
+        let fresh_path = fresh_dir.path().join("momotaro.db");
+        let mut fresh = Store::open(&fresh_path).expect("open fresh store");
+        fresh.init_schema().expect("initialize fresh");
+
+        let migrated_dir = tempfile::tempdir().expect("create temp dir");
+        let migrated_path = migrated_dir.path().join("momotaro.db");
+        seed_v4_store(&migrated_path);
+        let mut migrated = Store::open(&migrated_path).expect("open v4 store");
+        migrated.init_schema().expect("migrate to current");
+
+        assert_eq!(
+            schema_shape(&fresh),
+            schema_shape(&migrated),
+            "both paths must land on the same schema"
+        );
     }
 
     #[test]
@@ -955,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_db_lands_at_version_two_with_tables_and_indexes() {
+    fn fresh_db_creates_the_revision_and_chunk_tables_and_indexes() {
         let (_dir, mut store) = open_temp_store();
         store.init_schema().expect("initialize schema");
 
