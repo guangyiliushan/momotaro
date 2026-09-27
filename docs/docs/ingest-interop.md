@@ -134,15 +134,55 @@ parse_error。
    同样只记清单——成员口径见第 10 条）。
    黑名单 = **一切点开头目录与文件**，watcher 对黑名单静默；
 2. **建边规则**：wikilink 全形态建边（含 heading/block/别名/markdown 标准链接
-   等价）；`[[#heading]]` 自环不建边；embed 建边但 `edge_kind='embed'` 单列；
-   frontmatter 内链建边但 `link_source='frontmatter'` 单列；tags 是分类语义
-   不建边；**dangling 链接是一等公民**（target NULL + 保留 raw 串，目标日后
-   创建时回填）；
-3. **同名歧义三级规则**：含路径→精确匹配；裸名唯一→唯一匹配；多候选→同目录
-   优先，仍并列则**不建边 + `ambiguous_wikilink` 事件**（比 Obsidian 更保守）；
-4. **locator_json 三型**：`heading` / `block(^id)` / `span`；`raw` 字段全量
-   保留原始锚点串（ingest 规则升级后可离线重放重建边）；锚点校验失败记
-   `stale_anchor` 不静默丢边；
+   等价）；`[[#heading]]` 自环**不建边、不发事件**——自环是显式设计的非边，不是
+   「没建成的边」；embed 建边但 `edge_kind='embed'` 单列——**附件 embed 同样
+   建边**，`to_source_key` 是附件自己的源键（附件是 Source，embed 不因目标是
+   附件而豁免）；frontmatter 内链建边但 `link_source='frontmatter'` 单列（扫描
+   规则见第 5 条）；tags 是分类语义不建边；`obsidian://`、`mailto:` 与 `http(s)://` 外链
+   不建边——外链判据是 **URI 形**（`scheme://…` 任意方案名与 `mailto:`；裸
+   `arxiv:1234` 形的名字不是 URI，照常按名字解析成 dangling）；**dangling 链接是一等公民**（`to_source_key` NULL + `raw_target`
+   保留原文，目标日后创建时随下一次 `index` 的重投影回填，见下）。**抽取与
+   投影**：每条链接的 `raw_target`/`anchor_raw` 原文在解析期一次抽取，落该
+   revision 的 `metadata_json` 的 **`links`** 键（记录形如
+   `{"raw_target":…, "edge_kind":…, "link_source":…, "anchor_kind":…, "anchor_raw":…}`
+   （`anchor_kind` 取 `"heading"` / `"block"` / `null`，`anchor_raw` 随之可空），
+   记录序 = 文档序、同一身份只留首现）；
+   每次 `index` 对每个走到的文件按**当前命名空间**解析抽取、整替换该文件的
+   `graph_links` 行（行身份、替换粒度与 `created_at` 语义见
+   [ADR 0027](adr/graph-links-rows-are-a-rebuilt-projection.md)）——删表重跑
+   逐行一致；rename 后旧键的边在下次 `index` 如实变回 dangling
+   （[ADR 0014](adr/note-rename-is-a-new-source.md)）；解析规则升级后可从存量
+   抽取离线重放、不需重读 vault。canvas 建边（file 节点 / 连线 / text 节点
+   内链）**本批不出生产者**：`canvas_card`/`canvas_edge` 两值随枚举闭合
+   （§8.2），生产者待 canvas 建边件；引用网络边（论文参考文献）留 v0.4 的
+   paper add。**现状（2026-09-26）**：建边、dangling、投影与回填**已落**；
+   canvas 建边与引用网络边**未做**。**迁移注记**：先于 `links` 键写入的行里
+   没有抽取记录，指纹未变的文件不重写 blob（`skipped` 也不会重抽取）——那些
+   文件的边要等内容变化或清库重建才建，`rm graph_links` 重跑对它们同样
+   一致（重建出的行与存量行都不含它们）。
+3. **同名歧义三级规则**：**含 `/` 的目标** → vault 相对路径精确匹配（命中 =
+   源键 tail，即 vault 相对 NFC 路径，等于该串或该串 + `.md`——注意不是
+   `local_path`，那是 workspace 相对的另一个坐标）；**裸名目标** → basename
+   等于该串、或去扩展名后等于该串（笔记与附件同一规则）；多候选 → 同目录
+   优先，仍并列则**不建边 + `ambiguous_wikilink` 事件**（比 Obsidian 更保守；
+   该文件 coverage 行的 `data_json` 带 `ambiguous` 清单——每个未建成的链接记
+   `raw_target` 与全部候选源键）。**markdown 标准链接同规则**：URL 解码后进
+   同一解析，前导 `./` 去掉；含 `..` 的目标不解析成键（键层同口径），一律
+   dangling。匹配比较按 NFC 规范化后进行、不做大小写折叠（D42 同口径）。
+   **现状（2026-09-26）**：三级规则、同目录优先与候选清单载荷**已落**。
+4. **locator 三型**：`heading` / `block(^id)` / `span` 是「定位」的共享词汇，
+   分工不同——`heading`/`block` 是**链接锚点**两型（`graph_links.anchor_kind`
+   的全部取值；无锚点时两列 NULL），`span`（行区间）是 **chunk 自身的定位**，
+   即 `Chunk::locator_json` 已有的那一型，**不当锚点值使**。`anchor_raw` 全量
+   保留原始锚点串（ingest 规则升级后可离线重放重建边）。`block` 的 `^id`
+   字符集 `[A-Za-z0-9-]+`，三种定义形态（段末 / 独立行 / bullet 后）在解析期
+   扫描建映射。**heading 是文本锚点非 ID**：`#H1#H2` 多级锚按 heading_path
+   逐级文本定位、`anchor_raw` 保留原文；目标笔记内同名标题**取第一个出现**
+   （本仓显式规则，不发事件）。锚点校验失败记 `stale_anchor` 不静默丢边
+   （行保留）。**附件目标不做锚点解析**（PDF 页参一类片段不是锚点）：
+   `anchor_raw` 原文保留、`anchor_kind` NULL、不校验、不发 `stale_anchor`。
+   **现状（2026-09-26）**：两型锚点、校验与 `stale_anchor` **已落**；`span`
+   先于本批已在 chunk 侧（`Chunk::locator_json`）。
 5. **frontmatter**：全量结构化解析（未知字段是 Obsidian 一等数据）；正文 FTS
    排除 frontmatter 块。块的身份只认**第一行**、且必须有**闭合**：只有首行恰为
    `---`（行尾空白除外）且其后存在列 0 的 `---` 或 `...` 时才成块；首行之前有
@@ -171,25 +211,60 @@ parse_error。
    的行里 `reason` 仍是句子；指纹未变的文件不会重写 blob（`skipped`），
    `rebuild-index` 也只重建 tantivy，所以那些行会一直带着旧词表——重解析即恢复，
    今天没有读者，故不做迁移。
+   **frontmatter 内链一律从 `raw` 扫描**（字段形状未建模也不会漏链）：`raw` 在
+   `Parsed` 与 `Failed` 两条路径都保留，扫描两路都生效；只扫**非注释行**
+   （列 0 `#` 开头是 YAML 注释，其中的 `[[x]]` 不建边）；块标量（`|`/`>`）
+   内容按 YAML 语义是**内容**，其中的 `[[x]]` **建边**。
+   **`metadata_json` 的键形状**（下游按形状分支，勿按散文匹配）：
+   `frontmatter` 四态——`{"state":"absent"}`（无块）；`{"state":"parsed", …}`
+   带 `"raw"`（块原文）与 `"fields":[{"key":…,"value":…},…]`——`value` 是
+   `{"scalar":…}` / `{"list":[…]}` / `{"raw":…}` 三型之一（YAML；JSON 属性块
+   同形、另带 `"source":"json"`）；`{"state":"failed", …}` 带 `"raw"` /
+   `"line"` / `"reason"`（读不出来的 JSON 块同态、`line` 恒 1）。`fields` 序 =
+   源序（JSON 属性块按键序）、重复键全
+   保留，`value` 三型与 `Value` 枚举同构。`links` 键见第 2 条（存量记录里本 build 不认识的拼写整条跳过并按
+   `unknown_link_syntax` 记损失——降级窗口里也不许无码消失）；`link_losses`
+   键 = 抽取期损失的**去重码表**（声明序，`markdown_link_decode_error` /
+   `unknown_link_syntax` 两类事实随行重投影，`skipped` 行不丢码）；`outline`
+   键 = `{"headings":[[<级别文本>…],…],"block_ids":[…]}`——锚点校验与离线
+   重放的依据（每个标题一条路径 = 它入栈后的栈快照；`block_ids` 为行末
+   `^id` 定义）。指纹刷新整块重写 `metadata_json`，各键都由调用方带过
+   （刷新语义 = 内容未变）。
    `chunks.text` 仍是原文切片，locator 必须把切掉的字节/行加回（见
    [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 同层的口径）——
    注意解析基座不这么看（CommonMark 把 `---`+散文+`---` 读成 hr + 第二道 `---`
    作散文的 setext H2 下划线），所以**剥离必须先于解析**：先切块、再 desugar、
    建 index；
-   **现状（2026-09-18）**：解析、接线与排除**已落地**（字段进
-   `source_revisions.metadata_json` 的 `frontmatter` 键、正文进 chunker 且 locator
-   按原 note 计、失败发 `frontmatter_parse_error` 且 `outcome` 仍为 `indexed`）；
-   **未做**的是 wikilink 五类降级（随 W2.4 建边）；同步盘三条（OneDrive/iCloud/Windows
-   非法名）**已落**，是 `Warning` 而非十类之一（口径见 §6 第 5 条与第 8 条 ⑤）；十类里**已有生产者的
-   五类**是 `frontmatter_parse_error`、`canvas_parse_error`、`excalidraw_detected`
-   （第 9 条）、`attachment_unindexed`、`symlink_encountered`（第 10 条）；
+   **现状（2026-09-26）**：解析、接线与排除**已落地**（字段进
+   `source_revisions.metadata_json` 的 `frontmatter` 键、正文进 chunker 且
+   locator 按原 note 计、失败发 `frontmatter_parse_error` 且 `outcome` 仍为
+   `indexed`）；wikilink 五类降级**已随 W2.4 建边落地**（第 2–4 条）；同步盘
+   三条（OneDrive/iCloud/Windows 非法名）**已落**，是 `Warning` 而非十类之一
+   （口径见 §6 第 5 条与第 8 条 ⑤）；十类**全部有生产者**：
+   `frontmatter_parse_error`（本条）、五类 wikilink 码（第 2–4 条）、
+   `excalidraw_detected`/`canvas_parse_error`（第 9 条）、
+   `symlink_encountered`/`attachment_unindexed`（第 10 条）；
 6. **解析基座**：pulldown-cmark ≥ 0.13.3 + `ENABLE_WIKILINKS`（官方内置、
-   Obsidian 兼容目标）；私有语法（Dendron 式）当 `unknown_link_syntax` 降级；
+   Obsidian 兼容目标）；私有语法（Dendron 式）当 `unknown_link_syntax` 降级——
+   **触发面 = 正文里「长得像链接但解析器没成链」的残迹**（空锚 `[[#^]]`、
+   只有别名的 `[[|x]]` 这类），按纯文本保留并发码；锚在了链上但形态非法
+   （`^` 后不是 `[A-Za-z0-9-]+`）同样归它；**code span / 代码围栏里的
+   `[[x]]` 不算**：那是有意的代码文本，不是疑似链接，不发码。
+   **现状（2026-09-26）**：全部解析点已开 `ENABLE_WIKILINKS`（chunker、title
+   与 links 的抽取/轮廓两处，共四处；黄金集复测逐位未动——夹具内 `[[` 为 0
+   次，属夹具巧合 + 按构造不变）；
+   `unknown_link_syntax` 生产者**已落**。
 7. **降级事件十类**：frontmatter_parse_error / unresolved_wikilink /
    ambiguous_wikilink / stale_anchor / markdown_link_decode_error /
    unknown_link_syntax / excalidraw_detected / canvas_parse_error /
    symlink_encountered / attachment_unindexed——每条「没索引/没建边」的决定
    都留可审计事件，ingest 汇总报告回答「覆盖了多少、漏了什么、为什么」。
+   **五类 wikilink 码的行为空间**（生产者随 W2.4 落地）：`unresolved_wikilink`
+   = dangling 行照建 + 码；`ambiguous_wikilink` = **不建行** + 码（候选清单
+   进 `data_json`）；`stale_anchor` = 行保留 + 码；`markdown_link_decode_error`
+   = **不建行** + 码（该链接按纯文本入 FTS）；`unknown_link_syntax` =
+   **不建行** + 码（原文本保留）。**现状（2026-09-26）**：十类全部有生产者，
+   落点见第 2–6 条与第 9/10 条。
 8. **一个文件可以同时丢好几样**（降级槽的形状，2026-09-20 定）：W2.4 起，
    「三条悬挂 + 一条歧义」是常态，所以**不许**用单槽表示。取值形状如下——
    ① `FileOutcome::Indexed` 携带**一个列表**（`degradations: Vec<Degradation>`），
@@ -209,6 +284,8 @@ parse_error。
    `doctor --coverage` 两个清单都渲染。
    两条被否的替代：**每码一行**（破坏「每个走到的文件恰好一行」的计数不变量）
    与 **`reason_code` 里拼分隔串**（列是稳定码，编码串会诱使下游做字符串匹配）。
+   **现状（2026-09-26）**：槽形状先于本批已落；五类 wikilink 码走同一槽、无新
+   形状（一文件多码共现按本条既有规则：`reason_code` 取首个、`data_json` 全表）。
 9. **`.canvas` 的文本口径，与 Excalidraw 场景段（2026-09-21 定，随 W2.3 落地）**：
    `.canvas` 是 JSON Canvas 1.0（顶层只有 `nodes`/`edges` 两个数组，规范里**两个都是
    optional**），进索引的只有规范**赋予了文本语义**的字段——`text` 节点取 `text`
@@ -300,7 +377,8 @@ parse_error。
    键层不做任何 casefold（Linux 大小写双写合法并存，折叠 = 数据丢失级事故）；
 4. **碰撞策略**：NFC 键相同而原始字节不同 → 两条目都保留 + 消歧后缀 +
    `key_collision` 警告事件；**「绝不静默合并」只作用于身份键**（内容寻址的
-   revision 集与同策略幂等替换的 chunk 集允许静默并）；
+   revision 集、同策略幂等替换的 chunk 集与 `graph_links` 行集允许静默并——
+   [ADR 0027](adr/graph-links-rows-are-a-rebuilt-projection.md)）；
 5. **同步盘预警（D42 三条，词表 `Warning`）**：
    - **OneDrive placeholder**：判据**只认** `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`——
      官方要求所有 Cloud Files 占位必须置位；`OFFLINE`（普通文件上也能置位，实测）、

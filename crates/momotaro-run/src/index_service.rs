@@ -10,14 +10,16 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use momotaro_contracts::{
-    Chunk, CoverageCounts, CoverageFailure, CoverageReport, Degradation, IndexFileError,
-    IndexFileErrorKind, IndexPolicy, IndexReport, OriginClass, RetrievalHit, SourceKind, Warning,
-    WorkspaceStatus,
+    AnchorKind, Chunk, CoverageCounts, CoverageFailure, CoverageReport, Degradation, GraphLink,
+    IndexFileError, IndexFileErrorKind, IndexPolicy, IndexReport, OriginClass, RetrievalHit,
+    SourceKind, Warning, WorkspaceStatus,
 };
 use momotaro_ingest::frontmatter::{self, FrontmatterParse};
 use momotaro_ingest::{
-    SourceOffset, VaultFileKind, attributes_of, chunk_markdown_with, derive_title,
-    is_cloud_placeholder, normalize_markdown, raw_name_for, revision_hash, revision_hash_reader,
+    Extracted, Namespace, Outline, Resolution, SourceOffset, VaultFileKind, analyze,
+    anchor_still_exists, attributes_of, chunk_markdown_with, derive_title,
+    extract_frontmatter_links, is_cloud_placeholder, normalize_markdown, parent_dir,
+    percent_decode, raw_name_for, resolve as resolve_link, revision_hash, revision_hash_reader,
     scene_spans, source_key_for, walk_entries, windows_incompatible_components,
 };
 use momotaro_retrieve::{IndexWriterHandle, RetrieveError, SearchIndex};
@@ -373,6 +375,8 @@ mod tests {
                 ],
                 warnings: &[],
                 windows_names: &[],
+                ambiguous: &[],
+                stale: &[],
             }),
             "{\"degradations\":[\"frontmatter_parse_error\",\"excalidraw_detected\"]}"
         );
@@ -381,6 +385,8 @@ mod tests {
                 degradations: &[Degradation::FrontmatterParseError],
                 warnings: &[Warning::WindowsIncompatibleName],
                 windows_names: &["dir.".to_owned()],
+                ambiguous: &[],
+                stale: &[],
             }),
             "{\"degradations\":[\"frontmatter_parse_error\"],\"warnings\":[\"windows_incompatible_name\"],\"windows_incompatible_names\":[\"dir.\"]}"
         );
@@ -389,8 +395,93 @@ mod tests {
                 degradations: &[],
                 warnings: &[Warning::IcloudPlaceholder],
                 windows_names: &[],
+                ambiguous: &[],
+                stale: &[],
             }),
             "{\"warnings\":[\"icloud_placeholder\"]}"
+        );
+        // An ambiguous link carries its writing and its candidates (§5 第 3 条):
+        // the audit of a no-edge decision.
+        assert_eq!(
+            payload_json(&RowPayload {
+                degradations: &[Degradation::AmbiguousWikilink],
+                warnings: &[],
+                windows_names: &[],
+                ambiguous: &[(
+                    "note".to_owned(),
+                    vec!["note:a/note.md".to_owned(), "note:b/note.md".to_owned()]
+                )],
+                stale: &[],
+            }),
+            // serde_json maps sort their keys, so the payload's key order is
+            // alphabetical and deterministic — pinned here as written.
+            "{\"ambiguous\":[{\"candidates\":[\"note:a/note.md\",\"note:b/note.md\"],\"raw_target\":\"note\"}],\"degradations\":[\"ambiguous_wikilink\"]}"
+        );
+        // A stale anchor carries which one (target + raw), like the ambiguous
+        // candidates do — the audit of a kept-but-unverified edge (§5 第 4 条).
+        assert_eq!(
+            payload_json(&RowPayload {
+                degradations: &[Degradation::StaleAnchor],
+                warnings: &[],
+                windows_names: &[],
+                ambiguous: &[],
+                stale: &[("note:target.md".to_owned(), "NoSuch".to_owned())],
+            }),
+            "{\"degradations\":[\"stale_anchor\"],\"stale_anchors\":[{\"anchor\":\"NoSuch\",\"target\":\"note:target.md\"}]}"
+        );
+    }
+
+    #[test]
+    fn a_blob_record_from_a_newer_build_is_skipped_not_rewritten() {
+        let blob = serde_json::json!({
+            "links": [
+                {"raw_target": "x", "edge_kind": "kind_from_the_future",
+                 "link_source": "wikilink", "anchor_kind": null, "anchor_raw": null},
+                {"raw_target": "y", "edge_kind": "link", "link_source": "wikilink",
+                 "anchor_kind": "anchor_from_the_future", "anchor_raw": "H"},
+                {"raw_target": "z", "edge_kind": "link", "link_source": "source_from_the_future",
+                 "anchor_kind": null, "anchor_raw": null},
+            ],
+            "link_losses": [],
+            "outline": {"headings": [], "block_ids": []},
+        })
+        .to_string();
+        let out = parse_link_blob(&blob);
+        assert!(
+            out.links.is_empty(),
+            "an unknown spelling anywhere drops the record whole: {:?}",
+            out.links
+        );
+        assert_eq!(
+            out.losses,
+            [Degradation::UnknownLinkSyntax],
+            "and the drop is reported, never silent (§5 第 7 条)"
+        );
+    }
+
+    #[test]
+    fn the_links_blob_record_is_the_contract_shape() {
+        // The persisted record is contract (§5 第 2 条): exact keys, exact
+        // spellings, nulls where the anchor is absent — asserted against the
+        // literal JSON so a drift cannot agree with itself.
+        let input = chunk_input("body [[x]]", VaultFileKind::Note);
+        let blob = revision_metadata("{}", &input.frontmatter, &input.extracted, &input.outline);
+        let value: serde_json::Value = serde_json::from_str(&blob).expect("blob is JSON");
+        assert_eq!(
+            value["links"][0],
+            serde_json::json!({
+                "raw_target": "x",
+                "edge_kind": "link",
+                "link_source": "wikilink",
+                "anchor_kind": null,
+                "anchor_raw": null,
+            }),
+            "{blob}"
+        );
+        assert_eq!(value["link_losses"], serde_json::json!([]), "{blob}");
+        assert!(
+            value.get("outline").is_some(),
+            "the outline key is always there"
         );
     }
 
@@ -751,13 +842,53 @@ fn fingerprint_matches(metadata_json: &str, metadata: &fs::Metadata) -> bool {
         && value.get("size_bytes").and_then(serde_json::Value::as_u64) == Some(metadata.len())
 }
 
-/// The revision's metadata blob: the stat fingerprint plus what the frontmatter
-/// block turned out to be.
-fn revision_metadata(fingerprint: &str, frontmatter: &FrontmatterParse) -> String {
+/// The revision's metadata blob: the stat fingerprint, what the frontmatter
+/// block turned out to be, and the two facts edge rebuilding replays from
+/// (`§5 第 2/4/5 条`): the `links` extraction plus its `link_losses`, and the
+/// `outline` anchors are validated against.
+fn revision_metadata(
+    fingerprint: &str,
+    frontmatter: &FrontmatterParse,
+    extracted: &Extracted,
+    outline: &Outline,
+) -> String {
     let mut blob = serde_json::from_str::<serde_json::Value>(fingerprint)
         .unwrap_or_else(|_| serde_json::json!({}));
     if let Some(object) = blob.as_object_mut() {
         object.insert("frontmatter".to_owned(), frontmatter_json(frontmatter));
+        object.insert(
+            "links".to_owned(),
+            serde_json::json!(
+                extracted
+                    .links
+                    .iter()
+                    .map(|link| serde_json::json!({
+                        "raw_target": link.raw_target,
+                        "edge_kind": link.edge_kind.as_str(),
+                        "link_source": link.link_source.as_str(),
+                        "anchor_kind": link.anchor_kind.map(AnchorKind::as_str),
+                        "anchor_raw": link.anchor_raw,
+                    }))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        object.insert(
+            "link_losses".to_owned(),
+            serde_json::json!(
+                extracted
+                    .losses
+                    .iter()
+                    .map(|code| code.as_str())
+                    .collect::<Vec<_>>()
+            ),
+        );
+        object.insert(
+            "outline".to_owned(),
+            serde_json::json!({
+                "headings": outline.headings,
+                "block_ids": outline.block_ids,
+            }),
+        );
     }
     blob.to_string()
 }
@@ -882,6 +1013,11 @@ struct RowPayload<'a> {
     degradations: &'a [Degradation],
     warnings: &'a [Warning],
     windows_names: &'a [String],
+    /// Every ambiguous link of the file: the writing and the candidates it
+    /// matched (`§5 第 3 条`) — the audit a no-edge decision leaves behind.
+    ambiguous: &'a [(String, Vec<String>)],
+    /// Every checked anchor that no longer exists in its target (`§5 第 4 条`).
+    stale: &'a [(String, String)],
 }
 
 impl RowPayload<'_> {
@@ -890,6 +1026,8 @@ impl RowPayload<'_> {
         degradations: &[],
         warnings: &[],
         windows_names: &[],
+        ambiguous: &[],
+        stale: &[],
     };
 }
 
@@ -928,6 +1066,36 @@ fn payload_json(payload: &RowPayload<'_>) -> String {
         object.insert(
             "windows_incompatible_names".to_owned(),
             serde_json::json!(payload.windows_names),
+        );
+    }
+    if !payload.stale.is_empty() {
+        object.insert(
+            "stale_anchors".to_owned(),
+            serde_json::json!(
+                payload
+                    .stale
+                    .iter()
+                    .map(|(target, anchor)| serde_json::json!({
+                        "target": target,
+                        "anchor": anchor,
+                    }))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    if !payload.ambiguous.is_empty() {
+        object.insert(
+            "ambiguous".to_owned(),
+            serde_json::json!(
+                payload
+                    .ambiguous
+                    .iter()
+                    .map(|(raw, candidates)| serde_json::json!({
+                        "raw_target": raw,
+                        "candidates": candidates,
+                    }))
+                    .collect::<Vec<_>>()
+            ),
         );
     }
     serde_json::Value::Object(object).to_string()
@@ -976,76 +1144,6 @@ fn record_coverage(
         report.errors.push(file_error(source_key, kind, message));
     }
     Ok(())
-}
-
-/// Writes one file's coverage row: the outcome's own codes, plus what the
-/// file's name is worth saying (D42).
-///
-/// One home for the merge, so the placeholder path and the ordinary path
-/// cannot disagree about what rides a row: `windows_incompatible_name` (with
-/// the components it is about) rides every non-error row — the name is a fact
-/// about the file whether or not this run read its bytes, and a report that
-/// dropped it on a no-op re-run would call the vault clean.
-fn record_file_row(
-    store: &mut Store,
-    report: &mut IndexReport,
-    batch_id: &str,
-    seq: &mut i64,
-    source_key: &str,
-    raw_name: &str,
-    outcome: Result<FileOutcome, IndexFileError>,
-) -> Result<(), RunError> {
-    match outcome {
-        Err(IndexFileError { kind, message, .. }) => record_coverage(
-            store,
-            report,
-            batch_id,
-            seq,
-            Some(source_key),
-            "error",
-            None,
-            None,
-            &RowPayload::NONE,
-            Some((kind, message)),
-        ),
-        Ok(outcome) => {
-            let windows_names = windows_incompatible_components(raw_name);
-            let mut warnings = outcome.warnings().to_vec();
-            if !windows_names.is_empty() {
-                warnings.push(Warning::WindowsIncompatibleName);
-            }
-            // Enum declaration order, so a re-run reports the same list.
-            warnings.sort_unstable();
-            warnings.dedup();
-            // The row's primary code and its message: the first degradation
-            // when the file lost something, the first warning when it did not
-            // (§5 第 8 条 ②⑤).
-            let (primary, sentence) = match (outcome.degradation(), warnings.first().copied()) {
-                (Some(code), _) => (
-                    Some(Degradation::as_str(code)),
-                    Some(degradation_message(code)),
-                ),
-                (None, Some(code)) => (Some(Warning::as_str(code)), Some(warning_message(code))),
-                (None, None) => (None, None),
-            };
-            record_coverage(
-                store,
-                report,
-                batch_id,
-                seq,
-                Some(source_key),
-                outcome.as_str(),
-                primary,
-                sentence,
-                &RowPayload {
-                    degradations: outcome.degradations(),
-                    warnings: &warnings,
-                    windows_names: &windows_names,
-                },
-                None,
-            )
-        }
-    }
 }
 
 /// What one degradation code means.
@@ -1265,7 +1363,39 @@ pub fn index_workspace_with(
         external_id: None,
     })?;
 
+    // The namespace every link resolves against (§5 第 3 条): every walked
+    // path that has a key, keyed by its vault-relative tail. Built before any
+    // processing so resolution never depends on walk order — a link to a file
+    // processed later resolves exactly like one processed earlier.
+    let mut namespace_pairs: Vec<(String, String)> = Vec::new();
+    // Attachment and canvas keys ride the same pass, for the anchor carve-out
+    // (§5 第 4 条): a fragment on such a target is not an anchor — a PDF page
+    // number, a canvas subpath, neither is a heading.
+    let mut non_note_keys: HashSet<String> = HashSet::new();
+    for entry in &entries {
+        let Ok(key) = source_key_for(&vault_root, &entry.path) else {
+            continue;
+        };
+        let tail = key.strip_prefix("note:").unwrap_or(&key).to_owned();
+        namespace_pairs.push((tail, key.clone()));
+        if matches!(
+            entry.kind,
+            VaultFileKind::Attachment | VaultFileKind::Canvas
+        ) {
+            non_note_keys.insert(key);
+        }
+    }
+    let ns = Namespace::new(
+        namespace_pairs
+            .iter()
+            .map(|(tail, key)| (tail.as_str(), key.as_str())),
+    );
+
     let mut claimed: HashMap<String, String> = HashMap::new();
+    // Coverage rows are written after the data batch (ADR 0026: data first,
+    // events after): `stale_anchor` is decided against the state every file
+    // left behind, never against walk order (§5 第 4 条).
+    let mut pending: Vec<PendingRow> = Vec::new();
 
     for entry in entries {
         let file = &entry.path;
@@ -1278,20 +1408,14 @@ pub fn index_workspace_with(
                 // this arm; it stays correct by construction because the row's
                 // code is the typed kind's spelling, never a literal.
                 let message = error.to_string();
-                record_coverage(
-                    &mut store,
-                    &mut report,
-                    &batch_id,
-                    &mut seq,
-                    None,
-                    "error",
-                    None,
-                    // The failure tuple below carries the text; passing it here
-                    // as well would be dead — the writer prefers the failure.
-                    None,
-                    &RowPayload::NONE,
-                    Some((error.kind(), message)),
-                )?;
+                pending.push(PendingRow {
+                    source_key: None,
+                    raw_name: None,
+                    outcome: Err(file_error(None, error.kind(), message)),
+                    replace_rows: None,
+                    anchors: Vec::new(),
+                    ambiguous: Vec::new(),
+                });
                 continue;
             }
         };
@@ -1300,18 +1424,14 @@ pub fn index_workspace_with(
             Ok(name) => name,
             Err(error) => {
                 let message = error.to_string();
-                record_coverage(
-                    &mut store,
-                    &mut report,
-                    &batch_id,
-                    &mut seq,
-                    Some(source_key.as_str()),
-                    "error",
-                    None,
-                    None,
-                    &RowPayload::NONE,
-                    Some((error.kind(), message)),
-                )?;
+                pending.push(PendingRow {
+                    source_key: Some(source_key.clone()),
+                    raw_name: None,
+                    outcome: Err(file_error(Some(&source_key), error.kind(), message)),
+                    replace_rows: None,
+                    anchors: Vec::new(),
+                    ambiguous: Vec::new(),
+                });
                 continue;
             }
         };
@@ -1325,18 +1445,14 @@ pub fn index_workspace_with(
         if let Some(first) = claimed.get(&source_key) {
             let message = format!("claimed by both {first:?} and {raw_name:?}");
             let kind = IndexFileErrorKind::KeyCollision;
-            record_coverage(
-                &mut store,
-                &mut report,
-                &batch_id,
-                &mut seq,
-                Some(source_key.as_str()),
-                "error",
-                None,
-                None,
-                &RowPayload::NONE,
-                Some((kind, message)),
-            )?;
+            pending.push(PendingRow {
+                source_key: Some(source_key.clone()),
+                raw_name: Some(raw_name.clone()),
+                outcome: Err(file_error(Some(&source_key), kind, message)),
+                replace_rows: None,
+                anchors: Vec::new(),
+                ambiguous: Vec::new(),
+            });
             continue;
         }
         claimed.insert(source_key.clone(), raw_name.clone());
@@ -1353,98 +1469,146 @@ pub fn index_workspace_with(
             match attributes_of(file) {
                 Ok(attrs) if is_cloud_placeholder(attrs) => {
                     report.files_skipped += 1;
-                    record_file_row(
-                        &mut store,
-                        &mut report,
-                        &batch_id,
-                        &mut seq,
-                        &source_key,
-                        &raw_name,
-                        Ok(FileOutcome::Skipped {
+                    pending.push(PendingRow {
+                        source_key: Some(source_key.clone()),
+                        raw_name: Some(raw_name.clone()),
+                        outcome: Ok(FileOutcome::Skipped {
                             degradations: Vec::new(),
                             warnings: vec![Warning::OneDrivePlaceholder],
                         }),
-                    )?;
+                        replace_rows: None,
+                        anchors: Vec::new(),
+                        ambiguous: Vec::new(),
+                    });
                     continue;
                 }
                 Ok(_) => {}
                 Err(error) => {
                     let message = error.to_string();
-                    record_coverage(
-                        &mut store,
-                        &mut report,
-                        &batch_id,
-                        &mut seq,
-                        Some(source_key.as_str()),
-                        "error",
-                        None,
-                        None,
-                        &RowPayload::NONE,
-                        Some((IndexFileErrorKind::Io, message)),
-                    )?;
+                    pending.push(PendingRow {
+                        source_key: Some(source_key.clone()),
+                        raw_name: Some(raw_name.clone()),
+                        outcome: Err(file_error(
+                            Some(&source_key),
+                            IndexFileErrorKind::Io,
+                            message,
+                        )),
+                        replace_rows: None,
+                        anchors: Vec::new(),
+                        ambiguous: Vec::new(),
+                    });
                     continue;
                 }
             }
         }
 
-        let outcome = match entry.kind {
+        let (outcome, findings) = match entry.kind {
             // A link is not content: this version does not follow them (the vault
             // layer says so by kind), so the row is the whole record — no revision,
             // no chunks, and nothing is ever read through the link (§5 第 10 条).
             VaultFileKind::Symlink => {
                 report.files_skipped += 1;
-                Ok(FileOutcome::Skipped {
-                    degradations: vec![Degradation::SymlinkEncountered],
-                    warnings: Vec::new(),
-                })
+                (
+                    Ok(FileOutcome::Skipped {
+                        degradations: vec![Degradation::SymlinkEncountered],
+                        warnings: Vec::new(),
+                    }),
+                    LinkFindings::default(),
+                )
             }
             // An iCloud eviction stub is not content either: the note it stands
             // for is not on this device, so the row is the whole record and the
             // warning says why (D42).
             VaultFileKind::IcloudPlaceholder => {
                 report.files_skipped += 1;
-                Ok(FileOutcome::Skipped {
-                    degradations: Vec::new(),
-                    warnings: vec![Warning::IcloudPlaceholder],
-                })
+                (
+                    Ok(FileOutcome::Skipped {
+                        degradations: Vec::new(),
+                        warnings: vec![Warning::IcloudPlaceholder],
+                    }),
+                    LinkFindings::default(),
+                )
             }
             // Everything that is not a note is registered rather than read: the
             // vault's inventory is complete without pretending binary bytes are
             // searchable (§5 第 10 条).
-            VaultFileKind::Attachment => register_attachment(
-                &mut store,
-                &workspace_root,
-                file,
-                &source_key,
-                &raw_name,
-                &mut report,
+            VaultFileKind::Attachment => (
+                register_attachment(
+                    &mut store,
+                    &workspace_root,
+                    file,
+                    &source_key,
+                    &raw_name,
+                    &mut report,
+                ),
+                LinkFindings::default(),
             ),
-            VaultFileKind::Note | VaultFileKind::Canvas => process_file(
-                entry.kind,
-                &mut store,
-                &search_index,
-                &mut writer,
-                &workspace_root,
-                file,
-                &source_key,
-                &raw_name,
-                policy,
-                &mut report,
-            ),
+            VaultFileKind::Note | VaultFileKind::Canvas => {
+                match process_file(
+                    entry.kind,
+                    &mut store,
+                    &search_index,
+                    &mut writer,
+                    &workspace_root,
+                    file,
+                    &source_key,
+                    &raw_name,
+                    policy,
+                    &mut report,
+                    &ns,
+                    &non_note_keys,
+                ) {
+                    Ok((outcome, findings)) => (Ok(outcome), findings),
+                    Err(error) => (Err(error), LinkFindings::default()),
+                }
+            }
         };
 
-        record_file_row(
-            &mut store,
-            &mut report,
-            &batch_id,
-            &mut seq,
-            &source_key,
-            &raw_name,
+        pending.push(PendingRow {
+            source_key: Some(source_key.clone()),
+            raw_name: Some(raw_name.clone()),
             outcome,
-        )?;
+            replace_rows: findings.replace_rows,
+            anchors: findings.anchors,
+            ambiguous: findings.ambiguous,
+        });
     }
 
     writer.commit()?;
+
+    // The data sweep: every projection-only row set commits together — one
+    // transaction for the batch, each source still wholesale (ADR 0027) — and
+    // the rows of sources this walk no longer names go with it: a rebuilt table
+    // never produced them, so leaving them would break "a rebuild reproduces
+    // every row".
+    let mut projections: Vec<(String, Vec<GraphLink>)> = Vec::new();
+    for row in &mut pending {
+        if let (Some(key), Some(rows)) = (row.source_key.clone(), row.replace_rows.take()) {
+            projections.push((key, rows));
+        }
+    }
+    if !projections.is_empty() {
+        store.replace_edges_many(&projections)?;
+    }
+    let keep: Vec<&str> = namespace_pairs
+        .iter()
+        .map(|(_, key)| key.as_str())
+        .collect();
+    let keep_json = serde_json::to_string(&keep).expect("keys serialize");
+    store.prune_graph_edges_outside(&keep_json)?;
+    let (graph_rows, graph_dangling) = store.graph_counts()?;
+
+    // The event sweep: every file's data — chunks, blobs, rows — is settled, so
+    // an anchor check sees the run's final state and the codes cannot depend on
+    // walk order (§5 第 4 条). Data first, events after (ADR 0026).
+    let mut graph_ambiguous = 0u64;
+    let mut graph_stale = 0u64;
+    for row in pending {
+        let stale = stale_anchors(&store, &row.anchors, &non_note_keys)?;
+        graph_ambiguous += row.ambiguous.len() as u64;
+        graph_stale += stale.len() as u64;
+        flush_row(&mut store, &mut report, &batch_id, &mut seq, row, stale)?;
+    }
 
     seq += 1;
     store.append_store_event(&NewStoreEvent {
@@ -1464,6 +1628,10 @@ pub fn index_workspace_with(
             "revisions_created": report.revisions_created,
             "chunks_written": report.chunks_written,
             "errors": report.errors.len(),
+            "graph_rows": graph_rows,
+            "graph_dangling": graph_dangling,
+            "graph_ambiguous_links": graph_ambiguous,
+            "graph_stale_anchors": graph_stale,
         })
         .to_string(),
         external_id: None,
@@ -1588,6 +1756,22 @@ impl FileOutcome {
     fn degradation(&self) -> Option<Degradation> {
         self.degradations().first().copied()
     }
+
+    /// Adds one code and restores the declaration order (§5 第 8 条).
+    ///
+    /// The event sweep calls this: `stale_anchor` is decided against the run's
+    /// final state, after every file's data is written (§5 第 4 条), so it joins
+    /// the list last while the row still reads in enum order.
+    fn push_degradation(&mut self, code: Degradation) {
+        let list = match self {
+            Self::Skipped { degradations, .. }
+            | Self::MetadataRefreshed { degradations, .. }
+            | Self::Indexed { degradations, .. } => degradations,
+        };
+        list.push(code);
+        list.sort_unstable();
+        list.dedup();
+    }
 }
 
 /// Ingests one file into the store and the search index.
@@ -1611,7 +1795,9 @@ fn process_file(
     raw_name: &str,
     policy: &IndexPolicy,
     report: &mut IndexReport,
-) -> Result<FileOutcome, IndexFileError> {
+    ns: &Namespace,
+    non_note_keys: &HashSet<String>,
+) -> Result<(FileOutcome, LinkFindings), IndexFileError> {
     let metadata = fs::metadata(file)
         .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Io, error))?;
     let fingerprint = fingerprint_json(&metadata);
@@ -1620,6 +1806,7 @@ fn process_file(
     // path may only be assumed correct if it is compared.
     let local_path = momotaro_ingest::local_path_in(workspace_root, file)
         .map_err(|error| file_error(Some(source_key), error.kind(), error))?;
+    let from_dir = from_dir_for(source_key);
 
     let current = store_step(source_key, || store.current_revision(source_key))?;
 
@@ -1629,12 +1816,32 @@ fn process_file(
         && revision.raw_name.as_deref() == Some(raw_name)
     {
         report.files_skipped += 1;
-        // Nothing was read, so nothing was lost: the lists are empty here, and
-        // the variant carries them so every outcome has the same shape.
-        return Ok(FileOutcome::Skipped {
-            degradations: Vec::new(),
-            warnings: Vec::new(),
-        });
+        // Nothing was *read*, but the file's links still resolve against the
+        // namespace as it stands today (ADR 0027): the rows are re-projected
+        // from the stored extraction, and what they cost the file — a target
+        // that vanished, a name that turned ambiguous, a decode loss the blob
+        // remembers — rides the row (`§5 第 2 条` / `§5 第 7 条`). A blob from
+        // before the keys existed reads as no links (迁移注记).
+        let extracted = parse_link_blob(&revision.metadata_json);
+        let projection = project_links(
+            &extracted,
+            source_key,
+            from_dir,
+            revision.ingested_at,
+            ns,
+            non_note_keys,
+        );
+        return Ok((
+            FileOutcome::Skipped {
+                degradations: projection.codes,
+                warnings: Vec::new(),
+            },
+            LinkFindings {
+                replace_rows: Some(projection.rows),
+                anchors: projection.anchors,
+                ambiguous: projection.ambiguous,
+            },
+        ));
     }
 
     let bytes = fs::read(file)
@@ -1651,11 +1858,24 @@ fn process_file(
         // lost is re-derived from the very text that hashed equal — one derivation,
         // and a workspace indexed before the `frontmatter` key existed gets it here.
         let input = chunk_input(&normalized, kind);
+        let projection = project_links(
+            &input.extracted,
+            source_key,
+            from_dir,
+            revision.ingested_at,
+            ns,
+            non_note_keys,
+        );
         store_step(source_key, || {
             store.update_revision_fingerprint(
                 source_key,
                 &revision.revision_hash,
-                &revision_metadata(&fingerprint, &input.frontmatter),
+                &revision_metadata(
+                    &fingerprint,
+                    &input.frontmatter,
+                    &input.extracted,
+                    &input.outline,
+                ),
                 &local_path,
                 raw_name,
             )
@@ -1663,10 +1883,17 @@ fn process_file(
         report.files_indexed += 1;
         // The codes were derived above for the blob; the same answer rides on the
         // row, or this path reports a broken block as a clean file.
-        return Ok(FileOutcome::MetadataRefreshed {
-            degradations: input.degradations,
-            warnings: Vec::new(),
-        });
+        return Ok((
+            FileOutcome::MetadataRefreshed {
+                degradations: merge_codes(input.degradations, projection.codes),
+                warnings: Vec::new(),
+            },
+            LinkFindings {
+                replace_rows: Some(projection.rows),
+                anchors: projection.anchors,
+                ambiguous: projection.ambiguous,
+            },
+        ));
     }
 
     let input = chunk_input(&normalized, kind);
@@ -1684,10 +1911,26 @@ fn process_file(
     let title = derive_title(&input.text, source_key);
     // The parsed block rides in the revision blob (D41.5: unknown fields are
     // Obsidian's data, so the whole block is kept rather than modelled further).
-    let metadata_json = revision_metadata(&fingerprint, &input.frontmatter);
+    let metadata_json = revision_metadata(
+        &fingerprint,
+        &input.frontmatter,
+        &input.extracted,
+        &input.outline,
+    );
     // Vault content is owner content — stated once, used by the revision row and
     // the index document alike, so the two can never disagree.
     let origin = OriginClass::Owner;
+    // The rows' `created_at` is this revision's `ingested_at` (ADR 0027): the
+    // same number the revision row records, so a rebuild reproduces the rows.
+    let ingested_at = now_epoch_secs();
+    let projection = project_links(
+        &input.extracted,
+        source_key,
+        from_dir,
+        ingested_at,
+        ns,
+        non_note_keys,
+    );
 
     store_step(source_key, || {
         store.append_revision(&NewSourceRevision {
@@ -1700,11 +1943,14 @@ fn process_file(
             raw_name: Some(raw_name),
             origin_class: origin,
             metadata_json: &metadata_json,
-            ingested_at: now_epoch_secs(),
+            ingested_at,
         })
     })?;
+    // The edges ride the file's content transaction (ADR 0027, D40's unit):
+    // a crash between the two is exactly the half-written state that unit
+    // refuses to allow.
     store_step(source_key, || {
-        store.replace_chunks(source_key, &hash, &chunks)
+        store.replace_chunks(source_key, &hash, &chunks, &projection.rows)
     })?;
 
     index_step(source_key, || {
@@ -1723,11 +1969,128 @@ fn process_file(
     report.chunks_written += chunks.len() as u64;
     // What a file lost never stops the file: its text is indexed and each loss
     // becomes a code on the coverage row (`frontmatter_parse_error`,
-    // `canvas_parse_error`, `excalidraw_detected`).
-    Ok(FileOutcome::Indexed {
-        degradations: input.degradations,
-        warnings: Vec::new(),
-    })
+    // `canvas_parse_error`, `excalidraw_detected`, and the wikilink codes of
+    // `§5 第 7 条`).
+    Ok((
+        FileOutcome::Indexed {
+            degradations: merge_codes(input.degradations, projection.codes),
+            warnings: Vec::new(),
+        },
+        LinkFindings {
+            replace_rows: None,
+            anchors: projection.anchors,
+            ambiguous: projection.ambiguous,
+        },
+    ))
+}
+
+/// The part of one projection the event sweep still owes work for.
+#[derive(Default)]
+struct LinkFindings {
+    /// Rows to write in the sweep's single batch transaction (`Some` on the
+    /// projection-only paths; a parse's rows ride its content transaction).
+    replace_rows: Option<Vec<GraphLink>>,
+    /// Resolved anchors awaiting validation against settled targets.
+    anchors: Vec<(String, AnchorKind, String)>,
+    /// Links that matched several notes and built no edge (`§5 第 3 条`).
+    ambiguous: Vec<(String, Vec<String>)>,
+}
+
+/// Writes one deferred coverage row: `stale_anchor` first (the sweep's whole
+/// reason), then the outcome's own codes, plus what the file's name is worth
+/// saying (D42).
+///
+/// One home for the merge, so the placeholder path and the ordinary path
+/// cannot disagree about what rides a row: `windows_incompatible_name` (with
+/// the components it is about) rides every non-error row — the name is a fact
+/// about the file whether or not this run read its bytes, and a report that
+/// dropped it on a no-op re-run would call the vault clean.
+fn flush_row(
+    store: &mut Store,
+    report: &mut IndexReport,
+    batch_id: &str,
+    seq: &mut i64,
+    mut row: PendingRow,
+    stale: Vec<(String, String)>,
+) -> Result<(), RunError> {
+    if !stale.is_empty()
+        && let Ok(outcome) = &mut row.outcome
+    {
+        outcome.push_degradation(Degradation::StaleAnchor);
+    }
+    let (Some(source_key), Some(raw_name)) = (row.source_key, row.raw_name) else {
+        let Err(IndexFileError { kind, message, .. }) = row.outcome else {
+            // Only error outcomes reach here: every success path carries a
+            // raw name. Unreachable by construction; say so rather than
+            // invent a row shape for it.
+            return Err(RunError::Invariant("a nameless row carried no failure"));
+        };
+        return record_coverage(
+            store,
+            report,
+            batch_id,
+            seq,
+            None,
+            "error",
+            None,
+            None,
+            &RowPayload::NONE,
+            Some((kind, message)),
+        );
+    };
+    match row.outcome {
+        Err(IndexFileError { kind, message, .. }) => record_coverage(
+            store,
+            report,
+            batch_id,
+            seq,
+            Some(&source_key),
+            "error",
+            None,
+            None,
+            &RowPayload::NONE,
+            Some((kind, message)),
+        ),
+        Ok(outcome) => {
+            let windows_names = windows_incompatible_components(&raw_name);
+            let mut warnings = outcome.warnings().to_vec();
+            if !windows_names.is_empty() {
+                warnings.push(Warning::WindowsIncompatibleName);
+            }
+            // Enum declaration order, so a re-run reports the same list.
+            warnings.sort_unstable();
+            warnings.dedup();
+            // The row's primary code and its message: the first degradation
+            // when the file lost something, the first warning when it did not
+            // (§5 第 8 条 ②⑤).
+            let (primary, sentence) = match (outcome.degradation(), warnings.first().copied()) {
+                (Some(code), _) => (
+                    Some(Degradation::as_str(code)),
+                    Some(degradation_message(code)),
+                ),
+                (None, Some(code)) => (Some(Warning::as_str(code)), Some(warning_message(code))),
+                (None, None) => (None, None),
+            };
+            record_coverage(
+                store,
+                report,
+                batch_id,
+                seq,
+                Some(&source_key),
+                outcome.as_str(),
+                primary,
+                sentence,
+                &RowPayload {
+                    degradations: outcome.degradations(),
+                    warnings: &warnings,
+                    windows_names: &windows_names,
+                    ambiguous: &row.ambiguous,
+                    stale: &stale,
+                },
+                None,
+            )
+        }
+    }
 }
 
 /// What one file hands the chunker, and what it lost on the way.
@@ -1746,6 +2109,277 @@ struct ChunkInput<'a> {
     /// The file a *rendered* text was built from, when it was not cut out of one (a
     /// readable `.canvas`): its chunk locators then name the file itself.
     rendered_from: Option<&'a str>,
+    /// The links this file writes (`§5 第 2 条`): the `links` / `link_losses`
+    /// blob keys and the rows the projection builds.
+    extracted: Extracted,
+    /// Headings and `^id` definitions for later anchors pointing here
+    /// (`§5 第 4 条`): the `outline` blob key.
+    outline: Outline,
+}
+
+/// One file's coverage row, deferred to the batch's event sweep (ADR 0026:
+/// data first, events after).
+///
+/// The wikilink codes ride here too: `stale_anchor` is only decidable once
+/// every file's data — and so every target's outline — is in the store, and a
+/// code decided mid-run would depend on walk order (`§5 第 4 条`).
+struct PendingRow {
+    source_key: Option<String>,
+    raw_name: Option<String>,
+    outcome: Result<FileOutcome, IndexFileError>,
+    /// Projection-only rows, written by the sweep's batch (ADR 0027).
+    replace_rows: Option<Vec<GraphLink>>,
+    /// Resolved anchors awaiting validation: `(target key, kind, anchor text)`.
+    anchors: Vec<(String, AnchorKind, String)>,
+    /// Links that matched several notes and built no edge (`§5 第 3 条`).
+    ambiguous: Vec<(String, Vec<String>)>,
+}
+
+/// What one file's links resolve to: the rows to write, the codes to report,
+/// and what still needs the settled state (ADR 0027).
+struct LinkProjection {
+    rows: Vec<GraphLink>,
+    codes: Vec<Degradation>,
+    anchors: Vec<(String, AnchorKind, String)>,
+    ambiguous: Vec<(String, Vec<String>)>,
+}
+
+/// The directory a link is written in, in the same vault-relative spelling the
+/// namespace matches against.
+fn from_dir_for(source_key: &str) -> &str {
+    let tail = source_key.strip_prefix("note:").unwrap_or(source_key);
+    parent_dir(tail)
+}
+
+/// Merges two code lists into the enum's declaration order, once each
+/// (§5 第 8 条).
+fn merge_codes(mut base: Vec<Degradation>, extra: Vec<Degradation>) -> Vec<Degradation> {
+    base.extend(extra);
+    base.sort_unstable();
+    base.dedup();
+    base
+}
+
+/// Resolves one extraction against the namespace and builds the rows.
+///
+/// The rows themselves never depend on anchor validation: a stale anchor keeps
+/// its row (`§5 第 4 条`), so the table rebuilds identically whatever the
+/// validation state. The codes ride the file's row; `stale_anchor` is added by
+/// the event sweep.
+fn project_links(
+    extracted: &Extracted,
+    from_key: &str,
+    from_dir: &str,
+    created_at: i64,
+    ns: &Namespace,
+    non_note_keys: &HashSet<String>,
+) -> LinkProjection {
+    let mut rows = Vec::new();
+    let mut codes = extracted.losses.clone();
+    let mut anchors = Vec::new();
+    let mut ambiguous = Vec::new();
+    for link in &extracted.links {
+        let decoded_anchor = match (link.link_source, &link.anchor_raw) {
+            (momotaro_contracts::LinkSource::Markdown, Some(raw)) => {
+                percent_decode(raw).unwrap_or_else(|| raw.clone())
+            }
+            (_, raw) => raw.clone().unwrap_or_default(),
+        };
+        match resolve_link(&link.raw_target, from_dir, link.link_source, ns) {
+            Resolution::Resolved(target) => {
+                // An attachment target takes no anchor parse (§5 第 4 条): the
+                // raw fragment is kept, the kind is NULL, and nothing is ever
+                // checked against a PDF's page numbers.
+                let is_non_note = non_note_keys.contains(&target);
+                let anchor_kind = if is_non_note { None } else { link.anchor_kind };
+                if let (false, Some(kind)) = (is_non_note, link.anchor_kind) {
+                    anchors.push((target.clone(), kind, decoded_anchor));
+                }
+                rows.push(GraphLink {
+                    from_source_key: from_key.to_owned(),
+                    to_source_key: Some(target),
+                    raw_target: link.raw_target.clone(),
+                    edge_kind: link.edge_kind,
+                    link_source: link.link_source,
+                    anchor_kind,
+                    anchor_raw: link.anchor_raw.clone(),
+                    created_at,
+                });
+            }
+            Resolution::Dangling => {
+                codes.push(Degradation::UnresolvedWikilink);
+                rows.push(GraphLink {
+                    from_source_key: from_key.to_owned(),
+                    to_source_key: None,
+                    raw_target: link.raw_target.clone(),
+                    edge_kind: link.edge_kind,
+                    link_source: link.link_source,
+                    anchor_kind: link.anchor_kind,
+                    anchor_raw: link.anchor_raw.clone(),
+                    created_at,
+                });
+            }
+            Resolution::Ambiguous(candidates) => {
+                codes.push(Degradation::AmbiguousWikilink);
+                ambiguous.push((link.raw_target.clone(), candidates));
+            }
+        }
+    }
+    codes.sort_unstable();
+    codes.dedup();
+    LinkProjection {
+        rows,
+        codes,
+        anchors,
+        ambiguous,
+    }
+}
+
+/// Reads the `links` / `link_losses` keys back out of a revision blob.
+///
+/// Read stances differ by surface, on purpose: the `graph_links` **table** is
+/// typed at both ends and refuses an unknown spelling with
+/// `StoreError::UnknownGraphSpelling`; this **blob** is a cache of raw
+/// extractions, and a record spelled by a newer build is skipped without a
+/// panic. A blob from before the keys existed reads as no links — its files
+/// rebuild their edges when their content next changes (§5 第 2 条 迁移注记).
+fn parse_link_blob(metadata_json: &str) -> Extracted {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(metadata_json) else {
+        return Extracted::default();
+    };
+    let mut out = Extracted::default();
+    if let Some(records) = value.get("links").and_then(serde_json::Value::as_array) {
+        for record in records {
+            let Some(object) = record.as_object() else {
+                continue;
+            };
+            let (Some(raw_target), Some(edge_kind), Some(link_source)) = (
+                object.get("raw_target").and_then(serde_json::Value::as_str),
+                object
+                    .get("edge_kind")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(momotaro_contracts::EdgeKind::from_code),
+                object
+                    .get("link_source")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(momotaro_contracts::LinkSource::from_code),
+            ) else {
+                // A record this build cannot spell is a link it cannot speak
+                // for: the row is dropped, but the loss is reported — the
+                // audit promise of §5 第 7 条 covers downgrade windows too.
+                out.push_loss(Degradation::UnknownLinkSyntax);
+                continue;
+            };
+            // An unknown spelling in any vocabulary skips the record whole —
+            // one stance, like `edge_kind`/`link_source` above: a record with a
+            // rewritten anchor is not the record that was written.
+            let anchor_kind = match object.get("anchor_kind") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(value) => match value.as_str().and_then(AnchorKind::from_code) {
+                    Some(kind) => Some(kind),
+                    None => {
+                        out.push_loss(Degradation::UnknownLinkSyntax);
+                        continue;
+                    }
+                },
+            };
+            out.push_link(momotaro_ingest::RawLink {
+                raw_target: raw_target.to_owned(),
+                edge_kind,
+                link_source,
+                anchor_kind,
+                anchor_raw: object
+                    .get("anchor_raw")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            });
+        }
+    }
+    if let Some(losses) = value
+        .get("link_losses")
+        .and_then(serde_json::Value::as_array)
+    {
+        for code in losses {
+            if let Some(code) = code.as_str().and_then(Degradation::from_code) {
+                out.push_loss(code);
+            }
+        }
+    }
+    out
+}
+
+/// The target-side outline stored in a revision blob (`§5 第 4 条`).
+///
+/// `None` when the key is absent (a blob older than the key): an anchor
+/// pointing here is not verifiable, and "cannot verify" is not "missing" —
+/// only a confirmed miss reports `stale_anchor`.
+fn outline_from_blob(metadata_json: &str) -> Option<Outline> {
+    let value: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
+    let outline = value.get("outline")?;
+    let mut out = Outline::default();
+    for path in outline
+        .get("headings")
+        .and_then(serde_json::Value::as_array)?
+    {
+        // A malformed entry makes the whole outline unverifiable: a silently
+        // truncated path could match an anchor that was never written.
+        let levels = path
+            .as_array()?
+            .iter()
+            .map(|level| level.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()?;
+        out.headings.push(levels);
+    }
+    for id in outline
+        .get("block_ids")
+        .and_then(serde_json::Value::as_array)?
+    {
+        out.block_ids.push(id.as_str()?.to_owned());
+    }
+    Some(out)
+}
+
+/// Every anchor that was checked and found missing in its target, as
+/// `(target key, anchor)` — the audit trail a `stale_anchor` row carries
+/// (`data_json`), symmetric with the ambiguous candidates.
+///
+/// Runs in the event sweep, against the state every file's data left behind.
+/// Attachment and canvas targets are never checked (`§5 第 4 条`), and a note
+/// whose blob predates `outline` cannot be checked — neither reports a code.
+fn stale_anchors(
+    store: &Store,
+    checks: &[(String, AnchorKind, String)],
+    non_note_keys: &HashSet<String>,
+) -> Result<Vec<(String, String)>, RunError> {
+    let mut missing = Vec::new();
+    // One lookup per target, not per anchor: a note with ten links to one
+    // target checks its outline once.
+    let mut outlines: HashMap<String, Option<Outline>> = HashMap::new();
+    for (target, kind, raw) in checks {
+        if non_note_keys.contains(target) {
+            continue;
+        }
+        if !outlines.contains_key(target) {
+            // A store refusal is not "cannot verify": it propagates (store_step's
+            // stance), or a transient error would silently publish clean rows.
+            let outline = match store.current_revision(target)? {
+                Some(revision) if revision.kind == SourceKind::Note => {
+                    outline_from_blob(&revision.metadata_json)
+                }
+                _ => None,
+            };
+            outlines.insert(target.clone(), outline);
+        }
+        // `None` covers "no revision", "not a note", and "no outline": none of
+        // them is a checked-and-missing anchor.
+        let Some(outline) = outlines[target].as_ref() else {
+            continue;
+        };
+        if !anchor_still_exists(*kind, raw, outline) {
+            missing.push((target.clone(), raw.clone()));
+        }
+    }
+    Ok(missing)
 }
 
 /// Derives the chunker's input, and the code list that goes with it.
@@ -1766,6 +2400,10 @@ fn chunk_input<'a>(normalized: &'a str, kind: VaultFileKind) -> ChunkInput<'a> {
                 excluded: Vec::new(),
                 degradations: Vec::new(),
                 rendered_from: Some(normalized),
+                // Canvas edge building is its own task (B7 / §5 第 2 条): a
+                // canvas contributes no extraction yet, and none is stored.
+                extracted: Extracted::default(),
+                outline: Outline::default(),
             },
             None => ChunkInput {
                 frontmatter: FrontmatterParse::Absent,
@@ -1774,6 +2412,8 @@ fn chunk_input<'a>(normalized: &'a str, kind: VaultFileKind) -> ChunkInput<'a> {
                 excluded: Vec::new(),
                 degradations: vec![Degradation::CanvasParseError],
                 rendered_from: None,
+                extracted: Extracted::default(),
+                outline: Outline::default(),
             },
         };
     }
@@ -1784,6 +2424,14 @@ fn chunk_input<'a>(normalized: &'a str, kind: VaultFileKind) -> ChunkInput<'a> {
     if !excluded.is_empty() {
         degradations.push(Degradation::ExcalidrawDetected);
     }
+    // One extraction for both consumers (rows and blob): body links minus the
+    // excluded scene, plus the frontmatter block's own links from its `raw`
+    // (§5 第 5 条: an unmodelled field shape cannot hide a link).
+    // Frontmatter first, then the body: record order is the note's document
+    // order (§5 第 2 条), and first occurrence wins the identity dedupe.
+    let mut extracted = extract_frontmatter_links(frontmatter_raw(&frontmatter).unwrap_or(""));
+    let (body_links, outline) = analyze(body, &excluded);
+    extracted.absorb(body_links);
     ChunkInput {
         frontmatter,
         text: Cow::Borrowed(body),
@@ -1791,6 +2439,18 @@ fn chunk_input<'a>(normalized: &'a str, kind: VaultFileKind) -> ChunkInput<'a> {
         excluded,
         degradations,
         rendered_from: None,
+        outline,
+        extracted,
+    }
+}
+
+/// The block's raw text, on every path that kept it (`Parsed`, `Json`,
+/// `Failed`) — the one thing link extraction reads (§5 第 5 条).
+fn frontmatter_raw(parse: &FrontmatterParse) -> Option<&str> {
+    match parse {
+        FrontmatterParse::Absent => None,
+        FrontmatterParse::Parsed(frontmatter) => Some(&frontmatter.raw),
+        FrontmatterParse::Json(raw) | FrontmatterParse::Failed { raw, .. } => Some(raw),
     }
 }
 

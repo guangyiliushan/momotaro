@@ -87,6 +87,11 @@ pub enum RunError {
         source: io::Error,
     },
 
+    /// An internal invariant broke: a bug in Momotaro, never a state the user's
+    /// workspace can cause. Saying so beats borrowing `io error`'s costume.
+    #[error("invariant violated: {0}")]
+    Invariant(&'static str),
+
     /// A derived directory could not be removed, and the path is the only way a
     /// user can act on it.
     #[error(
@@ -4179,5 +4184,536 @@ mod tests {
             "a known degradation in the column is counted, not failed: {coverage:?}"
         );
         assert_eq!(coverage.failures.len(), 1, "{coverage:?}");
+    }
+
+    // ---- W2.4: wikilink edge building (`§5 第 2–4 条`, ADR 0027) ----
+
+    /// Reads one file's `ingest.coverage` row of the batch: outcome, primary
+    /// code, and the `data_json` payload.
+    fn coverage_row_of(
+        report: &momotaro_contracts::IndexReport,
+        store: &Store,
+        key: &str,
+    ) -> (String, String, String) {
+        let rows = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read the batch");
+        let row = rows
+            .iter()
+            .rev()
+            .find(|event| event.source_key.as_deref() == Some(key))
+            .unwrap_or_else(|| panic!("a coverage row for {key}"));
+        (
+            row.outcome.clone().unwrap_or_default(),
+            row.reason_code.clone().unwrap_or_default(),
+            row.data_json.clone(),
+        )
+    }
+
+    #[test]
+    fn graph_links_build_dangling_and_rebuild_identically() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("target.md"), "# Head\n\nbody\n").expect("write target");
+        fs::write(vault.join("a.md"), "links [[target]] and [[missing]]\n").expect("write a");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        let store = store_of(dir.path());
+        let rows = store.all_graph_links().expect("read rows");
+        assert_eq!(rows.len(), 2, "one edge and one dangling row: {rows:?}");
+        let resolved = rows
+            .iter()
+            .find(|row| row.raw_target == "target")
+            .expect("the resolved row");
+        assert_eq!(resolved.to_source_key.as_deref(), Some("note:target.md"));
+        let dangling = rows
+            .iter()
+            .find(|row| row.raw_target == "missing")
+            .expect("the dangling row");
+        assert_eq!(
+            dangling.to_source_key, None,
+            "dangling is NULL, not dropped"
+        );
+        assert_eq!(dangling.raw_target, "missing", "and keeps the writing");
+        // `created_at` is the revision's `ingested_at`, not a build clock
+        // (ADR 0027) — asserted against the revision row directly, because two
+        // runs inside one wall-clock second cannot tell a clock from a constant.
+        let revision = store
+            .current_revision("note:a.md")
+            .expect("read")
+            .expect("a revision");
+        for row in &rows {
+            assert_eq!(
+                row.created_at, revision.ingested_at,
+                "created_at is the revision's, not the writer's clock: {row:?}"
+            );
+        }
+
+        // And the code survives the summarizer: a reader of the coverage report
+        // sees the loss, not a silent success.
+        let coverage = coverage_report(dir.path()).expect("read").expect("a batch");
+        assert_eq!(
+            coverage
+                .degradations
+                .get(&momotaro_contracts::Degradation::UnresolvedWikilink)
+                .map(|counts| (counts.in_index, counts.skipped)),
+            Some((1, 0)),
+            "{coverage:?}"
+        );
+
+        // The batch summary says how the graph stands (§5 第 7 条 「覆盖了多少」):
+        // rows, dangling, and this run's ambiguous/stale decisions.
+        let events = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read the batch");
+        let finished = events
+            .iter()
+            .find(|event| event.event_type == "ingest.finished")
+            .expect("the closing event");
+        let payload: serde_json::Value =
+            serde_json::from_str(&finished.data_json).expect("payload is JSON");
+        assert_eq!(payload["graph_rows"], 2, "{payload}");
+        assert_eq!(payload["graph_dangling"], 1, "{payload}");
+        assert_eq!(payload["graph_ambiguous_links"], 0, "{payload}");
+        assert_eq!(payload["graph_stale_anchors"], 0, "{payload}");
+        // `rm graph_links` + re-run: the table is a projection, so every row
+        // comes back byte for byte — `created_at` included (ADR 0027). The
+        // second run skips every file; the rows are re-projected from the
+        // stored extraction regardless.
+        let connection =
+            rusqlite::Connection::open(database_path(dir.path())).expect("open the store file");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        connection
+            .execute("DELETE FROM graph_links", [])
+            .expect("rm graph_links");
+        drop(connection);
+        index_workspace(dir.path(), None).expect("re-index");
+        let rebuilt = store_of(dir.path()).all_graph_links().expect("read rows");
+        assert_eq!(
+            rows, rebuilt,
+            "a rebuild reproduces every row byte for byte"
+        );
+        // And the rebuilt rows carry the revision's stamp, not the rebuild's
+        // clock — checked across a clock tick, because two runs inside one
+        // second cannot tell a stamp from a clock (the resolution trap).
+        let revision = store_of(dir.path())
+            .current_revision("note:a.md")
+            .expect("read")
+            .expect("a revision");
+        for row in &rebuilt {
+            assert_eq!(row.created_at, revision.ingested_at, "{row:?}");
+        }
+
+        // The codes ride the file's row (§5 第 7 条): the resolved link is not
+        // a loss, the dangling one is exactly one.
+        let (_, code, data) = coverage_row_of(&report, &store, "note:a.md");
+        assert_eq!(code, "unresolved_wikilink", "{data}");
+    }
+
+    #[test]
+    fn a_bad_anchor_keeps_the_row_and_a_good_anchor_is_not_stale() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        // The link sorts before its target: on the very first run the target
+        // has no blob yet when the link is processed, so an anchor check run
+        // mid-batch reports `stale_anchor` for a perfectly good heading. The
+        // sweep checks against settled state, so `aaa-good` must stay clean.
+        fs::write(vault.join("aaa-good.md"), "[[zzz-target#Head]]\n").expect("write good");
+        fs::write(vault.join("aaa-bad.md"), "[[zzz-target#NoSuch]]\n").expect("write bad");
+        fs::write(vault.join("zzz-target.md"), "# Head\n\nbody\n").expect("write target");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        let store = store_of(dir.path());
+        let rows = store.all_graph_links().expect("read rows");
+        assert_eq!(rows.len(), 2, "both anchors keep their rows: {rows:?}");
+        let (good_outcome, good_code, _) = coverage_row_of(&report, &store, "note:aaa-good.md");
+        assert_eq!(good_outcome, "indexed");
+        assert!(
+            good_code.is_empty(),
+            "a heading that exists is not stale: {good_code}"
+        );
+        let (_, bad_code, bad_data) = coverage_row_of(&report, &store, "note:aaa-bad.md");
+        assert_eq!(bad_code, "stale_anchor", "{bad_data}");
+        let payload: serde_json::Value = serde_json::from_str(&bad_data).expect("payload is JSON");
+        assert_eq!(
+            payload["stale_anchors"],
+            serde_json::json!([{ "target": "note:zzz-target.md", "anchor": "NoSuch" }]),
+            "which anchor went stale is on the record: {bad_data}"
+        );
+
+        // Re-projection keeps saying so: a skipped file's row carries the code
+        // its links still cost it (§5 第 7 条).
+        let report = index_workspace(dir.path(), None).expect("re-index");
+        let (outcome, code, _) = coverage_row_of(&report, &store, "note:aaa-bad.md");
+        assert_eq!(outcome, "skipped");
+        assert_eq!(code, "stale_anchor", "a skipped row does not drop codes");
+    }
+
+    #[test]
+    fn an_ambiguous_name_builds_no_edge_and_lists_its_candidates() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        for path in ["d1", "d2", "d3"] {
+            fs::create_dir_all(vault.join(path)).expect("create dir");
+            fs::write(vault.join(path).join("dup.md"), "dup\n").expect("write dup");
+        }
+        fs::write(vault.join("from.md"), "[[dup]]\n").expect("write from");
+        fs::write(vault.join("d1/uses.md"), "[[dup]]\n").expect("write uses");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        let store = store_of(dir.path());
+        let rows = store.all_graph_links().expect("read rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the same-directory one gets an edge: {rows:?}"
+        );
+        assert_eq!(rows[0].from_source_key, "note:d1/uses.md");
+        assert_eq!(rows[0].to_source_key.as_deref(), Some("note:d1/dup.md"));
+
+        let (outcome, code, data) = coverage_row_of(&report, &store, "note:from.md");
+        assert_eq!(outcome, "indexed");
+        assert_eq!(code, "ambiguous_wikilink", "{data}");
+        let payload: serde_json::Value = serde_json::from_str(&data).expect("payload is JSON");
+        let candidates = payload["ambiguous"][0]["candidates"]
+            .as_array()
+            .expect("the candidates are listed")
+            .clone();
+        assert_eq!(
+            serde_json::Value::Array(candidates),
+            serde_json::json!(["note:d1/dup.md", "note:d2/dup.md", "note:d3/dup.md"]),
+            "every candidate is on the record, sorted: {data}"
+        );
+    }
+
+    #[test]
+    fn markdown_links_decode_decode_badly_and_dangle() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("target.md"), "# Head\n\nbody\n").expect("write target");
+        fs::write(
+            vault.join("a.md"),
+            "good [t](target.md#Head) bad [u](bad%ZZname.md) gone [v](gone.md)\n",
+        )
+        .expect("write a");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        let store = store_of(dir.path());
+        let rows = store.all_graph_links().expect("read rows");
+        let mut targets: Vec<(String, Option<String>)> = rows
+            .iter()
+            .map(|row| (row.raw_target.clone(), row.to_source_key.clone()))
+            .collect();
+        targets.sort();
+        assert_eq!(
+            targets,
+            [
+                ("gone.md".to_owned(), None),
+                ("target.md".to_owned(), Some("note:target.md".to_owned()))
+            ],
+            "decode errors build nothing; the other two are rows: {targets:?}"
+        );
+        let (_, code, data) = coverage_row_of(&report, &store, "note:a.md");
+        // The row's primary code is the list's first, in the enum's declaration
+        // order (§5 第 8 条 ②) — `unresolved_wikilink` outranks the decode loss
+        // — and the whole list rides `data_json`.
+        assert_eq!(code, "unresolved_wikilink", "{data}");
+        let payload: serde_json::Value = serde_json::from_str(&data).expect("payload is JSON");
+        assert_eq!(
+            payload["degradations"],
+            serde_json::json!(["unresolved_wikilink", "markdown_link_decode_error"]),
+            "both losses are on the record, in declaration order: {data}"
+        );
+
+        // A skipped file still carries the losses its links cost it: the decode
+        // fact lives in the blob and re-projects every run (§5 第 5 条).
+        let report = index_workspace(dir.path(), None).expect("re-index");
+        let (outcome, code, data) = coverage_row_of(&report, &store, "note:a.md");
+        assert_eq!(outcome, "skipped");
+        let payload: serde_json::Value = serde_json::from_str(&data).expect("payload is JSON");
+        assert!(
+            payload["degradations"]
+                .as_array()
+                .expect("a list")
+                .contains(&serde_json::json!("markdown_link_decode_error")),
+            "a skipped row does not drop the decode loss: {data}"
+        );
+        let _ = code;
+    }
+
+    #[test]
+    fn a_refused_syntax_is_reported_and_kept_as_text() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(
+            vault.join("a.md"),
+            "x [[#^]] y
+",
+        )
+        .expect("write a");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        let store = store_of(dir.path());
+        assert!(
+            store.all_graph_links().expect("rows").is_empty(),
+            "a refused shape builds no edge"
+        );
+        let (_, code, data) = coverage_row_of(&report, &store, "note:a.md");
+        assert_eq!(code, "unknown_link_syntax", "{data}");
+        assert!(
+            store
+                .all_current_chunks()
+                .expect("chunks")
+                .iter()
+                .any(|chunk| chunk.text.contains("[[#^]]")),
+            "and the text stays in the chunks verbatim"
+        );
+    }
+
+    #[test]
+    fn frontmatter_links_embeds_and_self_loops() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("target.md"), "# Head\n\nbody\n").expect("write target");
+        fs::write(
+            vault.join("a.md"),
+            "---\nrelated: \"[[target]]\"\n---\nembed ![[target]] self [[#Head]] twice [[target]] [[target]]\n",
+        )
+        .expect("write a");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        index_workspace(dir.path(), None).expect("index");
+
+        let store = store_of(dir.path());
+        let rows = store.all_graph_links().expect("read rows");
+        assert_eq!(
+            rows.len(),
+            3,
+            "three identities: frontmatter, body link (written twice, one row), embed — \
+             and the self-loop built nothing: {rows:?}"
+        );
+        let frontmatter = rows
+            .iter()
+            .find(|row| row.link_source == momotaro_contracts::LinkSource::Frontmatter)
+            .expect("the frontmatter link is singled out");
+        assert_eq!(frontmatter.edge_kind, momotaro_contracts::EdgeKind::Link);
+        let embed = rows
+            .iter()
+            .find(|row| row.edge_kind == momotaro_contracts::EdgeKind::Embed)
+            .expect("the embed is singled out");
+        assert_eq!(embed.link_source, momotaro_contracts::LinkSource::Embed);
+        assert!(
+            rows.iter()
+                .all(|row| row.raw_target != "#Head" && row.raw_target != "Head"),
+            "the self-loop built nothing"
+        );
+    }
+
+    #[test]
+    fn a_target_created_later_backfills_and_a_target_removed_goes_dangling() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("a.md"), "[[late]]\n").expect("write a");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        index_workspace(dir.path(), None).expect("run 1");
+
+        let store = store_of(dir.path());
+        let rows = store.all_graph_links().expect("read rows");
+        assert_eq!(
+            rows[0].to_source_key, None,
+            "dangling while the target is not here"
+        );
+
+        // The target appears; `a.md` is untouched and will be skipped. The
+        // next run's re-projection is the backfill (§5 第 2 条).
+        fs::write(vault.join("late.md"), "late\n").expect("write late");
+        index_workspace(dir.path(), None).expect("run 2");
+        let rows = store_of(dir.path()).all_graph_links().expect("read rows");
+        assert_eq!(
+            rows[0].to_source_key.as_deref(),
+            Some("note:late.md"),
+            "the next index backfills the edge"
+        );
+
+        // ADR 0014: the target is renamed away — the old key is gone, so the
+        // edge honestly goes dangling again rather than pointing at nothing.
+        fs::remove_file(vault.join("late.md")).expect("remove late");
+        index_workspace(dir.path(), None).expect("run 3");
+        let rows = store_of(dir.path()).all_graph_links().expect("read rows");
+        assert_eq!(
+            rows[0].to_source_key, None,
+            "a vanished target makes the edge dangling again"
+        );
+    }
+
+    #[test]
+    fn a_refresh_carries_the_blob_and_the_rows() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("a.md"), "[[gone]]\n").expect("write a");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        index_workspace(dir.path(), None).expect("run 1");
+
+        // Same bytes, new mtime: the refresh path rewrites the blob wholesale,
+        // and every key the edge rebuild replays from must survive the rewrite
+        // (the W2.3 lesson: a whole-blob rewrite drops un-carried keys).
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(vault.join("a.md"), "[[gone]]\n").expect("rewrite a");
+        let report = index_workspace(dir.path(), None).expect("run 2");
+        let (outcome, _, _) = coverage_row_of(&report, &store_of(dir.path()), "note:a.md");
+        assert_eq!(outcome, "metadata_refreshed");
+
+        let store = store_of(dir.path());
+        let revision = store
+            .current_revision("note:a.md")
+            .expect("read")
+            .expect("a revision");
+        let blob: serde_json::Value =
+            serde_json::from_str(&revision.metadata_json).expect("blob is JSON");
+        assert!(blob.get("links").is_some(), "{blob}");
+        assert!(blob.get("outline").is_some(), "{blob}");
+        let rows = store.all_graph_links().expect("rows");
+        assert_eq!(rows.len(), 1, "and the rows re-project from it: {rows:?}");
+    }
+
+    #[test]
+    fn an_attachment_target_takes_no_anchor_kind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("doc.pdf"), b"%PDF-1.4 fake").expect("write pdf");
+        fs::write(vault.join("a.md"), "see [[doc.pdf#page=2]]\n").expect("write a");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        let report = index_workspace(dir.path(), None).expect("index");
+
+        let store = store_of(dir.path());
+        let rows = store.all_graph_links().expect("read rows");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].to_source_key.as_deref(), Some("note:doc.pdf"));
+        assert_eq!(
+            rows[0].anchor_kind, None,
+            "a PDF page parameter is not an anchor (第五条 4 条的附件豁免)"
+        );
+        assert_eq!(rows[0].anchor_raw.as_deref(), Some("page=2"), "raw kept");
+        let (_, code, _) = coverage_row_of(&report, &store, "note:a.md");
+        assert!(
+            code != "stale_anchor",
+            "and nothing is checked against page numbers"
+        );
+    }
+
+    #[test]
+    fn replacing_a_file_drops_the_rows_it_no_longer_writes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("a.md"), "[[gone]] and [[missing]]\n").expect("write a");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        index_workspace(dir.path(), None).expect("run 1");
+        let store = store_of(dir.path());
+        assert_eq!(store.all_graph_links().expect("rows").len(), 2);
+
+        // The whole from-key set is replaced, not added to: a link removed from
+        // the note must take its row with it.
+        fs::write(vault.join("a.md"), "[[gone]]\n").expect("rewrite a");
+        index_workspace(dir.path(), None).expect("run 2");
+        let rows = store_of(dir.path()).all_graph_links().expect("rows");
+        assert_eq!(rows.len(), 1, "the stale row is gone: {rows:?}");
+        assert_eq!(rows[0].raw_target, "gone");
+    }
+
+    #[test]
+    fn an_anchor_is_not_stale_when_the_target_cannot_be_verified() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("target.md"), "# Head\n\nbody\n").expect("write target");
+        fs::write(vault.join("a.md"), "[[target#NoSuch]]\n").expect("write a");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        index_workspace(dir.path(), None).expect("run 1");
+
+        // Take the target's outline away (a blob from before the key existed):
+        // "cannot verify" is not "missing", and no code may fire.
+        let connection =
+            rusqlite::Connection::open(database_path(dir.path())).expect("open the store file");
+        connection
+            .execute(
+                "UPDATE source_revisions SET metadata_json = json_remove(metadata_json, '$.outline')
+                 WHERE source_key = 'note:target.md'",
+                [],
+            )
+            .expect("strip the outline");
+        drop(connection);
+
+        let report = index_workspace(dir.path(), None).expect("run 2");
+        let (outcome, code, data) = coverage_row_of(&report, &store_of(dir.path()), "note:a.md");
+        assert_eq!(outcome, "skipped");
+        assert_ne!(code, "stale_anchor", "unverifiable is not stale: {data}");
+    }
+
+    #[test]
+    fn renaming_a_source_moves_its_rows_and_prunes_the_old() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::write(vault.join("a.md"), "[[gone]]\n").expect("write a");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        index_workspace(dir.path(), None).expect("run 1");
+        let store = store_of(dir.path());
+        let rows = store.all_graph_links().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].from_source_key, "note:a.md");
+
+        // The source itself renames away (ADR 0014: delete + create). The old
+        // key's rows must not outlive it: a rebuild would never produce them.
+        fs::rename(vault.join("a.md"), vault.join("b.md")).expect("rename");
+        index_workspace(dir.path(), None).expect("run 2");
+        let rows = store_of(dir.path()).all_graph_links().expect("rows");
+        let from: Vec<&str> = rows
+            .iter()
+            .map(|row| row.from_source_key.as_str())
+            .collect();
+        assert_eq!(
+            from,
+            ["note:b.md"],
+            "the old source's rows are pruned: {rows:?}"
+        );
+
+        // And a rebuild agrees.
+        let connection =
+            rusqlite::Connection::open(database_path(dir.path())).expect("open the store file");
+        connection
+            .execute("DELETE FROM graph_links", [])
+            .expect("rm graph_links");
+        drop(connection);
+        index_workspace(dir.path(), None).expect("run 3");
+        let rebuilt = store_of(dir.path()).all_graph_links().expect("rows");
+        assert_eq!(
+            rows, rebuilt,
+            "a rebuild reproduces every row byte for byte"
+        );
     }
 }

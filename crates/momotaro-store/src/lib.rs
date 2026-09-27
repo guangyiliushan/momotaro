@@ -14,6 +14,7 @@ use thiserror::Error;
 mod backup;
 pub mod chunks;
 pub mod events;
+mod graph;
 mod migration;
 pub mod revisions;
 
@@ -51,6 +52,16 @@ pub enum StoreError {
     /// SQLite returned an error.
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+
+    /// A `graph_links` row this build cannot read: a vocabulary spelling from
+    /// a newer one (ADR 0027 rows are typed at both ends).
+    #[error("graph_links row has unknown {column} spelling {value:?}")]
+    UnknownGraphSpelling {
+        /// Which vocabulary column the spelling sits in.
+        column: &'static str,
+        /// The spelling found.
+        value: String,
+    },
 
     /// The database was created by a newer version of Momotaro.
     #[error("database schema version {found} is newer than supported {supported}")]
@@ -1762,12 +1773,50 @@ mod tests {
             },
         ];
         store
-            .replace_chunks("a.md", "a2", &chunks)
+            .replace_chunks("a.md", "a2", &chunks, &[])
             .expect("replace chunks");
 
         let report = store.stats().expect("stats");
         assert!(report.initialized);
         assert_eq!(report.sources, Some(1));
         assert_eq!(report.chunks, Some(2));
+    }
+
+    #[test]
+    fn the_schema_declares_exactly_the_expected_indexes() {
+        // The one explicit index list, pinned: sqlite_autoindex_* rows come
+        // with their constraints and are excluded (`sql` is NULL for them), so
+        // this asserts what the schema *declares* — a new or dropped explicit
+        // index is a schema change this test must see (the step-5 assertion the
+        // v5 batch deferred to W2.4).
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = Store::open(dir.path().join("momotaro.db")).expect("open");
+        store.init_schema().expect("init");
+        let mut names = Vec::new();
+        {
+            let mut statement = store
+                .connection
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'index' AND sql IS NOT NULL ORDER BY name",
+                )
+                .expect("prepare");
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query");
+            for row in rows {
+                names.push(row.expect("row"));
+            }
+        }
+        assert_eq!(
+            names,
+            [
+                "idx_chunks_rev",
+                "idx_graph_links_from",
+                "idx_revisions_current",
+                "idx_store_events_external",
+                "idx_store_events_source",
+            ]
+        );
     }
 }

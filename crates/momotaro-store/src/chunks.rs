@@ -34,12 +34,15 @@ fn read_chunk_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chunk> {
 }
 
 impl crate::Store {
-    /// Atomically replaces every chunk of one source revision.
+    /// Atomically replaces every chunk of one source revision, and the same
+    /// source's `graph_links` rows (ADR 0027: the edges ride the file's own
+    /// content transaction — D40's unit).
     pub fn replace_chunks(
         &mut self,
         source_key: &str,
         revision_hash: &str,
         chunks: &[Chunk],
+        edges: &[momotaro_contracts::GraphLink],
     ) -> Result<(), StoreError> {
         let tx = self.connection.transaction()?;
         tx.execute(
@@ -67,6 +70,7 @@ impl crate::Store {
                 ])?;
             }
         }
+        crate::graph::write_edges_tx(&tx, source_key, edges)?;
         tx.commit()?;
         Ok(())
     }
@@ -192,7 +196,7 @@ mod tests {
             chunk("c3", "a.md", "hash1", 2),
         ];
         store
-            .replace_chunks("a.md", "hash1", &first)
+            .replace_chunks("a.md", "hash1", &first, &[])
             .expect("first write");
         assert_eq!(chunk_count(&store, "a.md", "hash1"), 3);
 
@@ -201,12 +205,12 @@ mod tests {
             chunk("c4", "a.md", "hash1", 1),
         ];
         store
-            .replace_chunks("a.md", "hash1", &second)
+            .replace_chunks("a.md", "hash1", &second, &[])
             .expect("replace");
         assert_eq!(chunk_count(&store, "a.md", "hash1"), 2);
 
         store
-            .replace_chunks("a.md", "hash1", &second)
+            .replace_chunks("a.md", "hash1", &second, &[])
             .expect("replace again");
         assert_eq!(chunk_count(&store, "a.md", "hash1"), 2, "idempotent");
     }
@@ -217,7 +221,7 @@ mod tests {
         ingest_current(&mut store, "a.md", "hash1");
         let expected = chunk("c1", "a.md", "hash1", 0);
         store
-            .replace_chunks("a.md", "hash1", std::slice::from_ref(&expected))
+            .replace_chunks("a.md", "hash1", std::slice::from_ref(&expected), &[])
             .expect("write");
 
         let loaded = store.get_chunk("c1").expect("read").expect("exists");
@@ -234,17 +238,18 @@ mod tests {
 
         // Stale chunks for superseded revisions must be excluded.
         store
-            .replace_chunks("a.md", "a1", &[chunk("stale", "a.md", "a1", 0)])
+            .replace_chunks("a.md", "a1", &[chunk("stale", "a.md", "a1", 0)], &[])
             .expect("stale write");
         store
             .replace_chunks(
                 "a.md",
                 "a2",
                 &[chunk("ca1", "a.md", "a2", 1), chunk("ca0", "a.md", "a2", 0)],
+                &[],
             )
             .expect("a2 chunks");
         store
-            .replace_chunks("b.md", "b2", &[chunk("cb0", "b.md", "b2", 0)])
+            .replace_chunks("b.md", "b2", &[chunk("cb0", "b.md", "b2", 0)], &[])
             .expect("b2 chunks");
 
         let loaded = store.all_current_chunks().expect("read");
@@ -260,7 +265,7 @@ mod tests {
         ingest_current(&mut store, "b.md", "b1");
 
         store
-            .replace_chunks("a.md", "a2", &[chunk("ca0", "a.md", "a2", 0)])
+            .replace_chunks("a.md", "a2", &[chunk("ca0", "a.md", "a2", 0)], &[])
             .expect("chunks");
 
         let counts = store.counts().expect("counts");

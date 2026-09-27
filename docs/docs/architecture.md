@@ -784,16 +784,42 @@ usage_projections
 | `link_source` | which syntax produced it |
 | `anchor_kind` | what the anchor points at, when the link has one |
 | `anchor_raw` | the anchor as written |
-| `created_at` | when the row was built |
+| `created_at` | the `ingested_at` of the source revision whose content carries the link — a rebuilt row reproduces it byte for byte (ADR 0027) |
 
-Columns and their order come from the plan's D41. The two vocabularies the D41
-build matrix implies are `edge_kind` (a link, an embed, a canvas edge, a
-frontmatter link) and `link_source` (`wikilink`, `markdown`, `embed`, `canvas`,
-`frontmatter`), with `anchor_kind` covering a heading anchor and a block anchor;
-they close when W2.4 lands; the store creates the table empty as of schema v5,
-with row identity and replacement left to W2.4. The row is derived: `rm
-graph_links` and a rebuild must reproduce it, which is what the W2.4 acceptance
-check runs.
+Columns and their order come from D41's build matrix. The vocabularies closed
+with W2.4 — each is an enum in `momotaro-contracts` (`ALL`, wire spellings,
+witnesses), and each sentence below is the variant's definition:
+
+| `edge_kind` | meaning |
+|---|---|
+| `link` | an ordinary link written in text: a wikilink, a markdown link, or a frontmatter link |
+| `embed` | an inclusion (`![[…]]`, `![](…)`) — stronger than a plain link, singled out so retrieval can weight it differently |
+| `canvas_card` | a JSON Canvas `file` node naming a file (producer ships with canvas edge building) |
+| `canvas_edge` | a JSON Canvas `edges` arrow resolved from its endpoint nodes to files (same batch as `canvas_card`) |
+
+| `link_source` | meaning |
+|---|---|
+| `wikilink` | produced by `[[…]]` syntax |
+| `markdown` | produced by `[…](…)` syntax |
+| `embed` | produced by `![[…]]` syntax |
+| `canvas` | produced by canvas structure (a file node or an arrow) |
+| `frontmatter` | written inside frontmatter — singled out there even when the syntax is a wikilink |
+
+| `anchor_kind` | meaning |
+|---|---|
+| `heading` | a `#heading` anchor, including multi-level `#H1#H2` |
+| `block` | a `#^id` block anchor |
+| *(NULL)* | no anchor, or a fragment that is not an anchor (e.g. a PDF page parameter) |
+
+A frontmatter link is `edge_kind='link'` + `link_source='frontmatter'`:
+frontmatter is singled out on the `link_source` axis, an embed on the
+`edge_kind` axis. Row identity is the as-written six-tuple
+`(from_source_key, raw_target, edge_kind, link_source, anchor_kind, anchor_raw)`;
+`to_source_key` is a resolution product, never identity. The table is an
+idempotent projection — one row per identity, replaced wholesale per
+`from_source_key` in the same transaction as the file's chunks (ADR 0027). The
+row is derived: `rm graph_links`, re-run ingest, and a rebuild reproduces it row
+for row — which is what the W2.4 acceptance check runs.
 
 
 MVP 只实现 Tantivy BM25。中文用 CJK tokenizer，不要把 SQLite FTS5 当主引擎。SQLite 留下做关系事实。
@@ -1148,7 +1174,7 @@ cargo test --workspace
 
 `index` / lexical `search` / Tantivy。重建索引不丢 canonical 数据。1,000 个 Markdown 可完成。
 
-已做：`source_key` NFC 身份键、vault ⊆ workspace、origin 乘性权重、`store_events` 审计日志、`doctor --coverage`。本波剩余：wikilink 五类降级事件（随 W2.4 建边）、D42 的碰撞消歧后缀策略（两条目都保留 + 消歧后缀 + 事件，ADR 0002 与 ADR 0026 都指向它）、wikilink → `graph_links`、watcher + 对账四触发、平台测试矩阵、D24 的多链头暴露。D40 的「单文件 = 恰好一个事务」见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 的诚实口径，**不是已交付**。
+已做：`source_key` NFC 身份键、vault ⊆ workspace、origin 乘性权重、`store_events` 审计日志、`doctor --coverage`、wikilink 全形态建边入 derived `graph_links`（dangling/歧义/锚点校验齐，五类降级码生产者；行身份与重建见 [ADR 0027](adr/graph-links-rows-are-a-rebuilt-projection.md)）。本波剩余：D42 的碰撞消歧后缀策略（两条目都保留 + 消歧后缀 + 事件，ADR 0002 与 ADR 0026 都指向它）、watcher + 对账四触发、平台测试矩阵、D24 的多链头暴露。D40 的「单文件 = 恰好一个事务」见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 的诚实口径，**不是已交付**。
 
 ### v0.3 可追溯问答
 

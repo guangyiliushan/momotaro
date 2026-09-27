@@ -153,8 +153,11 @@ decision; making that decision is not part of this contract.
 
 - One `ingest.coverage` row per file makes a batch's work visible and measurable —
   `indexed | skipped | metadata_refreshed | error` per source, beside the batch's
-  own counters. The row is small, and it is appended right after the file's own
-  write.
+  own counters. The row is small. Since W2.4 the coverage rows are appended in
+  one **event sweep** after the batch's data is settled (the `stale_anchor` code
+  is decided against the settled state, `§5 第 4 条`), one transaction for the
+  sweep: the loss window is the batch tail — a crash before the sweep loses the
+  batch's coverage rows while every data write survives, never the reverse.
 - **Events never claim work that is not there.** Each append is one transaction,
   and the ingest path writes a file's data *before* the event that describes it,
   so a crash can lose an event but never invent one. The other half of that
@@ -162,14 +165,16 @@ decision; making that decision is not part of this contract.
   for (D40: events are the hint, reconciliation is the truth).
 - A batch-wide transaction was considered and rejected: it would hold the write
   lock across a 1000-file run and turn one crash into a lost batch. **What the
-  code does today is three appends per file** — the revision (`revisions.rs`),
-  its chunks (`chunks.rs`) and then the coverage row (`events.rs`) — so D40's
-  "a single file update is exactly one transaction" is met by none of them, and a
-  crash between the appends can lose a row for a file whose data landed. The
-  *never invent* half above holds because every data write precedes its event;
-  closing the *lose* half needs a store API that writes revision + chunks + event
-  as one unit. That API does not exist yet and is registered as follow-up work
-  rather than claimed here.
+  code does today is two content appends per file** — the revision
+  (`revisions.rs`) and its chunks together with the file's `graph_links` rows
+  (`chunks.rs`) — plus the batch-tail event sweep (`events.rs`). D40's "a single
+  file update is exactly one transaction" is met by the content unit's chunks +
+  edges half; the revision append is still its own transaction, so a crash
+  between the two can lose a row for a file whose data landed. The *never
+  invent* half above holds because every data write precedes its event; closing
+  the *lose* half needs a store API that writes revision + chunks + event as one
+  unit. That API does not exist yet and is registered as follow-up work rather
+  than claimed here.
 - A batch that aborts mid-way leaves `ingest.started` with no terminal event, so a
   reader sees "running" rather than "crashed". That is stated here rather than
   discovered later; the fix, when a consumer needs it, is an `ingest.failed`

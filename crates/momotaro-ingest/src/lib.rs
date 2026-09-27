@@ -13,6 +13,7 @@ mod chunker;
 pub mod excalidraw;
 pub mod frontmatter;
 mod hash;
+pub mod links;
 mod normalize;
 mod path;
 mod portability;
@@ -22,6 +23,10 @@ mod walk;
 pub use chunker::{SourceOffset, chunk_markdown, chunk_markdown_with};
 pub use excalidraw::scene_spans;
 pub use hash::{chunk_hash, chunk_id, revision_hash, revision_hash_reader};
+pub use links::{
+    Extracted, Namespace, Outline, RawLink, Resolution, analyze, anchor_still_exists,
+    extract_frontmatter_links, parent_dir, percent_decode, resolve,
+};
 pub use normalize::normalize_markdown;
 pub use path::{canonical_workspace_root, is_within, local_path_in, resolve_local_path};
 pub use portability::{attributes_of, is_cloud_placeholder, windows_incompatible_components};

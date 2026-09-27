@@ -86,14 +86,16 @@ CREATE INDEX IF NOT EXISTS idx_store_events_source
     // §8.2 in the table's own column order — `to_source_key` is NULL exactly
     // for a dangling link, which stays a first-class row, and `raw_target`
     // keeps the target as written for a later resolve. Row identity and the
-    // replace granularity of `graph_links` are deliberately NOT pinned here:
-    // W2.4 decides them, and the table is derived, so it can be rebuilt with
+    // replace granularity of `graph_links` are pinned by ADR 0027 (decided
+    // with W2.4): identity is the as-written six-tuple, replacement is per
+    // `from_source_key`, and the table is derived — it can be rebuilt with
     // a different shape without touching canonical data. The tables already
     // present (source_revisions, chunks, store_events) are not rebuilt.
     //
     // The PRIMARY KEY / UNIQUE declarations carry their own autoindexes, and
-    // those already serve every leftmost prefix the tables need — no explicit
-    // index is created here.
+    // those already serve every leftmost prefix the tables need. The one
+    // explicit index is `graph_links(from_source_key)` — that table declares no
+    // key, and every projection replace deletes by `from_source_key` (ADR 0027).
     (
         5,
         "CREATE TABLE IF NOT EXISTS sessions (
@@ -253,8 +255,9 @@ CREATE TABLE IF NOT EXISTS graph_links (
   link_source TEXT NOT NULL,       -- which syntax produced it
   anchor_kind TEXT,                -- what the anchor points at, when the link has one
   anchor_raw TEXT,                 -- the anchor as written
-  created_at INTEGER NOT NULL      -- when the row was built
-);",
+  created_at INTEGER NOT NULL      -- the ingested_at of the revision carrying the link (ADR 0027)
+);
+CREATE INDEX IF NOT EXISTS idx_graph_links_from ON graph_links (from_source_key);",
     ),
 ];
 

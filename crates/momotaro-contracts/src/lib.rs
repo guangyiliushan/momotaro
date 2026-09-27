@@ -73,6 +73,17 @@ pub fn note_source_key(vault_relative: &str) -> Result<String, SourceKeyError> {
     Ok(format!("{NOTE_SCHEME}{tail}"))
 }
 
+/// NFC-normalizes a string for comparison against key tails (D42).
+///
+/// Comparison follows the key's normalization; folding does not — this is
+/// never case-folded and never NFKC. Readers that match user-typed text (link
+/// targets, anchors) against stored identities normalize both sides through
+/// here and nowhere else.
+#[must_use]
+pub fn nfc_text(value: &str) -> String {
+    value.nfc().collect()
+}
+
 fn normalize_key_tail(raw: &str) -> Result<String, SourceKeyError> {
     if raw.contains('\0') {
         return Err(SourceKeyError::Nul);
@@ -502,8 +513,8 @@ pub struct IndexFileError {
 ///
 /// These ride on **`indexed`** rows: the file *was* indexed, so the outcome stays
 /// `indexed` and this code says what it lost. All ten of D41's are here; the
-/// features that raise the last four (canvas, Excalidraw, symlinks, attachments)
-/// land with the vault-syntax work, and each one wires its code when it does.
+/// Every one of the ten has a producer as of W2.4 (§5 第 5–10 条); what each
+/// code means is its own variant's sentence.
 /// Having them typed is what keeps
 /// `degradation_message` exhaustive and stops a sentence from claiming to be about
 /// the wrong code.
@@ -655,6 +666,179 @@ impl Warning {
             .into_iter()
             .find(|candidate| candidate.as_str() == code)
     }
+}
+
+/// How a `graph_links` edge was expressed (architecture §8.2, ADR 0027).
+///
+/// The vocabulary closed with W2.4. `canvas_card` / `canvas_edge` have no
+/// producer yet — canvas edge building is its own task (§5 第 2 条) — and are
+/// typed now so the vocabulary closes instead of drifting when that task
+/// lands. A frontmatter link is [`Self::Link`] + [`LinkSource::Frontmatter`]:
+/// frontmatter is singled out on the `link_source` axis, an embed on this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeKind {
+    /// An ordinary link written in text: a wikilink, a markdown link, or a
+    /// frontmatter link.
+    Link,
+    /// An inclusion (`![[…]]`, `![](…)`): stronger than a plain link, singled
+    /// out so retrieval can weight it differently.
+    Embed,
+    /// A JSON Canvas `file` node naming a file (producer pending).
+    CanvasCard,
+    /// A JSON Canvas `edges` arrow resolved from its endpoint nodes to files
+    /// (producer pending).
+    CanvasEdge,
+}
+
+impl EdgeKind {
+    /// Every kind, in the order rows are sorted and counted.
+    ///
+    /// One list, iterated by [`Self::from_code`] and by the tests:
+    /// `the_edge_kind_list_is_complete` matches every variant without a
+    /// wildcard, so a kind cannot be added to `as_str` alone.
+    pub const ALL: [Self; 4] = [Self::Link, Self::Embed, Self::CanvasCard, Self::CanvasEdge];
+
+    /// The wire spelling, as stored in `graph_links.edge_kind`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Link => "link",
+            Self::Embed => "embed",
+            Self::CanvasCard => "canvas_card",
+            Self::CanvasEdge => "canvas_edge",
+        }
+    }
+
+    /// The spelling back as a variant, for readers of stored rows.
+    ///
+    /// `None` is a spelling written by a build that knows a kind this one does
+    /// not; [`Self::as_str`] is the only writer, so the two cannot drift apart
+    /// silently.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == code)
+    }
+}
+
+/// Which syntax produced a `graph_links` edge (architecture §8.2, ADR 0027).
+///
+/// "Which syntax produced it" with one carve-out the build matrix fixes:
+/// a link written inside frontmatter is [`Self::Frontmatter`] even when its
+/// syntax is a wikilink. `canvas` waits for its producers like
+/// [`EdgeKind::CanvasCard`] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkSource {
+    /// Produced by `[[…]]` syntax in a note body.
+    Wikilink,
+    /// Produced by `[…](…)` syntax.
+    Markdown,
+    /// Produced by `![[…]]` syntax.
+    Embed,
+    /// Produced by canvas structure (a file node or an arrow; producer pending).
+    Canvas,
+    /// Written inside frontmatter — singled out there even when the syntax is a
+    /// wikilink (§5 第 2 条).
+    Frontmatter,
+}
+
+impl LinkSource {
+    /// Every source, in the order rows are sorted and counted.
+    pub const ALL: [Self; 5] = [
+        Self::Wikilink,
+        Self::Markdown,
+        Self::Embed,
+        Self::Canvas,
+        Self::Frontmatter,
+    ];
+
+    /// The wire spelling, as stored in `graph_links.link_source`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Wikilink => "wikilink",
+            Self::Markdown => "markdown",
+            Self::Embed => "embed",
+            Self::Canvas => "canvas",
+            Self::Frontmatter => "frontmatter",
+        }
+    }
+
+    /// The spelling back as a variant, for readers of stored rows.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == code)
+    }
+}
+
+/// What a link's anchor points at, when it has one (architecture §8.2).
+///
+/// The whole vocabulary: `heading` (`#H1#H2` multi-level included) and `block`
+/// (`#^id`). A NULL on the row means no anchor — or a fragment that is not an
+/// anchor, like a PDF page parameter (§5 第 4 条: attachment targets are never
+/// anchor-parsed). `span` is not an anchor kind: it is the chunk's own
+/// line-interval locator (`Chunk::locator_json`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorKind {
+    /// A `#heading` text anchor, matched by level text (§5 第 4 条).
+    Heading,
+    /// A `#^id` block anchor; the id charset is `[A-Za-z0-9-]+`.
+    Block,
+}
+
+impl AnchorKind {
+    /// Every kind, in the order rows are sorted and counted.
+    pub const ALL: [Self; 2] = [Self::Heading, Self::Block];
+
+    /// The wire spelling, as stored in `graph_links.anchor_kind`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Heading => "heading",
+            Self::Block => "block",
+        }
+    }
+
+    /// The spelling back as a variant, for readers of stored rows.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == code)
+    }
+}
+
+/// One `graph_links` row: an as-written link edge (architecture §8.2, ADR 0027).
+///
+/// Identity is the as-written six-tuple; `to_source_key` is a resolution
+/// product and `created_at` is the `ingested_at` of the revision whose content
+/// carries the link, so a rebuild reproduces every row byte for byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphLink {
+    /// The note (or canvas) the link is written in.
+    pub from_source_key: String,
+    /// The resolved target, or `None` for a dangling link — a first-class row.
+    pub to_source_key: Option<String>,
+    /// The target exactly as written.
+    pub raw_target: String,
+    /// How the edge was expressed.
+    pub edge_kind: EdgeKind,
+    /// Which syntax produced it.
+    pub link_source: LinkSource,
+    /// What the anchor points at; `None` when the link has no anchor.
+    pub anchor_kind: Option<AnchorKind>,
+    /// The anchor exactly as written; `None` when the link has none. It can
+    /// outlive `anchor_kind`: an attachment's page fragment is kept raw while
+    /// the kind is NULL (`§5 第 4 条`).
+    pub anchor_raw: Option<String>,
+    /// The `ingested_at` of the revision whose content carries the link.
+    pub created_at: i64,
 }
 
 /// How the rows carrying one code were handled.
@@ -915,6 +1099,184 @@ mod tests {
             sorted,
             Warning::ALL,
             "reorder the enum and `ALL` together, or a row's order changes"
+        );
+    }
+
+    #[test]
+    fn the_edge_kind_list_is_complete() {
+        // No wildcard here, so a fifth kind fails to compile, and the count then
+        // forces it into `ALL` (the hole `the_variant_list_is_complete` was
+        // written for: a writer knowing a code the reader's array did not).
+        for kind in EdgeKind::ALL {
+            match kind {
+                EdgeKind::Link => {}
+                EdgeKind::Embed => {}
+                EdgeKind::CanvasCard => {}
+                EdgeKind::CanvasEdge => {}
+            }
+        }
+        assert_eq!(EdgeKind::ALL.len(), 4, "extend ALL, not just as_str");
+    }
+
+    #[test]
+    fn an_edge_kind_code_parses_back_to_its_variant() {
+        for kind in EdgeKind::ALL {
+            assert_eq!(EdgeKind::from_code(kind.as_str()), Some(kind));
+        }
+        assert_eq!(
+            EdgeKind::from_code("a_kind_from_the_future"),
+            None,
+            "an unknown spelling is none of our business, not a panic"
+        );
+        assert_eq!(
+            EdgeKind::from_code("wikilink"),
+            None,
+            "the vocabularies are separate: a link_source is not an edge_kind"
+        );
+    }
+
+    #[test]
+    fn every_edge_kind_spells_the_same_on_the_wire() {
+        for kind in EdgeKind::ALL {
+            assert_eq!(
+                serde_json::to_string(&kind).expect("serialize"),
+                format!("\"{}\"", kind.as_str()),
+                "{kind:?} spells differently in JSON and in as_str"
+            );
+        }
+    }
+
+    #[test]
+    fn the_edge_kind_list_is_in_declaration_order() {
+        // `Ord` is the declaration order and the row writer's set and sort read
+        // it; reorder one side alone and row order flips silently.
+        let mut sorted = EdgeKind::ALL;
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            EdgeKind::ALL,
+            "reorder the enum and `ALL` together, or the wire order drifts from the contract table"
+        );
+    }
+
+    #[test]
+    fn the_link_source_list_is_complete() {
+        for source in LinkSource::ALL {
+            match source {
+                LinkSource::Wikilink => {}
+                LinkSource::Markdown => {}
+                LinkSource::Embed => {}
+                LinkSource::Canvas => {}
+                LinkSource::Frontmatter => {}
+            }
+        }
+        assert_eq!(LinkSource::ALL.len(), 5, "extend ALL, not just as_str");
+    }
+
+    #[test]
+    fn a_link_source_code_parses_back_to_its_variant() {
+        for source in LinkSource::ALL {
+            assert_eq!(LinkSource::from_code(source.as_str()), Some(source));
+        }
+        assert_eq!(
+            LinkSource::from_code("a_source_from_the_future"),
+            None,
+            "an unknown spelling is none of our business, not a panic"
+        );
+        assert_eq!(
+            LinkSource::from_code("link"),
+            None,
+            "the vocabularies are separate: an edge_kind is not a link_source"
+        );
+    }
+
+    #[test]
+    fn every_link_source_spells_the_same_on_the_wire() {
+        for source in LinkSource::ALL {
+            assert_eq!(
+                serde_json::to_string(&source).expect("serialize"),
+                format!("\"{}\"", source.as_str()),
+                "{source:?} spells differently in JSON and in as_str"
+            );
+        }
+    }
+
+    #[test]
+    fn the_link_source_list_is_in_declaration_order() {
+        let mut sorted = LinkSource::ALL;
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            LinkSource::ALL,
+            "reorder the enum and `ALL` together, or the wire order drifts from the contract table"
+        );
+    }
+
+    #[test]
+    fn the_anchor_kind_list_is_complete() {
+        for kind in AnchorKind::ALL {
+            match kind {
+                AnchorKind::Heading => {}
+                AnchorKind::Block => {}
+            }
+        }
+        assert_eq!(
+            AnchorKind::ALL.len(),
+            2,
+            "extend ALL, not just as_str — and `span` is a chunk locator, not an anchor"
+        );
+    }
+
+    #[test]
+    fn an_anchor_kind_code_parses_back_to_its_variant() {
+        for kind in AnchorKind::ALL {
+            assert_eq!(AnchorKind::from_code(kind.as_str()), Some(kind));
+        }
+        assert_eq!(
+            AnchorKind::from_code("span"),
+            None,
+            "`span` is the chunk locator's kind, never an anchor kind (§5 第 4 条)"
+        );
+    }
+
+    #[test]
+    fn every_anchor_kind_spells_the_same_on_the_wire() {
+        for kind in AnchorKind::ALL {
+            assert_eq!(
+                serde_json::to_string(&kind).expect("serialize"),
+                format!("\"{}\"", kind.as_str()),
+                "{kind:?} spells differently in JSON and in as_str"
+            );
+        }
+    }
+
+    #[test]
+    fn the_anchor_kind_list_is_in_declaration_order() {
+        let mut sorted = AnchorKind::ALL;
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            AnchorKind::ALL,
+            "reorder the enum and `ALL` together, or the wire order drifts from the contract table"
+        );
+    }
+
+    #[test]
+    fn the_graph_vocabularies_spell_exactly_as_the_contract_table() {
+        // Literals taken from architecture §8.2's three tables — written here
+        // by hand, so a spelling that drifts in `as_str` fails against the
+        // contract text instead of against itself.
+        assert_eq!(
+            EdgeKind::ALL.map(|kind| kind.as_str()),
+            ["link", "embed", "canvas_card", "canvas_edge"]
+        );
+        assert_eq!(
+            LinkSource::ALL.map(|source| source.as_str()),
+            ["wikilink", "markdown", "embed", "canvas", "frontmatter"]
+        );
+        assert_eq!(
+            AnchorKind::ALL.map(|kind| kind.as_str()),
+            ["heading", "block"]
         );
     }
 
