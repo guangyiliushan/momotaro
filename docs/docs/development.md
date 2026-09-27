@@ -120,7 +120,7 @@ CLI shim 示例（业务不写在 package.json 里）：
 
 | job | 触发 | 内容 |
 |---|---|---|
-| `test` | push / PR（Rust 路径、`tools/evals/**` 或 workflow 自身改动）+ 每日 | ubuntu 与 windows 两腿：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`cargo test --workspace --locked`。**windows 腿串行**（`RUST_TEST_THREADS=1`）：并行建索引在该平台会瞬时拒绝访问（实测并行 5/40 与 2/12 红、串行 0/11）——这是**换稳定，不是修因**，flaky 本体仍登记在册 |
+| `test` | push / PR（Rust 路径、`tools/evals/**` 或 workflow 自身改动）+ 每日 | ubuntu 与 windows 两腿：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --locked`、`cargo test --workspace --locked`，外加 `Path matrix (named target)` 步（`cargo test -p momotaro-ingest --test path_matrix --locked`：W2.6 平台矩阵的按名主场，workspace 步已覆盖其自动档；手工 `#[ignore]` 档永不进 CI，本地按名跑，配方在 `path_matrix.rs` 头注）。**windows 腿串行**（`RUST_TEST_THREADS=1`）：并行建索引在该平台会瞬时拒绝访问（实测并行 5/40 与 2/12 红、串行 0/11）——这是**换稳定，不是修因**，flaky 本体仍登记在册 |
 | `deny` | 同上 | `cargo deny --locked check`（`deny.toml` 是唯一策略文件：licenses / bans / advisories / sources；特性覆盖来自 `[graph] all-features`，不是 CLI flag） |
 | `instruments` | 同上 | `perf_smoke`（1000 文件性能冒烟，`#[ignore]` 那条）与 `bash tools/evals/run_golden.sh`（golden set 回归绊线）。**配方与门槛只有这一份**：README 教的就是它、CI 调的就是它，门槛写在脚本里（贴基线，仪器确定性 ⇒ 不是容差；golden set 扩容时显式重设） |
 
