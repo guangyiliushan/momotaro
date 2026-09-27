@@ -66,6 +66,10 @@ refuses "a git directory itself" "$sandbox/fake/.git"
 refuses "a directory holding Cargo.toml" "$sandbox/with-manifest"
 refuses "the home directory" "$HOME"
 refuses "the filesystem root" "/"
+# The gap a review caught: a scratch INSIDE the repository passes every case
+# above (no .git, no Cargo.toml at its root) and rm -rf deletes source. The
+# fake's tools/ holds the canary, so a failed guard also destroys the proof.
+refuses "a directory inside the repository" "$fake/inner"
 
 # Positive control: a plain scratch directory is accepted, so the guard is not
 # simply refusing everything. (`rm` is stubbed here too, and the scratch is
