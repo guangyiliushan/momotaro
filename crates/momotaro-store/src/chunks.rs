@@ -33,6 +33,48 @@ fn read_chunk_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chunk> {
     })
 }
 
+/// Replaces one revision's chunks and its source's `graph_links` rows inside
+/// the caller's transaction.
+///
+/// Every row is written under the `source_key` / `revision_hash` arguments —
+/// the delete key — so a row struct's own fields cannot disagree with them,
+/// the same rule the `graph_links` writer enforces.
+pub(crate) fn replace_chunks_tx(
+    tx: &rusqlite::Transaction<'_>,
+    source_key: &str,
+    revision_hash: &str,
+    chunks: &[Chunk],
+    edges: &[momotaro_contracts::GraphLink],
+) -> Result<(), StoreError> {
+    tx.execute(
+        "DELETE FROM chunks WHERE source_key = ?1 AND revision_hash = ?2",
+        params![source_key, revision_hash],
+    )?;
+    {
+        let mut insert = tx.prepare_cached(
+            "INSERT INTO chunks
+                (chunk_id, source_key, revision_hash, ordinal, heading_path, text, locator_json,
+                 chunk_hash, token_estimate)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+        for chunk in chunks {
+            insert.execute(params![
+                chunk.chunk_id,
+                source_key,
+                revision_hash,
+                chunk.ordinal,
+                chunk.heading_path,
+                chunk.text,
+                chunk.locator_json,
+                chunk.chunk_hash,
+                chunk.token_estimate,
+            ])?;
+        }
+    }
+    crate::graph::write_edges_tx(tx, source_key, edges)?;
+    Ok(())
+}
+
 impl crate::Store {
     /// Atomically replaces every chunk of one source revision, and the same
     /// source's `graph_links` rows (ADR 0027: the edges ride the file's own
@@ -45,32 +87,7 @@ impl crate::Store {
         edges: &[momotaro_contracts::GraphLink],
     ) -> Result<(), StoreError> {
         let tx = self.connection.transaction()?;
-        tx.execute(
-            "DELETE FROM chunks WHERE source_key = ?1 AND revision_hash = ?2",
-            params![source_key, revision_hash],
-        )?;
-        {
-            let mut insert = tx.prepare_cached(
-                "INSERT INTO chunks
-                    (chunk_id, source_key, revision_hash, ordinal, heading_path, text, locator_json,
-                     chunk_hash, token_estimate)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            )?;
-            for chunk in chunks {
-                insert.execute(params![
-                    chunk.chunk_id,
-                    chunk.source_key,
-                    chunk.revision_hash,
-                    chunk.ordinal,
-                    chunk.heading_path,
-                    chunk.text,
-                    chunk.locator_json,
-                    chunk.chunk_hash,
-                    chunk.token_estimate,
-                ])?;
-            }
-        }
-        crate::graph::write_edges_tx(&tx, source_key, edges)?;
+        replace_chunks_tx(&tx, source_key, revision_hash, chunks, edges)?;
         tx.commit()?;
         Ok(())
     }

@@ -662,6 +662,22 @@ mod tests {
     }
 
     #[test]
+    fn every_ingest_write_goes_through_the_unit() {
+        // The wiring cannot be driven through the public API (production passes
+        // the real store), so it is counted, on the precedent just above:
+        // reverting a call site to `append_revision` + `replace_chunks` must go
+        // red here, or "one file is one transaction" quietly degrades to "the
+        // API exists". The needle is split so this test is not its own hit.
+        let source = include_str!("index_service.rs");
+        let calls = concat!("store.commit_source", "_file(");
+        assert_eq!(
+            source.matches(calls).count(),
+            2,
+            "both ingest write sites commit through the unit"
+        );
+    }
+
+    #[test]
     fn a_store_refusal_keeps_its_kind() {
         let error = store_step::<()>("note:a.md", || {
             Err(StoreError::RevisionMissing {
@@ -1209,7 +1225,7 @@ fn warning_message(code: Warning) -> &'static str {
 /// A store refusal here is engine state a test cannot portably provoke — the file
 /// is a real file, the database real and healthy — so the shape is replayed
 /// rather than provoked, on the `discard_with` precedent. The kind is written once,
-/// here, so the four store calls one pass makes cannot drift apart.
+/// here, so the store calls one pass makes cannot drift apart.
 ///
 /// What this pins is the classification: which resource refused, which kind that
 /// maps to, which `source_key` it is attributed to, and that the message passes
@@ -1932,25 +1948,29 @@ fn process_file(
         non_note_keys,
     );
 
+    // One file, one transaction (D40's unit, `commit_source_file`): revision,
+    // chunks and edges land together — a crash cannot leave half a file. The
+    // event slot stays empty here on purpose: this batch's coverage rows ride
+    // the batch-tail sweep (ADR 0026).
     store_step(source_key, || {
-        store.append_revision(&NewSourceRevision {
-            source_key,
-            revision_hash: &hash,
-            kind: SourceKind::Note,
-            title: Some(&title),
-            uri: None,
-            local_path: Some(&local_path),
-            raw_name: Some(raw_name),
-            origin_class: origin,
-            metadata_json: &metadata_json,
-            ingested_at,
-        })
-    })?;
-    // The edges ride the file's content transaction (ADR 0027, D40's unit):
-    // a crash between the two is exactly the half-written state that unit
-    // refuses to allow.
-    store_step(source_key, || {
-        store.replace_chunks(source_key, &hash, &chunks, &projection.rows)
+        store.commit_source_file(
+            &NewSourceRevision {
+                source_key,
+                revision_hash: &hash,
+                kind: SourceKind::Note,
+                title: Some(&title),
+                uri: None,
+                local_path: Some(&local_path),
+                raw_name: Some(raw_name),
+                origin_class: origin,
+                metadata_json: &metadata_json,
+                ingested_at,
+            },
+            &chunks,
+            &projection.rows,
+            None,
+            || Ok(()),
+        )
     })?;
 
     index_step(source_key, || {
@@ -2619,24 +2639,30 @@ fn register_attachment(
     }
 
     // No H1 to find and no frontmatter to record: the fingerprint is the whole
-    // blob, and the title is the file's name without its extension.
+    // blob, and the title is the file's name without its extension. The unit
+    // carries no chunks and no edges — the kind is decided by the extension, so
+    // a key that is an attachment never had either.
     let title = derive_title("", source_key);
     store_step(source_key, || {
-        store.append_revision(&NewSourceRevision {
-            source_key,
-            revision_hash: &hash,
-            kind: SourceKind::Attachment,
-            title: Some(&title),
-            uri: None,
-            local_path: Some(&local_path),
-            raw_name: Some(raw_name),
-            origin_class: OriginClass::Owner,
-            metadata_json: &fingerprint,
-            ingested_at: now_epoch_secs(),
-        })
+        store.commit_source_file(
+            &NewSourceRevision {
+                source_key,
+                revision_hash: &hash,
+                kind: SourceKind::Attachment,
+                title: Some(&title),
+                uri: None,
+                local_path: Some(&local_path),
+                raw_name: Some(raw_name),
+                origin_class: OriginClass::Owner,
+                metadata_json: &fingerprint,
+                ingested_at: now_epoch_secs(),
+            },
+            &[],
+            &[],
+            None,
+            || Ok(()),
+        )
     })?;
-    // No chunk call at all: the kind is decided by the extension, so a key that is
-    // an attachment never had chunks to replace.
 
     report.files_indexed += 1;
     report.revisions_created += 1;

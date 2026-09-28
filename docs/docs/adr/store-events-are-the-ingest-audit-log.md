@@ -155,26 +155,26 @@ decision; making that decision is not part of this contract.
   `indexed | skipped | metadata_refreshed | error` per source, beside the batch's
   own counters. The row is small. Since W2.4 the coverage rows are appended in
   one **event sweep** after the batch's data is settled (the `stale_anchor` code
-  is decided against the settled state, `§5 第 4 条`), one transaction for the
-  sweep: the loss window is the batch tail — a crash before the sweep loses the
-  batch's coverage rows while every data write survives, never the reverse.
+  is decided against the settled state, `§5 第 4 条`), each row its own
+  transaction: the loss window is the batch tail — a crash before or during the
+  sweep loses the unwritten coverage rows while every data write survives, never
+  the reverse.
 - **Events never claim work that is not there.** Each append is one transaction,
   and the ingest path writes a file's data *before* the event that describes it,
   so a crash can lose an event but never invent one. The other half of that
   window — work that landed without its event — is what reconciliation exists
   for (D40: events are the hint, reconciliation is the truth).
 - A batch-wide transaction was considered and rejected: it would hold the write
-  lock across a 1000-file run and turn one crash into a lost batch. **What the
-  code does today is two content appends per file** — the revision
-  (`revisions.rs`) and its chunks together with the file's `graph_links` rows
-  (`chunks.rs`) — plus the batch-tail event sweep (`events.rs`). D40's "a single
-  file update is exactly one transaction" is met by the content unit's chunks +
-  edges half; the revision append is still its own transaction, so a crash
-  between the two can lose a row for a file whose data landed. The *never
-  invent* half above holds because every data write precedes its event; closing
-  the *lose* half needs a store API that writes revision + chunks + event as one
-  unit. That API does not exist yet and is registered as follow-up work rather
-  than claimed here.
+  lock across a 1000-file run and turn one crash into a lost batch. **One file
+  is one transaction**: `commit_source_file` (`unit.rs`) writes the revision,
+  its chunks and its `graph_links` rows — and the file's event, when the caller
+  supplies one — in a single `BEGIN IMMEDIATE`, the caller's guard first. That
+  is D40's unit; for a caller that supplies the event (the watcher path of
+  W2.5) it closes the *lose* half outright. The index batch deliberately
+  supplies none — its coverage rows carry `stale_anchor`, which is decided
+  against the settled state (`§5 第 4 条`) — so the batch keeps exactly the
+  tail window the first bullet states. The *never invent* half holds in both
+  shapes, because every data write precedes its event.
 - A batch that aborts mid-way leaves `ingest.started` with no terminal event, so a
   reader sees "running" rather than "crashed". That is stated here rather than
   discovered later; the fix, when a consumer needs it, is an `ingest.failed`

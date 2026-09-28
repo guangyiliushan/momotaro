@@ -17,6 +17,7 @@ pub mod events;
 mod graph;
 mod migration;
 pub mod revisions;
+mod unit;
 
 pub use chunks::SourceCounts;
 pub use events::{NewStoreEvent, StoreEvent};
@@ -128,7 +129,8 @@ pub enum StoreError {
     #[error("pre-migration backup failed: {0}")]
     BackupFailed(String),
 
-    /// A stored column value does not decode into its contract enum.
+    /// A stored column value does not decode into its contract enum — or a
+    /// caller's input names a field the store refuses (`column` says which).
     #[error("invalid value in column {column}: {value}")]
     InvalidValue {
         /// The column that failed to decode.
@@ -136,6 +138,11 @@ pub enum StoreError {
         /// The raw value found in the column.
         value: String,
     },
+
+    /// The caller's transaction guard refused the unit — e.g. the file's stat
+    /// moved between read and commit.
+    #[error("write guard refused the transaction: {0}")]
+    GuardRejected(String),
 }
 
 pub(crate) fn invalid_value(column: &'static str, value: impl Into<String>) -> StoreError {

@@ -431,7 +431,7 @@ CREATE TABLE project_memberships (
 CREATE TABLE source_revisions (
   source_key TEXT NOT NULL,
   revision_hash TEXT NOT NULL,
-  kind TEXT NOT NULL,              -- note | paper | web
+  kind TEXT NOT NULL,              -- note | paper | web | attachment
   title TEXT,
   uri TEXT,
   local_path TEXT,
@@ -1174,7 +1174,7 @@ cargo test --workspace
 
 `index` / lexical `search` / Tantivy。重建索引不丢 canonical 数据。1,000 个 Markdown 可完成。
 
-已做：`source_key` NFC 身份键、vault ⊆ workspace、origin 乘性权重、`store_events` 审计日志、`doctor --coverage`、wikilink 全形态建边入 derived `graph_links`（dangling/歧义/锚点校验齐，五类降级码生产者；行身份与重建见 [ADR 0027](adr/graph-links-rows-are-a-rebuilt-projection.md)）。本波剩余：D42 的碰撞消歧后缀策略（两条目都保留 + 消歧后缀 + 事件，ADR 0002 与 ADR 0026 都指向它）、watcher + 对账四触发、平台测试矩阵、D24 的多链头暴露。D40 的「单文件 = 恰好一个事务」见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 的诚实口径，**不是已交付**。
+已做：`source_key` NFC 身份键、vault ⊆ workspace、origin 乘性权重、`store_events` 审计日志、`doctor --coverage`、wikilink 全形态建边入 derived `graph_links`（dangling/歧义/锚点校验齐，五类降级码生产者；行身份与重建见 [ADR 0027](adr/graph-links-rows-are-a-rebuilt-projection.md)）。本波剩余：D42 的碰撞消歧后缀策略（两条目都保留 + 消歧后缀 + 事件，ADR 0002 与 ADR 0026 都指向它）、watcher + 对账四触发、平台测试矩阵、D24 的多链头暴露。D40 的「单文件 = 恰好一个事务」已由 store 的 `commit_source_file` 交付（revision + chunks + 边 + 事件同事务，口径见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md)）；余 W2.5 的 watcher 作为带事件入事务的调用方。
 
 ### v0.3 可追溯问答
 
@@ -1587,11 +1587,12 @@ watcher = `notify` 8.2.0 稳定线 + `notify-debouncer-full`（Windows 溢出缺
 由对账兜底，不冒险 RC）；事件永不 trust，全部归并为「重扫该路径」：stat
 双验（racy 强制内容校验，git 同构）→ 读全文双 stat（撕裂重试，绝不落库）→
 sha256 与库比对才重建 chunk。对账四触发（启动全 walk / 每日 / 手动 / watcher
-异常恢复），10k 文件亚秒级。单文件更新的**目标**是恰好一个 SQLite 事务，chunk
-内容寻址 upsert，canonical 永不污染；v0.2 ingest 实际是每文件三次小事务
-（revision / chunks / 事件），数据先写、事件随后——崩溃只可能丢事件、不可能
-凭空造事件，三者一体的 store API 登记在
-[ADR 0026](adr/store-events-are-the-ingest-audit-log.md)，本文不假装它已满足。网络盘维持探测告警（D31），不做轮询降级
+异常恢复），10k 文件亚秒级。单文件更新 = 恰好一个 SQLite 事务（store 的
+`commit_source_file`：revision + chunks + 边 + 事件同事务），chunk
+内容寻址 upsert，canonical 永不污染；批量 index 的 coverage 行仍在批尾
+sweep（丢窗 = 批尾、对账承接），
+watcher（W2.5）路径事件入事务、零丢窗——口径见
+[ADR 0026](adr/store-events-are-the-ingest-audit-log.md)。网络盘维持探测告警（D31），不做轮询降级
 实现。细则见 [摄取安全与 Vault 互操作](ingest-interop.md)。
 
 ### D41：vault 语法边界与建边矩阵

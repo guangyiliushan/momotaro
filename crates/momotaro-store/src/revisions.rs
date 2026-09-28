@@ -99,6 +99,37 @@ fn query_current(
     Ok(revision)
 }
 
+/// The two statements of a revision append, inside the caller's transaction.
+pub(crate) fn append_revision_tx(
+    tx: &rusqlite::Transaction<'_>,
+    revision: &NewSourceRevision<'_>,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "UPDATE source_revisions SET is_current = 0 WHERE source_key = ?1 AND is_current = 1",
+        params![revision.source_key],
+    )?;
+    tx.execute(
+        "INSERT INTO source_revisions
+            (source_key, revision_hash, kind, title, uri, local_path, raw_name, origin_class,
+             metadata_json, ingested_at, is_current)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)
+         ON CONFLICT(source_key, revision_hash) DO UPDATE SET is_current = 1",
+        params![
+            revision.source_key,
+            revision.revision_hash,
+            revision.kind.as_str(),
+            revision.title,
+            revision.uri,
+            revision.local_path,
+            revision.raw_name,
+            revision.origin_class.as_str(),
+            revision.metadata_json,
+            revision.ingested_at,
+        ],
+    )?;
+    Ok(())
+}
+
 impl crate::Store {
     /// Appends a revision, making it the current one for its source key.
     ///
@@ -106,29 +137,7 @@ impl crate::Store {
     /// idempotent: it simply marks that row current again.
     pub fn append_revision(&mut self, revision: &NewSourceRevision<'_>) -> Result<(), StoreError> {
         let tx = self.connection.transaction()?;
-        tx.execute(
-            "UPDATE source_revisions SET is_current = 0 WHERE source_key = ?1 AND is_current = 1",
-            params![revision.source_key],
-        )?;
-        tx.execute(
-            "INSERT INTO source_revisions
-                (source_key, revision_hash, kind, title, uri, local_path, raw_name, origin_class,
-                 metadata_json, ingested_at, is_current)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)
-             ON CONFLICT(source_key, revision_hash) DO UPDATE SET is_current = 1",
-            params![
-                revision.source_key,
-                revision.revision_hash,
-                revision.kind.as_str(),
-                revision.title,
-                revision.uri,
-                revision.local_path,
-                revision.raw_name,
-                revision.origin_class.as_str(),
-                revision.metadata_json,
-                revision.ingested_at,
-            ],
-        )?;
+        append_revision_tx(&tx, revision)?;
         tx.commit()?;
         Ok(())
     }

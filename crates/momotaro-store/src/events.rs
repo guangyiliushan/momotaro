@@ -110,7 +110,7 @@ impl Store {
     /// (`docs/docs/storage-events.md`, "缺失不得代偿"; Jensen & Snodgrass on
     /// transaction time). Read by `id`, which is the same order the log is read
     /// in, so this is one row lookup rather than an aggregate over the table.
-    fn next_recorded_at(&self) -> Result<i64, StoreError> {
+    pub(crate) fn next_recorded_at(&self) -> Result<i64, StoreError> {
         let now = now_epoch_secs();
         let last: Option<i64> = self
             .connection
@@ -142,6 +142,37 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreEvent> {
     })
 }
 
+/// Inserts `events` inside the caller's transaction, at the given transaction
+/// time.
+pub(crate) fn insert_events_tx(
+    tx: &rusqlite::Transaction<'_>,
+    batch_id: &str,
+    events: &[NewStoreEvent<'_>],
+    recorded_at: i64,
+) -> Result<(), StoreError> {
+    let mut statement = tx.prepare(INSERT)?;
+    for event in events {
+        if event.batch_id != batch_id {
+            return Err(invalid_value("batch_id", event.batch_id));
+        }
+        statement.execute(params![
+            event.occurred_at,
+            recorded_at,
+            event.batch_id,
+            event.seq,
+            event.domain,
+            event.event_type,
+            event.source_key,
+            event.outcome,
+            event.reason_code,
+            event.message,
+            event.data_json,
+            event.external_id,
+        ])?;
+    }
+    Ok(())
+}
+
 impl Store {
     /// Appends one event, in a batch of its own — the batch id it carries.
     ///
@@ -163,28 +194,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         let recorded_at = self.next_recorded_at()?;
         let transaction = self.connection.transaction()?;
-        {
-            let mut statement = transaction.prepare(INSERT)?;
-            for event in events {
-                if event.batch_id != batch_id {
-                    return Err(invalid_value("batch_id", event.batch_id));
-                }
-                statement.execute(params![
-                    event.occurred_at,
-                    recorded_at,
-                    event.batch_id,
-                    event.seq,
-                    event.domain,
-                    event.event_type,
-                    event.source_key,
-                    event.outcome,
-                    event.reason_code,
-                    event.message,
-                    event.data_json,
-                    event.external_id,
-                ])?;
-            }
-        }
+        insert_events_tx(&transaction, batch_id, events, recorded_at)?;
         transaction.commit()?;
         Ok(())
     }
