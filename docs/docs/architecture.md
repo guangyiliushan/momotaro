@@ -1076,10 +1076,12 @@ fetch/parse 安全五件套与四态 reason-code 映射（D38）见
 不知道 vault，不访问 SQLite。只在可观察输出前 retry。不做多 provider registry。
 
 缓存记账（2026-09-15 调查）：`usage` 结构带 `cached_tokens` / `billable_tokens`
-（provider 报什么记什么，不报为 NULL）；tools 定义 canonical 序列化（列表排序 +
-字段序固定）并纳入 `request_hash`——provider 的缓存键就是 tools JSON 的序列化
-顺序。不做语义缓存（三线证伪：vCache「不可部署」、NDSS 投毒、ICML 碰撞劫持），
-本地只做 `request_hash` → response 的精确缓存（后置，一张 SQLite 表）。
+（provider 报什么记什么，不报为 NULL）；tools 定义 canonical 序列化（列表序=
+调用方给定序——序即身份，顺序变化即为不同请求，不排序不归一；对象字段序=字典序
+固定）并纳入 `request_hash`——provider 的缓存键就是 tools JSON 的序列化顺序。
+不做语义缓存（三线证伪：vCache「不可部署」、NDSS 投毒、ICML 碰撞劫持），
+本地只做 `request_hash` → response 的精确缓存（后置，一张 SQLite 表；缓存键
+= 端点身份 + `request_hash`——hash 不含端点，换槽/换端点不得命中旧响应）。
 
 ## 17. 表面：CLI / 桌面 / 移动 / 文档 / www
 
@@ -1134,6 +1136,9 @@ momotaro spark --project <id>
 | `llm_auth` | user | false |
 | `llm_rate_limit` | provider | true |
 | `llm_context_overflow` | user/provider | maybe |
+| `llm_provider` | provider | true |
+| `llm_rejected` | user/harness | false |
+| `llm_malformed` | provider | maybe |
 | `network_disabled` | policy | false |
 | `citation_invalid` | harness/model | false |
 | `model_probe` | system | true |

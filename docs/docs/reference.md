@@ -124,10 +124,17 @@ model-visible output, replay policy, tool version, and terminal status.
 
 ### LLM turn
 
-An LLM turn records exactly one provider request.
+An LLM turn records exactly one provider exchange: one client call, however
+many attempts it took.
 
 It preserves provider, model, request hash, input and output token usage,
-terminal status, and a raw reference when the provider exposes one.
+terminal status, and a raw reference when the provider exposes one. A
+client-side retry that fires before any observable output is part of the same
+exchange — it is not a second `llm_turns` row. The per-exchange attempts
+count is carried on the client's typed result (`LlmOutput::attempts` /
+`LlmError::attempts`); `llm_turns` has no column for it yet (`未实现` — a
+persisted attempts count lands with a schema change, in the same commit as
+the column).
 
 ### Answer
 

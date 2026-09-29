@@ -31,6 +31,8 @@ momotaro-platform = { path = "crates/momotaro-platform" }
 clap = { version = "4.5", features = ["derive"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
+# Do not enable serde_json's `preserve_order` anywhere in this workspace:
+# momotaro-llm's request_hash relies on Map = BTreeMap (lexicographic keys).
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"

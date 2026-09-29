@@ -832,11 +832,9 @@ name = "momotaro-llm"
 version = "0.1.0"
 dependencies = [
  "hex",
- "momotaro-contracts",
  "serde",
  "serde_json",
  "sha2",
- "tempfile",
  "thiserror",
 ]
 
