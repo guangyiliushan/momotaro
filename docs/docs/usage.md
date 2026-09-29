@@ -161,6 +161,54 @@ not follow, an iCloud eviction stub, or a cloud placeholder. A pure directory
 move refreshes the stored path and shows up as `indexed` with `0 new
 revisions`, because no new content revision was created.
 
+## Watch the vault
+
+```bash
+momotaro watch
+```
+
+A long-running process. It opens the file watcher first and then runs one full
+vault walk+stat reconciliation — the watcher is already listening by then,
+which is what makes the cookie that walk waits for mean anything — and after
+that it serves events. **Events are hints, never truth** (D40): every event,
+whatever it says, is merged into "rescan that path", and the rescan decides
+from the file's own bytes whether anything actually changed. It reconciles
+again every 24 hours, immediately when the platform reports that it dropped
+events, and again when a single batch of events names more than 256 paths (an
+event storm — at that point a full walk is cheaper than N rescans and is the
+only thing that can be sure).
+
+`Ctrl-C` stops it. There is no graceful-shutdown handler: the process is torn
+down by the operating system. That is safe because every file's rows commit
+with its data — a batch interrupted part-way simply has not happened yet, and
+the next startup reconciliation picks it up.
+
+Everything it says goes to **stdout**, in both modes. With `--json` each line
+is one object tagged `kind`, so a script can tell them apart: `batch`
+(`{"kind", "batch_id", "rescanned", "rebuilt", "refreshed", "unchanged",
+"removed", "dropped"}`), `reconciled` (`trigger`, `batch_id`), `degraded`
+(`reason`), `network_volume` (`message`), `cookie_skipped` (`reason`), and
+`retries_exhausted` (`path`). A watch on
+a network volume is reported and **not** promised to be real-time; a backend
+that cannot start falls back to polling and says so in a `degraded` line.
+
+## Reconcile the vault
+
+```bash
+momotaro reconcile
+```
+
+One full vault walk+stat, writing `vault.reconcile.started`,
+`vault.reconcile.coverage` (one row per file) and `vault.reconcile.finished`.
+This is the command the other three triggers share: the watcher runs it at
+startup and every 24 hours, and again after the platform reports dropped
+events. Run it by hand whenever you suspect the store and the vault have
+drifted — a deleted file, a rename while the watcher was down, an interrupted
+index.
+
+With `--json` it prints `{"batch_id", "scanned", "changed", "removed",
+"events"}`.
+
 ## Exit codes
 
 `0` means the command succeeded; `1` means it failed. **`doctor` is the one
@@ -182,6 +230,13 @@ run `init` — and if the directory is not a workspace at all (no `momotaro.toml
 `--coverage` reports that instead, because `init` would fail there too.
 
 Other commands exit `1` only when they fail.
+
+`reconcile` follows the ordinary rule: `0` when the walk ran, `1` when the vault
+or the store was unusable. `watch` runs until it is stopped, so its exit code
+only describes how it *ended* — `0` for an orderly stop, `1` when it could not
+start (missing vault, unusable store, or a filesystem backend that refuses to
+watch). A reconcile whose cookie wait timed out still runs the walk and still
+exits `0`: waiting is an optimisation, not a precondition.
 
 An engine inside the WAL-reset window — or a withdrawn 3.52.x release — is
 reported as `invalid` too, with the bundled `sqlite_version()` /

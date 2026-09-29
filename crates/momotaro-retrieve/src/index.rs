@@ -170,6 +170,25 @@ impl SearchIndex {
         Ok(())
     }
 
+    /// Drops every indexed chunk of one source.
+    ///
+    /// The derived half of a deletion: SQLite keeps the revision as history
+    /// (ADR 0014) and `graph_links` are pruned in the same batch, but a
+    /// document left in Tantivy would keep answering searches for a file that
+    /// is gone — which is the one place "eventually consistent" would be a
+    /// lie the user can see. Nothing is committed; call
+    /// [`IndexWriterHandle::commit`] once after a batch.
+    pub fn remove_source(
+        writer: &mut IndexWriterHandle,
+        fields: &Fields,
+        source_key: &str,
+    ) -> Result<(), RetrieveError> {
+        writer
+            .inner
+            .delete_term(Term::from_field_text(fields.source_key, source_key));
+        Ok(())
+    }
+
     /// Rebuilds the whole index from a full chunk set.
     ///
     /// Deletes all documents, then indexes every chunk. Titles and trust classes

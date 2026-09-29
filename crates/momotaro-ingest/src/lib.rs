@@ -29,9 +29,11 @@ pub use links::{
 };
 pub use normalize::normalize_markdown;
 pub use path::{canonical_workspace_root, is_within, local_path_in, resolve_local_path};
-pub use portability::{attributes_of, is_cloud_placeholder, windows_incompatible_components};
+pub use portability::{
+    attributes_of, icloud_stub, is_cloud_placeholder, windows_incompatible_components,
+};
 pub use title::derive_title;
-pub use walk::{VaultEntry, VaultFileKind, raw_name_for, source_key_for, walk_entries};
+pub use walk::{VaultEntry, VaultFileKind, is_hidden, raw_name_for, source_key_for, walk_entries};
 
 /// Failures raised while turning vault files into chunks.
 #[derive(Debug, thiserror::Error)]

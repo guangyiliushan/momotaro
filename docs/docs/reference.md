@@ -194,18 +194,27 @@ session_id, `conversation.compacted` ← summary present, `previous_response.id`
 
 ### Ingest / feed events (not run events)
 
-Index, feed poll, and note rename emit store events, not Runs:
+Index, feed poll, watch, and reconcile emit store events, not Runs:
 
 ```text
 ingest.started
 ingest.finished
 ingest.coverage
 source_moved
+vault.reconcile.started
+vault.reconcile.coverage
+vault.reconcile.finished
 feed.poll.started
 feed.poll.finished
 ```
 
-`source_moved(old_key, new_key)` is a hint. It must not rewrite stored
+`index` and `watch` both write the `ingest` domain — a watcher batch is an
+ingest batch, so `doctor --coverage` reports whichever of them wrote last.
+The four reconciliation triggers write the `vault` domain.
+
+`source_moved(old_key, new_key)` is a hint, written only for a rename the
+debouncer actually paired (a path that vanished with no partner is a
+deletion, and the batch's removal row says so). It must not rewrite stored
 `source_key` values. Missing bytes at `local_path` are `source_missing` /
 `source_integrity`.
 

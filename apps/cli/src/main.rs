@@ -7,10 +7,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use momotaro_run::{
-    RunError, SearchOutput, coverage_report, doctor, format_coverage, format_error, format_health,
-    format_index_error, format_index_summary, format_rebuild, format_search_excerpt,
-    format_search_hit, index_workspace, init_workspace, is_healthy, is_uninitialized,
-    rebuild_index, search_workspace, stats,
+    RunError, SearchOutput, WatchLine, coverage_report, doctor, format_coverage, format_error,
+    format_health, format_index_error, format_index_summary, format_rebuild, format_reconcile,
+    format_search_excerpt, format_search_hit, format_watch_line, index_workspace, init_workspace,
+    is_healthy, is_uninitialized, rebuild_index, reconcile, search_workspace, stats, watch,
 };
 
 /// A personal knowledge engine for serious learners.
@@ -42,7 +42,8 @@ enum Command {
     /// Check the workspace, or read the last ingest batch back
     /// (`--coverage`, ADR 0026).
     Doctor {
-        /// Report what the most recent `index` run did to each file, read from
+        /// Report what the most recent ingest run (`index` or `watch`) did to
+        /// each file, read from
         /// the audit log, instead of checking workspace health.
         #[arg(long)]
         coverage: bool,
@@ -70,6 +71,12 @@ enum Command {
 
     /// Rebuild the Tantivy index from canonical chunks (canonical data untouched).
     RebuildIndex,
+
+    /// Keep the store current with the vault while it changes (D40).
+    Watch,
+
+    /// Bring the store up to date with the whole vault in one pass (D40 §4.4).
+    Reconcile,
 }
 
 fn print_success(json: bool, payload: String, human: &str) -> ExitCode {
@@ -226,6 +233,33 @@ fn main() -> ExitCode {
                 Err(error) => print_error(cli.json, error),
             }
         }
+        Command::Watch => {
+            // Every line the watcher produces goes through one callback, so
+            // `--json` and the human exit cannot promise different fields.
+            let json = cli.json;
+            let mut emit = |line: &WatchLine| {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(line).expect("watch line serializes")
+                    );
+                } else {
+                    println!("{}", format_watch_line(line));
+                }
+            };
+            match watch(&root, &mut emit) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => print_error(json, error),
+            }
+        }
+        Command::Reconcile => match reconcile(&root) {
+            Ok(report) => print_success(
+                cli.json,
+                serde_json::to_string_pretty(&report).expect("reconcile report serializes"),
+                &format_reconcile(&report),
+            ),
+            Err(error) => print_error(cli.json, error),
+        },
         Command::RebuildIndex => match rebuild_index(&root) {
             Ok(report) => {
                 if cli.json {

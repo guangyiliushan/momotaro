@@ -3,7 +3,7 @@
 //! follow-up work).
 
 use momotaro_contracts::{Chunk, GraphLink};
-use rusqlite::TransactionBehavior;
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::events::NewStoreEvent;
 use crate::revisions::NewSourceRevision;
@@ -23,6 +23,11 @@ impl Store {
     /// [`StoreError::GuardRejected`]; a caller with no end-of-transaction
     /// check to make (the index batch) passes a no-op.
     ///
+    /// Returns whether a revision row was actually *created*. Re-appending a
+    /// pair that already exists re-adopts it instead — the shape a deleted file
+    /// takes when it comes back — and a caller counting "revisions created"
+    /// from this would otherwise claim one for a row that was already there.
+    ///
     /// The event must name the revision's source: a row about another source
     /// riding this unit would claim work that is not here (ADR 0026). The data
     /// half replays idempotently (revision upsert; chunks and edges replaced
@@ -35,7 +40,7 @@ impl Store {
         edges: &[GraphLink],
         event: Option<&NewStoreEvent<'_>>,
         guard: impl FnOnce() -> Result<(), StoreError>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         if let Some(event) = event
             && event.source_key != Some(revision.source_key)
         {
@@ -54,6 +59,16 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         guard()?;
+        // Asked inside the transaction, so the answer and the insert
+        // cannot disagree about a row someone else wrote in between.
+        let existed = tx
+            .query_row(
+                "SELECT 1 FROM source_revisions WHERE source_key = ?1 AND revision_hash = ?2",
+                params![revision.source_key, revision.revision_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .is_ok_and(|found| found.is_some());
         crate::revisions::append_revision_tx(&tx, revision)?;
         crate::chunks::replace_chunks_tx(
             &tx,
@@ -62,6 +77,76 @@ impl Store {
             chunks,
             edges,
         )?;
+        if let Some((event, recorded_at)) = pending_event {
+            crate::events::insert_events_tx(
+                &tx,
+                event.batch_id,
+                std::slice::from_ref(event),
+                recorded_at,
+            )?;
+        }
+        tx.commit()?;
+        Ok(!existed)
+    }
+
+    /// Commits one file's *refresh* in exactly one `BEGIN IMMEDIATE`.
+    ///
+    /// The sibling of [`Store::commit_source_file`] for the case where the bytes
+    /// did not change: the fingerprint, the stored path or the raw spelling moved,
+    /// so the mutable columns are rewritten in place and no new revision appears
+    /// (`local_path` left behind after a directory move is exactly the staleness
+    /// this closes — see the store discipline note on fingerprint refreshes). The
+    /// chunks stay as they are — they are addressed by the same
+    /// `(source_key, revision_hash)`, so there is nothing to replace — while the
+    /// source's `graph_links` rows are re-projected wholesale, because the
+    /// namespace they resolve against may have moved since.
+    ///
+    /// Same order and same guarantees as the sibling: the guard runs first and a
+    /// refusal rolls the whole unit back, the event lands with the data or not at
+    /// all, and the event must be about this source.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_source_refresh(
+        &mut self,
+        source_key: &str,
+        revision_hash: &str,
+        metadata_json: &str,
+        local_path: &str,
+        raw_name: &str,
+        edges: &[GraphLink],
+        event: Option<&NewStoreEvent<'_>>,
+        guard: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        if let Some(event) = event
+            && event.source_key != Some(source_key)
+        {
+            return Err(invalid_value(
+                "source_key",
+                event.source_key.unwrap_or("<none>"),
+            ));
+        }
+        let pending_event = match event {
+            Some(event) => Some((event, self.next_recorded_at()?)),
+            None => None,
+        };
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        guard()?;
+        let changed = crate::revisions::update_revision_fingerprint_tx(
+            &tx,
+            source_key,
+            revision_hash,
+            metadata_json,
+            local_path,
+            raw_name,
+        )?;
+        if changed != 1 {
+            return Err(StoreError::RevisionMissing {
+                source_key: source_key.to_owned(),
+                revision_hash: revision_hash.to_owned(),
+            });
+        }
+        crate::graph::write_edges_tx(&tx, source_key, edges)?;
         if let Some((event, recorded_at)) = pending_event {
             crate::events::insert_events_tx(
                 &tx,
@@ -398,6 +483,121 @@ mod tests {
         assert_eq!(scalar(&store, "SELECT COUNT(*) FROM chunks"), 0);
         assert_eq!(scalar(&store, "SELECT COUNT(*) FROM graph_links"), 0);
         assert_eq!(scalar(&store, "SELECT COUNT(*) FROM store_events"), 0);
+    }
+
+    /// The refresh unit answers the same two questions the build unit does:
+    /// the guard is first, and a refusal leaves the row's mutable columns,
+    /// its edges and the log exactly as they were (D40 §4.7).
+    #[test]
+    fn a_guard_refusal_writes_nothing_on_a_refresh() {
+        let (_dir, mut store) = temp_store();
+        store
+            .append_revision(&revision("note:a", "h1"))
+            .expect("plant the revision to refresh");
+        let before = store
+            .current_revision("note:a")
+            .expect("read")
+            .expect("exists");
+        store
+            .replace_chunks("note:a", "h1", &[], &[edge("note:a", "B")])
+            .expect("plant an edge");
+
+        let result = store.commit_source_refresh(
+            "note:a",
+            "h1",
+            "{}",
+            "moved/a.md",
+            "a.md",
+            &[edge("note:a", "C")],
+            Some(&event("batch", 1, Some("note:a"))),
+            || Err(StoreError::GuardRejected("stat moved".to_owned())),
+        );
+        assert!(
+            matches!(result, Err(StoreError::GuardRejected(_))),
+            "the refusal surfaces as itself: {result:?}"
+        );
+        let after = store
+            .current_revision("note:a")
+            .expect("read")
+            .expect("exists");
+        assert_eq!(
+            after.local_path, before.local_path,
+            "the path is not moved by a refused refresh"
+        );
+        assert_eq!(scalar(&store, "SELECT COUNT(*) FROM store_events"), 0);
+        assert_eq!(
+            scalar(
+                &store,
+                "SELECT COUNT(*) FROM graph_links WHERE raw_target = 'C'"
+            ),
+            0,
+            "the edges the refresh would have written are not there"
+        );
+        assert_eq!(
+            scalar(
+                &store,
+                "SELECT COUNT(*) FROM graph_links WHERE raw_target = 'B'"
+            ),
+            1,
+            "and the old ones are untouched"
+        );
+    }
+
+    /// What a refresh actually writes, in one unit: the mutable columns, the
+    /// re-projected edges and the caller's event — no new revision, because the
+    /// bytes did not change (D40 §4.7).
+    #[test]
+    fn a_refresh_lands_columns_edges_and_event_in_one_unit() {
+        let (_dir, mut store) = temp_store();
+        store
+            .append_revision(&revision("note:a", "h1"))
+            .expect("plant the revision");
+        store
+            .replace_chunks("note:a", "h1", &[], &[edge("note:a", "B")])
+            .expect("plant an edge");
+        let revisions = scalar(&store, "SELECT COUNT(*) FROM source_revisions");
+
+        store
+            .commit_source_refresh(
+                "note:a",
+                "h1",
+                "{\"fingerprint\":1}",
+                "moved/a.md",
+                "a.md",
+                &[edge("note:a", "C")],
+                Some(&event("batch", 1, Some("note:a"))),
+                || Ok(()),
+            )
+            .expect("refresh");
+
+        assert_eq!(
+            scalar(&store, "SELECT COUNT(*) FROM source_revisions"),
+            revisions,
+            "the same bytes append no revision"
+        );
+        let row = store
+            .current_revision("note:a")
+            .expect("read")
+            .expect("exists");
+        assert_eq!(row.local_path.as_deref(), Some("moved/a.md"));
+        assert_eq!(row.raw_name.as_deref(), Some("a.md"));
+        assert_eq!(scalar(&store, "SELECT COUNT(*) FROM store_events"), 1);
+        assert_eq!(
+            scalar(
+                &store,
+                "SELECT COUNT(*) FROM graph_links WHERE raw_target = 'C'"
+            ),
+            1,
+            "the re-projection lands with the columns, not after them"
+        );
+        assert_eq!(
+            scalar(
+                &store,
+                "SELECT COUNT(*) FROM graph_links WHERE raw_target = 'B'"
+            ),
+            0,
+            "and the old edges are gone wholesale"
+        );
     }
 
     /// Guard refusal surfaces before any write failure — the guard cannot be

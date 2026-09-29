@@ -113,7 +113,12 @@ pub(crate) fn append_revision_tx(
             (source_key, revision_hash, kind, title, uri, local_path, raw_name, origin_class,
              metadata_json, ingested_at, is_current)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)
-         ON CONFLICT(source_key, revision_hash) DO UPDATE SET is_current = 1",
+         ON CONFLICT(source_key, revision_hash) DO UPDATE SET
+             is_current = 1,
+             title = excluded.title,
+             local_path = excluded.local_path,
+             raw_name = excluded.raw_name,
+             metadata_json = excluded.metadata_json",
         params![
             revision.source_key,
             revision.revision_hash,
@@ -133,8 +138,11 @@ pub(crate) fn append_revision_tx(
 impl crate::Store {
     /// Appends a revision, making it the current one for its source key.
     ///
-    /// Re-appending an existing `(source_key, revision_hash)` pair is
-    /// idempotent: it simply marks that row current again.
+    /// Re-appending an existing `(source_key, revision_hash)` pair re-adopts
+    /// it: the row becomes current again **with the mutable columns this call
+    /// just read** — a source that was demoted when its file disappeared and
+    /// has since come back must not keep the path and blob of its old life,
+    /// and identity (`source_key`, `revision_hash`, `ingested_at`) is untouched.
     pub fn append_revision(&mut self, revision: &NewSourceRevision<'_>) -> Result<(), StoreError> {
         let tx = self.connection.transaction()?;
         append_revision_tx(&tx, revision)?;
@@ -216,6 +224,52 @@ impl crate::Store {
         Ok(titles)
     }
 
+    /// Every source that still has a current revision: its key, the spelling
+    /// its file had, and the moment the revision was written.
+    ///
+    /// All three, not just the key: reconcile compares this against what the
+    /// walk still names (D40 §4.2's delete half at vault scale), the row it
+    /// writes for a missing file is attributed by `raw_name`, and whether such
+    /// a row already exists is answered by asking whether one came *after* the
+    /// revision did. `raw_name` predates the column for some rows, so it stays
+    /// optional here and the caller falls back to the key's own spelling.
+    pub fn current_sources(&self) -> Result<Vec<(String, Option<String>, i64)>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT source_key, raw_name, ingested_at FROM source_revisions WHERE is_current = 1",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<(String, Option<String>, i64)>>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Marks every revision of `source_key` as no longer current.
+    ///
+    /// The rows stay — history is never rewritten (ADR 0014) and the chunks
+    /// stay with them — but a source whose file is gone has no *current*
+    /// revision, and that one bit is what three separate guarantees rest on:
+    /// a later `rebuild-index` rebuilds from current revisions only, so it
+    /// cannot resurrect the file; the link namespace stops resolving to it, so
+    /// its edges dangle honestly; and `current_sources` stops naming it, so the
+    /// next walk does not report the same absence twice — while a file that
+    /// comes back becomes current again and earns a *fresh* absence if it
+    /// disappears a second time.
+    ///
+    /// Returns whether anything was demoted, so a caller can skip a row it
+    /// would otherwise repeat.
+    pub fn demote_current(&mut self, source_key: &str) -> Result<bool, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE source_revisions SET is_current = 0 WHERE source_key = ?1 AND is_current = 1",
+            params![source_key],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Refreshes the mutable columns of one revision in place.
     ///
     /// Used when a file's bytes did not change but its fingerprint, stored path
@@ -230,17 +284,13 @@ impl crate::Store {
         local_path: &str,
         raw_name: &str,
     ) -> Result<(), StoreError> {
-        let changed = self.connection.execute(
-            "UPDATE source_revisions
-             SET metadata_json = ?3, local_path = ?4, raw_name = ?5
-             WHERE source_key = ?1 AND revision_hash = ?2",
-            params![
-                source_key,
-                revision_hash,
-                metadata_json,
-                local_path,
-                raw_name
-            ],
+        let changed = update_revision_fingerprint_tx(
+            &self.connection,
+            source_key,
+            revision_hash,
+            metadata_json,
+            local_path,
+            raw_name,
         )?;
         if changed != 1 {
             return Err(StoreError::RevisionMissing {
@@ -250,6 +300,35 @@ impl crate::Store {
         }
         Ok(())
     }
+}
+
+/// The `UPDATE` half of [`Store::update_revision_fingerprint`], on any
+/// connection — the caller's transaction or the store's own.
+///
+/// Split so the watcher's refresh can sit inside the same `BEGIN IMMEDIATE`
+/// as its edges and its event (D40 §4.7's "exactly one transaction"): the
+/// statement itself is identical either way.
+pub(crate) fn update_revision_fingerprint_tx(
+    connection: &Connection,
+    source_key: &str,
+    revision_hash: &str,
+    metadata_json: &str,
+    local_path: &str,
+    raw_name: &str,
+) -> Result<u64, StoreError> {
+    let changed = connection.execute(
+        "UPDATE source_revisions
+         SET metadata_json = ?3, local_path = ?4, raw_name = ?5
+         WHERE source_key = ?1 AND revision_hash = ?2",
+        params![
+            source_key,
+            revision_hash,
+            metadata_json,
+            local_path,
+            raw_name
+        ],
+    )?;
+    Ok(u64::try_from(changed).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]

@@ -99,23 +99,54 @@ parse_error。
 
 **事件是提示，对账是真相**——事件永不 trust，全部事件归并为「重扫该路径」。
 
-1. **选型**：`notify` 8.2.0 + `notify-debouncer-full`（稳定线；Windows RDCW
-   溢出无信号的缺口由对账兜底，不冒险 RC）；backend 一律 RecommendedWatcher，
-   异常整体降级 PollWatcher。不自研 watcher；
-2. **重扫流程**：stat 与库比对（一致且非 racy 则丢弃假事件）→ 读全文（读
+1. **选型**：`notify` 8.2.0 + `notify-debouncer-full` 0.7（稳定线；8.2.0 的
+   Windows 后端不为 RDCW 溢出发 rescan 信号，缺口一律由对账兜底，不冒险 RC）；
+   backend 一律 RecommendedWatcher。**降级只在后端起不来时发生**：构造失败、
+   `MaxFilesWatch`、backend I/O 错误 ⇒ 换 PollWatcher 并播报「已降级为轮询，
+   不再承诺实时」。**网络挂载不走这条**——见第 8 条。不自研 watcher；
+2. **重扫流程**：stat 与库比对（一致且**非 racy** 则丢弃假事件）→ 读全文（读
    前后双 stat，不一致 = 撕裂进重试队列）→ sha256 与库中 revision_hash 比对
-   → 变了才重建 chunk。rename 降维为 delete+create 两条重扫；
-3. **racy 强制内容校验（git racy-git 同构）**：stat 一致但 mtime ≥ 上次索引
-   写入时刻 → 强制读内容比对；FAT/exFAT 卷最近 N 秒内有事件则放宽为内容
-   比对；
-4. **对账四触发**：启动全 vault walk+stat；每日定时；手动命令；watcher 异常
-   恢复（IN_Q_OVERFLOW / FSEvents KernelDropped / 事件风暴）。对账成本锚点：
-   10k 文件亚秒级；对账与事件流会合用 Watchman cookie 协议（sentinel 文件）；
-5. **防抖与撕裂重试**：归并窗口 ~500ms；撕裂 = 指数退避 + mtime 稳定窗口
-   （连续两次 stat 间隔 ≥50–100ms 相同），5 次后挂延迟队列（30s），仍失败
-   留给每日对账——**绝不把撕裂内容落库**；
-6. **黑名单**（事件层直接丢弃）：`.~lock.*#`、`~$*`、`*.swp`、`*~`、`*.tmp`、
-   点开头目录内一切事件；
+   → 变了才重建 chunk。**rename 降维为 delete+create 两条重扫**：delete 半程
+   只确认路径已不存在，**不写数据**（键在历史里永不改写，[ADR 0014](adr/note-rename-is-a-new-source.md)）；
+   create 半程提交**之后**，若防抖器把这对 From/To 配上了，追加一行
+   `source_moved(old_key, new_key)` 提示（单独一个 rename batch），且绝不
+   UPDATE 已存 `source_key`。**「某键从 walk 里消失了」是每一批都会重算的收敛**，
+   不分 rename 与真删除：该键落一行 `skipped` + `source_removed`；同一批里
+   `graph_links` 的剪除与派生索引中该源的文档**一并删掉**，不等下一次对账——
+   等对账的是「事件流根本没看见」，不是「看见了却不改」；
+3. **racy 强制内容校验（git racy-git 同构）**：stat 一致但 `mtime ≥ 上次写入
+   store 的时刻` → 强制读内容比对。该时刻取**全库口径**（`store_events` 最新行的
+   `recorded_at`），与 git 的 `is_racy_stat()` 用 index 文件自身 mtime 同构；
+   **不是**该行的 `ingested_at`（那是每行的入索引时刻，会让同秒入索引的文件
+   永久粘滞）。**racy 且比对相等 ⇒ 落一行 `skipped` 覆盖行**——等价
+   `git update-index --refresh`，让 `recorded_at` 越过 mtime 自行解除 racy；
+   非 racy 且 stat 一致仍按第 2 条静默丢弃。FAT/exFAT 卷（两秒刻度）最近有
+   事件则同样放宽为内容比对——`gate` 只在事件到达时运行，所以「最近有事件」
+   恒成立；卷粒度判定只在 Windows 上做，其余平台答「未知」、本条不适用。**不模仿
+   git 的 size-smudge**：`metadata_json.size_bytes` 有下游读者，截断会污染
+   locator 校验；
+4. **对账四触发**：启动全 vault walk+stat；每日定时（24h，进程内）；手动
+   `momotaro reconcile`；watcher 异常恢复——`Flag::Rescan`（覆盖 Linux
+   `IN_Q_OVERFLOW` 与 FSEvents `KernelDropped`，notify 8.2 在两者上发出的是
+   同一个 flag）**或**单个防抖批去重后路径数 > 256 的事件风暴。四者全部写
+   `vault.reconcile.*`。对账成本（一次全量 walk+stat 的 no-op、release 构建、
+   参考机实测）：1000 文件 ≈ 0.35 s、10000 文件 ≈ 2.9 s——这是**量级**锚点，
+   不是「亚秒」。**对账与事件流会合用
+   Watchman cookie 协议（sentinel 文件）**：同进程内有 watcher 时，reconcile
+   先写 `.momotaro-reconcile-sentinel`、等 watcher 回报该路径再 walk、结束后
+   删除；**无 watcher 则跳过**；**等待超时不使对账失败**——降级为「不带
+   cookie 继续 walk」并**播报一行**（`cookie_timeout`），让读者知道这一遍
+   可能落后一个事件；
+5. **防抖与撕裂重试**：归并窗口 ~500ms（`tick_rate` 默认为其 1/4）；撕裂 =
+   指数退避 + mtime 稳定窗口（连续两次 stat 间隔 ≥50–100ms 相同），5 次后挂
+   进程内延迟队列（30s），仍失败留给每日对账——**绝不把撕裂内容落库**；
+   队列不落盘，进程退出即由四触发承接；
+6. **黑名单**（事件层直接丢弃，先于一切重扫）：`.~lock.*#`、`~$*`、`*.swp`、
+   `*~`、`*.tmp`、**一切点开头目录与文件**（与 walker 共用同一判定，索引范围
+   逐字一致，否则同一个 vault 两套真相），**唯 `.icloud` 驱逐存根除外**——walker
+   正是为了能报「那条笔记怎么了」才留下它（D42），watcher 不留它就是两套真相。
+   sentinel 也是点开头文件，因而同样被本条丢掉；它作为**协议消息**是在本条
+   **之前**、在原始事件流上被认出来的（第 4 条），不是被豁免；
 7. **索引事务边界**：单文件一次一致性更新 = 恰好一个 SQLite 事务（BEGIN IMMEDIATE，
    `store::commit_source_file`：revision + chunks + 边 + 事件同事务；批量 index 的
    coverage 行仍走批尾 sweep，丢窗 = 批尾、对账承接；口径
@@ -123,9 +154,14 @@ parse_error。
    同一单元**：guard 闭包做事务首步 stat 复核、不一致拒绝 ⇒ ROLLBACK 重入队；chunk 以
    `chunk_id`（= `f(source_key, revision_hash, ordinal)` 的内容寻址主键）幂等替换、
    按 `(source_key, revision_hash)` 整体换版（`chunk_hash` 只是内容指纹）；提交前不再
-   读文件；极端落旧 revision 由每日对账收敛——最终一致且 canonical 永不污染；
-8. **网络盘立场**：维持 D31 的探测告警，不做 PollWatcher 降级实现、不承诺
-   支持；文案明示网络盘不承诺实时。
+   读文件；极端落旧 revision 由每日对账收敛——最终一致且 canonical 永不污染。
+   **watcher 的事件是 `ingest.coverage`，批壳是 `ingest.started` / `ingest.finished`，
+   域 = `ingest`**（每个防抖批一个 batch）——摄取就是摄取，读命令不必学会第二个域；
+8. **网络盘立场**：维持 D31 的探测告警——**启动 watcher 与 `doctor` 时探测数据
+   目录与 vault 根所在的卷**，Windows 上判 `GetDriveTypeW == DRIVE_REMOTE`，
+   其余平台报「未知」。探测到网络挂载 ⇒ **不降级 PollWatcher**，只告警并明示
+   「网络盘不承诺实时」；不承诺支持。文案同时说明 SQLite 在网络文件系统上
+   WAL 不工作、锁不正确时可能损坏库。
 
 ## 5. vault 语法边界与建边矩阵（D41）
 
@@ -274,7 +310,7 @@ parse_error。
    `data_json` 列已存在，**不需要 schema 迁移**；④ `CoverageReport` 按码**计数**
    暴露（`doctor --coverage` 因此不再把带码的行只算作 `indexed` 而把码吞掉）。
    ⑤ **预警与降级是两个词表、同一行**（2026-09-24）：同步盘三条（`onedrive_placeholder` /
-   `icloud_placeholder` / `windows_incompatible_name`）是 `Warning` 而不是
+   `icloud_placeholder` / `windows_incompatible_name` / `source_removed`）是 `Warning` 而不是
    `Degradation`——十类仍是十类（预警不是「丢了什么」，是「换一台平台活不下去」）。
    承载与降级同形：`reason_code` = 降级的首个，**无降级时才轮到**预警的首个（两份列表都按各自枚举的声明顺序——确定性，重跑同结果，首个即行主码）；
    `data_json` 增 `"warnings"` 键、非法名行另有 `"windows_incompatible_names"` 键

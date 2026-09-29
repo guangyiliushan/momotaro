@@ -150,6 +150,15 @@ pub struct HealthReport {
     pub sqlite: Option<SqliteFacts>,
     /// User-facing explanation for non-ready states.
     pub message: Option<String>,
+    /// Whether a volume this workspace lives on is a network mount.
+    ///
+    /// `None` is "nothing could be read", which is not `false` — a reader that
+    /// collapsed the two would stop warning on exactly the machines the
+    /// warning exists for. `Some(false)` means the volumes were read and are
+    /// local. Set by the surfaces that know the workspace (D31 / D40 §4.8);
+    /// the store itself has no workspace context and reports `None`.
+    #[serde(default)]
+    pub network_volume: Option<bool>,
 }
 
 /// Facts about the SQLite engine this build links, surfaced by `doctor`.
@@ -626,6 +635,24 @@ pub enum Warning {
     /// character, trailing dot or space): indexed here, refused or mangled by
     /// the tools and sync clients that follow the rules (D42).
     WindowsIncompatibleName,
+    /// The path a watcher just reported no longer holds a file (D40 §4.2's
+    /// delete half, and a real deletion).
+    ///
+    /// Nothing is written for the *file* — keys in history are never
+    /// rewritten (ADR 0014: a rename is delete+create and no stored
+    /// `source_key` is ever updated) and the store keeps the old revision as
+    /// history — so the row is the whole record of the decision. It rides
+    /// `outcome = skipped` because that is what the four outcome values already
+    /// mean: the file was not indexed, and here is why.
+    ///
+    /// Every full walk finds this, not only the watcher: a rename's source
+    /// key is just as absent from the walk as a deleted file's, and
+    /// `source_moved` is what tells them apart. The projections converge in
+    /// the *same* batch — `graph_links` by the prune, the search index by
+    /// dropping that source's documents — because a document left behind would
+    /// keep answering for a file that is gone, and that is a lie a user can
+    /// see.
+    SourceRemoved,
 }
 
 impl Warning {
@@ -638,10 +665,11 @@ impl Warning {
     /// wildcard, so a code cannot be added to `as_str` alone, and
     /// `the_warning_list_is_in_the_order_rows_are_counted` keeps this array
     /// and the declaration order agreeing.
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 4] = [
         Self::OneDrivePlaceholder,
         Self::IcloudPlaceholder,
         Self::WindowsIncompatibleName,
+        Self::SourceRemoved,
     ];
 
     /// The wire spelling written to `store_events.reason_code` and to the
@@ -652,6 +680,7 @@ impl Warning {
             Self::OneDrivePlaceholder => "onedrive_placeholder",
             Self::IcloudPlaceholder => "icloud_placeholder",
             Self::WindowsIncompatibleName => "windows_incompatible_name",
+            Self::SourceRemoved => "source_removed",
         }
     }
 
@@ -1046,16 +1075,17 @@ mod tests {
 
     #[test]
     fn the_warning_list_is_complete() {
-        // Same rule as the degradation list above: no wildcard here, so a fourth
+        // Same rule as the degradation list above: no wildcard here, so a fifth
         // warning fails to compile, and the count then forces it into `ALL`.
         for warning in Warning::ALL {
             match warning {
                 Warning::OneDrivePlaceholder => {}
                 Warning::IcloudPlaceholder => {}
                 Warning::WindowsIncompatibleName => {}
+                Warning::SourceRemoved => {}
             }
         }
-        assert_eq!(Warning::ALL.len(), 3, "extend ALL, not just as_str");
+        assert_eq!(Warning::ALL.len(), 4, "extend ALL, not just as_str");
     }
 
     #[test]

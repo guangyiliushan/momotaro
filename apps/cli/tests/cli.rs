@@ -53,6 +53,107 @@ fn run_cli(cwd: &std::path::Path, args: &[&str]) -> (String, String, bool) {
 }
 
 #[test]
+fn reconcile_exits_zero_on_a_healthy_workspace() {
+    // The exit code is the contract a script gates on (usage.md, "Exit
+    // codes"); the library returning `Ok` says nothing about this arm.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    stage_vault(tempdir.path());
+    write_config(tempdir.path());
+
+    let (stdout, stderr, ok) = run_cli(tempdir.path(), &["init"]);
+    assert!(ok, "init should succeed: {stderr}");
+    let _ = stdout;
+
+    let (stdout, stderr, ok) = run_cli(tempdir.path(), &["reconcile", "--json"]);
+    assert!(
+        ok,
+        "reconcile should exit 0 on a healthy workspace: {stderr}"
+    );
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|error| panic!("reconcile stdout is JSON: {error}\n{stdout}"));
+    for key in ["batch_id", "scanned", "changed", "removed", "events"] {
+        assert!(value.get(key).is_some(), "`{key}` is in the report");
+    }
+    assert!(
+        value["batch_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("reconcile-")
+    );
+}
+
+#[test]
+fn watch_emits_a_batch_when_a_file_changes() {
+    // R5's finding: `momotaro watch` had no test at all, which is how a batch
+    // id, a renderer and an exit path could all be wrong behind a green gate.
+    // The reader thread keeps the child from blocking on a full pipe; the wait
+    // is bounded rather than a fixed sleep, so a slow machine does not flake.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    stage_vault(tempdir.path());
+    write_config(tempdir.path());
+    let (_, stderr, ok) = run_cli(tempdir.path(), &["init"]);
+    assert!(ok, "init should succeed: {stderr}");
+    let (_, stderr, ok) = run_cli(tempdir.path(), &["index"]);
+    assert!(ok, "index should succeed: {stderr}");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_momotaro-cli"))
+        .args(["watch", "--json"])
+        .current_dir(tempdir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("watch runs");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let collected: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let sink = collected.clone();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            sink.lock().expect("lock").push(line);
+        }
+    });
+
+    // Give the startup reconciliation a moment, then change a file for real.
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    std::fs::write(
+        tempdir.path().join("vault").join("a.md"),
+        "# A\n\nedited while watch was running\n",
+    )
+    .expect("write");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut saw_startup = false;
+    let mut saw_batch = false;
+    while std::time::Instant::now() < deadline && !(saw_startup && saw_batch) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let lines = collected.lock().expect("lock").clone();
+        saw_startup = lines
+            .iter()
+            .any(|line| line.contains("\"kind\":\"reconciled\""));
+        saw_batch = lines
+            .iter()
+            .any(|line| line.contains("\"kind\":\"batch\"") && line.contains("\"rebuilt\":1"));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+
+    let lines = collected.lock().expect("lock").clone();
+    let joined = lines.join("\n");
+    assert!(
+        saw_startup,
+        "the startup reconciliation is reported: {joined}"
+    );
+    assert!(
+        saw_batch,
+        "a real edit produces one batch that rebuilt one file: {joined}"
+    );
+}
+
+#[test]
 fn index_and_search_round_trip() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     stage_vault(tempdir.path());

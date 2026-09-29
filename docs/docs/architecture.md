@@ -1174,7 +1174,7 @@ cargo test --workspace
 
 `index` / lexical `search` / Tantivy。重建索引不丢 canonical 数据。1,000 个 Markdown 可完成。
 
-已做：`source_key` NFC 身份键、vault ⊆ workspace、origin 乘性权重、`store_events` 审计日志、`doctor --coverage`、wikilink 全形态建边入 derived `graph_links`（dangling/歧义/锚点校验齐，五类降级码生产者；行身份与重建见 [ADR 0027](adr/graph-links-rows-are-a-rebuilt-projection.md)）。本波剩余：D42 的碰撞消歧后缀策略（两条目都保留 + 消歧后缀 + 事件，ADR 0002 与 ADR 0026 都指向它）、watcher + 对账四触发、平台测试矩阵、D24 的多链头暴露。D40 的「单文件 = 恰好一个事务」已由 store 的 `commit_source_file` 交付（revision + chunks + 边 + 事件同事务，口径见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md)）；余 W2.5 的 watcher 作为带事件入事务的调用方。
+已做：`source_key` NFC 身份键、vault ⊆ workspace、origin 乘性权重、`store_events` 审计日志、`doctor --coverage`、wikilink 全形态建边入 derived `graph_links`（dangling/歧义/锚点校验齐，五类降级码生产者；行身份与重建见 [ADR 0027](adr/graph-links-rows-are-a-rebuilt-projection.md)）、**watcher + 对账四触发**（`notify` 8.2 + debouncer、事件一律归并为重扫、racy 强制内容校验、四触发写 `vault.reconcile.*`，细则见 [摄取安全与 Vault 互操作](ingest-interop.md) §4）。本波剩余：D42 的碰撞消歧后缀策略（两条目都保留 + 消歧后缀 + 事件，ADR 0002 与 ADR 0026 都指向它）、平台测试矩阵、D24 的多链头暴露。D40 的「单文件 = 恰好一个事务」已由 store 的 `commit_source_file` 交付（revision + chunks + 边 + 事件同事务，口径见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md)），watcher 是它带事件入事务的调用方。
 
 ### v0.3 可追溯问答
 
@@ -1493,7 +1493,10 @@ keyring「不可用/被锁」与「无凭据」显式区分并提示；Windows �
 （快照时间戳命名防网盘冲突副本）；C5 源 Markdown 镜像同步并行留缝（移动端
 从源重建索引的降级实现，不承诺）。CRDT / 双向同步 / 多写者复制正式排除
 （local-first 研究：单编辑者文件同步即工作得很好；单人场景历史膨胀负资产）。
-运行时防御：打开库探测网络挂载并告警；数据目录三分离——源 Markdown（可
+运行时防御：打开库探测网络挂载并告警（**已落**：`doctor` 与 `watch` 启动时
+探测数据目录与 vault 根所在的卷，Windows 上判 `GetDriveTypeW == DRIVE_REMOTE`，
+其余平台报「未知」、只在 Windows 探测，两处共用同一句文案——见
+[摄取安全与 Vault 互操作](ingest-interop.md) §4 第 8 条）；数据目录三分离——源 Markdown（可
 同步）/ 运行时库+索引（禁同步）/ 快照导出（可同步）。移动端口径「小时级
 滞后」。
 
@@ -1583,15 +1586,17 @@ https-only 强制 / per-host 限流 / DNS pinning（单用户桌面威胁模型�
 
 笔记改名 = 新 Source，不改写已落库键（[ADR 0014](adr/note-rename-is-a-new-source.md)）。
 
-watcher = `notify` 8.2.0 稳定线 + `notify-debouncer-full`（Windows 溢出缺口
-由对账兜底，不冒险 RC）；事件永不 trust，全部归并为「重扫该路径」：stat
+watcher = `notify` 8.2.0 稳定线 + `notify-debouncer-full` 0.7（Windows 溢出缺口
+由对账兜底，不冒险 RC），**已落**；**后端起不来才**降级 PollWatcher（构造失败、
+inotify watch 上限、backend I/O 错误），网络盘不在此列。事件永不 trust，全部归并为「重扫该路径」：stat
 双验（racy 强制内容校验，git 同构）→ 读全文双 stat（撕裂重试，绝不落库）→
 sha256 与库比对才重建 chunk。对账四触发（启动全 walk / 每日 / 手动 / watcher
-异常恢复），10k 文件亚秒级。单文件更新 = 恰好一个 SQLite 事务（store 的
+异常恢复）；一次 no-op 对账 1000 文件 ≈ 0.35 s、10000 文件 ≈ 2.9 s（release、
+参考机实测）。单文件更新 = 恰好一个 SQLite 事务（store 的
 `commit_source_file`：revision + chunks + 边 + 事件同事务），chunk
 内容寻址 upsert，canonical 永不污染；批量 index 的 coverage 行仍在批尾
 sweep（丢窗 = 批尾、对账承接），
-watcher（W2.5）路径事件入事务、零丢窗——口径见
+watcher 路径事件入事务、零丢窗——口径见
 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md)。网络盘维持探测告警（D31），不做轮询降级
 实现。细则见 [摄取安全与 Vault 互操作](ingest-interop.md)。
 

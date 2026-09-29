@@ -4,11 +4,15 @@
 #![warn(missing_docs)]
 
 mod index_service;
+mod reconcile;
+mod watch;
 
 pub use index_service::{
     RebuildReport, SearchHit, SearchOutput, coverage_report, index_workspace, index_workspace_with,
     rebuild_index, search_workspace,
 };
+pub use reconcile::{ReconcileReport, format_reconcile, reconcile};
+pub use watch::{WatchLine, format_watch_line, watch};
 
 use std::fs;
 use std::io;
@@ -130,6 +134,14 @@ pub enum RunError {
     /// The local store failed.
     #[error(transparent)]
     Store(#[from] StoreError),
+
+    /// No filesystem backend would start (D40 §4.1), or the vault sits on a
+    /// network volume that D40 §4.8 refuses to pretend to support.
+    #[error("cannot watch the vault: {reason}")]
+    WatcherUnavailable {
+        /// What the platform said, already carrying any network-volume caveat.
+        reason: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -260,6 +272,7 @@ pub fn doctor(root: impl AsRef<Path>) -> Result<HealthReport, RunError> {
 pub fn doctor_with_facts(root: &Path, sqlite: &SqliteFacts) -> Result<HealthReport, RunError> {
     // Every branch reports the engine facts: the version of the engine that
     // writes the database is part of the workspace's health, not a detail.
+    let network_volume = network_volume_of(root);
     let report = |status: WorkspaceStatus,
                   schema_version: Option<SchemaVersion>,
                   message: Option<String>| HealthReport {
@@ -267,6 +280,7 @@ pub fn doctor_with_facts(root: &Path, sqlite: &SqliteFacts) -> Result<HealthRepo
         schema_version,
         sqlite: Some(sqlite.clone()),
         message,
+        network_volume,
     };
 
     // An engine that must not write this workspace invalidates every other
@@ -344,6 +358,11 @@ pub fn doctor_with_facts(root: &Path, sqlite: &SqliteFacts) -> Result<HealthRepo
 
     Ok(HealthReport {
         sqlite: Some(sqlite.clone()),
+        // The store has no workspace, so it answered `None`; this surface
+        // does know the workspace and answers for it (D31 / D40 §4.8).
+        // The closure above already asked; asking again is a config parse and
+        // up to nine Win32 calls for a value that cannot have moved.
+        network_volume,
         ..health
     })
 }
@@ -508,6 +527,34 @@ pub fn is_uninitialized(report: &HealthReport) -> bool {
     report.status == WorkspaceStatus::Uninitialized
 }
 
+/// The copy every network-volume warning carries (D31 / D40 §4.8).
+///
+/// One sentence for both exits: `doctor`'s human line and the watcher's
+/// `network_volume` line say the same thing, so a promise one of them makes
+/// cannot be missing from the other.
+pub const NETWORK_VOLUME_NOTE: &str = "this workspace is on a network volume, which Momotaro does not promise to be real-time; SQLite's WAL does not work over a network filesystem, and broken locking there can corrupt the database";
+
+/// Whether the volumes holding this workspace's data and vault are network
+/// mounts (D31 / D40 §4.8).
+///
+/// Both paths are asked because they can differ: the store may be local while
+/// the vault sits on a share, or the other way round. `None` means nothing
+/// could be read — never "no".
+fn network_volume_of(root: &Path) -> Option<bool> {
+    let data = match momotaro_platform::volume_info(&data_dir(root)).remote {
+        answer @ Some(_) => answer,
+        // Before `init` the data directory does not exist; its parent is on
+        // the same volume, and that is the answer the question needs.
+        None => momotaro_platform::volume_info(root).remote,
+    };
+    let vault = load_config(root)
+        .ok()
+        .and_then(|config| vault_scope(root, &config).ok())
+        .and_then(|scope| momotaro_platform::volume_info(&scope.root).remote);
+    let answers: Vec<bool> = [data, vault].into_iter().flatten().collect();
+    (!answers.is_empty()).then(|| answers.into_iter().any(|remote| remote))
+}
+
 /// Renders one workspace health report as a terminal line.
 ///
 /// A report that is not `Ready` must say why: printing "workspace is ready" for
@@ -521,9 +568,15 @@ pub fn format_health(report: &HealthReport) -> String {
 
     // The engine that writes the database is part of the answer, not a detail
     // reserved for `--json`.
-    match report.sqlite.as_ref() {
+    let line = match report.sqlite.as_ref() {
         Some(facts) => format!("{line} (SQLite {})", facts.version),
         None => line,
+    };
+    // Neither is the mount this workspace lives on: `--json` carries the
+    // `network_volume` field, so the human exit has to carry the sentence.
+    match report.network_volume {
+        Some(true) => format!("{line}; {NETWORK_VOLUME_NOTE}"),
+        _ => line,
     }
 }
 
@@ -2591,6 +2644,7 @@ mod tests {
             schema_version: None,
             sqlite: None,
             message: Some("vault /x is outside workspace /y".to_owned()),
+            network_volume: None,
         };
         let line = format_health(&report);
         assert!(line.contains("Invalid"), "{line}");
@@ -2602,6 +2656,7 @@ mod tests {
             schema_version: Some(momotaro_contracts::SchemaVersion(3)),
             sqlite: None,
             message: None,
+            network_volume: None,
         };
         assert_eq!(format_health(&ready), "workspace is ready");
     }
@@ -4715,5 +4770,607 @@ mod tests {
             rows, rebuilt,
             "a rebuild reproduces every row byte for byte"
         );
+    }
+
+    // ------------------------------------------------------------ D40 (W2.5)
+
+    /// One gated batch — what `momotaro watch` runs for one debounce batch.
+    fn gated_batch(root: &Path, path: &Path) -> crate::index_service::BatchOutcome {
+        crate::index_service::run_batch(
+            root,
+            None,
+            momotaro_ingest::attributes_of,
+            crate::index_service::BatchShape::watched(
+                crate::index_service::WATCH_PLAN,
+                std::collections::HashSet::from([path.to_path_buf()]),
+            ),
+        )
+        .expect("gated batch")
+    }
+
+    /// A workspace whose files are older than its store: anything indexed in
+    /// the same second it was written is *racy* (D40 §4.3, and git's own
+    /// rule), which is the case that does write a row. Waiting one second
+    /// makes the settled case the one this helper returns.
+    fn settled_workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("vault");
+        fs::write(vault.join("a.md"), "# A\n\nfirst body\n").expect("write");
+        fs::write(vault.join("b.md"), "# B\n\nsecond body\n").expect("write");
+        let root = dir.path().to_path_buf();
+        write_config(&root, &vault);
+        init_workspace(&root).expect("init");
+        // A file indexed in the same second it was written is *racy* (D40 §4.3
+        // and git's own rule), which is the case that does write a row. One
+        // second later it is not, and that is the settled case these tests ask
+        // for.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        index_workspace(&root, None).expect("index");
+        (dir, vault, root)
+    }
+
+    #[test]
+    fn a_false_event_writes_nothing_at_all() {
+        // D40 §4.2 verbatim: "一致且非 racy 则丢弃假事件" — dropped means
+        // nothing is written, not "a row saying nothing happened". A watcher
+        // that answered every editor save with three rows would fill the log
+        // with the fact that nothing changed.
+        let (_dir, vault, root) = settled_workspace();
+        let before = store_of(&root)
+            .latest_store_events(100)
+            .expect("read")
+            .len();
+
+        let outcome = gated_batch(&root, &vault.join("a.md"));
+        let after = store_of(&root)
+            .latest_store_events(100)
+            .expect("read")
+            .len();
+
+        assert_eq!(
+            outcome.report.files_scanned, 0,
+            "the gate found no work to do"
+        );
+        assert_eq!(before, after, "a false event writes nothing at all");
+    }
+
+    #[test]
+    fn a_file_the_vault_lost_is_recorded_once() {
+        // D40 §4.2's delete half. Every full walk redisovers the absence, so
+        // without the guard a file gone for a week would earn a row per run.
+        let (dir, vault, root) = settled_workspace();
+        fs::remove_file(vault.join("b.md")).expect("remove");
+
+        let count = |store: &Store| {
+            store
+                .latest_store_events(100)
+                .expect("read")
+                .iter()
+                .filter(|event| {
+                    event.source_key.as_deref() == Some("note:b.md")
+                        && event.reason_code.as_deref() == Some("source_removed")
+                })
+                .count()
+        };
+
+        index_workspace(&root, None).expect("run 2");
+        assert_eq!(
+            count(&store_of(&root)),
+            1,
+            "the first walk after the deletion records it"
+        );
+        let row = store_of(&root)
+            .latest_store_events(100)
+            .expect("read")
+            .into_iter()
+            .find(|event| event.reason_code.as_deref() == Some("source_removed"))
+            .expect("the row exists");
+        assert_eq!(row.outcome.as_deref(), Some("skipped"));
+        assert_eq!(row.domain, "ingest");
+
+        index_workspace(&root, None).expect("run 3");
+        assert_eq!(
+            count(&store_of(&root)),
+            1,
+            "rediscovered every walk, recorded once"
+        );
+        assert!(
+            !dir.path().join("vault").join("b.md").exists(),
+            "the file really is gone from the vault"
+        );
+    }
+
+    #[test]
+    fn a_watcher_batch_records_each_file_exactly_once() {
+        // The row rides the file's own transaction (D40 §4.7), so the batch
+        // tail must not write it a second time — and the batch must still be
+        // an ingest batch, because `doctor --coverage` reads that domain.
+        let (_dir, vault, root) = settled_workspace();
+        fs::write(vault.join("a.md"), "# A\n\nsecond body changed\n").expect("write");
+
+        let outcome = gated_batch(&root, &vault.join("a.md"));
+        assert!(
+            outcome.report.batch_id.starts_with("watch-"),
+            "a reader can tell who wrote it: {}",
+            outcome.report.batch_id
+        );
+        assert_eq!(
+            outcome.report.revisions_created, 1,
+            "the bytes were rebuilt"
+        );
+
+        let store = store_of(&root);
+        let events = store
+            .store_events_for_batch(&outcome.report.batch_id)
+            .expect("read batch");
+        let types: Vec<&str> = events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect();
+        assert_eq!(
+            types,
+            vec!["ingest.started", "ingest.coverage", "ingest.finished"],
+            "one row per file, not two"
+        );
+        assert!(
+            events.iter().all(|event| event.domain == "ingest"),
+            "a watcher batch is an ingest batch (ADR 0026)"
+        );
+        let coverage = &events[1];
+        assert_eq!(
+            coverage.source_key.as_deref(),
+            Some("note:a.md"),
+            "the row names the file it is about"
+        );
+        assert_eq!(coverage.outcome.as_deref(), Some("indexed"));
+        assert_eq!(
+            outcome.removed, 0,
+            "nothing was deleted, so nothing is reported as gone"
+        );
+    }
+
+    #[test]
+    fn a_vault_that_lost_a_file_reports_the_removal_it_found() {
+        // Both existing assertions on `removed` are `== 0`, so a batch that
+        // always reported zero passed every one of them. This is the other
+        // side: exactly one key gone, exactly one counted.
+        let (dir, vault, root) = settled_workspace();
+        fs::remove_file(vault.join("b.md")).expect("remove");
+
+        let outcome = crate::index_service::run_batch(
+            &root,
+            None,
+            momotaro_ingest::attributes_of,
+            crate::index_service::BatchShape::full(crate::index_service::RECONCILE_PLAN),
+        )
+        .expect("batch");
+        assert_eq!(
+            outcome.removed, 1,
+            "the key the walk no longer names is counted once"
+        );
+        assert_eq!(outcome.report.files_scanned, 1, "one file is left");
+        let _ = dir;
+    }
+
+    #[test]
+    fn a_directory_event_opens_no_batch() {
+        // A folder created in the vault is not a file to rescan. Admitting it
+        // used to open a batch that claimed a scan and wrote no row — an audit
+        // log asserting work on a file that does not exist.
+        let (dir, vault, root) = settled_workspace();
+        let before = store_of(&root)
+            .latest_store_events(100)
+            .expect("read")
+            .len();
+        fs::create_dir_all(vault.join("brand-new-folder")).expect("mkdir");
+
+        let outcome = gated_batch(&root, &vault.join("brand-new-folder"));
+        assert_eq!(
+            outcome.report.files_scanned, 0,
+            "a directory is not a file to scan"
+        );
+        assert_eq!(outcome.removed, 0, "and nothing was deleted");
+        let after = store_of(&root)
+            .latest_store_events(100)
+            .expect("read")
+            .len();
+        assert_eq!(
+            before, after,
+            "no batch, no rows: the gate said there was nothing to do"
+        );
+        let _ = dir;
+    }
+
+    /// Counts `source_removed` rows for one source, straight from the log.
+    fn removals_for(root: &Path, source_key: &str) -> usize {
+        store_of(root)
+            .latest_store_events(200)
+            .expect("read")
+            .iter()
+            .filter(|event| {
+                event.source_key.as_deref() == Some(source_key)
+                    && event.reason_code.as_deref() == Some("source_removed")
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_removed_source_leaves_the_index_and_a_rebuild_does_not_bring_it_back() {
+        // §4.2: "the document goes with it, in the same batch". The mutation
+        // that deletes `SearchIndex::remove_source` must die here — no other
+        // test could see it, because every other search runs against a file
+        // that is still in the vault.
+        let (dir, vault, root) = settled_workspace();
+        assert!(
+            search_workspace(&root, "second body", 5)
+                .expect("search")
+                .hits
+                .iter()
+                .any(|hit| hit.hit.source_key.contains("b.md")),
+            "the fixture is findable before anything is deleted"
+        );
+
+        fs::remove_file(vault.join("b.md")).expect("remove");
+        let outcome = crate::index_service::run_batch(
+            &root,
+            None,
+            momotaro_ingest::attributes_of,
+            crate::index_service::BatchShape::full(crate::index_service::RECONCILE_PLAN),
+        )
+        .expect("reconcile");
+        assert_eq!(outcome.removed, 1, "one key gone");
+        assert!(
+            search_workspace(&root, "second body", 5)
+                .expect("search")
+                .hits
+                .iter()
+                .all(|hit| !hit.hit.source_key.contains("b.md")),
+            "the document went with the source, in the same batch"
+        );
+
+        // And the derived index is a *projection*: rebuilding it from the
+        // canonical store must reproduce the deletion, not undo it.
+        rebuild_index(&root).expect("rebuild");
+        assert!(
+            search_workspace(&root, "second body", 5)
+                .expect("search")
+                .hits
+                .iter()
+                .all(|hit| !hit.hit.source_key.contains("b.md")),
+            "a rebuild reads current revisions, so a demoted source stays gone"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn a_restored_file_is_searchable_again_without_a_rebuild() {
+        // The other half of the same guarantee: taking a source out of the
+        // index has to be reversible by the ordinary path, or "eventually
+        // consistent" means "until someone runs rebuild-index by hand".
+        let (dir, vault, root) = settled_workspace();
+        let bytes = fs::read(vault.join("b.md")).expect("read");
+        fs::remove_file(vault.join("b.md")).expect("remove");
+        index_workspace(&root, None).expect("index");
+        assert_eq!(removals_for(&root, "note:b.md"), 1);
+
+        fs::write(vault.join("b.md"), &bytes).expect("restore");
+        index_workspace(&root, None).expect("index again");
+        assert!(
+            search_workspace(&root, "second body", 5)
+                .expect("search")
+                .hits
+                .iter()
+                .any(|hit| hit.hit.source_key.contains("b.md")),
+            "identical bytes come back through the ordinary index path"
+        );
+        assert_eq!(
+            removals_for(&root, "note:b.md"),
+            1,
+            "restoring is not a second deletion"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn a_second_disappearance_is_a_second_fact() {
+        // `has_row_since`'s window was a window that never reopened —
+        // `ingested_at` is written by the INSERT alone — so delete → restore →
+        // delete recorded the second absence not at all. `is_current` is the
+        // state that actually moves, and this is what it buys.
+        let (dir, vault, root) = settled_workspace();
+        let bytes = fs::read(vault.join("b.md")).expect("read");
+
+        fs::remove_file(vault.join("b.md")).expect("remove");
+        index_workspace(&root, None).expect("first removal");
+        assert_eq!(removals_for(&root, "note:b.md"), 1);
+
+        fs::write(vault.join("b.md"), &bytes).expect("restore");
+        index_workspace(&root, None).expect("restore");
+        assert_eq!(removals_for(&root, "note:b.md"), 1, "still one");
+
+        fs::remove_file(vault.join("b.md")).expect("remove");
+        index_workspace(&root, None).expect("second removal");
+        assert_eq!(
+            removals_for(&root, "note:b.md"),
+            2,
+            "the file came back and left again: both absences are facts"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn a_narrowed_walk_says_nothing_about_the_rest_of_the_vault() {
+        // `index --vault <sub>` names fewer files on purpose. Treating every
+        // other source as deleted emptied the search index outside the
+        // override and wrote `source_removed` rows for files still on disk.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(vault.join("sub")).expect("subdir");
+        fs::write(vault.join("outside.md"), "# O\n\noutside body\n").expect("write");
+        fs::write(vault.join("sub/inside.md"), "# I\n\ninside body\n").expect("write");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        index_workspace(dir.path(), None).expect("full index");
+        assert!(removals_for(dir.path(), "note:outside.md") == 0);
+
+        let report = index_workspace(dir.path(), Some(&vault.join("sub"))).expect("sub index");
+        assert_eq!(report.files_scanned, 1, "only the override was walked");
+        assert_eq!(
+            removals_for(dir.path(), "note:outside.md"),
+            0,
+            "a narrowed walk may not call the rest of the vault absent"
+        );
+        assert!(
+            search_workspace(dir.path(), "outside body", 5)
+                .expect("search")
+                .hits
+                .iter()
+                .any(|hit| hit.hit.source_key.contains("outside")),
+            "and the search index still has it"
+        );
+    }
+
+    #[test]
+    fn coverage_ignores_a_batch_that_never_opened() {
+        // A `source_moved` hint rides the `ingest` domain in a batch of its own
+        // with no shell. "The newest row in the domain" would report *that* as
+        // the last ingest run and hand the reader an unfinished `batch_id`.
+        let (dir, _vault, root) = settled_workspace();
+        let report = coverage_report(&root)
+            .expect("read")
+            .expect("there is an ingest batch");
+        assert!(
+            report.batch_id.starts_with("index-"),
+            "the real batch: {}",
+            report.batch_id
+        );
+
+        let mut store = store_of(&root);
+        store
+            .append_store_event(&momotaro_store::NewStoreEvent {
+                occurred_at: 1_700_000_000,
+                batch_id: "move-1700000000000-1-0",
+                seq: 1,
+                domain: "ingest",
+                event_type: "source_moved",
+                source_key: Some("note:gone.md"),
+                outcome: None,
+                reason_code: None,
+                message: None,
+                data_json: r#"{"old_key":"note:a.md","new_key":"note:b.md"}"#,
+                external_id: None,
+            })
+            .expect("hint");
+
+        let after = coverage_report(&root)
+            .expect("read")
+            .expect("there is still an ingest batch");
+        assert_eq!(
+            after.batch_id, report.batch_id,
+            "a shell-less hint does not become the last ingest run"
+        );
+        assert!(after.finished, "and the batch it names is finished");
+        let _ = dir;
+    }
+
+    #[test]
+    fn a_directory_rename_keeps_its_children_searchable() {
+        // notify reports a directory rename as an event about the directory:
+        // the children of the old path then look absent from the walk, and the
+        // children of the new path have had no event at all. Gating a
+        // directory away silently emptied the index for the whole subtree.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(vault.join("dir00")).expect("dir");
+        for n in 0..5 {
+            fs::write(
+                vault.join(format!("dir00/f{n}.md")),
+                format!("# F{n}\n\nZEBRAQUARK paragraph {n}\n"),
+            )
+            .expect("write");
+        }
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        index_workspace(dir.path(), None).expect("index");
+        let hits = |root: &Path| {
+            search_workspace(root, "ZEBRAQUARK", 10)
+                .expect("search")
+                .hits
+                .len()
+        };
+        assert_eq!(hits(dir.path()), 5, "all five are findable");
+
+        fs::rename(vault.join("dir00"), vault.join("dir00x")).expect("rename");
+        let outcome = gated_batch(dir.path(), &vault.join("dir00x"));
+        assert!(
+            outcome.report.files_scanned >= 5,
+            "a directory event brings its children: {}",
+            outcome.report.files_scanned
+        );
+        assert_eq!(
+            hits(dir.path()),
+            5,
+            "and they are still findable after the move"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn the_network_sentence_is_the_same_at_both_exits() {
+        // D40 §4.8's copy: one sentence, two exits. A promise that only the
+        // human line makes is a promise `--json` consumers never hear.
+        let report = HealthReport {
+            status: WorkspaceStatus::Ready,
+            schema_version: None,
+            sqlite: None,
+            message: None,
+            network_volume: Some(true),
+        };
+        let human = format_health(&report);
+        assert!(
+            human.contains(NETWORK_VOLUME_NOTE),
+            "the human line carries it: {human}"
+        );
+        let json_side = format_watch_line(&WatchLine::NetworkVolume {
+            message: NETWORK_VOLUME_NOTE.to_owned(),
+        });
+        assert_eq!(
+            json_side, NETWORK_VOLUME_NOTE,
+            "both exits say the same words"
+        );
+        let local = HealthReport {
+            network_volume: Some(false),
+            ..report
+        };
+        assert!(
+            !format_health(&local).contains(NETWORK_VOLUME_NOTE),
+            "a local volume is not warned about"
+        );
+    }
+
+    #[test]
+    fn the_reconcile_line_names_every_field() {
+        // `format_reconcile` is the only writer of that sentence; the JSON exit
+        // serializes the same struct, so the two can only drift through here.
+        let report = ReconcileReport {
+            batch_id: "reconcile-1".to_owned(),
+            scanned: 3,
+            changed: 2,
+            removed: 1,
+            events: 7,
+        };
+        let line = format_reconcile(&report);
+        for expected in [
+            "reconcile-1",
+            "3 scanned",
+            "2 changed",
+            "1 removed",
+            "7 events",
+        ] {
+            assert!(line.contains(expected), "`{expected}` in {line}");
+        }
+    }
+
+    #[test]
+    fn a_reconcile_writes_its_own_family() {
+        // D40 §4.4's manual trigger: the four triggers share one walk and one
+        // event family, and `domain = "vault"` keeps it out of what
+        // `doctor --coverage` calls an ingest batch.
+        let (dir, vault, root) = settled_workspace();
+        let _ = vault;
+        let report = reconcile(&root).expect("reconcile");
+        assert!(
+            report.batch_id.starts_with("reconcile-"),
+            "{}",
+            report.batch_id
+        );
+
+        let store = store_of(&root);
+        let events = store
+            .store_events_for_batch(&report.batch_id)
+            .expect("read batch");
+        let types: Vec<&str> = events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                "vault.reconcile.started",
+                "vault.reconcile.coverage",
+                "vault.reconcile.coverage",
+                "vault.reconcile.finished"
+            ]
+        );
+        assert!(
+            events.iter().all(|event| event.domain == "vault"),
+            "reconciliation is its own domain"
+        );
+        assert_eq!(
+            report.events,
+            events.len() as u64,
+            "the report counts what the log holds, not what the writer thought"
+        );
+        assert_eq!(report.scanned, 2, "both files are still there");
+        assert_eq!(report.changed, 0, "and neither changed");
+        assert_eq!(report.removed, 0, "nothing was deleted");
+        let _ = dir;
+    }
+
+    #[test]
+    fn the_gate_answers_from_a_real_store() {
+        // The four answers, against a store that actually holds a row. The
+        // fifth (`ForceRebuild`) needs bytes that differ behind an identical
+        // stat, which no portable test can build — `verdict` carries it.
+        let (dir, vault, root) = settled_workspace();
+        let store = store_of(&root);
+        let workspace = momotaro_ingest::canonical_workspace_root(&root).expect("canonical");
+        let vault = momotaro_ingest::canonical_workspace_root(&vault).expect("canonical");
+
+        assert_eq!(
+            crate::index_service::gate(
+                &store,
+                &workspace,
+                &vault,
+                &vault.join("a.md"),
+                false,
+                crate::index_service::last_written(&store),
+            )
+            .expect("gate"),
+            crate::index_service::Gate::Drop,
+            "settled and unchanged: a false event"
+        );
+        assert_eq!(
+            crate::index_service::gate(
+                &store,
+                &workspace,
+                &vault,
+                &vault.join("gone.md"),
+                false,
+                crate::index_service::last_written(&store),
+            )
+            .expect("gate"),
+            crate::index_service::Gate::Absent,
+            "not there any more"
+        );
+        fs::write(vault.join("a.md"), "# A\n\nedited while we watched\n").expect("write");
+        let store = store_of(&root);
+        assert_eq!(
+            crate::index_service::gate(
+                &store,
+                &workspace,
+                &vault,
+                &vault.join("a.md"),
+                false,
+                crate::index_service::last_written(&store),
+            )
+            .expect("gate"),
+            crate::index_service::Gate::Proceed,
+            "the stat moved, so there is work"
+        );
+        let _ = dir;
     }
 }

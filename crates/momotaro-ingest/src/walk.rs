@@ -9,7 +9,15 @@ use super::IngestError;
 use super::canvas::is_canvas_path;
 use super::portability::icloud_stub;
 
-fn is_hidden(file_name: &std::ffi::OsStr) -> bool {
+/// Whether a file name starts with a dot (the vault's "hidden" test).
+///
+/// One predicate for the walker and for the watcher: D40 §4.6's event-layer
+/// blacklist and §5 第 1 条's index range have to agree, or a single vault
+/// answers two ways — the watcher would ingest a dot-prefixed file that
+/// `index` drops. The root itself is never tested (a dot-prefixed temp root is
+/// legal), which is why this takes a name and not a path.
+#[must_use]
+pub fn is_hidden(file_name: &std::ffi::OsStr) -> bool {
     file_name
         .to_str()
         .is_some_and(|s| s.starts_with('.') && s != ".")

@@ -199,6 +199,48 @@ impl Store {
         Ok(())
     }
 
+    /// How many events one batch holds.
+    ///
+    /// For callers that want the number and not the rows: the read side of
+    /// `store_events_for_batch` allocates per row, and a 10k-file reconcile
+    /// has 10k of them.
+    pub fn count_batch(&self, batch_id: &str) -> Result<u64, StoreError> {
+        let count = self.connection.query_row(
+            "SELECT COUNT(*) FROM store_events WHERE batch_id = ?1",
+            params![batch_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(u64::try_from(count).unwrap_or(u64::MAX))
+    }
+
+    /// The newest batch in `domain` that opened itself with `started_type`.
+    ///
+    /// A batch is identified by its first event, not by "the newest row in the
+    /// domain": a `source_moved` hint rides the `ingest` domain in a batch of
+    /// its own with no shell at all, and reporting *that* as the last ingest
+    /// batch would hand a reader a `batch_id` `store_events` describes as
+    /// unfinished while a real batch sits one line below it. An opened batch
+    /// that never closed is still returned — "started, not finished" is a
+    /// fact worth reporting, and it is the one `doctor --coverage` exists for.
+    pub fn latest_batch_opened_in(
+        &self,
+        domain: &str,
+        started_type: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let batch = self
+            .connection
+            .query_row(
+                "SELECT batch_id FROM store_events
+                 WHERE domain = ?1 AND type = ?2
+                 ORDER BY id DESC
+                 LIMIT 1",
+                params![domain, started_type],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(batch)
+    }
+
     /// Reads one batch in the order it was appended.
     pub fn store_events_for_batch(&self, batch_id: &str) -> Result<Vec<StoreEvent>, StoreError> {
         let mut statement = self

@@ -10,6 +10,9 @@ momotaro-contracts = { workspace = true }
 momotaro-ingest = { workspace = true }
 momotaro-retrieve = { workspace = true }
 momotaro-store = { workspace = true }
+momotaro-platform = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

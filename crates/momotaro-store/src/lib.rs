@@ -424,6 +424,10 @@ impl Store {
                 schema_version,
                 sqlite: None,
                 message: Some(refusal.to_string()),
+                // The store holds a database path, not a workspace: it cannot
+                // say anything about a mount (D40 §4.8), and `None` is the
+                // honest answer to a question it was never asked.
+                network_volume: None,
             });
         }
 
@@ -452,6 +456,8 @@ impl Store {
             schema_version,
             sqlite: None,
             message,
+            // See the refusal path above: no workspace context here either.
+            network_volume: None,
         })
     }
 

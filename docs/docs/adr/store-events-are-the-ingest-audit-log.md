@@ -38,10 +38,10 @@ CREATE TABLE store_events (
                                      -- read sits outside the write transaction,
                                      -- which is sound under the single-writer
                                      -- premise this ADR states.
-  batch_id TEXT NOT NULL,            -- one index / feed poll / rename batch
+  batch_id TEXT NOT NULL,            -- one index, watch, reconcile, feed poll or rename
   seq INTEGER NOT NULL,              -- monotonic inside the batch
   domain TEXT NOT NULL,              -- ingest | feed | vault | annotate
-  type TEXT NOT NULL,                -- ingest.started / ingest.finished / ingest.coverage / source_moved / …
+  type TEXT NOT NULL,                -- ingest.* / vault.reconcile.* / source_moved / feed.poll.*
   source_key TEXT,                   -- set when the event is about one source
   outcome TEXT,                      -- success | no_results | upstream_error | parse_error
   reason_code TEXT,                  -- frontmatter_parse_error / empty_feed / …
@@ -65,9 +65,10 @@ and each **domain** owns its set:
 
 | domain | `outcome` | `reason_code` |
 |---|---|---|
-| `ingest` | `indexed` \| `skipped` \| `metadata_refreshed` \| `error` | the `IndexFileErrorKind` spelling (`key_collision`, `invalid_utf8`, `outside_vault`, `invalid_source_key`, `io`, `store`, `index`, `other`) — or, on a non-`error` row (`indexed` / `metadata_refreshed` / `skipped`), a degradation code (D41's ten; five have a producer today, the wikilink five arrive with W2.4's edges) — or a warning code (`onedrive_placeholder` / `icloud_placeholder` / `windows_incompatible_name`; `momotaro_contracts::Warning`, the section below says why) |
+| `ingest` | `indexed` \| `skipped` \| `metadata_refreshed` \| `error` | the `IndexFileErrorKind` spelling (`key_collision`, `invalid_utf8`, `outside_vault`, `invalid_source_key`, `io`, `store`, `index`, `other`) — or, on a non-`error` row (`indexed` / `metadata_refreshed` / `skipped`), a degradation code (D41's ten; five have a producer today, the wikilink five arrive with W2.4's edges) — or a warning code (`onedrive_placeholder` / `icloud_placeholder` / `windows_incompatible_name` / `source_removed`; `momotaro_contracts::Warning`, the section below says why) |
 | `feed` | `success` \| `no_results` \| `upstream_error` \| `parse_error` | provider codes (`response_too_large`, `empty_feed`, …) |
-| `vault` / `annotate` | not implemented | not implemented |
+| `vault` | `indexed` \| `skipped` \| `metadata_refreshed` \| `error` — the same four as `ingest`, because a reconcile is the same loop under a different event family | the same two vocabularies as `ingest` |
+| `annotate` | not implemented | not implemented |
 
 The column cannot catch a third spelling; the writers keep the vocabularies
 closed instead — `FileOutcome` renders the outcome, `IndexFileErrorKind` renders

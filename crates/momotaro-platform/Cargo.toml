@@ -1,0 +1,16 @@
+[package]
+name = "momotaro-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Deliberately the one workspace member without `#![forbid(unsafe_code)]`.
+# See `src/lib.rs` for why the boundary is this crate rather than a loosened
+# lint somewhere else.
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+  "Win32_Storage_FileSystem",
+  "Win32_System_WindowsProgramming",
+] }
