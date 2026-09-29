@@ -53,6 +53,107 @@ fn run_cli(cwd: &std::path::Path, args: &[&str]) -> (String, String, bool) {
 }
 
 #[test]
+fn reconcile_exits_zero_on_a_healthy_workspace() {
+    // The exit code is the contract a script gates on (usage.md, "Exit
+    // codes"); the library returning `Ok` says nothing about this arm.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    stage_vault(tempdir.path());
+    write_config(tempdir.path());
+
+    let (stdout, stderr, ok) = run_cli(tempdir.path(), &["init"]);
+    assert!(ok, "init should succeed: {stderr}");
+    let _ = stdout;
+
+    let (stdout, stderr, ok) = run_cli(tempdir.path(), &["reconcile", "--json"]);
+    assert!(
+        ok,
+        "reconcile should exit 0 on a healthy workspace: {stderr}"
+    );
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|error| panic!("reconcile stdout is JSON: {error}\n{stdout}"));
+    for key in ["batch_id", "scanned", "changed", "removed", "events"] {
+        assert!(value.get(key).is_some(), "`{key}` is in the report");
+    }
+    assert!(
+        value["batch_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("reconcile-")
+    );
+}
+
+#[test]
+fn watch_emits_a_batch_when_a_file_changes() {
+    // R5's finding: `momotaro watch` had no test at all, which is how a batch
+    // id, a renderer and an exit path could all be wrong behind a green gate.
+    // The reader thread keeps the child from blocking on a full pipe; the wait
+    // is bounded rather than a fixed sleep, so a slow machine does not flake.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    stage_vault(tempdir.path());
+    write_config(tempdir.path());
+    let (_, stderr, ok) = run_cli(tempdir.path(), &["init"]);
+    assert!(ok, "init should succeed: {stderr}");
+    let (_, stderr, ok) = run_cli(tempdir.path(), &["index"]);
+    assert!(ok, "index should succeed: {stderr}");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_momotaro-cli"))
+        .args(["watch", "--json"])
+        .current_dir(tempdir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("watch runs");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let collected: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let sink = collected.clone();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            sink.lock().expect("lock").push(line);
+        }
+    });
+
+    // Give the startup reconciliation a moment, then change a file for real.
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    std::fs::write(
+        tempdir.path().join("vault").join("a.md"),
+        "# A\n\nedited while watch was running\n",
+    )
+    .expect("write");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut saw_startup = false;
+    let mut saw_batch = false;
+    while std::time::Instant::now() < deadline && !(saw_startup && saw_batch) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let lines = collected.lock().expect("lock").clone();
+        saw_startup = lines
+            .iter()
+            .any(|line| line.contains("\"kind\":\"reconciled\""));
+        saw_batch = lines
+            .iter()
+            .any(|line| line.contains("\"kind\":\"batch\"") && line.contains("\"rebuilt\":1"));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+
+    let lines = collected.lock().expect("lock").clone();
+    let joined = lines.join("\n");
+    assert!(
+        saw_startup,
+        "the startup reconciliation is reported: {joined}"
+    );
+    assert!(
+        saw_batch,
+        "a real edit produces one batch that rebuilt one file: {joined}"
+    );
+}
+
+#[test]
 fn index_and_search_round_trip() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     stage_vault(tempdir.path());
@@ -147,6 +248,74 @@ fn doctor_gates_on_health_not_on_failure() {
     );
 }
 
+#[test]
+fn doctor_coverage_reads_the_last_batch_back() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    stage_vault(workspace.path());
+    write_config(workspace.path());
+
+    // Nothing indexed yet: not a failure, a fact worth saying out loud.
+    let (_, stderr, ok) = run_cli(workspace.path(), &["doctor", "--coverage"]);
+    assert!(ok, "no batch yet is not a failure: {stderr}");
+    assert!(stderr.contains("no ingest batch recorded yet"), "{stderr}");
+    assert!(
+        stderr.contains("`momotaro init` first"),
+        "advice a reader can act on: {stderr}"
+    );
+    // …and `--json` still answers on stdout, where a script looks.
+    let (stdout, _, ok) = run_cli(workspace.path(), &["doctor", "--coverage", "--json"]);
+    assert!(ok, "{stdout}");
+    assert_eq!(
+        stdout.trim(),
+        "null",
+        "a script gets an answer where it looks"
+    );
+
+    let (_, stderr, ok) = run_cli(workspace.path(), &["init"]);
+    assert!(ok, "init: {stderr}");
+    // Initialized but never indexed: the advice is `index`, not `init`.
+    let (_, stderr, ok) = run_cli(workspace.path(), &["doctor", "--coverage"]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stderr.contains("run `momotaro index` first"),
+        "an initialized workspace is one `index` away: {stderr}"
+    );
+
+    // A directory that is not a workspace at all gets the reason, not advice
+    // that cannot run: `init` fails there too, for want of a configuration. The
+    // sentence is `doctor`'s, and it goes to stdout like `doctor`'s does.
+    let bare = tempfile::tempdir().expect("bare dir");
+    let (stdout, _, ok) = run_cli(bare.path(), &["doctor", "--coverage"]);
+    assert!(
+        !ok,
+        "not a workspace is not the same as 'nothing happened yet': {stdout}"
+    );
+    assert!(stdout.contains("momotaro.toml"), "{stdout}");
+    let (stdout, stderr, ok) = run_cli(workspace.path(), &["index", "--json"]);
+    assert!(ok, "index: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|error| panic!("json: {error}\n{stdout}"));
+    let batch_id = report["batch_id"].as_str().expect("index names its batch");
+
+    let (stdout, _, ok) = run_cli(workspace.path(), &["doctor", "--coverage"]);
+    assert!(ok, "{stdout}");
+    assert!(stdout.contains(batch_id), "the batch is named: {stdout}");
+    assert!(
+        stdout.contains("5 indexed"),
+        "the fixture is five files: {stdout}"
+    );
+    assert!(stdout.contains("0 failed"), "{stdout}");
+
+    // The JSON form is the same report, for scripts.
+    let (stdout, _, ok) = run_cli(workspace.path(), &["doctor", "--coverage", "--json"]);
+    assert!(ok, "{stdout}");
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|error| panic!("json: {error}\n{stdout}"));
+    assert_eq!(value["batch_id"], batch_id);
+    assert_eq!(value["indexed"], 5);
+    assert_eq!(value["finished"], true);
+}
+
 /// The source key is derived from the file name, and POSIX allows control
 /// characters in names — an ESC or newline must never reach stderr raw.
 /// Linux-only: Win32 refuses such names outright, and macOS normalizes the
@@ -199,5 +368,57 @@ fn control_characters_in_names_never_reach_stderr_raw() {
     assert!(
         !stdout.contains('\u{1b}'),
         "stdout leaked a raw ESC: {stdout:?}"
+    );
+}
+
+#[test]
+fn doctor_coverage_renders_sync_drive_warnings() {
+    // D42: an eviction stub and a Windows-illegal name are facts
+    // `doctor --coverage` must show — and they are warnings, not failures, in
+    // both exits.
+    let workspace = tempfile::tempdir().expect("workspace");
+    stage_vault(workspace.path());
+    write_config(workspace.path());
+    let vault = workspace.path().join("vault");
+    std::fs::write(vault.join(".note.md.icloud"), "stub text\n").expect("write the stub");
+    std::fs::write(vault.join("con.md"), "# con\n\nbody\n").expect("write con.md");
+
+    let (_, stderr, ok) = run_cli(workspace.path(), &["init"]);
+    assert!(ok, "init: {stderr}");
+    let (stdout, stderr, ok) = run_cli(workspace.path(), &["index"]);
+    assert!(ok, "index: {stderr}");
+    assert!(
+        stdout.contains("indexed 6 of 7 files"),
+        "six of the seven files are content: {stdout}"
+    );
+    assert!(stdout.contains("1 skipped"), "{stdout}");
+
+    let (stdout, stderr, ok) = run_cli(workspace.path(), &["doctor", "--coverage"]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("0 failed"),
+        "a warning is not a failure: {stdout}"
+    );
+    assert!(stdout.contains("icloud_placeholder"), "{stdout}");
+    assert!(stdout.contains("windows_incompatible_name"), "{stdout}");
+
+    let (stdout, _, ok) = run_cli(workspace.path(), &["doctor", "--coverage", "--json"]);
+    assert!(ok, "{stdout}");
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|error| panic!("json: {error}\n{stdout}"));
+    assert_eq!(value["indexed"], 6);
+    assert_eq!(value["skipped"], 1);
+    assert_eq!(
+        value["warnings"]["icloud_placeholder"]["skipped"], 1,
+        "{value}"
+    );
+    assert_eq!(
+        value["warnings"]["windows_incompatible_name"]["in_index"], 1,
+        "{value}"
+    );
+    assert_eq!(
+        value["failures"].as_array().map(Vec::len),
+        Some(0),
+        "{value}"
     );
 }

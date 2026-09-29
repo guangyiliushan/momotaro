@@ -200,6 +200,19 @@ mod tests {
     #[test]
     fn resolve_rejects_absolute_and_parent_dir_values() {
         let root = ws();
+        // Kept as two lists joined at use: a `#[cfg(windows)] extend` would leave
+        // `mut` unused on the other platform, and `-D warnings` turns that into a
+        // red CI leg that only one platform can see.
+        #[cfg(windows)]
+        let windows_only = [
+            r"C:\ws\a.md",
+            r"\\srv\share\a.md",
+            r"\a.md",
+            r"a\..\..\b.md",
+            "C:a.md",
+        ];
+        #[cfg(not(windows))]
+        let windows_only: [&str; 0] = [];
         let mut bad = vec![
             "/etc/passwd",
             "..",
@@ -207,14 +220,9 @@ mod tests {
             "a/../../b.md",
             "./../../b.md",
         ];
-        #[cfg(windows)]
-        bad.extend([
-            r"C:\ws\a.md",
-            r"\\srv\share\a.md",
-            r"\a.md",
-            r"a\..\..\b.md",
-            "C:a.md",
-        ]);
+        // `extend` runs on both platforms, so `mut` is always used — the reason
+        // this is not an `.into_iter().chain(...)`.
+        bad.extend(windows_only);
         for value in bad {
             assert!(
                 matches!(

@@ -81,12 +81,13 @@ momotaro/
 6. 桌面 / 移动 / 未来 HTTP 面只能调用 `momotaro-run` 暴露的服务函数。
 7. UI 不直连 SQLite，不拼 prompt，不执行 policy。
 8. 跨 crate 依赖必须在各自 `Cargo.toml` 显式声明。
+9. 未实现不得返回空成功（响亮拒绝）：`refuse_write` / `IndexUnusable` 是本仓既有的形态，读路径同样适用——库不可用时报库自己的原因，不报「先跑 index」；仪器看不到的面要在报告里明说，不许把「仪器绿」当「特性成立」。
 
 ## Canonical versus derived
 
 分类以 [Architecture](architecture.md) §8.1/§8.2 为准，本文件不复制清单：
 
-- canonical：sessions、projects、source_revisions、annotations、sparks、runs、run_events、history_items、retrievals、retrieval_hits、run_context_items、tool_calls、llm_turns、answers、answer_citations、verifications、feed_sources、feed_items；
+- canonical：sessions、projects、source_revisions、annotations、sparks、runs、run_events、history_items、retrievals、retrieval_hits、run_context_items、tool_calls、llm_turns、answers、answer_citations、verifications、feed_sources、feed_items，以及库自己的审计日志 `store_events`（[ADR 0026](adr/store-events-are-the-ingest-audit-log.md)：只追加、归档走 `VACUUM INTO`）；
 - 第三态（保留型投影）：chunks —— 见 [ADR 0022](adr/chunks-are-a-retained-projection.md)，既不是 canonical 也不是可随手丢弃的 derived；
 - derived：Tantivy 段、embeddings / BM42 / SPLADE、graph_links、graph_layout、usage_projections。
 
@@ -119,7 +120,7 @@ CLI shim 示例（业务不写在 package.json 里）：
 
 | job | 触发 | 内容 |
 |---|---|---|
-| `test` | push / PR（Rust 路径、`tools/evals/**` 或 workflow 自身改动）+ 每日 | ubuntu 与 windows 两腿：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`cargo test --workspace --locked`。**windows 腿串行**（`RUST_TEST_THREADS=1`）：并行建索引在该平台会瞬时拒绝访问（实测并行 5/40 与 2/12 红、串行 0/11）——这是**换稳定，不是修因**，flaky 本体仍登记在册 |
+| `test` | push / PR（Rust 路径、`tools/evals/**` 或 workflow 自身改动）+ 每日 | ubuntu 与 windows 两腿：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --locked`、`cargo test --workspace --locked`，外加 `Path matrix (named target)` 步（`cargo test -p momotaro-ingest --test path_matrix --locked`：W2.6 平台矩阵的按名主场，workspace 步已覆盖其自动档；手工 `#[ignore]` 档永不进 CI，本地按名跑，配方在 `path_matrix.rs` 头注）。**windows 腿串行**（`RUST_TEST_THREADS=1`）：并行建索引在该平台会瞬时拒绝访问（实测并行 5/40 与 2/12 红、串行 0/11）——这是**换稳定，不是修因**，flaky 本体仍登记在册 |
 | `deny` | 同上 | `cargo deny --locked check`（`deny.toml` 是唯一策略文件：licenses / bans / advisories / sources；特性覆盖来自 `[graph] all-features`，不是 CLI flag） |
 | `instruments` | 同上 | `perf_smoke`（1000 文件性能冒烟，`#[ignore]` 那条）与 `bash tools/evals/run_golden.sh`（golden set 回归绊线）。**配方与门槛只有这一份**：README 教的就是它、CI 调的就是它，门槛写在脚本里（贴基线，仪器确定性 ⇒ 不是容差；golden set 扩容时显式重设） |
 

@@ -71,6 +71,10 @@ FTS5 索引；`~/.hermes/sessions/*.jsonl` 是 gateway transcript 和请求 brea
 
 ### 1. 会话管理：事件日志留在 SQLite
 
+> 库自己的 ingest 审计日志是另一张表：`store_events`（只追加、只搬移不删除），
+> 见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 与 Architecture §8.1。
+> 下面的规则针对**会话**那张面（`run_events` / `history_items`），两者不混用。
+
 现有模型已经是逻辑上的 event sourcing：
 
 ```text
@@ -153,6 +157,16 @@ Momotaro 一座 SQLite 直接拥有——「SQLite canonical」决策被双库�
 要学的是**投影可重建**（如 Tantivy 会话索引从 history_items 重建），不是
 存储形态。`occurred_at` / `created_at` 双时间戳在公开同类中无先例，保留并在
 重放/导入断言中明确「occurred_at 保持事件时刻」。
+
+**缺失不得代偿**（通用纪律，价格红线升级而来）：未知值不许由其它字段、其它
+时间轴或当前时刻填充；替换必须具名、显式、默认关闭（Dyreson & Snodgrass,
+TODS 1998 的替换语义）。逐列点名：**`store_events.recorded_at`** 不得用
+`store_events.occurred_at` 回填，也不得用当前时刻去补 `occurred_at`；
+**`run_events` / `history_items` 的 `created_at`** 与本表的写入时刻同源于
+store，永不取自事件载荷。**`store_events.recorded_at` 还是事务时间**：由
+store 每批赋一次，且**永不低于上一行的值**（`max(now, last)`；NTP 回拨不得让
+事务时间倒退）——表上没有 `CHECK`，因为 SQLite 表达不了跨行约束，钳由 store
+自己执行（[ADR 0026](adr/store-events-are-the-ingest-audit-log.md)）。
 
 ## 参考
 

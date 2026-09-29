@@ -11,7 +11,10 @@ pub fn derive_title(normalized: &str, source_key: &str) -> String {
 }
 
 fn first_h1(normalized: &str) -> Option<String> {
-    let parser = Parser::new_ext(normalized, Options::ENABLE_TABLES);
+    let parser = Parser::new_ext(
+        normalized,
+        Options::ENABLE_TABLES | Options::ENABLE_WIKILINKS,
+    );
     let mut in_h1 = false;
     let mut text = String::new();
     for event in parser {
@@ -43,22 +46,52 @@ fn file_stem_of(source_key: &str) -> &str {
         .strip_prefix(momotaro_contracts::NOTE_SCHEME)
         .unwrap_or(source_key);
     let base = key.rsplit('/').next().unwrap_or(key);
-    strip_md_extension(base)
+    strip_extension(base)
 }
 
-/// Strips a trailing `.md`, ignoring ASCII case (the walker accepts `.MD`).
+/// Strips a file's single trailing extension, whatever it is: a title is the
+/// name without it, for notes (`.md`, `.canvas`) and attachments (`.png`) alike,
+/// and only one goes — `board.canvas.md` is a Markdown note called
+/// `board.canvas`.
 ///
-/// Never splits a multi-byte character: `rsplit_once` works on characters,
-/// and a name with no dot is returned unchanged.
-fn strip_md_extension(name: &str) -> &str {
+/// Never splits a multi-byte character: `rsplit_once` works on characters, and a
+/// name with no dot is returned unchanged.
+fn strip_extension(name: &str) -> &str {
     match name.rsplit_once('.') {
-        Some((stem, extension)) if extension.eq_ignore_ascii_case("md") => stem,
-        _ => name,
+        Some((stem, _extension)) => stem,
+        None => name,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_wikilink_in_a_heading_is_consumed_by_the_parser() {
+        // The witness for `Options::ENABLE_WIKILINKS`: with the switch on the
+        // parser hands back the link's visible text instead of the raw brackets.
+        // The switch was on before this test existed and nothing noticed either
+        // way, so this pins the observable side — the title. Chunk boundaries are
+        // left to the chunker: a reviewer measured them byte-invariant under the
+        // switch, and the golden set would catch a move.
+        assert_eq!(
+            derive_title(
+                "# See [[Alpha]] now
+",
+                "note:a.md"
+            ),
+            "See Alpha now"
+        );
+        assert_eq!(
+            derive_title(
+                "# [[a|b]]
+",
+                "note:a.md"
+            ),
+            "b",
+            "the alias is the visible text"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -93,6 +126,22 @@ mod tests {
     #[test]
     fn falls_back_to_file_stem_for_uppercase_extension() {
         assert_eq!(derive_title("no heading\n", "note:Notes/Inner.MD"), "Inner");
+    }
+
+    /// A `.canvas` is a note too, so its title drops the extension the same way —
+    /// only one trailing extension, so a Markdown note named `board.canvas.md`
+    /// keeps the `.canvas` that is part of its name.
+    #[test]
+    fn falls_back_to_file_stem_for_a_canvas() {
+        assert_eq!(derive_title("no heading\n", "note:board.canvas"), "board");
+        assert_eq!(
+            derive_title("no heading\n", "note:deep/Board.CANVAS"),
+            "Board"
+        );
+        assert_eq!(
+            derive_title("no heading\n", "note:board.canvas.md"),
+            "board.canvas"
+        );
     }
 
     /// Names shorter than the extension, and a cut that would land inside a

@@ -6,12 +6,17 @@ members = [
   "crates/momotaro-run",
   "crates/momotaro-ingest",
   "crates/momotaro-retrieve",
+  "crates/momotaro-llm",
+  "crates/momotaro-context",
+  "crates/momotaro-verify",
+  "crates/momotaro-platform",
   "apps/cli",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.97.1"
 
 [workspace.dependencies]
 momotaro-contracts = { path = "crates/momotaro-contracts" }
@@ -19,6 +24,10 @@ momotaro-run = { path = "crates/momotaro-run" }
 momotaro-store = { path = "crates/momotaro-store" }
 momotaro-ingest = { path = "crates/momotaro-ingest" }
 momotaro-retrieve = { path = "crates/momotaro-retrieve" }
+momotaro-llm = { path = "crates/momotaro-llm" }
+momotaro-context = { path = "crates/momotaro-context" }
+momotaro-verify = { path = "crates/momotaro-verify" }
+momotaro-platform = { path = "crates/momotaro-platform" }
 clap = { version = "4.5", features = ["derive"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -32,3 +41,11 @@ sha2 = "0.11"
 hex = "0.4"
 walkdir = "2.5"
 unicode-normalization = "0.1"
+# D40 §4.1: the stable line only — 9.x is still a release candidate, and the
+# Windows RDCW overflow gap is closed by reconciliation rather than by an RC.
+notify = "8.2"
+notify-debouncer-full = "0.7"
+# D31 / D40 §4.8: drive type. There is no std call for it (`std::os::windows`
+# exposes no volume kind), so a network-mount warning needs these bindings.
+# Consumers declare it under `[target.'cfg(windows)'.dependencies]`.
+windows-sys = "0.61"

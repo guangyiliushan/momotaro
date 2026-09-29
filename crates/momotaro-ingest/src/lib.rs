@@ -8,19 +8,32 @@
 
 use momotaro_contracts::IndexFileErrorKind;
 
+mod canvas;
 mod chunker;
+pub mod excalidraw;
+pub mod frontmatter;
 mod hash;
+pub mod links;
 mod normalize;
 mod path;
+mod portability;
 mod title;
 mod walk;
 
-pub use chunker::chunk_markdown;
-pub use hash::{chunk_hash, chunk_id, revision_hash};
+pub use chunker::{SourceOffset, chunk_markdown, chunk_markdown_with};
+pub use excalidraw::scene_spans;
+pub use hash::{chunk_hash, chunk_id, revision_hash, revision_hash_reader};
+pub use links::{
+    Extracted, Namespace, Outline, RawLink, Resolution, analyze, anchor_still_exists,
+    extract_frontmatter_links, parent_dir, percent_decode, resolve,
+};
 pub use normalize::normalize_markdown;
 pub use path::{canonical_workspace_root, is_within, local_path_in, resolve_local_path};
+pub use portability::{
+    attributes_of, icloud_stub, is_cloud_placeholder, windows_incompatible_components,
+};
 pub use title::derive_title;
-pub use walk::{raw_name_for, source_key_for, walk_markdown_files};
+pub use walk::{VaultEntry, VaultFileKind, is_hidden, raw_name_for, source_key_for, walk_entries};
 
 /// Failures raised while turning vault files into chunks.
 #[derive(Debug, thiserror::Error)]
@@ -28,7 +41,8 @@ pub enum IngestError {
     /// Underlying filesystem failure.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    /// A source file is not valid UTF-8.
+    /// A string that must be UTF-8 is not: a name, a path component, or the
+    /// file's bytes.
     #[error("invalid utf-8 in {0}")]
     InvalidUtf8(String),
     /// A path argument is not beneath the vault root.
@@ -52,7 +66,10 @@ impl IngestError {
             Self::InvalidUtf8(_) => IndexFileErrorKind::InvalidUtf8,
             Self::OutsideVault(_) | Self::OutsideWorkspace(_) => IndexFileErrorKind::OutsideVault,
             Self::InvalidSourceKey(_) => IndexFileErrorKind::InvalidSourceKey,
-            Self::Io(_) | Self::VaultMissing(_) => IndexFileErrorKind::Other,
+            Self::Io(_) => IndexFileErrorKind::Io,
+            // A missing vault root is a workspace problem, not a read failure of
+            // one file; it keeps the catch-all until a kind of its own is needed.
+            Self::VaultMissing(_) => IndexFileErrorKind::Other,
         }
     }
 }
@@ -81,7 +98,7 @@ mod tests {
         );
         assert_eq!(
             IngestError::Io(std::io::Error::other("x")).kind(),
-            IndexFileErrorKind::Other
+            IndexFileErrorKind::Io
         );
     }
 }

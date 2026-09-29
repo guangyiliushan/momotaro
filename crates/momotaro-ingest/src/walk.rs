@@ -6,8 +6,18 @@ use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 use super::IngestError;
+use super::canvas::is_canvas_path;
+use super::portability::icloud_stub;
 
-fn is_hidden(file_name: &std::ffi::OsStr) -> bool {
+/// Whether a file name starts with a dot (the vault's "hidden" test).
+///
+/// One predicate for the walker and for the watcher: D40 §4.6's event-layer
+/// blacklist and §5 第 1 条's index range have to agree, or a single vault
+/// answers two ways — the watcher would ingest a dot-prefixed file that
+/// `index` drops. The root itself is never tested (a dot-prefixed temp root is
+/// legal), which is why this takes a name and not a path.
+#[must_use]
+pub fn is_hidden(file_name: &std::ffi::OsStr) -> bool {
     file_name
         .to_str()
         .is_some_and(|s| s.starts_with('.') && s != ".")
@@ -18,12 +28,50 @@ fn is_markdown(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
 }
 
-/// Walk `vault_root` and return all Markdown file paths, sorted.
+/// What one kept file is, decided by the walker.
+///
+/// The indexing path branches on this instead of re-deriving it from the path,
+/// and a file that is not a note is still a fact: an attachment is registered,
+/// a link is recorded, an eviction stub is reported, and none of them is
+/// silently dropped (`docs/docs/ingest-interop.md` §5 第 10 条).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultFileKind {
+    /// Markdown: chunked and indexed.
+    Note,
+    /// A JSON Canvas: rendered through its fields, then chunked.
+    Canvas,
+    /// Any other regular file: registered, never chunked.
+    Attachment,
+    /// A symlink or junction: recorded, never followed.
+    Symlink,
+    /// An iCloud eviction stub (`.name.icloud`): the note it stands for is not
+    /// on this device. Dot-prefixed like every other hidden entry, and kept
+    /// out of the index exactly as it always was — classified so that a row
+    /// can say what happened to the note (D42).
+    IcloudPlaceholder,
+}
+
+/// One file the walker kept, with what it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultEntry {
+    /// The path as the walk found it.
+    pub path: PathBuf,
+    /// What the file is.
+    pub kind: VaultFileKind,
+}
+
+/// Walk `vault_root` and return every file it holds, sorted by path.
+///
+/// This is the walker: one walk, one classification, and every caller reads the
+/// same list — the indexing path branches on the kind rather than walking again.
 ///
 /// Hidden directories (any component starting with `.`) are skipped, so
-/// `.git`, `.obsidian`, and `.momotaro` never contribute files. The root
-/// itself is exempt from the hidden check so dot-prefixed temp roots work.
-pub fn walk_markdown_files(vault_root: &Path) -> Result<Vec<PathBuf>, IngestError> {
+/// `.git`, `.obsidian`, and `.momotaro` never contribute files, and so is every
+/// other dot-prefixed file — except an iCloud eviction stub, which is
+/// classified to become a row that says what happened to the note it stands
+/// for (D42). The root itself is exempt from the hidden check so dot-prefixed
+/// temp roots work.
+pub fn walk_entries(vault_root: &Path) -> Result<Vec<VaultEntry>, IngestError> {
     let metadata = fs::metadata(vault_root).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             IngestError::VaultMissing(vault_root.display().to_string())
@@ -35,20 +83,63 @@ pub fn walk_markdown_files(vault_root: &Path) -> Result<Vec<PathBuf>, IngestErro
         return Err(IngestError::VaultMissing(vault_root.display().to_string()));
     }
 
-    let mut files: Vec<PathBuf> = WalkDir::new(vault_root)
+    let mut entries: Vec<VaultEntry> = WalkDir::new(vault_root)
         .into_iter()
-        // Prune dot-prefixed entries (and their subtrees) by their own file
-        // name; the root itself is exempt so dot-prefixed temp roots work.
-        .filter_entry(|entry| entry.depth() == 0 || !is_hidden(entry.file_name()))
+        // Prune dot-prefixed directories (and their subtrees) by their own
+        // file name; dot-prefixed files reach `classify`, which drops every
+        // one of them except an iCloud eviction stub (D42). The root itself
+        // is exempt so dot-prefixed temp roots work.
+        .filter_entry(|entry| {
+            entry.depth() == 0 || !entry.file_type().is_dir() || !is_hidden(entry.file_name())
+        })
         .filter_map(|entry| entry.ok())
-        // Symlink entries are skipped: `file_type()` does not follow links,
-        // so a vault-supplied `link.md` pointing outside the root can never
-        // pull external content into the index.
-        .filter(|entry| entry.file_type().is_file() && is_markdown(entry.path()))
-        .map(|entry| entry.into_path())
+        .filter_map(|entry| {
+            let kind = classify(&entry)?;
+            Some(VaultEntry {
+                path: entry.into_path(),
+                kind,
+            })
+        })
         .collect();
-    files.sort();
-    Ok(files)
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
+}
+
+/// What one directory entry is, or `None` when the vault layer does not keep it.
+///
+/// A link is classified by its own type first: `file_type()` does not follow
+/// links, so a vault-supplied `link.md` pointing outside the root can never pull
+/// external content into the index, and the kind it gets is the record that it
+/// was seen. A directory (outside the root itself) is not a file and is not kept;
+/// the walk does not descend into links either, so no target is walked twice.
+/// Dot-prefixed files are not vault content either — the only one kept is an
+/// iCloud eviction stub, whose whole point is that its absence can be reported
+/// (D42).
+fn classify(entry: &walkdir::DirEntry) -> Option<VaultFileKind> {
+    let name = entry.file_name();
+    let stub = name.to_str().is_some_and(icloud_stub);
+    if is_hidden(name) && !stub {
+        return None;
+    }
+    if entry.file_type().is_symlink() {
+        return Some(VaultFileKind::Symlink);
+    }
+    if !entry.file_type().is_file() {
+        return None;
+    }
+    if stub {
+        return Some(VaultFileKind::IcloudPlaceholder);
+    }
+    if is_markdown(entry.path()) {
+        return Some(VaultFileKind::Note);
+    }
+    if is_canvas_path(entry.path()) {
+        return Some(VaultFileKind::Canvas);
+    }
+    // Everything else that is a regular file is an attachment: the official
+    // list is categories (images, audio, video, PDF, `.base`), not a closed set,
+    // and a file the index cannot read is still a file in the vault.
+    Some(VaultFileKind::Attachment)
 }
 
 /// Derives the vault-relative `raw_name` exactly as the file spells it
@@ -111,6 +202,17 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// The indexable files of a vault — the view the deleted wrapper offered, kept
+    /// where it is used instead of as an API with no caller.
+    fn indexable(root: &Path) -> Vec<PathBuf> {
+        walk_entries(root)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| matches!(entry.kind, VaultFileKind::Note | VaultFileKind::Canvas))
+            .map(|entry| entry.path)
+            .collect()
+    }
+
     fn write(root: &Path, rel: &str, contents: &str) {
         let full = root.join(rel);
         if let Some(parent) = full.parent() {
@@ -130,13 +232,168 @@ mod tests {
         write(root, ".git/hooks.md", "hidden");
         write(root, ".momotaro/db.md", "hidden");
         write(root, "notes.txt", "not md");
+        write(root, "board.canvas", "{}");
+        write(root, "board.canvas.md", "a markdown note");
 
-        let found = walk_markdown_files(root).unwrap();
+        let found = indexable(root);
         let keys: Vec<String> = found
             .iter()
             .map(|p| source_key_for(root, p).unwrap())
             .collect();
-        assert_eq!(keys, vec!["note:a/c.md", "note:a/inner.MD", "note:b.md"]);
+        assert_eq!(
+            keys,
+            vec![
+                "note:a/c.md",
+                "note:a/inner.MD",
+                "note:b.md",
+                "note:board.canvas",
+                "note:board.canvas.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn walk_entries_says_what_each_file_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "note.md", "n");
+        write(root, "board.canvas", "{}");
+        write(root, "pic.png", "not really a png");
+        write(root, "notes.txt", "text");
+        write(root, "weird.excalidraw", "{}");
+        write(root, "sub/inner.md", "nested");
+        // A link is classified rather than dropped, and the fixture is gated on what
+        // this platform can create — a junction on Windows (no privilege needed),
+        // a symlink elsewhere — not on which platform the logic runs on.
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(root.join("linked"))
+                .arg(root.join("sub"))
+                .status()
+                .expect("run mklink");
+            assert!(status.success(), "this test needs a junction to exist");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("note.md"), root.join("linked"))
+            .expect("create the symlink");
+
+        let entries = walk_entries(root).unwrap();
+        let kinds: Vec<(String, VaultFileKind)> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry
+                        .path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string(),
+                    entry.kind,
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("board.canvas".to_string(), VaultFileKind::Canvas),
+                ("linked".to_string(), VaultFileKind::Symlink),
+                ("note.md".to_string(), VaultFileKind::Note),
+                // Everything else that is a regular file is registered rather
+                // than ignored: a `.txt` nobody can search is still a fact
+                // about the vault (§5 第 10 条).
+                ("notes.txt".to_string(), VaultFileKind::Attachment),
+                ("pic.png".to_string(), VaultFileKind::Attachment),
+                // The list is leaf names, so the nested note reads as `inner.md`.
+                ("inner.md".to_string(), VaultFileKind::Note),
+                ("weird.excalidraw".to_string(), VaultFileKind::Attachment),
+            ]
+        );
+        // The walk does not descend through the link: the note behind it is listed
+        // once, under its real path. The link entry itself is expected — that is the
+        // record — but nothing below it may appear.
+        assert!(
+            entries.iter().all(|entry| {
+                entry.kind == VaultFileKind::Symlink
+                    || !entry.path.to_string_lossy().contains("linked")
+            }),
+            "{entries:?}"
+        );
+
+        // The old view is the same walk, filtered — the two cannot disagree about
+        // what is in the vault.
+        let notes: Vec<String> = indexable(root)
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            notes,
+            // Leaf names again: the nested note is a note too, and it comes after the
+            // flat ones because the walk sorts by path.
+            vec![
+                "board.canvas".to_string(),
+                "note.md".to_string(),
+                "inner.md".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn walk_reports_icloud_stubs_and_still_drops_other_dot_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, ".hidden.md", "a hidden note");
+        write(root, ".note.md.icloud", "an eviction stub");
+        write(root, ".x.icloud.md", "another hidden note");
+        write(root, "note.md", "n");
+        write(root, "note.md.icloud", "the suffix, no dot: a plain file");
+        write(root, "x.icloud.md", "a real note");
+
+        let entries = walk_entries(root).unwrap();
+        let kinds: Vec<(String, VaultFileKind)> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry
+                        .path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string(),
+                    entry.kind,
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (
+                    ".note.md.icloud".to_string(),
+                    VaultFileKind::IcloudPlaceholder
+                ),
+                ("note.md".to_string(), VaultFileKind::Note),
+                // No leading dot: not the stub shape, so it is an ordinary
+                // file like any other.
+                ("note.md.icloud".to_string(), VaultFileKind::Attachment),
+                ("x.icloud.md".to_string(), VaultFileKind::Note),
+            ]
+        );
+        // A stub still has an identity for its row…
+        assert_eq!(
+            source_key_for(root, &root.join(".note.md.icloud")).unwrap(),
+            "note:.note.md.icloud"
+        );
+        // …and is still not indexable content: the stub and both hidden notes
+        // stay out of the view the index reads.
+        let notes: Vec<String> = indexable(root)
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            notes,
+            vec!["note.md".to_string(), "x.icloud.md".to_string()]
+        );
     }
 
     #[test]
@@ -144,7 +401,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("nope");
         assert!(matches!(
-            walk_markdown_files(&missing),
+            walk_entries(&missing),
             Err(IngestError::VaultMissing(_))
         ));
     }
@@ -181,7 +438,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("cafe\u{0301}.md"), "x").unwrap();
 
-        let found = walk_markdown_files(tmp.path()).unwrap();
+        let found = indexable(tmp.path());
         assert_eq!(found.len(), 1);
         assert_eq!(
             source_key_for(tmp.path(), &found[0]).unwrap(),
@@ -261,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn walk_skips_symlink_entries() {
+    fn the_indexable_view_excludes_link_entries() {
         #[cfg(unix)]
         {
             let outside = tempfile::tempdir().unwrap();
@@ -273,7 +530,7 @@ mod tests {
             std::os::unix::fs::symlink(&secret, vault.path().join("link.md")).unwrap();
             fs::write(vault.path().join("real.md"), "real").unwrap();
 
-            let found = walk_markdown_files(vault.path()).unwrap();
+            let found = indexable(vault.path());
             let names: Vec<String> = found
                 .iter()
                 .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
@@ -287,7 +544,7 @@ mod tests {
         {
             let vault = tempfile::tempdir().unwrap();
             fs::write(vault.path().join("real.md"), "real").unwrap();
-            let found = walk_markdown_files(vault.path()).unwrap();
+            let found = indexable(vault.path());
             assert_eq!(found.len(), 1);
         }
     }

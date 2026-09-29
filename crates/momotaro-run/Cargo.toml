@@ -2,6 +2,7 @@
 name = "momotaro-run"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish = false
 
 [dependencies]
@@ -9,10 +10,14 @@ momotaro-contracts = { workspace = true }
 momotaro-ingest = { workspace = true }
 momotaro-retrieve = { workspace = true }
 momotaro-store = { workspace = true }
+momotaro-platform = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
+rusqlite = { workspace = true }
 tempfile = { workspace = true }

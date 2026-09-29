@@ -63,7 +63,7 @@ pub fn build_schema() -> Schema {
 
 /// Resolves the named fields from a schema built by [`build_schema`].
 ///
-/// Returns [`RetrieveError::SchemaMismatch`] for schemas missing any
+/// Returns [`crate::RetrieveError::SchemaMismatch`] for schemas missing any
 /// expected field — e.g. an on-disk index written by another build. Callers
 /// should surface this as "rebuild the index", never panic.
 pub fn fields(schema: &Schema) -> Result<Fields, crate::RetrieveError> {

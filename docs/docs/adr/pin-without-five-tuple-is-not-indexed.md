@@ -8,3 +8,5 @@ sidebar_label: ADR 0013
 Revises D24.
 
 Pin is a human act. Retrieval eligibility is a separate fact: at least one `source_key + revision_hash + chunk_id + chunk_hash + locator` pointing at a live chunk. Forbidding pin-without-citations leaves no drawer except dismiss. Treating `run_id` / `history_id` as provenance would launder the episodic layer into a retrieval source.
+
+The five-tuple is a citation coordinate plus a content fingerprint (existence), not provenance in the why / how / where sense: `retrieval eligibility` is the accurate term for what it establishes, and `run_id` / `history_id` still must not be treated as either.

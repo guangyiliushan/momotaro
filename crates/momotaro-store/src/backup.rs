@@ -28,6 +28,21 @@ pub(crate) fn backup_before_migration(
     from: u32,
     to: u32,
 ) -> Result<PathBuf, StoreError> {
+    backup_before_migration_with(connection, dir, from, to, verify_artifact)
+}
+
+/// The four-step backup with the artifact check injected.
+///
+/// The seam exists so tests can drive the fail-closed wiring itself — that a
+/// refused artifact is never published and leaves nothing behind — while
+/// [`verify_artifact`] keeps covering what "verified" means.
+pub(crate) fn backup_before_migration_with(
+    connection: &Connection,
+    dir: &Path,
+    from: u32,
+    to: u32,
+    verify: impl FnOnce(&Path) -> Result<(), StoreError>,
+) -> Result<PathBuf, StoreError> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
@@ -47,7 +62,7 @@ pub(crate) fn backup_before_migration(
 
     // Verify the artifact before it may replace anything: `quick_check` reads
     // the whole file, which is also the first corruption screening (D32 L-backup).
-    if let Err(error) = verify_artifact(&temp) {
+    if let Err(error) = verify(&temp) {
         let _ = fs::remove_file(&temp);
         return Err(error);
     }
@@ -80,6 +95,73 @@ pub(crate) fn verify_artifact(path: &Path) -> Result<(), StoreError> {
 mod tests {
     use super::*;
     use crate::Store;
+
+    #[test]
+    fn a_failed_verification_publishes_nothing_and_cleans_up() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("momotaro.db");
+        let mut store = Store::open(&path).expect("open store");
+        store.init_schema().expect("init schema");
+
+        // The wiring itself: a refused artifact must fail the backup before
+        // anything carries the backup name, and the artifact must not linger.
+        // Removing the fail-closed branch leaves a published artifact behind
+        // and turns this test red.
+        let error = backup_before_migration_with(&store.connection, dir.path(), 2, 3, |_path| {
+            Err(StoreError::BackupFailed(
+                "injected: artifact refused".to_owned(),
+            ))
+        })
+        .expect_err("a refused artifact must fail the backup");
+        assert!(matches!(error, StoreError::BackupFailed(_)), "{error}");
+
+        let leftovers: Vec<String> = fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("backup-") || name.starts_with(TMP_PREFIX))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a refused artifact is neither published nor left behind: {leftovers:?}"
+        );
+        assert!(path.exists(), "the live database is untouched");
+    }
+
+    #[test]
+    fn the_artifact_is_verified_before_it_is_published() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("momotaro.db");
+        let mut store = Store::open(&path).expect("open store");
+        store.init_schema().expect("init schema");
+
+        // The order half: the verifier must see the *unpublished* artifact —
+        // its temp name is the proof that nothing carries the trusted backup
+        // name before verification. Swapping publish ahead of verification
+        // hands the verifier the published name and turns this test red.
+        let mut seen: Vec<String> = Vec::new();
+        let snapshot =
+            backup_before_migration_with(&store.connection, dir.path(), 2, 3, |artifact| {
+                seen.push(
+                    artifact
+                        .file_name()
+                        .expect("artifact name")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                Ok(())
+            })
+            .expect("backup succeeds");
+        assert_eq!(seen.len(), 1, "the verifier runs exactly once");
+        assert!(
+            seen[0].starts_with(TMP_PREFIX),
+            "verification runs on the unpublished temp artifact, not on the published name: {seen:?}"
+        );
+        assert!(
+            snapshot.exists(),
+            "and the snapshot is published afterwards"
+        );
+    }
 
     #[test]
     fn backup_publishes_a_verified_snapshot_and_leaves_the_original() {

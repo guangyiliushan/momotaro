@@ -73,7 +73,7 @@ Momotaro 是一个**本地优先、给人用的科研工作台**。它把笔记�
 
 - 检索与图路线：BM25 优先、零 LLM 索引、机制级引用、评测门槛；
 - 上下文工程：有限资源预算、缓存第一等约束、四层分离
-  （evidence/history/constraints/artifacts）、provenance 安全边界、评估闭环；
+  （evidence/history/constraints/artifacts）、引用资格（retrieval eligibility）安全边界、评估闭环；
 - LLM Wiki：形态学 LLM Wiki、治理学 Momotaro（D21/D22；proposed wiki 层 +
   零 LLM 治理工具包）；
 - 会话管理：会话骨架零项被推翻；压缩触发合并裁决（0.85 默认）、fork=复制前缀

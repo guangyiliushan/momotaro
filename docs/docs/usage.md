@@ -37,6 +37,47 @@ momotaro index ./notes
 
 索引是确定性的，不需要 API key。
 
+`index --json` 还会给出本批次的标识：
+
+```json
+{"batch_id": "index-1737000000000-2d87c684", "files_scanned": 5, "files_indexed": 5, …}
+```
+
+`batch_id` 也是 `store_events` 里那一批审计行的 `batch_id`（[ADR 0026](adr/store-events-are-the-ingest-audit-log.md)）：
+想知道「这次索引对每个文件做了什么」，按它查即可——
+
+```sql
+select seq, type, outcome, reason_code, source_key from store_events
+ where batch_id = ? order by seq;
+```
+
+人类可读的摘要行不带批次号（只有 `--json` 给）。
+
+## Check the workspace
+
+```bash
+momotaro doctor
+momotaro doctor --json      # the same report for scripts
+```
+
+`doctor` 不写任何东西，未初始化的 workspace 也会退非零（见下方 "Exit codes"）——**`--coverage` 是例外**：它是报告不是检查。
+
+想知道**上一次 `index` 对每个文件做了什么**（包括被拒的那些），读审计日志：
+
+```bash
+momotaro doctor --coverage
+# ingest batch index-1737000000000-2d87c684: 5 indexed, 0 skipped, 0 refreshed, 0 failed
+momotaro doctor --coverage --json   # CoverageReport，字段同上有事件计数与 finished
+```
+
+还没索引过时它会说 `no ingest batch recorded yet` 并**成功退出**（"没有批次"是事实，不是故障；
+`--json` 下 stdout 给 `null`）。未结束的批次会标成 `no ingest.finished yet: still running, or the
+process died`——日志分不出这两者，所以它不假装能分。`ingest.coverage` 的三种结果分别计数；
+降级（D41）与同步盘预警（D42）各按码计数（`degradations` / `warnings` 两个清单，人类行逐行渲染）；
+**预警不是失败**——只有两个词表都不认识的码才计入 failures。任何看不懂的 outcome 都会**归入 failures**
+而不是被丢掉。库不可用时（版本过新、外来库）退 1，
+报的是与 `doctor` **同一句拒绝文本**（`doctor` 自己那行还会带引擎版本）。
+
 ## Search
 
 ```bash
@@ -114,10 +155,59 @@ workspace**: SQLite's WAL does not work on network filesystems
 to corrupt it. Sync the notes; leave `.momotaro/` alone.
 
 `index` reports what the run did: `indexed N of M files (X new revisions,
-Y unchanged), C chunks, 0 errors`. `unchanged` counts files whose fingerprint
-**and** stored path both match; a pure directory move refreshes the stored path
-and shows up as `indexed` with `0 new revisions`, because no new content
-revision was created.
+Y skipped), C chunks, 0 errors`. `skipped` counts files nothing was read for:
+a fingerprint **and** stored path that both still match, a link the walk does
+not follow, an iCloud eviction stub, or a cloud placeholder. A pure directory
+move refreshes the stored path and shows up as `indexed` with `0 new
+revisions`, because no new content revision was created.
+
+## Watch the vault
+
+```bash
+momotaro watch
+```
+
+A long-running process. It opens the file watcher first and then runs one full
+vault walk+stat reconciliation — the watcher is already listening by then,
+which is what makes the cookie that walk waits for mean anything — and after
+that it serves events. **Events are hints, never truth** (D40): every event,
+whatever it says, is merged into "rescan that path", and the rescan decides
+from the file's own bytes whether anything actually changed. It reconciles
+again every 24 hours, immediately when the platform reports that it dropped
+events, and again when a single batch of events names more than 256 paths (an
+event storm — at that point a full walk is cheaper than N rescans and is the
+only thing that can be sure).
+
+`Ctrl-C` stops it. There is no graceful-shutdown handler: the process is torn
+down by the operating system. That is safe because every file's rows commit
+with its data — a batch interrupted part-way simply has not happened yet, and
+the next startup reconciliation picks it up.
+
+Everything it says goes to **stdout**, in both modes. With `--json` each line
+is one object tagged `kind`, so a script can tell them apart: `batch`
+(`{"kind", "batch_id", "rescanned", "rebuilt", "refreshed", "unchanged",
+"removed", "dropped"}`), `reconciled` (`trigger`, `batch_id`), `degraded`
+(`reason`), `network_volume` (`message`), `cookie_skipped` (`reason`), and
+`retries_exhausted` (`path`). A watch on
+a network volume is reported and **not** promised to be real-time; a backend
+that cannot start falls back to polling and says so in a `degraded` line.
+
+## Reconcile the vault
+
+```bash
+momotaro reconcile
+```
+
+One full vault walk+stat, writing `vault.reconcile.started`,
+`vault.reconcile.coverage` (one row per file) and `vault.reconcile.finished`.
+This is the command the other three triggers share: the watcher runs it at
+startup and every 24 hours, and again after the platform reports dropped
+events. Run it by hand whenever you suspect the store and the vault have
+drifted — a deleted file, a rename while the watcher was down, an interrupted
+index.
+
+With `--json` it prints `{"batch_id", "scanned", "changed", "removed",
+"events"}`.
 
 ## Exit codes
 
@@ -126,8 +216,27 @@ command that gates on health, not just on failure:** it exits `1` for an
 `invalid` **and** for an `uninitialized` workspace, so `if momotaro doctor; then
 momotaro index; fi` never indexes a workspace that is not ready (run `init` on a
 fresh directory first). `--json` still prints the full report on stdout first,
-so gating on the exit code loses nothing. Other commands exit `1` only when they
-fail.
+so gating on the exit code loses nothing.
+
+**Exception — `doctor --coverage` is a report, not a check.** It exits `0`
+whenever the log could be read, including "no ingest batch recorded yet" (a
+workspace that was never indexed): nothing having happened yet is a fact, not a
+failure. With `--json` it prints `null` on stdout in that case, so a script still
+gets an answer where it looks. A store this build cannot use is an error and
+exits `1`, with the same refusal text `doctor` reports (its own line adds the
+engine version; this one does not). A workspace whose database file does not
+exist yet is still "nothing has happened yet": the sentence tells its owner to
+run `init` — and if the directory is not a workspace at all (no `momotaro.toml`),
+`--coverage` reports that instead, because `init` would fail there too.
+
+Other commands exit `1` only when they fail.
+
+`reconcile` follows the ordinary rule: `0` when the walk ran, `1` when the vault
+or the store was unusable. `watch` runs until it is stopped, so its exit code
+only describes how it *ended* — `0` for an orderly stop, `1` when it could not
+start (missing vault, unusable store, or a filesystem backend that refuses to
+watch). A reconcile whose cookie wait timed out still runs the walk and still
+exits `0`: waiting is an optimisation, not a precondition.
 
 An engine inside the WAL-reset window — or a withdrawn 3.52.x release — is
 reported as `invalid` too, with the bundled `sqlite_version()` /

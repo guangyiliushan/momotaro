@@ -431,10 +431,11 @@ CREATE TABLE project_memberships (
 CREATE TABLE source_revisions (
   source_key TEXT NOT NULL,
   revision_hash TEXT NOT NULL,
-  kind TEXT NOT NULL,              -- note | paper | web
+  kind TEXT NOT NULL,              -- note | paper | web | attachment
   title TEXT,
   uri TEXT,
   local_path TEXT,
+  raw_name TEXT,                   -- 原始相对字节；键只做身份（D42）。（真实列由 v3 的 ALTER 追加在表末；本 DDL 按可读性排在路径列旁。）
   origin_class TEXT NOT NULL,      -- owner | paper | web | agent | system
   metadata_json TEXT NOT NULL,
   ingested_at INTEGER NOT NULL,
@@ -504,7 +505,7 @@ CREATE TABLE sparks (
 );
 ```
 
-未 pin 的 spark 不进入检索。空 citations 视为 unverified。**pin 不需要引用，检索资格才需要**：检索资格 = `pinned` 且至少一条指向 live chunk 的五元组；只有 `run_id` / `history_id` 的 pin 不算 provenance。未 pin 或无五元组的 pinned spark 都不进索引（[ADR 0013](adr/pin-without-five-tuple-is-not-indexed.md) / [ADR 0018](adr/spark-actions-are-pin-and-dismiss.md)）。pin 是人审动作，不改变信任构成（2026-09-15 调查：记忆投毒 OVERWRITE/ENTRENCH；Mem0 已回撤到 ADD-only）。
+未 pin 的 spark 不进入检索。空 citations 视为 unverified。**pin 不需要引用，检索资格才需要**：检索资格 = `pinned` 且至少一条指向 live chunk 的五元组；只有 `run_id` / `history_id` 的 pin **不算检索资格**（`retrieval eligibility`——它们既不是引用坐标，也不是内容指纹）。未 pin 或无五元组的 pinned spark 都不进索引（[ADR 0013](adr/pin-without-five-tuple-is-not-indexed.md) / [ADR 0018](adr/spark-actions-are-pin-and-dismiss.md)）。pin 是人审动作，不改变信任构成（2026-09-15 调查：记忆投毒 OVERWRITE/ENTRENCH；Mem0 已回撤到 ADD-only）。
 
 **取代链语义（D24）**：取代 = 新行 + `supersedes_spark_id` 指针，被取代行保留
 （可加 `superseded_at` 投影）；检索命中已被取代的工件时自动改投链头或降权，
@@ -750,6 +751,13 @@ Feed 项不是论文事实。解析出 doi/arxiv 后仍要经过 paper add gate 
 
 OPML 不是表：导入时把 `outline[@type=rss]/@xmlUrl` 写成 `feed_sources`。
 
+#### store_events
+
+库自己的审计日志（schema v4，[ADR 0026](adr/store-events-are-the-ingest-audit-log.md)）：ingest 批次、
+feed 轮询、改名、批注的 append-only 记录；字段与索引以那份 ADR 为准，此处不重复。与 `run_events` 的分工：
+`run_events` 记录**被接受的工作**（Run）的过程，`store_events` 记录**库自己做的事**——index / rename /
+annotate / typeahead 都不是 Run。归档走 `VACUUM INTO`，永不 `DELETE`（D30）。
+
 ### 8.2 Derived data
 
 可删除后重建：
@@ -759,9 +767,60 @@ tantivy index directory
 embeddings
 bm42 / splade indexes
 graph_links
+
+
 graph_layout
 usage_projections
 ```
+
+#### `graph_links` (derived, W2.4)
+
+| column | notes |
+|---|---|
+| `from_source_key` | the note the link is written in |
+| `to_source_key` | `NULL` for a **dangling** link — a first-class row, not a discard |
+| `raw_target` | the target exactly as written, kept so a later resolve can backfill |
+| `edge_kind` | how the edge was expressed |
+| `link_source` | which syntax produced it |
+| `anchor_kind` | what the anchor points at, when the link has one |
+| `anchor_raw` | the anchor as written |
+| `created_at` | the `ingested_at` of the source revision whose content carries the link — a rebuilt row reproduces it byte for byte (ADR 0027) |
+
+Columns and their order come from D41's build matrix. The vocabularies closed
+with W2.4 — each is an enum in `momotaro-contracts` (`ALL`, wire spellings,
+witnesses), and each sentence below is the variant's definition:
+
+| `edge_kind` | meaning |
+|---|---|
+| `link` | an ordinary link written in text: a wikilink, a markdown link, or a frontmatter link |
+| `embed` | an inclusion (`![[…]]`, `![](…)`) — stronger than a plain link, singled out so retrieval can weight it differently |
+| `canvas_card` | a JSON Canvas `file` node naming a file (producer ships with canvas edge building) |
+| `canvas_edge` | a JSON Canvas `edges` arrow resolved from its endpoint nodes to files (same batch as `canvas_card`) |
+
+| `link_source` | meaning |
+|---|---|
+| `wikilink` | produced by `[[…]]` syntax |
+| `markdown` | produced by `[…](…)` syntax |
+| `embed` | produced by `![[…]]` syntax |
+| `canvas` | produced by canvas structure (a file node or an arrow) |
+| `frontmatter` | written inside frontmatter — singled out there even when the syntax is a wikilink |
+
+| `anchor_kind` | meaning |
+|---|---|
+| `heading` | a `#heading` anchor, including multi-level `#H1#H2` |
+| `block` | a `#^id` block anchor |
+| *(NULL)* | no anchor, or a fragment that is not an anchor (e.g. a PDF page parameter) |
+
+A frontmatter link is `edge_kind='link'` + `link_source='frontmatter'`:
+frontmatter is singled out on the `link_source` axis, an embed on the
+`edge_kind` axis. Row identity is the as-written six-tuple
+`(from_source_key, raw_target, edge_kind, link_source, anchor_kind, anchor_raw)`;
+`to_source_key` is a resolution product, never identity. The table is an
+idempotent projection — one row per identity, replaced wholesale per
+`from_source_key` in the same transaction as the file's chunks (ADR 0027). The
+row is derived: `rm graph_links`, re-run ingest, and a rebuild reproduces it row
+for row — which is what the W2.4 acceptance check runs.
+
 
 MVP 只实现 Tantivy BM25。中文用 CJK tokenizer，不要把 SQLite FTS5 当主引擎。SQLite 留下做关系事实。
 
@@ -874,9 +933,10 @@ final_score = bm25_score × class_weight
 `class_weight` 是乘性因子（Q4 裁决；owner ×2.0 / paper ×1.0 / web ×0.6）。
 **加性公式（`bm25 + weight`）已被否决**：同一个常数在不同查询上改变排名的幅度
 不同（一次项查询值 +48.7%，六次项只值 +8.1%），乘法因子才是"同一个类在任何
-查询下都按同一比例缩放"。（两个百分比出自
-`research/2026-09-16-六问决策复核/agents/01-boost实现口径-引擎与文献.md` §3.1 的
-**示意模型**——k1=1.2、b=0.75、N=1000、avgdl=100 的自算 BM25，不是本仓基准测试。）
+查询下都按同一比例缩放"。（两个百分比来自本仓外做过的一次**示意模型**演算：
+k1=1.2、b=0.75、N=1000、avgdl=100 的自算 BM25，**不是本仓的基准测试**。它们
+要说明的是量纲——同一个加性常数在不同查询上的相对幅度不同，而乘法因子恒为
+同一比例。）
 recency 与 link 两项**后置**（v0.5+；link 见 D22，recency 尚无对应决策项）：进入
 时同为乘性因子（`link_score` 写作 `×(1+δ)`），不回到加性。
 
@@ -1114,7 +1174,7 @@ cargo test --workspace
 
 `index` / lexical `search` / Tantivy。重建索引不丢 canonical 数据。1,000 个 Markdown 可完成。
 
-一致性协议从第一行代码做对（D40–D42）：事件=hint、重扫走 stat 双验 + racy 内容校验 + 单事务边界、对账四触发；source_key = NFC 规范化（P0 级主键）；wikilink 基础建边（D22/D41）。
+已做：`source_key` NFC 身份键、vault ⊆ workspace、origin 乘性权重、`store_events` 审计日志、`doctor --coverage`、wikilink 全形态建边入 derived `graph_links`（dangling/歧义/锚点校验齐，五类降级码生产者；行身份与重建见 [ADR 0027](adr/graph-links-rows-are-a-rebuilt-projection.md)）、**watcher + 对账四触发**（`notify` 8.2 + debouncer、事件一律归并为重扫、racy 强制内容校验、四触发写 `vault.reconcile.*`，细则见 [摄取安全与 Vault 互操作](ingest-interop.md) §4）。本波剩余：D42 的碰撞消歧后缀策略（两条目都保留 + 消歧后缀 + 事件，ADR 0002 与 ADR 0026 都指向它）、平台测试矩阵、D24 的多链头暴露。D40 的「单文件 = 恰好一个事务」已由 store 的 `commit_source_file` 交付（revision + chunks + 边 + 事件同事务，口径见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md)），watcher 是它带事件入事务的调用方。
 
 ### v0.3 可追溯问答
 
@@ -1132,7 +1192,7 @@ PDF 解析按双层策略（2026-09 学术 RAG 调查结论 + D37 安全收紧�
 
 项目 CRUD；来源加入项目；批注钉 revision+locator。删项目不删 source。换版本后旧批注仍打开旧 revision。
 
-零 LLM 治理第一批（2026-09-15 LLM Wiki 调查 P0）：`[[wiki-link]]` 双链确定性解析入 `graph_links`（D22，Link expansion 第一步）；source-coverage 投影（各源被检索/进入上下文/被引用的统计，数据已在 `retrieval_hits`）。建边矩阵全量落地（D41：embed/canvas/frontmatter 链/歧义三级规则/降级十事件）；同步盘预警与平台测试矩阵 11 项进 CI（D42）。
+零 LLM 治理第一批（2026-09-15 LLM Wiki 调查 P0）：`[[wiki-link]]` 双链确定性解析入 `graph_links`（D22，Link expansion 第一步）；source-coverage 投影（各源被检索/进入上下文/被引用的统计，数据已在 `retrieval_hits`）。建边矩阵全量落地（D41：embed/canvas/frontmatter 链/歧义三级规则/降级十事件）；同步盘预警**已落**（D42）；平台测试矩阵 11 项随 W2.6 的 `path_matrix.rs` 进 CI。
 
 ### v0.6 桌面主路径
 
@@ -1298,6 +1358,12 @@ derived 存 `graph_links`；实体图只在 schema 限定（方法/数据集/任
 且检索基线显示多跳需求真实存在后才考虑。PPR 扩展是后置接缝，不是 1.0
 承诺。
 
+2026-09-18 的形式化调查从三条独立路径**加固**本决策，而不是提供新路线：
+无约束 OpenIE 的最强系统在 CaRB（EMNLP 2019）上 P=0.553 / R=0.437；抽取误差
+不能被分量界定（假边在单调演绎下只增结论）；开放世界假设下分不出「假」与
+「漏」。实体图仍只在 schema 限定、且检索基线证明多跳需求真实之后才考虑——
+「加 schema 前后」的对照数字在文献中未找到，故本项目不预埋接缝。
+
 ### D20：缓存是第一等工程约束；上下文常数是待校准参数
 
 （2026-09-15 上下文工程调查，239 项文献）三条公理：上下文是有限资源且边际
@@ -1347,7 +1413,9 @@ Pin 与检索资格分离见 [ADR 0013](adr/pin-without-five-tuple-is-not-indexe
 任何 agent 角色对黑板工件只可追加（新行 + supersedes 指针 + `superseded_at`
 双时间戳），不可 UPDATE/DELETE 他人工件；清理属于人的控制面（Mem0 投毒后
 整体回撤 ADD-only 的一手证据链）。检索命中已被取代的工件时自动改投链头或
-降权。固化/蒸馏产物的信任级显示不得高于其源记录的最低信任档（provenance
+降权；**多链头时无定义**——取唯一代表的读函数不是单调的，所以并列链头必须
+多值暴露（一并返回）并落事件，不许静默选一个（**未实现**：sparks / `supersedes_spark_id`
+尚未落地，本条随 D24 的读函数一起实现）。固化/蒸馏产物的信任级显示不得高于其源记录的最低信任档（provenance
 洗白防御）；pin（人审）授予检索资格，不改变信任构成。会话间只共享**已提交
 工件**（run 串行提交边界内），私有上下文与中间 token 永不入共享层。
 
@@ -1425,7 +1493,10 @@ keyring「不可用/被锁」与「无凭据」显式区分并提示；Windows �
 （快照时间戳命名防网盘冲突副本）；C5 源 Markdown 镜像同步并行留缝（移动端
 从源重建索引的降级实现，不承诺）。CRDT / 双向同步 / 多写者复制正式排除
 （local-first 研究：单编辑者文件同步即工作得很好；单人场景历史膨胀负资产）。
-运行时防御：打开库探测网络挂载并告警；数据目录三分离——源 Markdown（可
+运行时防御：打开库探测网络挂载并告警（**已落**：`doctor` 与 `watch` 启动时
+探测数据目录与 vault 根所在的卷，Windows 上判 `GetDriveTypeW == DRIVE_REMOTE`，
+其余平台报「未知」、只在 Windows 探测，两处共用同一句文案——见
+[摄取安全与 Vault 互操作](ingest-interop.md) §4 第 8 条）；数据目录三分离——源 Markdown（可
 同步）/ 运行时库+索引（禁同步）/ 快照导出（可同步）。移动端口径「小时级
 滞后」。
 
@@ -1515,12 +1586,18 @@ https-only 强制 / per-host 限流 / DNS pinning（单用户桌面威胁模型�
 
 笔记改名 = 新 Source，不改写已落库键（[ADR 0014](adr/note-rename-is-a-new-source.md)）。
 
-watcher = `notify` 8.2.0 稳定线 + `notify-debouncer-full`（Windows 溢出缺口
-由对账兜底，不冒险 RC）；事件永不 trust，全部归并为「重扫该路径」：stat
+watcher = `notify` 8.2.0 稳定线 + `notify-debouncer-full` 0.7（Windows 溢出缺口
+由对账兜底，不冒险 RC），**已落**；**后端起不来才**降级 PollWatcher（构造失败、
+inotify watch 上限、backend I/O 错误），网络盘不在此列。事件永不 trust，全部归并为「重扫该路径」：stat
 双验（racy 强制内容校验，git 同构）→ 读全文双 stat（撕裂重试，绝不落库）→
 sha256 与库比对才重建 chunk。对账四触发（启动全 walk / 每日 / 手动 / watcher
-异常恢复），10k 文件亚秒级。单文件更新 = 恰好一个 SQLite 事务，chunk 内容
-寻址 upsert，canonical 永不污染。网络盘维持探测告警（D31），不做轮询降级
+异常恢复）；一次 no-op 对账 1000 文件 ≈ 0.35 s、10000 文件 ≈ 2.9 s（release、
+参考机实测）。单文件更新 = 恰好一个 SQLite 事务（store 的
+`commit_source_file`：revision + chunks + 边 + 事件同事务），chunk
+内容寻址 upsert，canonical 永不污染；批量 index 的 coverage 行仍在批尾
+sweep（丢窗 = 批尾、对账承接），
+watcher 路径事件入事务、零丢窗——口径见
+[ADR 0026](adr/store-events-are-the-ingest-audit-log.md)。网络盘维持探测告警（D31），不做轮询降级
 实现。细则见 [摄取安全与 Vault 互操作](ingest-interop.md)。
 
 ### D41：vault 语法边界与建边矩阵
@@ -1534,7 +1611,7 @@ wikilink 全形态建边（pulldown-cmark `ENABLE_WIKILINKS`）；dangling 链�
 
 ### D42：source_key = NFC 身份键，键层永不折叠
 
-`source_key = note:<vault-relative NFC path> | arxiv:<id>`；NFC/不折叠/碰撞规则作用于 scheme 之后的 tail。verbatim 前缀与盘符大小写由解析时的 `canonicalize` 决定（既不是键的一部分，也不是我们做的改写）——用户可见处一律渲染存储的 `local_path`，不渲染解析后的路径（[ADR 0002](adr/source-key-is-scheme-prefixed.md) / [ADR 0024](adr/local-path-is-workspace-relative.md)）。大小写原样保留、`/` 分隔；**禁用 NFKC 与 casefold**（Linux 大小写双写合法并存，折叠 = 数据丢失级事故）；`raw_name` 原始字节另存（事件匹配/显示）；查询层大小写折叠另建 fold 索引列。NFC 碰撞（NFC/NFD 双写）：两条目都保留 + 消歧后缀 + 事件，绝不静默合并。同步盘预警：OneDrive placeholder 只建元数据不读内容；Windows 非法名在非 Windows 端照常索引但发预警（会经同步盘毒化 Windows 端）。平台测试矩阵 11 项进 CI。
+`source_key = note:<vault-relative NFC path> | arxiv:<id>`；NFC/不折叠/碰撞规则作用于 scheme 之后的 tail。verbatim 前缀与盘符大小写由解析时的 `canonicalize` 决定（既不是键的一部分，也不是我们做的改写）——用户可见处一律渲染存储的 `local_path`，不渲染解析后的路径（[ADR 0002](adr/source-key-is-scheme-prefixed.md) / [ADR 0024](adr/local-path-is-workspace-relative.md)）。大小写原样保留、`/` 分隔；**禁用 NFKC 与 casefold**（Linux 大小写双写合法并存，折叠 = 数据丢失级事故）；`raw_name` 原始字节另存（事件匹配/显示）；查询层大小写折叠另建 fold 索引列。**「绝不静默合并」作用于身份键**：NFC 碰撞（NFC/NFD 双写）两条目都保留 + 消歧后缀 + 事件，绝不静默合并——唯一性不变量不在并操作下封闭。它不是一条普遍禁令：**内容寻址**的 revision 集、同策略幂等替换的 chunk 集满足 join-semilattice 且不变量在并下封闭，静默并是对的；禁止的是对自由文本、互斥修改、或「取唯一代表」的读函数做静默并。同步盘预警：OneDrive placeholder（`RECALL_ON_DATA_ACCESS` 位）不读内容、不建 revision（行 = `skipped` + `onedrive_placeholder`，下载后下一次 `index` 正常读入）；iCloud 驱逐占位跳过 + `icloud_placeholder`；Windows 非法名照常索引但发 `windows_incompatible_name` 预警（文档规则是 Explorer／工具／同步端的实际约束——`\\?\` 能建这些名字不代表同步过去还能活）。平台测试矩阵 11 项随 W2.6 的 `path_matrix.rs` 进 CI（OneDrive 项只手工一次）。
 
 ### D43：更新管线——动态薄层 + 通道 endpoint 隔离 + 灰度
 

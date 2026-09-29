@@ -5,11 +5,13 @@
 
 use std::path::PathBuf;
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 /// The schema version understood by this build.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 /// A versioned SQLite schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +71,17 @@ pub enum SourceKeyError {
 pub fn note_source_key(vault_relative: &str) -> Result<String, SourceKeyError> {
     let tail = normalize_key_tail(vault_relative)?;
     Ok(format!("{NOTE_SCHEME}{tail}"))
+}
+
+/// NFC-normalizes a string for comparison against key tails (D42).
+///
+/// Comparison follows the key's normalization; folding does not — this is
+/// never case-folded and never NFKC. Readers that match user-typed text (link
+/// targets, anchors) against stored identities normalize both sides through
+/// here and nowhere else.
+#[must_use]
+pub fn nfc_text(value: &str) -> String {
+    value.nfc().collect()
 }
 
 fn normalize_key_tail(raw: &str) -> Result<String, SourceKeyError> {
@@ -137,6 +150,15 @@ pub struct HealthReport {
     pub sqlite: Option<SqliteFacts>,
     /// User-facing explanation for non-ready states.
     pub message: Option<String>,
+    /// Whether a volume this workspace lives on is a network mount.
+    ///
+    /// `None` is "nothing could be read", which is not `false` — a reader that
+    /// collapsed the two would stop warning on exactly the machines the
+    /// warning exists for. `Some(false)` means the volumes were read and are
+    /// local. Set by the surfaces that know the workspace (D31 / D40 §4.8);
+    /// the store itself has no workspace context and reports `None`.
+    #[serde(default)]
+    pub network_volume: Option<bool>,
 }
 
 /// Facts about the SQLite engine this build links, surfaced by `doctor`.
@@ -213,9 +235,18 @@ pub enum SourceKind {
     Paper,
     /// Web page captures.
     Web,
+    /// A vault file that is registered rather than indexed: images, audio,
+    /// video, PDFs and anything else the whitelist does not read. It is a
+    /// source (it has a key and a revision) with no chunks — `docs/docs/
+    /// ingest-interop.md` §5 第 10 条 says which files these are, and why the
+    /// index never pretends its bytes are searchable.
+    Attachment,
 }
 
 impl SourceKind {
+    /// Every kind, for readers and tests that must not miss a new one.
+    pub const ALL: [Self; 4] = [Self::Note, Self::Paper, Self::Web, Self::Attachment];
+
     /// The wire spelling, as stored in SQLite.
     ///
     /// One source of truth for the column value; `serde`'s `snake_case` renaming
@@ -225,6 +256,7 @@ impl SourceKind {
             Self::Note => "note",
             Self::Paper => "paper",
             Self::Web => "web",
+            Self::Attachment => "attachment",
         }
     }
 }
@@ -242,6 +274,7 @@ impl std::str::FromStr for SourceKind {
             "note" => Ok(Self::Note),
             "paper" => Ok(Self::Paper),
             "web" => Ok(Self::Web),
+            "attachment" => Ok(Self::Attachment),
             other => Err(UnknownSourceKind(other.to_owned())),
         }
     }
@@ -437,7 +470,9 @@ impl Default for IndexPolicy {
 pub enum IndexFileErrorKind {
     /// Two distinct files in one batch derived the same source key.
     KeyCollision,
-    /// The file name is not valid UTF-8.
+    /// A string that must be UTF-8 is not: a file name, a path component, or a
+    /// file's bytes. This arrived as "not a valid file name"; the index run also
+    /// reports it for content, so the narrower wording was wrong.
     InvalidUtf8,
     /// The path is not a name inside the vault root. Covers the wider
     /// workspace case too: since ADR 0024 every stored path is
@@ -446,7 +481,13 @@ pub enum IndexFileErrorKind {
     OutsideVault,
     /// The derived source key violated the key contract.
     InvalidSourceKey,
-    /// Anything else: IO, store, chunking.
+    /// Reading the file failed (IO).
+    Io,
+    /// Writing or reading the canonical store failed.
+    Store,
+    /// The search index refused the document.
+    Index,
+    /// Anything else.
     Other,
 }
 
@@ -457,6 +498,9 @@ impl std::fmt::Display for IndexFileErrorKind {
             Self::InvalidUtf8 => "invalid_utf8",
             Self::OutsideVault => "outside_vault",
             Self::InvalidSourceKey => "invalid_source_key",
+            Self::Io => "io",
+            Self::Store => "store",
+            Self::Index => "index",
             Self::Other => "other",
         };
         formatter.write_str(text)
@@ -474,12 +518,447 @@ pub struct IndexFileError {
     pub message: String,
 }
 
+/// What a file lost on the way into the index (D41).
+///
+/// These ride on **`indexed`** rows: the file *was* indexed, so the outcome stays
+/// `indexed` and this code says what it lost. All ten of D41's are here; the
+/// Every one of the ten has a producer as of W2.4 (§5 第 5–10 条); what each
+/// code means is its own variant's sentence.
+/// Having them typed is what keeps
+/// `degradation_message` exhaustive and stops a sentence from claiming to be about
+/// the wrong code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Degradation {
+    /// The frontmatter block could not be read (D41.5); the body was indexed.
+    FrontmatterParseError,
+    /// A `[[wikilink]]` points at a note that is not in the vault (D41.1).
+    UnresolvedWikilink,
+    /// A `[[wikilink]]` matches more than one note, so no edge is built (D41.2).
+    AmbiguousWikilink,
+    /// A `#heading` anchor does not exist in the target (D41.3); the edge is kept.
+    StaleAnchor,
+    /// A markdown link's target could not be percent-decoded (D41.4).
+    MarkdownLinkDecodeError,
+    /// A private link syntax this build does not know (D41.6), e.g. Dendron's.
+    UnknownLinkSyntax,
+    /// A `.canvas` block that is not readable as JSON (D41.8); the file keeps its
+    /// bytes and still gets indexed.
+    CanvasParseError,
+    /// A note that is an Excalidraw drawing (D41.7): the compressed scene stays
+    /// out of the index while the note's other sections are indexed normally.
+    ExcalidrawDetected,
+    /// A symlink under the vault (D41.9). The first version does not follow them,
+    /// so the link is recorded rather than read.
+    SymlinkEncountered,
+    /// A file that is registered rather than indexed (D41.10): images, audio,
+    /// video and PDFs get a revision with no chunks, so the vault's coverage is
+    /// answerable even though their bytes are not searchable.
+    AttachmentUnindexed,
+}
+
+impl Degradation {
+    /// Every code, in the order a file's degradations are reported and counted.
+    ///
+    /// One list, iterated by `from_code` and by the tests. `the_variant_list_is_
+    /// complete` matches every variant without a wildcard, so a code cannot be
+    /// added to `as_str` alone — which was the hole: the writer knew a
+    /// code the reader's array did not, and the row's code was dropped silently.
+    pub const ALL: [Self; 10] = [
+        Self::FrontmatterParseError,
+        Self::UnresolvedWikilink,
+        Self::AmbiguousWikilink,
+        Self::StaleAnchor,
+        Self::MarkdownLinkDecodeError,
+        Self::UnknownLinkSyntax,
+        Self::CanvasParseError,
+        Self::ExcalidrawDetected,
+        Self::SymlinkEncountered,
+        Self::AttachmentUnindexed,
+    ];
+    /// The wire spelling written to `store_events.reason_code`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FrontmatterParseError => "frontmatter_parse_error",
+            Self::UnresolvedWikilink => "unresolved_wikilink",
+            Self::AmbiguousWikilink => "ambiguous_wikilink",
+            Self::StaleAnchor => "stale_anchor",
+            Self::MarkdownLinkDecodeError => "markdown_link_decode_error",
+            Self::UnknownLinkSyntax => "unknown_link_syntax",
+            Self::CanvasParseError => "canvas_parse_error",
+            Self::ExcalidrawDetected => "excalidraw_detected",
+            Self::SymlinkEncountered => "symlink_encountered",
+            Self::AttachmentUnindexed => "attachment_unindexed",
+        }
+    }
+
+    /// The code back as a variant, for the readers of stored rows.
+    ///
+    /// `None` is a row written by a version that knows a code this one does not;
+    /// the caller decides whether that is worth saying, and [`Self::as_str`] is the
+    /// only writer, so the two cannot drift apart silently.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == code)
+    }
+}
+
+/// What will not survive another platform, though nothing was lost here (D42).
+///
+/// A warning is not a [`Degradation`]: the ten degradations say what a file
+/// lost on the way into the index, while a warning is a standing fact about
+/// the file — a cloud placeholder whose bytes are not on this device, an iCloud
+/// eviction stub in a note's place, a name Windows' own naming rules reserve.
+/// Nothing was lost by the file, the ten stay ten, and a reader that
+/// counts degradations is not taught a fourth kind of loss. The two
+/// vocabularies share the `reason_code` column and a row's `data_json`; a
+/// reader must consult both before calling a code unknown (ADR 0026, "A
+/// warning is not a degradation").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Warning {
+    /// A cloud placeholder (`FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`): its bytes
+    /// are not on this device, so it was not read (D42).
+    ///
+    /// The explicit rename is load-bearing: `snake_case` alone would split the
+    /// product name into `one_drive_placeholder`, and the witness test pins the
+    /// two spellings together.
+    #[serde(rename = "onedrive_placeholder")]
+    OneDrivePlaceholder,
+    /// An iCloud eviction stub (`.name.icloud`): the note it stands for is not
+    /// here; the stub itself is skipped and never read (D42).
+    IcloudPlaceholder,
+    /// A name Windows' own naming rules reserve (reserved device name, reserved
+    /// character, trailing dot or space): indexed here, refused or mangled by
+    /// the tools and sync clients that follow the rules (D42).
+    WindowsIncompatibleName,
+    /// The path a watcher just reported no longer holds a file (D40 §4.2's
+    /// delete half, and a real deletion).
+    ///
+    /// Nothing is written for the *file* — keys in history are never
+    /// rewritten (ADR 0014: a rename is delete+create and no stored
+    /// `source_key` is ever updated) and the store keeps the old revision as
+    /// history — so the row is the whole record of the decision. It rides
+    /// `outcome = skipped` because that is what the four outcome values already
+    /// mean: the file was not indexed, and here is why.
+    ///
+    /// Every full walk finds this, not only the watcher: a rename's source
+    /// key is just as absent from the walk as a deleted file's, and
+    /// `source_moved` is what tells them apart. The projections converge in
+    /// the *same* batch — `graph_links` by the prune, the search index by
+    /// dropping that source's documents — because a document left behind would
+    /// keep answering for a file that is gone, and that is a lie a user can
+    /// see.
+    SourceRemoved,
+}
+
+impl Warning {
+    /// Every warning, in the order a row's warnings are reported and counted
+    /// — the declaration order, which is what `Ord` gives the row writer's
+    /// sort and the report's map.
+    ///
+    /// One list, iterated by `from_code` and by the tests:
+    /// `the_warning_list_is_complete` matches every variant without a
+    /// wildcard, so a code cannot be added to `as_str` alone, and
+    /// `the_warning_list_is_in_the_order_rows_are_counted` keeps this array
+    /// and the declaration order agreeing.
+    pub const ALL: [Self; 4] = [
+        Self::OneDrivePlaceholder,
+        Self::IcloudPlaceholder,
+        Self::WindowsIncompatibleName,
+        Self::SourceRemoved,
+    ];
+
+    /// The wire spelling written to `store_events.reason_code` and to the
+    /// row's `warnings` payload.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OneDrivePlaceholder => "onedrive_placeholder",
+            Self::IcloudPlaceholder => "icloud_placeholder",
+            Self::WindowsIncompatibleName => "windows_incompatible_name",
+            Self::SourceRemoved => "source_removed",
+        }
+    }
+
+    /// The code back as a variant, for the readers of stored rows.
+    ///
+    /// `None` is a code from a vocabulary this build does not know (or one from
+    /// the other vocabulary); the caller decides, and [`Self::as_str`] is the
+    /// only writer, so the two cannot drift apart silently.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == code)
+    }
+}
+
+/// How a `graph_links` edge was expressed (architecture §8.2, ADR 0027).
+///
+/// The vocabulary closed with W2.4. `canvas_card` / `canvas_edge` have no
+/// producer yet — canvas edge building is its own task (§5 第 2 条) — and are
+/// typed now so the vocabulary closes instead of drifting when that task
+/// lands. A frontmatter link is [`Self::Link`] + [`LinkSource::Frontmatter`]:
+/// frontmatter is singled out on the `link_source` axis, an embed on this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeKind {
+    /// An ordinary link written in text: a wikilink, a markdown link, or a
+    /// frontmatter link.
+    Link,
+    /// An inclusion (`![[…]]`, `![](…)`): stronger than a plain link, singled
+    /// out so retrieval can weight it differently.
+    Embed,
+    /// A JSON Canvas `file` node naming a file (producer pending).
+    CanvasCard,
+    /// A JSON Canvas `edges` arrow resolved from its endpoint nodes to files
+    /// (producer pending).
+    CanvasEdge,
+}
+
+impl EdgeKind {
+    /// Every kind, in the order rows are sorted and counted.
+    ///
+    /// One list, iterated by [`Self::from_code`] and by the tests:
+    /// `the_edge_kind_list_is_complete` matches every variant without a
+    /// wildcard, so a kind cannot be added to `as_str` alone.
+    pub const ALL: [Self; 4] = [Self::Link, Self::Embed, Self::CanvasCard, Self::CanvasEdge];
+
+    /// The wire spelling, as stored in `graph_links.edge_kind`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Link => "link",
+            Self::Embed => "embed",
+            Self::CanvasCard => "canvas_card",
+            Self::CanvasEdge => "canvas_edge",
+        }
+    }
+
+    /// The spelling back as a variant, for readers of stored rows.
+    ///
+    /// `None` is a spelling written by a build that knows a kind this one does
+    /// not; [`Self::as_str`] is the only writer, so the two cannot drift apart
+    /// silently.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == code)
+    }
+}
+
+/// Which syntax produced a `graph_links` edge (architecture §8.2, ADR 0027).
+///
+/// "Which syntax produced it" with one carve-out the build matrix fixes:
+/// a link written inside frontmatter is [`Self::Frontmatter`] even when its
+/// syntax is a wikilink. `canvas` waits for its producers like
+/// [`EdgeKind::CanvasCard`] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkSource {
+    /// Produced by `[[…]]` syntax in a note body.
+    Wikilink,
+    /// Produced by `[…](…)` syntax.
+    Markdown,
+    /// Produced by `![[…]]` syntax.
+    Embed,
+    /// Produced by canvas structure (a file node or an arrow; producer pending).
+    Canvas,
+    /// Written inside frontmatter — singled out there even when the syntax is a
+    /// wikilink (§5 第 2 条).
+    Frontmatter,
+}
+
+impl LinkSource {
+    /// Every source, in the order rows are sorted and counted.
+    pub const ALL: [Self; 5] = [
+        Self::Wikilink,
+        Self::Markdown,
+        Self::Embed,
+        Self::Canvas,
+        Self::Frontmatter,
+    ];
+
+    /// The wire spelling, as stored in `graph_links.link_source`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Wikilink => "wikilink",
+            Self::Markdown => "markdown",
+            Self::Embed => "embed",
+            Self::Canvas => "canvas",
+            Self::Frontmatter => "frontmatter",
+        }
+    }
+
+    /// The spelling back as a variant, for readers of stored rows.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == code)
+    }
+}
+
+/// What a link's anchor points at, when it has one (architecture §8.2).
+///
+/// The whole vocabulary: `heading` (`#H1#H2` multi-level included) and `block`
+/// (`#^id`). A NULL on the row means no anchor — or a fragment that is not an
+/// anchor, like a PDF page parameter (§5 第 4 条: attachment targets are never
+/// anchor-parsed). `span` is not an anchor kind: it is the chunk's own
+/// line-interval locator (`Chunk::locator_json`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorKind {
+    /// A `#heading` text anchor, matched by level text (§5 第 4 条).
+    Heading,
+    /// A `#^id` block anchor; the id charset is `[A-Za-z0-9-]+`.
+    Block,
+}
+
+impl AnchorKind {
+    /// Every kind, in the order rows are sorted and counted.
+    pub const ALL: [Self; 2] = [Self::Heading, Self::Block];
+
+    /// The wire spelling, as stored in `graph_links.anchor_kind`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Heading => "heading",
+            Self::Block => "block",
+        }
+    }
+
+    /// The spelling back as a variant, for readers of stored rows.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == code)
+    }
+}
+
+/// One `graph_links` row: an as-written link edge (architecture §8.2, ADR 0027).
+///
+/// Identity is the as-written six-tuple; `to_source_key` is a resolution
+/// product and `created_at` is the `ingested_at` of the revision whose content
+/// carries the link, so a rebuild reproduces every row byte for byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphLink {
+    /// The note (or canvas) the link is written in.
+    pub from_source_key: String,
+    /// The resolved target, or `None` for a dangling link — a first-class row.
+    pub to_source_key: Option<String>,
+    /// The target exactly as written.
+    pub raw_target: String,
+    /// How the edge was expressed.
+    pub edge_kind: EdgeKind,
+    /// Which syntax produced it.
+    pub link_source: LinkSource,
+    /// What the anchor points at; `None` when the link has no anchor.
+    pub anchor_kind: Option<AnchorKind>,
+    /// The anchor exactly as written; `None` when the link has none. It can
+    /// outlive `anchor_kind`: an attachment's page fragment is kept raw while
+    /// the kind is NULL (`§5 第 4 条`).
+    pub anchor_raw: Option<String>,
+    /// The `ingested_at` of the revision whose content carries the link.
+    pub created_at: i64,
+}
+
+/// How the rows carrying one code were handled.
+///
+/// Two axes, because that is what the log holds: an `indexed`/`metadata_refreshed`
+/// row is in the index anyway, a `skipped` row was not read (a link is not
+/// followed; an unchanged attachment is not read again; an eviction stub or a
+/// cloud placeholder is not read at all), and both can carry the same code —
+/// whether it is a [`Degradation`] or a [`Warning`], which is why this type
+/// carries no vocabulary of its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageCounts {
+    /// Rows that went into the index anyway.
+    pub in_index: u64,
+    /// Rows nothing was read for.
+    pub skipped: u64,
+}
+
+impl CoverageCounts {
+    /// Both axes, for a reader that only wants the total.
+    #[must_use]
+    pub fn total(self) -> u64 {
+        self.in_index + self.skipped
+    }
+}
+
+/// What the most recent ingest batch did, read back out of `store_events`
+/// (ADR 0026). `None` comes back from `momotaro_run::coverage_report` when no
+/// batch was ever recorded — never because one failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageReport {
+    /// The batch these counts describe.
+    pub batch_id: String,
+    /// Rows that wrote a revision and its chunks.
+    pub indexed: u64,
+    /// Rows nothing was read for: the file was unchanged, a link was not
+    /// followed, or a stub or placeholder was not read. The row's code says
+    /// which.
+    pub skipped: u64,
+    /// Rows whose file only moved or was re-spelled.
+    pub refreshed: u64,
+    /// What the rows carrying a code lost on the way in, counted per code **and per
+    /// row state** (D41).
+    ///
+    /// The state is the row's, never the code's: the same code rides rows that are in
+    /// the index anyway and rows nothing was read for (`symlink_encountered` on a
+    /// `skipped` link, `attachment_unindexed` on an attachment that was not read
+    /// again), and a summary that guessed from the code contradicted its own counts.
+    /// Without this, a note whose block could not be read is indistinguishable from a
+    /// clean one in this report: the row says `indexed` and the code was only in the
+    /// event table.
+    pub degradations: BTreeMap<Degradation, CoverageCounts>,
+    /// What the rows carrying a warning said (D42), counted like [`Self::degradations`].
+    ///
+    /// A warning is not a loss: the file is in the index, or was skipped, and the
+    /// code says what will not survive another platform — a name no ordinary
+    /// Windows machine accepts, a placeholder whose bytes are not here, an
+    /// eviction stub where a note used to be. Same two axes, same rule: the
+    /// state is the row's, never the code's.
+    pub warnings: BTreeMap<Warning, CoverageCounts>,
+    /// Rows that failed, in the batch's own order (`seq`, not `id`).
+    pub failures: Vec<CoverageFailure>,
+    /// Every row in the batch, including its beginning and its end.
+    pub events: u64,
+    /// Whether the batch reached `ingest.finished`.
+    pub finished: bool,
+}
+
+/// One file a batch could not ingest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageFailure {
+    /// The source the row is about, when it has one.
+    pub source_key: Option<String>,
+    /// The stable code (`key_collision`, `outside_vault`, …).
+    pub reason_code: Option<String>,
+    /// The detail the row carried.
+    pub message: Option<String>,
+}
+
 /// Aggregate outcome of one `momotaro index` invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexReport {
-    /// Markdown files discovered under the vault root.
+    /// Identifier of this indexing batch, as written to `store_events`
+    /// (ADR 0026): one `index` run, one batch.
+    pub batch_id: String,
+    /// Files the vault walk kept — notes, canvases, attachments, links and
+    /// eviction stubs alike, since all of them get rows (§5 第 10 条).
     pub files_scanned: u64,
-    /// Files skipped because the fingerprint was unchanged.
+    /// Files nothing was read for: the fingerprint was unchanged, the walk saw a
+    /// link it does not follow, or the file is an eviction stub or a cloud
+    /// placeholder. All are skips, and the row's code says which.
     pub files_skipped: u64,
     /// Files that produced a new revision or refresh.
     pub files_indexed: u64,
@@ -544,6 +1023,315 @@ mod tests {
         let encoded =
             serde_json::to_string(&WorkspaceStatus::Uninitialized).expect("encode status");
         assert_eq!(encoded, r#""uninitialized""#);
+    }
+
+    #[test]
+    fn the_variant_list_is_complete() {
+        // No wildcard in this match: adding a seventh variant fails to compile
+        // here, and the count assertion then forces it into `ALL`.
+        for code in Degradation::ALL {
+            match code {
+                Degradation::FrontmatterParseError => {}
+                Degradation::UnresolvedWikilink => {}
+                Degradation::AmbiguousWikilink => {}
+                Degradation::StaleAnchor => {}
+                Degradation::MarkdownLinkDecodeError => {}
+                Degradation::UnknownLinkSyntax => {}
+                Degradation::CanvasParseError => {}
+                Degradation::ExcalidrawDetected => {}
+                Degradation::SymlinkEncountered => {}
+                Degradation::AttachmentUnindexed => {}
+            }
+        }
+        assert_eq!(Degradation::ALL.len(), 10, "extend ALL, not just as_str");
+    }
+
+    #[test]
+    fn a_degradation_code_parses_back_to_its_variant() {
+        // `from_code` is how a reader turns a stored row back into a code; the
+        // spelling is the only contract, so it is the only thing to check.
+        for code in Degradation::ALL {
+            assert_eq!(Degradation::from_code(code.as_str()), Some(code));
+        }
+        assert_eq!(
+            Degradation::from_code("a_code_from_the_future"),
+            None,
+            "an unknown code is none of our business, not a panic"
+        );
+    }
+
+    #[test]
+    fn every_degradation_spells_the_same_on_the_wire() {
+        // Same rule as the failure kinds above, same caveat: the list is written by
+        // hand, so a seventh code means adding it here as well.
+        for code in Degradation::ALL {
+            assert_eq!(
+                serde_json::to_string(&code).expect("serialize"),
+                format!("\"{}\"", code.as_str()),
+                "{code:?} spells differently in JSON and in Display (as_str)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_warning_list_is_complete() {
+        // Same rule as the degradation list above: no wildcard here, so a fifth
+        // warning fails to compile, and the count then forces it into `ALL`.
+        for warning in Warning::ALL {
+            match warning {
+                Warning::OneDrivePlaceholder => {}
+                Warning::IcloudPlaceholder => {}
+                Warning::WindowsIncompatibleName => {}
+                Warning::SourceRemoved => {}
+            }
+        }
+        assert_eq!(Warning::ALL.len(), 4, "extend ALL, not just as_str");
+    }
+
+    #[test]
+    fn a_warning_code_parses_back_to_its_variant() {
+        for warning in Warning::ALL {
+            assert_eq!(Warning::from_code(warning.as_str()), Some(warning));
+        }
+        assert_eq!(
+            Warning::from_code("a_code_from_the_future"),
+            None,
+            "an unknown code is none of our business, not a panic"
+        );
+        assert_eq!(
+            Warning::from_code("frontmatter_parse_error"),
+            None,
+            "the vocabularies are separate: a degradation is not a warning"
+        );
+    }
+
+    #[test]
+    fn every_warning_spells_the_same_on_the_wire() {
+        for warning in Warning::ALL {
+            assert_eq!(
+                serde_json::to_string(&warning).expect("serialize"),
+                format!("\"{}\"", warning.as_str()),
+                "{warning:?} spells differently in JSON and in Display (as_str)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_warning_list_is_in_the_order_rows_are_counted() {
+        // `ALL` claims to be "the order a row's warnings are reported and
+        // counted", and the row writer's `sort_unstable` and the report's
+        // `BTreeMap` both read the *declaration* order through `Ord`. Reorder
+        // one side alone and a two-warning row's primary code and payload list
+        // flip silently — `a|b.md.icloud` is exactly such a row.
+        let mut sorted = Warning::ALL;
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            Warning::ALL,
+            "reorder the enum and `ALL` together, or a row's order changes"
+        );
+    }
+
+    #[test]
+    fn the_edge_kind_list_is_complete() {
+        // No wildcard here, so a fifth kind fails to compile, and the count then
+        // forces it into `ALL` (the hole `the_variant_list_is_complete` was
+        // written for: a writer knowing a code the reader's array did not).
+        for kind in EdgeKind::ALL {
+            match kind {
+                EdgeKind::Link => {}
+                EdgeKind::Embed => {}
+                EdgeKind::CanvasCard => {}
+                EdgeKind::CanvasEdge => {}
+            }
+        }
+        assert_eq!(EdgeKind::ALL.len(), 4, "extend ALL, not just as_str");
+    }
+
+    #[test]
+    fn an_edge_kind_code_parses_back_to_its_variant() {
+        for kind in EdgeKind::ALL {
+            assert_eq!(EdgeKind::from_code(kind.as_str()), Some(kind));
+        }
+        assert_eq!(
+            EdgeKind::from_code("a_kind_from_the_future"),
+            None,
+            "an unknown spelling is none of our business, not a panic"
+        );
+        assert_eq!(
+            EdgeKind::from_code("wikilink"),
+            None,
+            "the vocabularies are separate: a link_source is not an edge_kind"
+        );
+    }
+
+    #[test]
+    fn every_edge_kind_spells_the_same_on_the_wire() {
+        for kind in EdgeKind::ALL {
+            assert_eq!(
+                serde_json::to_string(&kind).expect("serialize"),
+                format!("\"{}\"", kind.as_str()),
+                "{kind:?} spells differently in JSON and in as_str"
+            );
+        }
+    }
+
+    #[test]
+    fn the_edge_kind_list_is_in_declaration_order() {
+        // `Ord` is the declaration order and the row writer's set and sort read
+        // it; reorder one side alone and row order flips silently.
+        let mut sorted = EdgeKind::ALL;
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            EdgeKind::ALL,
+            "reorder the enum and `ALL` together, or the wire order drifts from the contract table"
+        );
+    }
+
+    #[test]
+    fn the_link_source_list_is_complete() {
+        for source in LinkSource::ALL {
+            match source {
+                LinkSource::Wikilink => {}
+                LinkSource::Markdown => {}
+                LinkSource::Embed => {}
+                LinkSource::Canvas => {}
+                LinkSource::Frontmatter => {}
+            }
+        }
+        assert_eq!(LinkSource::ALL.len(), 5, "extend ALL, not just as_str");
+    }
+
+    #[test]
+    fn a_link_source_code_parses_back_to_its_variant() {
+        for source in LinkSource::ALL {
+            assert_eq!(LinkSource::from_code(source.as_str()), Some(source));
+        }
+        assert_eq!(
+            LinkSource::from_code("a_source_from_the_future"),
+            None,
+            "an unknown spelling is none of our business, not a panic"
+        );
+        assert_eq!(
+            LinkSource::from_code("link"),
+            None,
+            "the vocabularies are separate: an edge_kind is not a link_source"
+        );
+    }
+
+    #[test]
+    fn every_link_source_spells_the_same_on_the_wire() {
+        for source in LinkSource::ALL {
+            assert_eq!(
+                serde_json::to_string(&source).expect("serialize"),
+                format!("\"{}\"", source.as_str()),
+                "{source:?} spells differently in JSON and in as_str"
+            );
+        }
+    }
+
+    #[test]
+    fn the_link_source_list_is_in_declaration_order() {
+        let mut sorted = LinkSource::ALL;
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            LinkSource::ALL,
+            "reorder the enum and `ALL` together, or the wire order drifts from the contract table"
+        );
+    }
+
+    #[test]
+    fn the_anchor_kind_list_is_complete() {
+        for kind in AnchorKind::ALL {
+            match kind {
+                AnchorKind::Heading => {}
+                AnchorKind::Block => {}
+            }
+        }
+        assert_eq!(
+            AnchorKind::ALL.len(),
+            2,
+            "extend ALL, not just as_str — and `span` is a chunk locator, not an anchor"
+        );
+    }
+
+    #[test]
+    fn an_anchor_kind_code_parses_back_to_its_variant() {
+        for kind in AnchorKind::ALL {
+            assert_eq!(AnchorKind::from_code(kind.as_str()), Some(kind));
+        }
+        assert_eq!(
+            AnchorKind::from_code("span"),
+            None,
+            "`span` is the chunk locator's kind, never an anchor kind (§5 第 4 条)"
+        );
+    }
+
+    #[test]
+    fn every_anchor_kind_spells_the_same_on_the_wire() {
+        for kind in AnchorKind::ALL {
+            assert_eq!(
+                serde_json::to_string(&kind).expect("serialize"),
+                format!("\"{}\"", kind.as_str()),
+                "{kind:?} spells differently in JSON and in as_str"
+            );
+        }
+    }
+
+    #[test]
+    fn the_anchor_kind_list_is_in_declaration_order() {
+        let mut sorted = AnchorKind::ALL;
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            AnchorKind::ALL,
+            "reorder the enum and `ALL` together, or the wire order drifts from the contract table"
+        );
+    }
+
+    #[test]
+    fn the_graph_vocabularies_spell_exactly_as_the_contract_table() {
+        // Literals taken from architecture §8.2's three tables — written here
+        // by hand, so a spelling that drifts in `as_str` fails against the
+        // contract text instead of against itself.
+        assert_eq!(
+            EdgeKind::ALL.map(|kind| kind.as_str()),
+            ["link", "embed", "canvas_card", "canvas_edge"]
+        );
+        assert_eq!(
+            LinkSource::ALL.map(|source| source.as_str()),
+            ["wikilink", "markdown", "embed", "canvas", "frontmatter"]
+        );
+        assert_eq!(
+            AnchorKind::ALL.map(|kind| kind.as_str()),
+            ["heading", "block"]
+        );
+    }
+
+    #[test]
+    fn every_failure_kind_spells_the_same_on_the_wire() {
+        // The terminal reads Display, the JSON reads serde; if they drift, "branch
+        // on the kind" silently means two different things. The list below is
+        // hand-written: a review measured that a ninth variant IS NOT forced into
+        // this loop, so adding one means adding it here too.
+        for kind in [
+            IndexFileErrorKind::KeyCollision,
+            IndexFileErrorKind::InvalidUtf8,
+            IndexFileErrorKind::OutsideVault,
+            IndexFileErrorKind::InvalidSourceKey,
+            IndexFileErrorKind::Io,
+            IndexFileErrorKind::Store,
+            IndexFileErrorKind::Index,
+            IndexFileErrorKind::Other,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&kind).expect("serialize"),
+                format!("\"{kind}\""),
+                "{kind:?} spells differently in JSON and in Display"
+            );
+        }
     }
 
     #[test]
@@ -665,10 +1453,25 @@ mod tests {
     // --- source-key contract (ADR 0002 / D42) ---
 
     #[test]
+    fn every_source_kind_is_in_all() {
+        // A no-wildcard match, the same guard `Degradation` has: a new kind cannot be
+        // added to `as_str` alone, and the list cannot quietly lose one either.
+        for kind in SourceKind::ALL {
+            match kind {
+                SourceKind::Note | SourceKind::Paper | SourceKind::Web | SourceKind::Attachment => {
+                }
+            }
+        }
+        assert_eq!(SourceKind::ALL.len(), 4, "extend ALL, not just as_str");
+    }
+
+    #[test]
     fn the_kind_spelling_matches_serde() {
         // The column value, the JSON form and `FromStr` are one spelling; the
         // store decodes through `FromStr` and writes through `as_str`.
-        for kind in [SourceKind::Note, SourceKind::Paper, SourceKind::Web] {
+        // Iterates `ALL`, so a new kind cannot be added to `as_str` alone: the same
+        // guard `Degradation` has, for the same hole.
+        for kind in SourceKind::ALL {
             assert_eq!(kind.as_str().parse::<SourceKind>(), Ok(kind));
             assert_eq!(
                 serde_json::to_string(&kind).expect("serialize"),
@@ -741,26 +1544,6 @@ mod tests {
             note_source_key("a\0b.md"),
             Err(SourceKeyError::Nul)
         ));
-    }
-
-    #[test]
-    fn index_error_kind_display_matches_serde() {
-        // The terminal reads Display, the JSON reads serde; if they drift,
-        // "branch on the kind" silently means two different things.
-        for kind in [
-            IndexFileErrorKind::KeyCollision,
-            IndexFileErrorKind::InvalidUtf8,
-            IndexFileErrorKind::OutsideVault,
-            IndexFileErrorKind::InvalidSourceKey,
-            IndexFileErrorKind::Other,
-        ] {
-            let json = serde_json::to_value(kind).expect("serialize kind");
-            assert_eq!(
-                kind.to_string(),
-                json.as_str().expect("kind serializes to a string"),
-                "Display and serde must agree for {kind:?}"
-            );
-        }
     }
 
     #[test]

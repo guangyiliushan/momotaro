@@ -47,6 +47,13 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Doc
+        # rustdoc is part of the public API; `-D warnings` catches broken
+        # intra-doc links and links to private items that every other gate
+        # ignores.
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
       - name: Test
         shell: bash
         run: |
@@ -61,6 +68,22 @@ jobs:
             export RUST_TEST_THREADS=1
           fi
           cargo test --workspace --locked
+      - name: Path matrix (named target)
+        # W2.6 matrix home: re-runs the target by name on both legs (the
+        # workspace run above already covers the auto tier; this step exists so
+        # the matrix is one named, toggleable thing — not because a second run
+        # adds safety). F6: never widen it to `--ignored` — the manual tier
+        # panics without its env vars (red on windows for reasons no change
+        # caused; ignored counts are platform-skewed 6/1 as of this change and
+        # are not an invariant). Manual runs are local and by name; the recipe
+        # lives in the path_matrix.rs header.
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            export RUST_TEST_THREADS=1
+          fi
+          cargo test -p momotaro-ingest --test path_matrix --locked
 
   deny:
     # Supply chain: licenses, advisories, yanks, sources. A policy file nobody

@@ -7,9 +7,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use momotaro_run::{
-    RunError, SearchOutput, doctor, format_error, format_health, format_index_error,
-    format_index_summary, format_rebuild, format_search_excerpt, format_search_hit,
-    index_workspace, init_workspace, is_healthy, rebuild_index, search_workspace, stats,
+    RunError, SearchOutput, WatchLine, coverage_report, doctor, format_coverage, format_error,
+    format_health, format_index_error, format_index_summary, format_rebuild, format_reconcile,
+    format_search_excerpt, format_search_hit, format_watch_line, index_workspace, init_workspace,
+    is_healthy, is_uninitialized, rebuild_index, reconcile, search_workspace, stats, watch,
 };
 
 /// A personal knowledge engine for serious learners.
@@ -38,14 +39,23 @@ enum Command {
     Init,
 
     /// Check workspace health without mutating it.
-    Doctor,
+    /// Check the workspace, or read the last ingest batch back
+    /// (`--coverage`, ADR 0026).
+    Doctor {
+        /// Report what the most recent ingest run (`index` or `watch`) did to
+        /// each file, read from
+        /// the audit log, instead of checking workspace health.
+        #[arg(long)]
+        coverage: bool,
+    },
 
     /// Print current local store stats.
     Stats,
 
     /// Index Markdown notes into the local store and search index.
     Index {
-        /// Optional vault path override (defaults to momotaro.toml [vault].path).
+        /// Optional vault path override (defaults to `[vault].path` in
+        /// `momotaro.toml`).
         path: Option<PathBuf>,
     },
 
@@ -61,6 +71,12 @@ enum Command {
 
     /// Rebuild the Tantivy index from canonical chunks (canonical data untouched).
     RebuildIndex,
+
+    /// Keep the store current with the vault while it changes (D40).
+    Watch,
+
+    /// Bring the store up to date with the whole vault in one pass (D40 §4.4).
+    Reconcile,
 }
 
 fn print_success(json: bool, payload: String, human: &str) -> ExitCode {
@@ -109,21 +125,69 @@ fn main() -> ExitCode {
             ),
             Err(error) => print_error(cli.json, error),
         },
-        Command::Doctor => match doctor(&root) {
-            Ok(report) => {
-                let payload =
-                    serde_json::to_string_pretty(&report).expect("health report serializes");
-                print_success(cli.json, payload, &format_health(&report));
-                // A health check that cannot fail a script is not a check
-                // (docs/docs/usage.md, "Exit codes").
-                if is_healthy(&report) {
-                    ExitCode::SUCCESS
-                } else {
-                    ExitCode::FAILURE
-                }
+        Command::Doctor { coverage } => {
+            if coverage {
+                // The audit log's read path (ADR 0026): what the last `index`
+                // run did to each file, including the ones it refused.
+                return match coverage_report(&root) {
+                    Ok(Some(report)) => print_success(
+                        cli.json,
+                        serde_json::to_string_pretty(&report).expect("coverage report serializes"),
+                        &format_coverage(&report),
+                    ),
+                    Ok(None) => match doctor(&root) {
+                        // A workspace that exists but has nothing in it yet: the
+                        // advice must be runnable, so `init` and `index` are two
+                        // different sentences.
+                        Ok(report) if is_uninitialized(&report) => {
+                            if cli.json {
+                                println!("null");
+                            }
+                            eprintln!(
+                                "no ingest batch recorded yet; this workspace is not initialized, \
+                                 run `momotaro init` first"
+                            );
+                            ExitCode::SUCCESS
+                        }
+                        Ok(report) if is_healthy(&report) => {
+                            if cli.json {
+                                println!("null");
+                            }
+                            eprintln!("no ingest batch recorded yet; run `momotaro index` first");
+                            ExitCode::SUCCESS
+                        }
+                        // Any other state — invalid, foreign, newer schema, or a
+                        // directory that is not a workspace at all — has its own
+                        // sentence and its own exit code, and they are the ones
+                        // `doctor` gives it. Inventing advice here would send the
+                        // reader to a command that cannot run.
+                        Ok(report) => {
+                            let payload = serde_json::to_string_pretty(&report)
+                                .expect("health report serializes");
+                            print_success(cli.json, payload, &format_health(&report));
+                            ExitCode::FAILURE
+                        }
+                        Err(error) => print_error(cli.json, error),
+                    },
+                    Err(error) => print_error(cli.json, error),
+                };
             }
-            Err(error) => print_error(cli.json, error),
-        },
+            match doctor(&root) {
+                Ok(report) => {
+                    let payload =
+                        serde_json::to_string_pretty(&report).expect("health report serializes");
+                    print_success(cli.json, payload, &format_health(&report));
+                    // A health check that cannot fail a script is not a check
+                    // (docs/docs/usage.md, "Exit codes").
+                    if is_healthy(&report) {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    }
+                }
+                Err(error) => print_error(cli.json, error),
+            }
+        }
         Command::Stats => match stats(&root) {
             Ok(report) => print_success(
                 cli.json,
@@ -169,6 +233,33 @@ fn main() -> ExitCode {
                 Err(error) => print_error(cli.json, error),
             }
         }
+        Command::Watch => {
+            // Every line the watcher produces goes through one callback, so
+            // `--json` and the human exit cannot promise different fields.
+            let json = cli.json;
+            let mut emit = |line: &WatchLine| {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(line).expect("watch line serializes")
+                    );
+                } else {
+                    println!("{}", format_watch_line(line));
+                }
+            };
+            match watch(&root, &mut emit) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => print_error(json, error),
+            }
+        }
+        Command::Reconcile => match reconcile(&root) {
+            Ok(report) => print_success(
+                cli.json,
+                serde_json::to_string_pretty(&report).expect("reconcile report serializes"),
+                &format_reconcile(&report),
+            ),
+            Err(error) => print_error(cli.json, error),
+        },
         Command::RebuildIndex => match rebuild_index(&root) {
             Ok(report) => {
                 if cli.json {
