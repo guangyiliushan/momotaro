@@ -541,6 +541,17 @@ mod tests {
     }
 
     #[test]
+    fn the_overlap_seed_is_the_largest_fitting_suffix() {
+        // Spec literals (largest suffix whose estimate fits the budget; CJK
+        // 1/char, other 4/char rounded up), not the helper's own output: a cut
+        // that drifts by one character moves the expected seed and goes red.
+        assert_eq!(overlap_suffix("abcdefghijkl", 2), "efghijkl");
+        assert_eq!(overlap_suffix("特征值abc", 2), "值abc");
+        assert_eq!(overlap_suffix("hello world", 64), "hello world");
+        assert_eq!(overlap_suffix("x", 0), "");
+    }
+
+    #[test]
     fn empty_and_heading_only_docs_yield_no_chunks() {
         assert!(chunk_markdown("e.md", "rh", "", &IndexPolicy::default()).is_empty());
         assert!(chunk_markdown("w.md", "rh", "  \n\n\t\n", &IndexPolicy::default()).is_empty());

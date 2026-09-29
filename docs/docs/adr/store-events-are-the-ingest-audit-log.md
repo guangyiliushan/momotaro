@@ -65,7 +65,7 @@ and each **domain** owns its set:
 
 | domain | `outcome` | `reason_code` |
 |---|---|---|
-| `ingest` | `indexed` \| `skipped` \| `metadata_refreshed` \| `error` | the `IndexFileErrorKind` spelling (`key_collision`, `invalid_utf8`, `outside_vault`, `invalid_source_key`, `io`, `store`, `index`, `other`) — or, on a non-`error` row (`indexed` / `metadata_refreshed` / `skipped`), a degradation code (D41's ten; five have a producer today, the wikilink five arrive with W2.4's edges) — or a warning code (`onedrive_placeholder` / `icloud_placeholder` / `windows_incompatible_name` / `source_removed`; `momotaro_contracts::Warning`, the section below says why) |
+| `ingest` | `indexed` \| `skipped` \| `metadata_refreshed` \| `error` | the `IndexFileErrorKind` spelling (`key_collision`, `invalid_utf8`, `outside_vault`, `invalid_source_key`, `io`, `store`, `index`, `other`) — or, on a non-`error` row (`indexed` / `metadata_refreshed` / `skipped`), a degradation code (D41's ten; all ten have had producers since W2.4's edges landed) — or a warning code (`onedrive_placeholder` / `icloud_placeholder` / `windows_incompatible_name` / `source_removed`; `momotaro_contracts::Warning`, the section below says why) |
 | `feed` | `success` \| `no_results` \| `upstream_error` \| `parse_error` | provider codes (`response_too_large`, `empty_feed`, …) |
 | `vault` | `indexed` \| `skipped` \| `metadata_refreshed` \| `error` — the same four as `ingest`, because a reconcile is the same loop under a different event family | the same two vocabularies as `ingest` |
 | `annotate` | not implemented | not implemented |
@@ -170,12 +170,15 @@ decision; making that decision is not part of this contract.
   is one transaction**: `commit_source_file` (`unit.rs`) writes the revision,
   its chunks and its `graph_links` rows — and the file's event, when the caller
   supplies one — in a single `BEGIN IMMEDIATE`, the caller's guard first. That
-  is D40's unit; for a caller that supplies the event (the watcher path of
-  W2.5) it closes the *lose* half outright. The index batch deliberately
-  supplies none — its coverage rows carry `stale_anchor`, which is decided
-  against the settled state (`§5 第 4 条`) — so the batch keeps exactly the
-  tail window the first bullet states. The *never invent* half holds in both
-  shapes, because every data write precedes its event.
+  is D40's unit; when a caller supplies the event it closes the *lose* half
+  outright. No production caller does today: the watcher path once supplied its
+  rows this way, and the nine-dimension review (2026-09-29) showed a multi-path
+  debounce batch then decided `stale_anchor` mid-walk — the same walk-order
+  dependence the index batch avoids by design. Rows settle at the tail sweep in
+  both shapes now, so every `stale_anchor` verdict is decided against the
+  settled state (`§5 第 4 条`) and both shapes keep exactly the tail window the
+  first bullet states. The *never invent* half holds in both shapes, because
+  every data write precedes its event.
 - A batch that aborts mid-way leaves `ingest.started` with no terminal event, so a
   reader sees "running" rather than "crashed". That is stated here rather than
   discovered later; the fix, when a consumer needs it, is an `ingest.failed`

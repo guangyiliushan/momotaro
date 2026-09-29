@@ -21,8 +21,10 @@ chunk_hash` 的命中，context 与 citation 层就不用返工。
 1. fragment 顺序固定：`policy.v1` 与 tool 定义在最前，history 居中，evidence
    按第 1.1 节的三层排序规则，`question.v1` 最后；
 2. 稳定前缀不含易变字段：system 级内容禁止出现时间戳、run_id、session 统计；
-3. tools 定义 canonical 序列化：列表排序 + 字段序固定（provider 的缓存键就是
-   tools JSON 的序列化顺序——百炼端点一手规则），并纳入 `request_hash`；
+3. tools 定义 canonical 序列化：列表序=调用方给定序（序即身份——顺序变化即为
+   不同请求，`request_hash` 随之变化，不对列表排序归一），对象字段序=字典序
+   固定（provider 的缓存键就是 tools JSON 的序列化顺序——百炼端点一手规则），
+   并纳入 `request_hash`；
 4. 去重按 `chunk_hash`，不按文本相似度。
 
 这是从 Codex 的上下文纪律借来的：不重写历史、避免缓存失效、单项有界。
