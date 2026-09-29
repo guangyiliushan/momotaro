@@ -4267,6 +4267,32 @@ mod tests {
     }
 
     #[test]
+    fn a_narrowed_walk_leaves_out_of_tree_graph_rows_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(vault.join("sub")).expect("create dirs");
+        fs::write(vault.join("a.md"), "links [[sub/b]]\n").expect("write a");
+        fs::write(vault.join("sub/b.md"), "links [[missing]]\n").expect("write b");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        index_workspace(dir.path(), None).expect("full index");
+        let before = store_of(dir.path()).all_graph_links().expect("rows");
+        assert_eq!(before.len(), 2, "{before:?}");
+
+        // A narrowed walk sees only `sub` — under its own vault root — and its
+        // namespace is not the vault's truth: every row of the tree it did not
+        // walk must survive the run (a rebuild reproduces all of them).
+        index_workspace(dir.path(), Some(&vault.join("sub"))).expect("narrow index");
+        let after = store_of(dir.path()).all_graph_links().expect("rows");
+        for row in &before {
+            assert!(
+                after.contains(row),
+                "a narrowed walk prunes nothing: {row:?} missing from {after:?}"
+            );
+        }
+    }
+
+    #[test]
     fn graph_links_build_dangling_and_rebuild_identically() {
         let dir = tempfile::tempdir().expect("temp dir");
         let vault = dir.path().join("vault");

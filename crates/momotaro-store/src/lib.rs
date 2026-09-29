@@ -1454,6 +1454,37 @@ mod tests {
     }
 
     #[test]
+    fn a_store_stamped_v5_in_the_index_window_converges_on_the_fresh_shape() {
+        // Step 5 shipped in two spellings: builds in the window before W2.4
+        // created v5 databases without `idx_graph_links_from`, and a migration
+        // chain only runs steps greater than the stored version — so that shape
+        // needs step 6 to converge. This test stands the window shape up and
+        // pins the convergence.
+        let fresh_dir = tempfile::tempdir().expect("create temp dir");
+        let fresh_path = fresh_dir.path().join("momotaro.db");
+        let mut fresh = Store::open(&fresh_path).expect("open fresh store");
+        fresh.init_schema().expect("initialize fresh");
+
+        let window_dir = tempfile::tempdir().expect("create temp dir");
+        let window_path = window_dir.path().join("momotaro.db");
+        {
+            let mut window = Store::open(&window_path).expect("open window store");
+            window.init_schema().expect("initialize");
+            window
+                .connection
+                .execute_batch("DROP INDEX idx_graph_links_from; PRAGMA user_version = 5;")
+                .expect("rewind to the window shape");
+        }
+        let mut window = Store::open(&window_path).expect("reopen window store");
+        window.init_schema().expect("migrate to current");
+        assert_eq!(
+            schema_shape(&fresh),
+            schema_shape(&window),
+            "the in-window v5 shape converges on the fresh shape"
+        );
+    }
+
+    #[test]
     fn a_legacy_store_is_refused_with_a_clear_message() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("momotaro.db");

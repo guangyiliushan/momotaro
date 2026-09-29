@@ -148,8 +148,9 @@ parse_error。
    sentinel 也是点开头文件，因而同样被本条丢掉；它作为**协议消息**是在本条
    **之前**、在原始事件流上被认出来的（第 4 条），不是被豁免；
 7. **索引事务边界**：单文件一次一致性更新 = 恰好一个 SQLite 事务（BEGIN IMMEDIATE，
-   `store::commit_source_file`：revision + chunks + 边 + 事件同事务；批量 index 的
-   coverage 行仍走批尾 sweep，丢窗 = 批尾、对账承接；口径
+   `store::commit_source_file`：revision + chunks + 边同事务，事件由调用方选配；
+   **coverage 行一律走批尾 sweep**（2026-09-29 起 watch 与批量同形——`stale_anchor`
+   只能对落定状态裁决，多路径防抖批中途裁决会随行走序翻转），丢窗 = 批尾、对账承接；口径
    与代价见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md)）。**watcher（W2.5）用
    同一单元**：guard 闭包做事务首步 stat 复核、不一致拒绝 ⇒ ROLLBACK 重入队；chunk 以
    `chunk_id`（= `f(source_key, revision_hash, ordinal)` 的内容寻址主键）幂等替换、

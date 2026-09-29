@@ -172,7 +172,8 @@ pub struct UnknownWireSpelling(String);
 /// One provider tool definition.
 ///
 /// `parameters_json` must hold a JSON object; it is embedded verbatim into the
-/// canonical tools serialization (field order fixed, list sorted by name).
+/// canonical tools serialization (field order fixed, list order = the caller's
+/// — 序即身份, §1.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolDefinition {
     /// Tool name (unique within one request).
@@ -273,7 +274,8 @@ pub struct ContextInput {
     /// The `policy.v1` resident text. Constraints belong inside it
     /// (§2 预算分配 level 1: policy + tool definitions + constraints).
     pub policy_text: String,
-    /// Tool definitions, in any order (rendering canonicalizes them).
+    /// Tool definitions, in the caller's order (§1.3: 序即身份 — rendering
+    /// fixes the field order but never reorders the list).
     pub tool_definitions: Vec<ToolDefinition>,
     /// The fixed instruction tail (§2 level 5).
     pub instructions: String,

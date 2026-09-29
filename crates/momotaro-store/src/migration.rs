@@ -259,6 +259,17 @@ CREATE TABLE IF NOT EXISTS graph_links (
 );
 CREATE INDEX IF NOT EXISTS idx_graph_links_from ON graph_links (from_source_key);",
     ),
+    // 5 -> 6: `idx_graph_links_from` joined the step-5 SQL after that step had
+    // already shipped (W2.4), so databases stamped v5 by builds in the window
+    // between the two carry the same version number without the index — and a
+    // migration chain only runs steps *greater* than the stored version. This
+    // step converges both shapes; it is a no-op where the index exists. Shipped
+    // steps are never edited again (step 5 itself exists in two historical
+    // spellings, which this step is what makes equivalent).
+    (
+        6,
+        "CREATE INDEX IF NOT EXISTS idx_graph_links_from ON graph_links (from_source_key);",
+    ),
 ];
 
 /// Applies every migration newer than `version`.

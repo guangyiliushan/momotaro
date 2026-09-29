@@ -61,14 +61,32 @@ impl Store {
         guard()?;
         // Asked inside the transaction, so the answer and the insert
         // cannot disagree about a row someone else wrote in between.
-        let existed = tx
+        let prior = tx
             .query_row(
-                "SELECT 1 FROM source_revisions WHERE source_key = ?1 AND revision_hash = ?2",
+                "SELECT ingested_at FROM source_revisions WHERE source_key = ?1 AND revision_hash = ?2",
                 params![revision.source_key, revision.revision_hash],
                 |row| row.get::<_, i64>(0),
             )
-            .optional()
-            .is_ok_and(|found| found.is_some());
+            .optional()?;
+        let existed = prior.is_some();
+        // A re-adoption keeps the revision's first stamp (the upsert below
+        // never touches `ingested_at`), so the edges carry that same stamp —
+        // ADR 0027 replays them from the revision row, and rows holding a
+        // later clock would not rebuild byte for byte.
+        let restamped;
+        let edges = match prior {
+            Some(ingested_at) => {
+                restamped = edges
+                    .iter()
+                    .map(|edge| GraphLink {
+                        created_at: ingested_at,
+                        ..edge.clone()
+                    })
+                    .collect::<Vec<_>>();
+                &restamped[..]
+            }
+            None => edges,
+        };
         crate::revisions::append_revision_tx(&tx, revision)?;
         crate::chunks::replace_chunks_tx(
             &tx,
@@ -321,6 +339,41 @@ mod tests {
             ),
             1,
             "the rollback leaves rows the unit never owned alone"
+        );
+    }
+
+    /// The shape the replay test below cannot see: the same content returning
+    /// under a later clock. The upsert re-adopts the row and keeps its first
+    /// `ingested_at`, so the edges must keep that stamp too — ADR 0027 rebuilds
+    /// them from the revision row, and rows carrying the later clock would not
+    /// replay byte for byte.
+    #[test]
+    fn a_re_adoption_keeps_the_first_stamp_on_the_edges() {
+        let (_dir, mut store) = temp_store();
+        let rev = revision("note:a", "h1");
+        store
+            .commit_source_file(&rev, &[], &[edge("note:a", "B")], None, || Ok(()))
+            .expect("first ingest");
+        let mut later = revision("note:a", "h1");
+        later.ingested_at = 99;
+        let mut later_edge = edge("note:a", "B");
+        later_edge.created_at = 99;
+        store
+            .commit_source_file(&later, &[], &[later_edge], None, || Ok(()))
+            .expect("re-adoption");
+        let rows = store.all_graph_links().expect("read");
+        assert_eq!(
+            rows[0].created_at, 7,
+            "the edges carry the revision's first stamp: {rows:?}"
+        );
+        assert_eq!(
+            store
+                .current_revision("note:a")
+                .expect("read")
+                .expect("row")
+                .ingested_at,
+            7,
+            "and the revision row keeps it as well"
         );
     }
 
@@ -630,22 +683,27 @@ mod tests {
     /// Behavior cannot see a lock mode; the contract says BEGIN IMMEDIATE
     /// (D40 / W2.5) and this needle pins it — the migration runner's shape is
     /// pinned the same way. The needle is split so the test cannot count its
-    /// own source text as a hit, and the search is scoped to the function
+    /// own source text as a hit, and the search is scoped to each function
     /// body so a stray mention elsewhere cannot stand in for the real thing.
+    /// Both units are in the search: a needle scoped to `commit_source_file`
+    /// alone let the sibling's transaction silently drop to DEFERRED.
     #[test]
     fn the_unit_opens_with_begin_immediate() {
         let file = include_str!("unit.rs");
-        let start = file
-            .find(concat!("pub fn commit_source", "_file("))
-            .expect("the unit exists");
-        let body = &file[start..];
-        let end = body.find("\n    }").expect("the function body ends");
-        let body = &body[..end];
         let needle = concat!("TransactionBehavior", "::Immediate");
-        assert!(
-            body.contains(needle),
-            "the unit opens its transaction with BEGIN IMMEDIATE"
-        );
+        for entry in [
+            concat!("pub fn commit_source", "_file("),
+            concat!("pub fn commit_source", "_refresh("),
+        ] {
+            let start = file.find(entry).expect("the unit exists");
+            let body = &file[start..];
+            let end = body.find("\n    }").expect("the function body ends");
+            let body = &body[..end];
+            assert!(
+                body.contains(needle),
+                "each unit opens its transaction with BEGIN IMMEDIATE ({entry:?})"
+            );
+        }
     }
 
     /// An event that names another source — or names nobody — is refused by

@@ -1179,7 +1179,7 @@ cargo test --workspace
 
 `index` / lexical `search` / Tantivy。重建索引不丢 canonical 数据。1,000 个 Markdown 可完成。
 
-已做：`source_key` NFC 身份键、vault ⊆ workspace、origin 乘性权重、`store_events` 审计日志、`doctor --coverage`、wikilink 全形态建边入 derived `graph_links`（dangling/歧义/锚点校验齐，五类降级码生产者；行身份与重建见 [ADR 0027](adr/graph-links-rows-are-a-rebuilt-projection.md)）、**watcher + 对账四触发**（`notify` 8.2 + debouncer、事件一律归并为重扫、racy 强制内容校验、四触发写 `vault.reconcile.*`，细则见 [摄取安全与 Vault 互操作](ingest-interop.md) §4）。本波剩余：D42 的碰撞消歧后缀策略（两条目都保留 + 消歧后缀 + 事件，ADR 0002 与 ADR 0026 都指向它）、D24 的多链头暴露（平台测试矩阵已随 W2.6 落地，不在此列）。D40 的「单文件 = 恰好一个事务」已由 store 的 `commit_source_file` 交付（revision + chunks + 边 + 事件同事务，口径见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md)），watcher 是它带事件入事务的调用方。
+已做：`source_key` NFC 身份键、vault ⊆ workspace、origin 乘性权重、`store_events` 审计日志、`doctor --coverage`、wikilink 全形态建边入 derived `graph_links`（dangling/歧义/锚点校验齐，五类降级码生产者；行身份与重建见 [ADR 0027](adr/graph-links-rows-are-a-rebuilt-projection.md)）、**watcher + 对账四触发**（`notify` 8.2 + debouncer、事件一律归并为重扫、racy 强制内容校验、四触发写 `vault.reconcile.*`，细则见 [摄取安全与 Vault 互操作](ingest-interop.md) §4）。本波剩余：D42 的碰撞消歧后缀策略（两条目都保留 + 消歧后缀 + 事件，ADR 0002 与 ADR 0026 都指向它）、D24 的多链头暴露（平台测试矩阵已随 W2.6 落地，不在此列）。D40 的「单文件 = 恰好一个事务」已由 store 的 `commit_source_file` 交付（revision + chunks + 边同事务，事件由调用方选配；现行调用方都不选配——行一律落批尾扫尾，`stale_anchor` 因此在两种形态都对落定状态裁决，口径见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md)）。
 
 ### v0.3 可追溯问答
 

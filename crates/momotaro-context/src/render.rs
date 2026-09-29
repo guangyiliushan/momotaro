@@ -324,20 +324,15 @@ pub fn validate_evidence_block(origin: OriginClass, rendered: &str) -> Result<()
     validate_untrusted_regions(rendered)
 }
 
-/// Canonical tools serialization (`context-retrieval.md` §1.3): list sorted
-/// by name, field order fixed. A tool whose `parameters_json` is not a JSON
-/// object is dropped with an explicit [`OmittedReason::InvalidToolSchema`].
+/// Canonical tools serialization (`context-retrieval.md` §1.3): the caller's
+/// list order is identity — a reordered list is a different request and
+/// changes `request_hash`, so the list is never sorted — and field order is
+/// fixed. A tool whose `parameters_json` is not a JSON object is dropped with
+/// an explicit [`OmittedReason::InvalidToolSchema`].
 pub(crate) fn canonical_tools_json(tools: &[ToolDefinition]) -> (String, Vec<Omission>) {
-    let mut sorted: Vec<&ToolDefinition> = tools.iter().collect();
-    sorted.sort_by(|a, b| {
-        a.name
-            .cmp(&b.name)
-            .then_with(|| a.description.cmp(&b.description))
-    });
-
-    let mut kept: Vec<serde_json::Value> = Vec::with_capacity(sorted.len());
+    let mut kept: Vec<serde_json::Value> = Vec::with_capacity(tools.len());
     let mut omitted = Vec::new();
-    for tool in sorted {
+    for tool in tools {
         let Ok(parameters) = serde_json::from_str::<serde_json::Value>(&tool.parameters_json)
         else {
             omitted.push(Omission {
@@ -542,7 +537,10 @@ mod tests {
     }
 
     #[test]
-    fn tools_serialize_canonically_sorted_by_name() {
+    fn tools_keep_the_callers_order() {
+        // 序即身份 (context-retrieval.md §1.3): the list keeps the caller's
+        // order — sorting it would collapse two different requests into one
+        // serialization. Field order stays fixed (the map is sorted).
         let tools = vec![
             ToolDefinition {
                 name: "kb_read".to_string(),
@@ -559,13 +557,16 @@ mod tests {
         assert!(omitted.is_empty());
         assert_eq!(
             json,
-            r#"[{"description":"math","name":"calc","parameters":{"properties":{},"type":"object"}},{"description":"read","name":"kb_read","parameters":{"type":"object"}}]"#
+            r#"[{"description":"read","name":"kb_read","parameters":{"type":"object"}},{"description":"math","name":"calc","parameters":{"properties":{},"type":"object"}}]"#
         );
     }
 
     #[test]
-    fn a_tool_name_tie_breaks_by_description() {
-        // Determinism witness: equal names must still order stably.
+    fn reordering_the_tools_changes_the_json() {
+        // The identity half, mirroring momotaro-llm's request_hash pin: a
+        // canonicalizer that sorted the list would make this test red, and
+        // flipping it is only legal together with a contract-wording change
+        // approved by the user.
         let tools = vec![
             ToolDefinition {
                 name: "t".to_string(),
@@ -578,11 +579,13 @@ mod tests {
                 parameters_json: "{}".to_string(),
             },
         ];
-        let (json, _) = canonical_tools_json(&tools);
-        assert_eq!(json.matches("\"description\":\"a\"").count(), 1);
-        assert!(
-            json.find("\"description\":\"a\"") < json.find("\"description\":\"b\""),
-            "equal names order by description: {json}"
+        let (forward, _) = canonical_tools_json(&tools);
+        let mut reversed = tools.clone();
+        reversed.reverse();
+        let (backward, _) = canonical_tools_json(&reversed);
+        assert_ne!(
+            forward, backward,
+            "the caller's order is part of the wire: {forward} vs {backward}"
         );
     }
 

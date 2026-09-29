@@ -324,7 +324,7 @@ fn commit_step<T>(
 
 /// Whether the caller insists on the content path although the stat matches
 /// (D40 §4.3): the stat was racy and the bytes differ.
-fn forced(mode: &ProcessMode<'_>) -> bool {
+fn forced(mode: &ProcessMode) -> bool {
     matches!(
         mode,
         ProcessMode::Watch {
@@ -761,6 +761,23 @@ pub(crate) fn index_dir(root: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// The production text with the tests module cut out, so needles count
+    /// call sites without counting the tests' own calls (the module sits
+    /// mid-file). The cut is the module's column-0 closing brace.
+    fn production_half() -> String {
+        let source = include_str!("index_service.rs");
+        let start = source
+            .find(concat!("#[cfg(", "test)]"))
+            .expect("the tests module");
+        let end = source[start..]
+            .find(concat!("\n", "}", "\n"))
+            .expect("the tests module ends");
+        let mut out = String::with_capacity(source.len());
+        out.push_str(&source[..start]);
+        out.push_str(&source[start + end + 2..]);
+        out
+    }
+
     #[test]
     fn the_row_payload_carries_each_list_only_when_it_has_one() {
         // The shape the coverage row's `data_json` carries, pinned on the pure
@@ -1078,13 +1095,55 @@ mod tests {
         // the real store), so it is counted, on the precedent just above:
         // reverting a call site to `append_revision` + `replace_chunks` must go
         // red here, or "one file is one transaction" quietly degrades to "the
-        // API exists". The needle is split so this test is not its own hit.
+        // API exists". The needles are split so this test is not its own hit,
+        // and both unit functions are counted: the refresh path is a third
+        // ingest write site, and a needle that missed it let a mutation splice
+        // three separate commits into `commit_source_refresh`'s place with the
+        // whole suite green.
         let source = include_str!("index_service.rs");
-        let calls = concat!("store.commit_source", "_file(");
+        let writes = concat!("store.commit_source", "_file(");
+        let refresh = concat!("store.commit_source", "_refresh(");
         assert_eq!(
-            source.matches(calls).count(),
+            source.matches(writes).count(),
             2,
-            "both ingest write sites commit through the unit"
+            "both content write sites commit through the unit"
+        );
+        assert_eq!(
+            source.matches(refresh).count(),
+            1,
+            "the refresh write site commits through its unit too"
+        );
+    }
+
+    #[test]
+    fn the_demotion_happens_after_the_writer_commits_and_the_rows_land() {
+        // A removal's halves run in a safe order: the absence signal is only
+        // consumed (`demote_current`) once the index deletes are durable and
+        // the coverage row is on the log. Consuming it earlier made a crash
+        // between the halves leave deleted files answering searches for ever —
+        // the next batch could not re-detect an absence it had already
+        // swallowed. Order is the thing under test, so it is counted.
+        let production = production_half();
+        let demote = concat!("store.demote", "_current(");
+        assert_eq!(
+            production.matches(demote).count(),
+            1,
+            "exactly one demote call site, and it runs in the tail"
+        );
+        let commit_at = production
+            .find(concat!("writer.commit", "()?;"))
+            .expect("the writer's commit");
+        let rows_at = production
+            .find(concat!("flush_row(", "&mut store"))
+            .expect("the row flush");
+        let demote_at = production.find(demote).expect("the demote call");
+        assert!(
+            commit_at < demote_at,
+            "the index deletes are durable before the signal is consumed"
+        );
+        assert!(
+            rows_at < demote_at,
+            "the removal's row is on the log before the signal is consumed"
         );
     }
 
@@ -1300,71 +1359,19 @@ mod tests {
     }
 
     #[test]
-    fn only_a_watcher_writes_the_row_it_was_asked_for() {
-        // ADR 0026 / D40 §4.7: under the watcher the row lands now, under a
-        // batch it does not — the batch writes it at its tail. Both halves
-        // have to be asserted, because either one alone passes with the other
-        // broken.
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut store = Store::open(dir.path().join("momotaro.db")).expect("open");
-        store.init_schema().expect("schema");
-        let empty_report = || IndexReport {
-            batch_id: String::new(),
-            files_skipped: 0,
-            files_indexed: 0,
-            revisions_created: 0,
-            chunks_written: 0,
-            errors: Vec::new(),
-            duration_ms: 0,
-            files_scanned: 0,
-        };
-        let row = |key: &str| PendingRow {
-            source_key: Some(key.to_owned()),
-            raw_name: Some("a.md".to_owned()),
-            outcome: Ok(FileOutcome::Skipped {
-                degradations: Vec::new(),
-                warnings: Vec::new(),
-            }),
-            row_written: false,
-            replace_rows: None,
-            anchors: Vec::new(),
-            ambiguous: Vec::new(),
-        };
-
-        let mut report = empty_report();
-        let mut batch = Batch::new(WATCH_PLAN);
-        let mut mode = ProcessMode::Watch {
-            force_content: false,
-            batch: &mut batch,
-        };
-        row_now(
-            &mut store,
-            &mut report,
-            &mut mode,
-            row("note:watched"),
-            Vec::new(),
-        )
-        .expect("watch row");
+    fn the_tail_sweep_is_the_only_row_writer() {
+        // ADR 0026: rows settle at the batch tail in both shapes — a
+        // `stale_anchor` verdict is a settled-state fact, and a row written
+        // while the batch still walks flips with walk order (the watcher used
+        // to write its rows early and a two-path debounce batch could report
+        // either way). The one writer is counted in the production half only,
+        // so a second call site — anyone writing rows mid-pass again — raises
+        // the number.
+        let production = production_half();
         assert_eq!(
-            store.latest_store_events(10).expect("read").len(),
-            1,
-            "a watcher's row is written by this call"
-        );
-
-        let mut report = empty_report();
-        let mut mode = ProcessMode::Batch;
-        row_now(
-            &mut store,
-            &mut report,
-            &mut mode,
-            row("note:batched"),
-            Vec::new(),
-        )
-        .expect("batch row is a no-op");
-        assert_eq!(
-            store.latest_store_events(10).expect("read").len(),
-            1,
-            "a batch's row is written at its tail, never here"
+            production.matches("flush_row(").count(),
+            2,
+            "the definition and exactly one call site, in the sweep"
         );
     }
 
@@ -1411,7 +1418,6 @@ mod tests {
         let mut batch = Batch::new(WATCH_PLAN);
         let mode = ProcessMode::Watch {
             force_content: false,
-            batch: &mut batch,
         };
 
         let passed = pass_one(
@@ -1424,9 +1430,23 @@ mod tests {
             &mut report,
             mode,
         );
-        let PassOne::Failed { .. } = passed.expect("a read failure is a refusal") else {
+        let PassOne::Failed {
+            source_key,
+            raw_name,
+            error,
+        } = passed.expect("a read failure is a refusal")
+        else {
             panic!("the file could not be read, so it is a refusal")
         };
+        assert!(
+            store
+                .store_events_for_batch(&batch.id)
+                .expect("read batch")
+                .is_empty(),
+            "the pass writes no row — the tail sweep is the one writer"
+        );
+        let row = refusal_row(source_key.as_deref(), raw_name.as_deref(), error);
+        flush_row(&mut store, &mut report, &mut batch, row, Vec::new()).expect("tail row");
 
         let rows: Vec<_> = store
             .store_events_for_batch(&batch.id)
@@ -2139,7 +2159,6 @@ pub(crate) fn run_batch(
                     degradations: Vec::new(),
                     warnings: vec![Warning::SourceRemoved],
                 }),
-                row_written: false,
                 replace_rows: None,
                 anchors: Vec::new(),
                 ambiguous: Vec::new(),
@@ -2191,16 +2210,17 @@ pub(crate) fn run_batch(
     let mut claimed: HashMap<String, String> = HashMap::new();
     // Coverage rows are written after the data batch (ADR 0026: data first,
     // events after): `stale_anchor` is decided against the state every file
-    // left behind, never against walk order (§5 第 4 条). A watcher's rows are
-    // already in the store by the time they get here (D40 §4.7).
-    // The store half and the derived half of the same fact: a revision that
-    // is no longer current stops a `rebuild-index` from resurrecting it, drops
-    // it out of the link namespace, and takes it out of the next walk's
-    // absence check — while the document goes out of the search index, which
-    // is the part a user can see.
+    // left behind, never against walk order (§5 第 4 条) — in both shapes.
+    // The two halves of a removal land in one batch but in a safe order: the
+    // index delete is queued here and made durable at the writer's commit, and
+    // the demotion waits until after the coverage rows (the tail below) — a
+    // crash anywhere before the demotion leaves the key still current, so the
+    // next batch re-detects the absence and repeats the idempotent halves
+    // instead of consuming the signal half-applied.
+    let mut removal_keys: Vec<String> = Vec::new();
     for row in &removals {
         if let Some(key) = &row.source_key {
-            store.demote_current(key)?;
+            removal_keys.push(key.clone());
             SearchIndex::remove_source(&mut writer, search_index.fields(), key)?;
         }
     }
@@ -2230,7 +2250,6 @@ pub(crate) fn run_batch(
         let mode = if shape.gated {
             ProcessMode::Watch {
                 force_content: forced.get(file).copied().unwrap_or(false),
-                batch: &mut batch,
             }
         } else {
             ProcessMode::Batch
@@ -2250,16 +2269,11 @@ pub(crate) fn run_batch(
                 source_key,
                 raw_name,
                 error,
-                row_written,
-            } => pending.push(PendingRow {
-                source_key,
-                raw_name,
-                outcome: Err(error),
-                row_written,
-                replace_rows: None,
-                anchors: Vec::new(),
-                ambiguous: Vec::new(),
-            }),
+            } => pending.push(refusal_row(
+                source_key.as_deref(),
+                raw_name.as_deref(),
+                error,
+            )),
             PassOne::Torn {
                 source_key,
                 raw_name,
@@ -2277,7 +2291,6 @@ pub(crate) fn run_batch(
                             IndexFileErrorKind::Io,
                             TORN_MESSAGE,
                         )),
-                        row_written: false,
                         replace_rows: None,
                         anchors: Vec::new(),
                         ambiguous: Vec::new(),
@@ -2301,7 +2314,6 @@ pub(crate) fn run_batch(
                             IndexFileErrorKind::Store,
                             GUARD_REFUSED,
                         )),
-                        row_written: false,
                         replace_rows: None,
                         anchors: Vec::new(),
                         ambiguous: Vec::new(),
@@ -2313,19 +2325,14 @@ pub(crate) fn run_batch(
                 raw_name,
                 outcome,
                 findings,
-                row_written,
             } => pending.push(PendingRow {
                 source_key: Some(source_key),
                 raw_name: Some(raw_name),
                 outcome,
-                // Under the watcher `pass_one` has already written the row —
-                // and, with it, the edges this projection owes.
-                row_written,
-                replace_rows: if shape.gated {
-                    None
-                } else {
-                    findings.replace_rows
-                },
+                // `None` when the file's own transaction carried the edges
+                // (the unit); `Some` for a projection-only path, whose rows
+                // the sweep writes in its batch (ADR 0027).
+                replace_rows: findings.replace_rows,
                 anchors: findings.anchors,
                 ambiguous: findings.ambiguous,
             }),
@@ -2353,7 +2360,13 @@ pub(crate) fn run_batch(
         .map(|(_, key)| key.as_str())
         .collect();
     let keep_json = serde_json::to_string(&keep).expect("keys serialize");
-    store.prune_graph_edges_outside(&keep_json)?;
+    // A narrowed walk (`index --vault sub`) names only part of the vault, so
+    // its namespace is not the vault's truth: like the absence detection
+    // above, the prune runs on a full walk only. A narrowed run leaves every
+    // out-of-tree row alone — a rebuild reproduces all of them.
+    if path_override.is_none() {
+        store.prune_graph_edges_outside(&keep_json)?;
+    }
     let (graph_rows, graph_dangling) = store.graph_counts()?;
 
     // The event sweep: every file's data — chunks, blobs, rows — is settled, so
@@ -2365,11 +2378,15 @@ pub(crate) fn run_batch(
         let stale = stale_anchors(&store, &row.anchors, &non_note_keys)?;
         graph_ambiguous += row.ambiguous.len() as u64;
         graph_stale += stale.len() as u64;
-        // A watcher's row rode its file's transaction: counting it here is the
-        // sweep's whole remaining job (ADR 0026 never meant two rows).
-        if !row.row_written {
-            flush_row(&mut store, &mut report, &mut batch, row, stale)?;
-        }
+        // Every row settles here — the one writer, in both shapes (ADR 0026).
+        flush_row(&mut store, &mut report, &mut batch, row, stale)?;
+    }
+
+    // The demotion, last of a removal's halves: its row is on the log and the
+    // index deletes are durable, so the signal cannot be consumed half-applied
+    // (order pinned by `the_demotion_happens_after_the_writer_commits_and_the_rows_land`).
+    for key in &removal_keys {
+        store.demote_current(key)?;
     }
 
     let seq = batch.next_seq();
@@ -2544,19 +2561,17 @@ impl FileOutcome {
 }
 
 /// What the caller wants from one file's pass (D40 §4.2 / §4.3 / §4.7).
-pub(crate) enum ProcessMode<'a> {
+pub(crate) enum ProcessMode {
     /// The batch. The walk took the stat this pass compares against, the
     /// coverage rows ride the batch-tail sweep (ADR 0026), and a matching
     /// fingerprint is enough to skip.
     Batch,
     /// The watcher. A matching fingerprint is *not* enough when the stat is
-    /// racy, the file's own event rides the file's own transaction, and that
-    /// transaction re-checks the file's stat as its first step.
+    /// racy, and the file's own transaction re-checks the file's stat as its
+    /// first step. Rows settle at the batch tail in both shapes.
     Watch {
         /// Bypass the skip branch: the stat matched but the bytes did not.
         force_content: bool,
-        /// The batch this file's row takes its sequence from.
-        batch: &'a mut Batch,
     },
 }
 
@@ -2600,9 +2615,6 @@ pub(crate) enum PassOne {
         raw_name: Option<String>,
         /// The classified failure.
         error: IndexFileError,
-        /// Whether this call already wrote the refusal's row: `true` under
-        /// [`ProcessMode::Watch`], `false` under [`ProcessMode::Batch`].
-        row_written: bool,
     },
     /// The file changed while it was read, so the buffer was never one
     /// version of it. Nothing was written and there is no row — the batch
@@ -2632,10 +2644,6 @@ pub(crate) enum PassOne {
         outcome: Result<FileOutcome, IndexFileError>,
         /// The part of the projection the caller still owes work for.
         findings: LinkFindings,
-        /// Whether this call already wrote the row: `true` under
-        /// [`ProcessMode::Watch`], always `false` under [`ProcessMode::Batch`],
-        /// whose rows ride the batch tail.
-        row_written: bool,
     },
 }
 
@@ -2649,25 +2657,6 @@ const TORN_MESSAGE: &str = "the file changed while it was being read; it was not
 /// all — the unit rolled back, so there is nothing to report.
 const GUARD_REFUSED: &str = "the file changed between the read and the commit";
 
-/// Writes one refusal's row now, when the caller asked for watcher rows, and
-/// does nothing when the caller will write it at the batch tail.
-///
-/// The batch keeps its rows for the tail on purpose (ADR 0026: every file's
-/// data settles first, so `stale_anchor` cannot depend on walk order), so this
-/// is the one place the two timings are allowed to differ.
-fn row_now(
-    store: &mut Store,
-    report: &mut IndexReport,
-    mode: &mut ProcessMode<'_>,
-    row: PendingRow,
-    stale: Vec<(String, String)>,
-) -> Result<(), RunError> {
-    match mode {
-        ProcessMode::Batch => Ok(()),
-        ProcessMode::Watch { batch, .. } => flush_row(store, report, batch, row, stale),
-    }
-}
-
 /// The `PendingRow` a refusal becomes, so both callers build the same shape.
 fn refusal_row(
     source_key: Option<&str>,
@@ -2678,7 +2667,6 @@ fn refusal_row(
         source_key: source_key.map(str::to_owned),
         raw_name: raw_name.map(str::to_owned),
         outcome: Err(error),
-        row_written: false,
         replace_rows: None,
         anchors: Vec::new(),
         ambiguous: Vec::new(),
@@ -2690,10 +2678,11 @@ fn refusal_row(
 ///
 /// Shared by the batch loop and by the watcher so the two cannot disagree
 /// about what a path is, whether its bytes may be read, or what a collision
-/// costs (D42). Under [`ProcessMode::Watch`] the row is written before this
-/// returns; under [`ProcessMode::Batch`] it is not — see [`PassOne::Done`].
-/// Anything that fails at batch level (rather than at *this file*) comes back
-/// as [`RunError`], because a row is not the way to report a dead store.
+/// costs (D42). Rows settle at the batch tail in both shapes — see
+/// [`PassOne::Done`] — so a `stale_anchor` verdict never depends on walk
+/// order. Anything that fails at batch level (rather than at *this file*)
+/// comes back as [`RunError`], because a row is not the way to report a dead
+/// store.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pass_one(
     kind: VaultFileKind,
@@ -2703,10 +2692,8 @@ pub(crate) fn pass_one(
     store: &mut Store,
     writer: &mut IndexWriterHandle,
     report: &mut IndexReport,
-    mut mode: ProcessMode<'_>,
+    mut mode: ProcessMode,
 ) -> Result<PassOne, RunError> {
-    let watch = matches!(mode, ProcessMode::Watch { .. });
-
     let source_key = match source_key_for(ctx.vault_root, file) {
         Ok(key) => key,
         // Reachable codes here: `invalid_utf8`, `outside_vault`,
@@ -2717,10 +2704,7 @@ pub(crate) fn pass_one(
         Err(error) => {
             let message = error.to_string();
             let error = file_error(None, error.kind(), message);
-            let row = refusal_row(None, None, error.clone());
-            row_now(store, report, &mut mode, row, Vec::new())?;
             return Ok(PassOne::Failed {
-                row_written: watch,
                 source_key: None,
                 raw_name: None,
                 error,
@@ -2733,10 +2717,7 @@ pub(crate) fn pass_one(
         Err(error) => {
             let message = error.to_string();
             let error = file_error(Some(&source_key), error.kind(), message);
-            let row = refusal_row(Some(&source_key), None, error.clone());
-            row_now(store, report, &mut mode, row, Vec::new())?;
             return Ok(PassOne::Failed {
-                row_written: watch,
                 source_key: Some(source_key),
                 raw_name: None,
                 error,
@@ -2753,10 +2734,7 @@ pub(crate) fn pass_one(
     if let Some(first) = claimed.get(&source_key) {
         let message = format!("claimed by both {first:?} and {raw_name:?}");
         let error = file_error(Some(&source_key), IndexFileErrorKind::KeyCollision, message);
-        let row = refusal_row(Some(&source_key), Some(&raw_name), error.clone());
-        row_now(store, report, &mut mode, row, Vec::new())?;
         return Ok(PassOne::Failed {
-            row_written: watch,
             source_key: Some(source_key),
             raw_name: Some(raw_name),
             error,
@@ -2779,32 +2757,18 @@ pub(crate) fn pass_one(
                     degradations: Vec::new(),
                     warnings: vec![Warning::OneDrivePlaceholder],
                 };
-                let row = PendingRow {
-                    source_key: Some(source_key.clone()),
-                    raw_name: Some(raw_name.clone()),
-                    outcome: Ok(outcome.clone()),
-                    row_written: false,
-                    replace_rows: None,
-                    anchors: Vec::new(),
-                    ambiguous: Vec::new(),
-                };
-                row_now(store, report, &mut mode, row, Vec::new())?;
                 return Ok(PassOne::Done {
                     source_key,
                     raw_name,
                     outcome: Ok(outcome),
                     findings: LinkFindings::default(),
-                    row_written: watch,
                 });
             }
             Ok(_) => {}
             Err(error) => {
                 let message = error.to_string();
                 let error = file_error(Some(&source_key), IndexFileErrorKind::Io, message);
-                let row = refusal_row(Some(&source_key), Some(&raw_name), error.clone());
-                row_now(store, report, &mut mode, row, Vec::new())?;
                 return Ok(PassOne::Failed {
-                    row_written: watch,
                     source_key: Some(source_key),
                     raw_name: Some(raw_name),
                     error,
@@ -2854,9 +2818,8 @@ pub(crate) fn pass_one(
             ),
             LinkFindings::default(),
         ),
-        // The note path owns its own transaction, so it returns here: a watcher
-        // row is written *inside* `process_file`, beside the data it describes
-        // (D40 §4.7), while a batch row is written at the tail.
+        // The note path owns its own transaction, so it returns here; its row,
+        // like every row, is written at the batch tail (ADR 0026).
         VaultFileKind::Note | VaultFileKind::Canvas => {
             let passed = process_file(
                 kind,
@@ -2879,7 +2842,6 @@ pub(crate) fn pass_one(
                     raw_name,
                     outcome: Ok(outcome),
                     findings,
-                    row_written: watch,
                 }),
                 Err(PassError::Torn) => Ok(PassOne::Torn {
                     source_key,
@@ -2889,47 +2851,23 @@ pub(crate) fn pass_one(
                     source_key,
                     raw_name,
                 }),
-                Err(PassError::File(error)) => {
-                    // `process_file` owns this row: it already wrote it when
-                    // the caller asked for watcher rows, and writing it here
-                    // too gave one failing file two rows in one batch.
-                    Ok(PassOne::Failed {
-                        row_written: watch,
-                        source_key: Some(source_key),
-                        raw_name: Some(raw_name),
-                        error,
-                    })
-                }
+                Err(PassError::File(error)) => Ok(PassOne::Failed {
+                    source_key: Some(source_key),
+                    raw_name: Some(raw_name),
+                    error,
+                }),
                 Err(PassError::Run(error)) => Err(error),
             };
         }
     };
 
-    // Only arms that never touched `process_file` reach here, so `mode` is
-    // still the caller's and the row's timing is still its choice.
-    if watch {
-        let stale = stale_anchors(store, &findings.anchors, ctx.non_note_keys)?;
-        let row = PendingRow {
-            source_key: Some(source_key.clone()),
-            raw_name: Some(raw_name.clone()),
-            outcome: outcome.clone(),
-            row_written: false,
-            replace_rows: findings.replace_rows.clone(),
-            anchors: findings.anchors.clone(),
-            ambiguous: findings.ambiguous.clone(),
-        };
-        row_now(store, report, &mut mode, row, stale)?;
-        if let Some(rows) = findings.replace_rows.clone() {
-            store.replace_edges_many(&[(source_key.clone(), rows)])?;
-        }
-    }
-
+    // Only arms that never touched `process_file` reach here. Their rows —
+    // like every row — settle at the batch tail sweep (ADR 0026).
     Ok(PassOne::Done {
         source_key,
         raw_name,
         outcome,
         findings,
-        row_written: watch,
     })
 }
 
@@ -2947,8 +2885,7 @@ fn process_body(
     report: &mut IndexReport,
     ns: &Namespace,
     non_note_keys: &HashSet<String>,
-    mode: &mut ProcessMode<'_>,
-    row_written: &mut bool,
+    mode: &mut ProcessMode,
 ) -> Result<(FileOutcome, LinkFindings), PassError> {
     let metadata = fs::metadata(file)
         .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Io, error))?;
@@ -3030,49 +2967,15 @@ fn process_body(
         );
         // The codes were derived above for the blob; the same answer rides on
         // the row, or this path reports a broken block as a clean file.
-        let mut outcome = FileOutcome::MetadataRefreshed {
+        let outcome = FileOutcome::MetadataRefreshed {
             degradations: merge_codes(input.degradations, projection.codes),
             warnings: Vec::new(),
         };
         // One transaction for the refresh as well (D40 §4.7): the mutable
-        // columns, the re-projected edges, and — under the watcher — this
-        // file's row. The edges come along rather than waiting for the batch
-        // sweep, so a refresh never leaves one half of the file behind.
-        // `stale_anchor` is decided against the store as this file found it,
-        // which for a one-file change *is* the settled state (§5 第 4 条). A
-        // batch leaves it to its tail sweep, whose outcome it has not built yet.
-        let stale = match mode {
-            ProcessMode::Batch => Vec::new(),
-            ProcessMode::Watch { .. } => stale_anchors(store, &projection.anchors, non_note_keys)?,
-        };
-        if !stale.is_empty() {
-            outcome.push_degradation(Degradation::StaleAnchor);
-        }
-        // The payload is only needed where the row rides this transaction: a
-        // batch writes its row at the tail and would build the same string a
-        // second time, so that arm assigns a placeholder nothing reads.
-        let data_json;
-        #[allow(unused_assignments)]
-        let event = match mode {
-            ProcessMode::Batch => {
-                data_json = String::new();
-                None
-            }
-            ProcessMode::Watch { batch, .. } => {
-                let fields = row_fields(&outcome, raw_name, &projection.ambiguous, &stale);
-                data_json = fields.data_json;
-                let seq = batch.next_seq();
-                Some(coverage_event(
-                    batch,
-                    seq,
-                    Some(source_key),
-                    fields.outcome,
-                    fields.reason_code,
-                    fields.message,
-                    &data_json,
-                ))
-            }
-        };
+        // columns and the re-projected edges land together, so a refresh never
+        // leaves one half of the file behind. No coverage row rides it — every
+        // row settles at the batch tail, where its `stale_anchor` verdict is
+        // decided against the settled state (§5 第 4 条) in both shapes.
         commit_step(source_key, || {
             store.commit_source_refresh(
                 source_key,
@@ -3086,24 +2989,17 @@ fn process_body(
                 &local_path,
                 raw_name,
                 &projection.rows,
-                event.as_ref(),
+                None,
                 guard_against(file, &metadata),
             )
         })?;
-        if event.is_some() {
-            *row_written = true;
-        }
         report.files_indexed += 1;
         return Ok((
             outcome,
             LinkFindings {
-                // The watcher's transaction already carried them; a batch's
-                // sweep still owes them.
-                replace_rows: if event.is_some() {
-                    None
-                } else {
-                    Some(projection.rows)
-                },
+                // The transaction already carried the edges; only a
+                // projection-only path owes the sweep a row set.
+                replace_rows: None,
                 anchors: projection.anchors,
                 ambiguous: projection.ambiguous,
             },
@@ -3147,49 +3043,14 @@ fn process_body(
     );
 
     // One file, one transaction (D40's unit, `commit_source_file`): revision,
-    // chunks and edges land together — a crash cannot leave half a file. A
-    // batch supplies no event: its coverage row rides the batch-tail sweep
-    // (ADR 0026), whose `stale_anchor` is decided against the settled state. A
-    // watcher supplies this file's row, so nothing about a file can be
-    // recorded before the data it describes (ADR 0026's "lose" half).
-    let mut outcome = FileOutcome::Indexed {
+    // chunks and edges land together — a crash cannot leave half a file. No
+    // coverage row rides it: every row settles at the batch-tail sweep
+    // (ADR 0026), where its `stale_anchor` verdict is decided against the
+    // settled state in both shapes (§5 第 4 条), and where every data write
+    // already precedes the event that describes it ("never invent").
+    let outcome = FileOutcome::Indexed {
         degradations: merge_codes(input.degradations, projection.codes),
         warnings: Vec::new(),
-    };
-    // `stale_anchor` is decided against the store as this file found it,
-    // which for a one-file change *is* the settled state (§5 第 4 条). A
-    // batch leaves it to its tail sweep, whose outcome it has not built yet.
-    let stale = match mode {
-        ProcessMode::Batch => Vec::new(),
-        ProcessMode::Watch { .. } => stale_anchors(store, &projection.anchors, non_note_keys)?,
-    };
-    if !stale.is_empty() {
-        outcome.push_degradation(Degradation::StaleAnchor);
-    }
-    // The payload is only needed where the row rides this transaction: a
-    // batch writes its row at the tail and would build the same string a
-    // second time, so that arm assigns a placeholder nothing reads.
-    let data_json;
-    #[allow(unused_assignments)]
-    let event = match mode {
-        ProcessMode::Batch => {
-            data_json = String::new();
-            None
-        }
-        ProcessMode::Watch { batch, .. } => {
-            let fields = row_fields(&outcome, raw_name, &projection.ambiguous, &stale);
-            data_json = fields.data_json;
-            let seq = batch.next_seq();
-            Some(coverage_event(
-                batch,
-                seq,
-                Some(source_key),
-                fields.outcome,
-                fields.reason_code,
-                fields.message,
-                &data_json,
-            ))
-        }
     };
     let created = commit_step(source_key, || {
         store.commit_source_file(
@@ -3207,13 +3068,10 @@ fn process_body(
             },
             &chunks,
             &projection.rows,
-            event.as_ref(),
+            None,
             guard_against(file, &metadata),
         )
     })?;
-    if event.is_some() {
-        *row_written = true;
-    }
 
     index_step(source_key, || {
         SearchIndex::upsert_source(
@@ -3250,13 +3108,12 @@ fn process_body(
 
 /// One file, with the caller's row timing applied (D40 §4.7 / ADR 0026).
 ///
-/// The body decides what the file *is*; this decides when its row lands. A
-/// watcher's row must land beside the data it describes, so the paths that own
-/// a transaction write theirs inside the body and set `row_written` — and if
-/// such a path fails *after* that commit (the search index refusing the
-/// document), no second row is invented for the same file. Everything left —
-/// a skip, a refusal — is written here, exactly once, and never in a batch,
-/// whose rows all ride the tail sweep.
+/// The body decides what the file *is*; the batch tail decides when its row
+/// lands. Rows settle at the tail sweep in both shapes — a `stale_anchor`
+/// verdict is a settled-state fact, so a row written while the batch is still
+/// walking can flip with walk order — and the data always precedes the row
+/// that describes it. A refusal returns its error here and the loop turns it
+/// into exactly one tail row.
 #[allow(clippy::too_many_arguments)]
 fn process_file(
     kind: VaultFileKind,
@@ -3271,11 +3128,9 @@ fn process_file(
     report: &mut IndexReport,
     ns: &Namespace,
     non_note_keys: &HashSet<String>,
-    mode: &mut ProcessMode<'_>,
+    mode: &mut ProcessMode,
 ) -> Result<(FileOutcome, LinkFindings), PassError> {
-    let watch = matches!(mode, ProcessMode::Watch { .. });
-    let mut row_written = false;
-    let passed = process_body(
+    process_body(
         kind,
         store,
         search_index,
@@ -3289,43 +3144,7 @@ fn process_file(
         ns,
         non_note_keys,
         mode,
-        &mut row_written,
-    );
-    match passed {
-        Ok((outcome, findings)) => {
-            if watch && !row_written {
-                let stale = stale_anchors(store, &findings.anchors, non_note_keys)?;
-                let row = PendingRow {
-                    source_key: Some(source_key.to_owned()),
-                    raw_name: Some(raw_name.to_owned()),
-                    outcome: Ok(outcome.clone()),
-                    row_written: false,
-                    replace_rows: findings.replace_rows.clone(),
-                    anchors: findings.anchors.clone(),
-                    ambiguous: findings.ambiguous.clone(),
-                };
-                if let ProcessMode::Watch { batch, .. } = mode {
-                    flush_row(store, report, batch, row, stale)?;
-                }
-                // A projection-only path owes its edges too: the batch's sweep
-                // writes them, and a watcher has no sweep.
-                if let Some(rows) = findings.replace_rows.clone() {
-                    store.replace_edges_many(&[(source_key.to_owned(), rows)])?;
-                }
-            }
-            Ok((outcome, findings))
-        }
-        Err(PassError::File(error)) => {
-            if watch && !row_written {
-                let row = refusal_row(Some(source_key), Some(raw_name), error.clone());
-                if let ProcessMode::Watch { batch, .. } = mode {
-                    flush_row(store, report, batch, row, Vec::new())?;
-                }
-            }
-            Err(PassError::File(error))
-        }
-        other => other,
-    }
+    )
 }
 
 /// The part of one projection the event sweep still owes work for.
@@ -3508,10 +3327,6 @@ struct PendingRow {
     source_key: Option<String>,
     raw_name: Option<String>,
     outcome: Result<FileOutcome, IndexFileError>,
-    /// Whether the row is already in the store (it rode its file's own
-    /// transaction, D40 §4.7). The sweep still counts what it owes the batch's
-    /// closing event; it just must not append it a second time.
-    row_written: bool,
     /// Projection-only rows, written by the sweep's batch (ADR 0027).
     replace_rows: Option<Vec<GraphLink>>,
     /// Resolved anchors awaiting validation: `(target key, kind, anchor text)`.
