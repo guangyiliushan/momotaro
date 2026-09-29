@@ -135,7 +135,7 @@ parse_error。
    Watchman cookie 协议（sentinel 文件）**：同进程内有 watcher 时，reconcile
    先写 `.momotaro-reconcile-sentinel`、等 watcher 回报该路径再 walk、结束后
    删除；**无 watcher 则跳过**；**等待超时不使对账失败**——降级为「不带
-   cookie 继续 walk」并**播报一行**（`cookie_timeout`），让读者知道这一遍
+   cookie 继续 walk」并**播报一行**（`cookie_skipped`，`reason`），让读者知道这一遍
    可能落后一个事件；
 5. **防抖与撕裂重试**：归并窗口 ~500ms（`tick_rate` 默认为其 1/4）；撕裂 =
    指数退避 + mtime 稳定窗口（连续两次 stat 间隔 ≥50–100ms 相同），5 次后挂

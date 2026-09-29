@@ -113,4 +113,32 @@ mod tests {
         assert_eq!(h1, chunk_hash(&cid, "one"));
         assert!(is_64_lower_hex(&h1));
     }
+
+    #[test]
+    fn the_identity_domains_are_pinned() {
+        // The domains are frozen identity: re-spelling one re-identifies every
+        // revision and chunk in every vault and breaks every citation
+        // five-tuple, while every test above stays green — both sides of each
+        // comparison move together. Literal digests are the only anchor that
+        // cannot drift with the code under test.
+        assert_eq!(
+            revision_hash("abc"),
+            "2876c774fe6e0f91739bdd2bfac9f6a5600268458b89bea9cdbef79c6e4eea4f"
+        );
+        assert_eq!(
+            revision_hash(""),
+            "95f1d4c541f4f64a3ff611404ddcf93c6d5abad310059f5d8ae9d51e9262fc32"
+        );
+        assert_eq!(
+            chunk_id("note:a.md", "h1", 0),
+            "95f12707c019c5435dbaebba6c5058da213d755ffab249896305afd6d7ade7a8"
+        );
+        assert_eq!(
+            chunk_hash(
+                "95f12707c019c5435dbaebba6c5058da213d755ffab249896305afd6d7ade7a8",
+                "text",
+            ),
+            "d8879b76c6b7cf2b0374a9a716e8872cf0778f6d3f3803527a463d0ded326df3"
+        );
+    }
 }
