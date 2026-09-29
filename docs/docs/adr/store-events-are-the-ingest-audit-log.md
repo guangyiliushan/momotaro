@@ -65,7 +65,7 @@ and each **domain** owns its set:
 
 | domain | `outcome` | `reason_code` |
 |---|---|---|
-| `ingest` | `indexed` \| `skipped` \| `metadata_refreshed` \| `error` | the `IndexFileErrorKind` spelling (`key_collision`, `invalid_utf8`, `outside_vault`, `invalid_source_key`, `io`, `store`, `index`, `other`) — or, on a non-`error` row (`indexed` / `metadata_refreshed` / `skipped`), a degradation code (D41's ten; five have a producer today, the wikilink five arrive with W2.4's edges) — or a warning code (`onedrive_placeholder` / `icloud_placeholder` / `windows_incompatible_name` / `source_removed`; `momotaro_contracts::Warning`, the section below says why) |
+| `ingest` | `indexed` \| `skipped` \| `metadata_refreshed` \| `error` | the `IndexFileErrorKind` spelling (`key_collision`, `invalid_utf8`, `outside_vault`, `invalid_source_key`, `io`, `store`, `index`, `other`) — or, on a non-`error` row (`indexed` / `metadata_refreshed` / `skipped`), a degradation code (D41's ten; all ten have had producers since W2.4's edges landed) — or a warning code (`onedrive_placeholder` / `icloud_placeholder` / `windows_incompatible_name` / `source_removed`; `momotaro_contracts::Warning`, the section below says why) |
 | `feed` | `success` \| `no_results` \| `upstream_error` \| `parse_error` | provider codes (`response_too_large`, `empty_feed`, …) |
 | `vault` | `indexed` \| `skipped` \| `metadata_refreshed` \| `error` — the same four as `ingest`, because a reconcile is the same loop under a different event family | the same two vocabularies as `ingest` |
 | `annotate` | not implemented | not implemented |

@@ -2468,11 +2468,10 @@ mod tests {
     fn rebuild_is_idempotent_and_counts_match_current_chunks() {
         let (dir, _vault) = fixture_workspace();
 
-        index_workspace(dir.path(), None).expect("index");
+        let report = index_workspace(dir.path(), None).expect("index");
 
         let store = store_of(dir.path());
         let counts = store.counts().expect("counts");
-        let current_chunks = store.all_current_chunks().expect("current chunks").len() as u64;
         drop(store);
 
         let first = rebuild_index(dir.path()).expect("rebuild once");
@@ -2482,9 +2481,11 @@ mod tests {
             "a healthy index is not reported as replaced: {first:?}"
         );
         assert_eq!(first.chunks, second.chunks, "rebuild is idempotent");
+        // Ingest's own write counter, not a second read of the list the rebuild
+        // replays: two code paths that must agree on how many chunks exist.
         assert_eq!(
-            first.chunks, current_chunks,
-            "rebuild covers exactly current chunks"
+            first.chunks, report.chunks_written,
+            "rebuild covers exactly what ingest wrote"
         );
 
         let store = store_of(dir.path());
@@ -5216,6 +5217,17 @@ mod tests {
             "and they are still findable after the move"
         );
         let _ = dir;
+    }
+
+    #[test]
+    fn the_network_sentence_is_the_contract_copy() {
+        // D31 / D40 §4.8's words are contract copy: rewording the constant must
+        // break a test before it ships, exactly like a wire spelling — the
+        // both-exits test below only proves the exits agree with each other.
+        assert_eq!(
+            NETWORK_VOLUME_NOTE,
+            "this workspace is on a network volume, which Momotaro does not promise to be real-time; SQLite's WAL does not work over a network filesystem, and broken locking there can corrupt the database",
+        );
     }
 
     #[test]

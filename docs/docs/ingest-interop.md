@@ -411,8 +411,10 @@ parse_error。
 2. **原始字节另存** `raw_name`（事件匹配、改名回写、显示用）；键只做身份；
 3. **查询层折叠另建 fold 索引列**（ASCII-only 起步，unicase 完整折叠）——
    键层不做任何 casefold（Linux 大小写双写合法并存，折叠 = 数据丢失级事故）；
-4. **碰撞策略**：NFC 键相同而原始字节不同 → 两条目都保留 + 消歧后缀 +
-   `key_collision` 警告事件；**「绝不静默合并」只作用于身份键**（内容寻址的
+4. **碰撞策略**（D42 目标口径；**现状（2026-09-29）**：消歧后缀未落地——第二个请求者被拒为
+   `outcome=error` + `reason_code=key_collision`，是 [ADR 0002](adr/source-key-is-scheme-prefixed.md) /
+   [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 如实标注的临时护栏）：NFC 键相同而原始字节不同 →
+   两条目都保留 + 消歧后缀 + `key_collision` 事件；**「绝不静默合并」只作用于身份键**（内容寻址的
    revision 集、同策略幂等替换的 chunk 集与 `graph_links` 行集允许静默并——
    [ADR 0027](adr/graph-links-rows-are-a-rebuilt-projection.md)）；
 5. **同步盘预警（D42 三条，词表 `Warning`）**：

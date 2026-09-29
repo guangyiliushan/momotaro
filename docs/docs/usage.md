@@ -66,7 +66,7 @@ momotaro doctor --json      # the same report for scripts
 
 ```bash
 momotaro doctor --coverage
-# ingest batch index-1737000000000-2d87c684: 5 indexed, 0 skipped, 0 refreshed, 0 failed
+# ingest batch "index-1737000000000-2d87c684": 5 indexed, 0 skipped, 0 refreshed, 0 failed
 momotaro doctor --coverage --json   # CoverageReport，字段同上有事件计数与 finished
 ```
 
@@ -76,7 +76,7 @@ process died`——日志分不出这两者，所以它不假装能分。`ingest
 降级（D41）与同步盘预警（D42）各按码计数（`degradations` / `warnings` 两个清单，人类行逐行渲染）；
 **预警不是失败**——只有两个词表都不认识的码才计入 failures。任何看不懂的 outcome 都会**归入 failures**
 而不是被丢掉。库不可用时（版本过新、外来库）退 1，
-报的是与 `doctor` **同一句拒绝文本**（`doctor` 自己那行还会带引擎版本）。
+报的是与 `doctor` **同一句拒绝文本**（含引擎版本）。
 
 ## Search
 
@@ -155,8 +155,8 @@ workspace**: SQLite's WAL does not work on network filesystems
 to corrupt it. Sync the notes; leave `.momotaro/` alone.
 
 `index` reports what the run did: `indexed N of M files (X new revisions,
-Y skipped), C chunks, 0 errors`. `skipped` counts files nothing was read for:
-a fingerprint **and** stored path that both still match, a link the walk does
+Y skipped), C chunks, 0 errors (0 key collisions) in T ms`. `skipped` counts files nothing was read for:
+a fingerprint, stored path **and** raw name that all still match, a link the walk does
 not follow, an iCloud eviction stub, or a cloud placeholder. A pure directory
 move refreshes the stored path and shows up as `indexed` with `0 new
 revisions`, because no new content revision was created.
@@ -223,8 +223,8 @@ whenever the log could be read, including "no ingest batch recorded yet" (a
 workspace that was never indexed): nothing having happened yet is a fact, not a
 failure. With `--json` it prints `null` on stdout in that case, so a script still
 gets an answer where it looks. A store this build cannot use is an error and
-exits `1`, with the same refusal text `doctor` reports (its own line adds the
-engine version; this one does not). A workspace whose database file does not
+exits `1`, with the same refusal text `doctor` reports (the same line, engine
+version included). A workspace whose database file does not
 exist yet is still "nothing has happened yet": the sentence tells its owner to
 run `init` — and if the directory is not a workspace at all (no `momotaro.toml`),
 `--coverage` reports that instead, because `init` would fail there too.

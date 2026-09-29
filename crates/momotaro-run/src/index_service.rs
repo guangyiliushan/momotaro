@@ -595,7 +595,7 @@ fn count_codes(report: &mut CoverageReport, event: &momotaro_store::StoreEvent) 
                 source_key: event.source_key.clone(),
                 reason_code: Some(code.clone()),
                 message: Some(format!(
-                    "an indexed row carries a degradation code this build does not know: {code}"
+                    "a row carries a degradation code this build does not know: {code}"
                 )),
             }),
         }
