@@ -7,17 +7,23 @@ publish = false
 
 [dependencies]
 momotaro-contracts = { workspace = true }
+momotaro-context = { workspace = true }
 momotaro-ingest = { workspace = true }
+momotaro-llm = { workspace = true }
 momotaro-retrieve = { workspace = true }
 momotaro-store = { workspace = true }
+momotaro-verify = { workspace = true }
 momotaro-platform = { workspace = true }
 notify = { workspace = true }
 notify-debouncer-full = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
 rusqlite = { workspace = true }
 tempfile = { workspace = true }
+momotaro-llm = { workspace = true, features = ["test-util"] }

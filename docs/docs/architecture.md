@@ -470,7 +470,7 @@ CREATE TABLE chunks (
 );
 ```
 
-`chunks` 是保留型投影：只要有 `answer_citations` / `run_context_items` / retrieval hit 指向该 `(source_key, revision_hash)`，行就留着；同 policy 同 revision 重复 ingest = 幂等替换，换 policy 只对新 ingest 生效。`chunk_id` / `chunk_hash` 是 `(source_key, revision_hash, ordinal, text)` 的纯函数。整表擦除 = 灾难恢复且必须报 drift（[ADR 0022](adr/chunks-are-a-retained-projection.md)）。
+`chunks` 是保留型投影：只要有 `answer_citations` / `run_context_items` 行的五元组仍指向某个 chunk（按 `chunk_id`），该行就留着——不删、不覆写（引用里的 `chunk_hash` 不许在引用下移动）；`retrieval_hits` 是检索审计行，不具保留力（否则被检索过的 chunk 几乎永不可删，「未被引用的行可删」就落空）。同 policy 同 revision 重复 ingest = 幂等替换，未被引用的行照常替换；换 policy 只对新 ingest 生效。`chunk_id` / `chunk_hash` 是 `(source_key, revision_hash, ordinal, text)` 的纯函数。整表擦除 = 灾难恢复，重 ingest 的 replace 必须报 drift（被引用但缺行），不是静默复验（[ADR 0022](adr/chunks-are-a-retained-projection.md)）。
 
 #### annotations
 
@@ -1144,7 +1144,7 @@ momotaro spark --project <id>
 | `model_probe` | system | true |
 | `user_cancelled` | user | false |
 
-可预期错误写入 run_events，带 `category / severity / attribution / retryable / count_as_failure`。
+可预期错误写入 run_events，带 `category / severity / attribution / retryable`。失败判定不落在错误行上：`count_as_failure` 的语义由终态事件承载（一个错误算不算数，看它后面是不是跟着 `run.finished` / `run.failed` / `run.cancelled`），该字段留待任务图波次（multi-agent §5.1 的共识语义）随真实读者定稿。
 
 ## 19. Testing
 
@@ -1616,7 +1616,7 @@ wikilink 全形态建边（pulldown-cmark `ENABLE_WIKILINKS`）；dangling 链�
 
 ### D42：source_key = NFC 身份键，键层永不折叠
 
-`source_key = note:<vault-relative NFC path> | arxiv:<id>`；NFC/不折叠/碰撞规则作用于 scheme 之后的 tail。verbatim 前缀与盘符大小写由解析时的 `canonicalize` 决定（既不是键的一部分，也不是我们做的改写）——用户可见处一律渲染存储的 `local_path`，不渲染解析后的路径（[ADR 0002](adr/source-key-is-scheme-prefixed.md) / [ADR 0024](adr/local-path-is-workspace-relative.md)）。大小写原样保留、`/` 分隔；**禁用 NFKC 与 casefold**（Linux 大小写双写合法并存，折叠 = 数据丢失级事故）；`raw_name` 原始字节另存（事件匹配/显示）；查询层大小写折叠另建 fold 索引列。**「绝不静默合并」作用于身份键**：NFC 碰撞（NFC/NFD 双写）两条目都保留 + 消歧后缀 + 事件，绝不静默合并（消歧后缀**现状（2026-09-29）**未落地：第二个请求者暂被拒为 `error` 行，见 ADR 0002 临时护栏）——唯一性不变量不在并操作下封闭。它不是一条普遍禁令：**内容寻址**的 revision 集、同策略幂等替换的 chunk 集满足 join-semilattice 且不变量在并下封闭，静默并是对的；禁止的是对自由文本、互斥修改、或「取唯一代表」的读函数做静默并。同步盘预警：OneDrive placeholder（`RECALL_ON_DATA_ACCESS` 位）不读内容、不建 revision（行 = `skipped` + `onedrive_placeholder`，下载后下一次 `index` 正常读入）；iCloud 驱逐占位跳过 + `icloud_placeholder`；Windows 非法名照常索引但发 `windows_incompatible_name` 预警（文档规则是 Explorer／工具／同步端的实际约束——`\\?\` 能建这些名字不代表同步过去还能活）。平台测试矩阵 11 项随 W2.6 的 `path_matrix.rs` 进 CI（OneDrive 项只手工一次）。
+`source_key = note:<vault-relative NFC path> | arxiv:<id>`；NFC/不折叠/碰撞规则作用于 scheme 之后的 tail。verbatim 前缀与盘符大小写由解析时的 `canonicalize` 决定（既不是键的一部分，也不是我们做的改写）——用户可见处一律渲染存储的 `local_path`，不渲染解析后的路径（[ADR 0002](adr/source-key-is-scheme-prefixed.md) / [ADR 0024](adr/local-path-is-workspace-relative.md)）。大小写原样保留、`/` 分隔；**禁用 NFKC 与 casefold**（Linux 大小写双写合法并存，折叠 = 数据丢失级事故）；`raw_name` 原始字节另存（事件匹配/显示）；查询层大小写折叠另建 fold 索引列。**「绝不静默合并」作用于身份键**：NFC 碰撞（NFC/NFD 双写）两条目都保留 + 消歧后缀 + 事件，绝不静默合并（消歧后缀**现状（2026-09-29）**未落地：第二个请求者暂被拒为 `error` 行，见 ADR 0002 临时护栏）——唯一性不变量不在并操作下封闭。它不是一条普遍禁令：**内容寻址**的 revision 集、同策略幂等替换的 chunk 集（可含被引用保留的历史行，见 ADR 0022）满足 join-semilattice 且不变量在并下封闭，静默并是对的；禁止的是对自由文本、互斥修改、或「取唯一代表」的读函数做静默并。同步盘预警：OneDrive placeholder（`RECALL_ON_DATA_ACCESS` 位）不读内容、不建 revision（行 = `skipped` + `onedrive_placeholder`，下载后下一次 `index` 正常读入）；iCloud 驱逐占位跳过 + `icloud_placeholder`；Windows 非法名照常索引但发 `windows_incompatible_name` 预警（文档规则是 Explorer／工具／同步端的实际约束——`\\?\` 能建这些名字不代表同步过去还能活）。平台测试矩阵 11 项随 W2.6 的 `path_matrix.rs` 进 CI（OneDrive 项只手工一次）。
 
 ### D43：更新管线——动态薄层 + 通道 endpoint 隔离 + 灰度
 

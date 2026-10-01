@@ -14,8 +14,9 @@ impl Store {
     ///
     /// Order inside the transaction is fixed: `guard` runs first (W2.5
     /// re-checks the file's stat there; a refusal rolls the whole unit back),
-    /// then the revision upsert, the wholesale replacement of the revision's
-    /// chunks and of the source's `graph_links` rows (D40 / ADR 0027), and
+    /// then the revision upsert, the replacement of the revision's chunks
+    /// (rows a reference names are retained — ADR 0022) and of the source's
+    /// `graph_links` rows (D40 / ADR 0027), and
     /// finally the file's event when the caller supplies one. Nothing is
     /// written unless the event lands with it, so a crash between data and
     /// event cannot exist inside this unit. A guard that wants its refusal
@@ -30,9 +31,16 @@ impl Store {
     ///
     /// The event must name the revision's source: a row about another source
     /// riding this unit would claim work that is not here (ADR 0026). The data
-    /// half replays idempotently (revision upsert; chunks and edges replaced
-    /// wholesale); the event is append-only like every event, and replay
+    /// half replays idempotently (revision upsert; chunks replaced, rows a
+    /// reference names retained — ADR 0022 — and edges replaced wholesale);
+    /// the event is append-only like every event, and replay
     /// semantics for it stay the caller's (`batch_id` / `seq` / `external_id`).
+    ///
+    /// The replace's [`ChunkReplaceReport`](crate::chunks::ChunkReplaceReport)
+    /// (retained / drift) is **discarded here** — the replace computes it,
+    /// this wrapper drops it, and a drift signal dropped is a one-shot signal
+    /// lost. Surfacing whole-table-wipe drift to ingest callers is follow-up
+    /// work (wiring the report through to the coverage report).
     pub fn commit_source_file(
         &mut self,
         revision: &NewSourceRevision<'_>,
@@ -378,7 +386,8 @@ mod tests {
     }
 
     /// Replaying the unit is idempotent: the same input twice leaves the same
-    /// rows — the data half is upsert plus wholesale replace.
+    /// rows — the data half is upsert plus replace (cited chunk rows are
+    /// retained, ADR 0022).
     #[test]
     fn replaying_the_same_unit_leaves_the_same_rows() {
         let (_dir, mut store) = temp_store();
@@ -423,7 +432,7 @@ mod tests {
     }
 
     /// The attachment shape — no chunks, no edges — lands the revision and
-    /// touches nothing else: the wholesale deletes find no rows of this source
+    /// touches nothing else: the replace's deletes find no rows of this source
     /// and leave every other source's rows alone.
     #[test]
     fn an_empty_unit_lands_only_the_revision() {
@@ -481,7 +490,7 @@ mod tests {
 
     /// Chunk rows are written under the unit's keys: a struct whose own fields
     /// disagree cannot smuggle rows under another key — out of the replay's
-    /// wholesale replace, where they would accumulate.
+    /// keyed replace, where they would accumulate.
     #[test]
     fn chunk_rows_are_written_under_the_units_keys() {
         let (_dir, mut store) = temp_store();
@@ -687,13 +696,55 @@ mod tests {
     /// body so a stray mention elsewhere cannot stand in for the real thing.
     /// Both units are in the search: a needle scoped to `commit_source_file`
     /// alone let the sibling's transaction silently drop to DEFERRED.
+    ///
+    /// Deliberate extension (W3.7, the run units): the search was widened to
+    /// `runs.rs` and its eight `commit_run_*` units when they joined the
+    /// family — a new unit function is never invisible to this needle, which
+    /// is the point of one needle over the whole family.
     #[test]
     fn the_unit_opens_with_begin_immediate() {
-        let file = include_str!("unit.rs");
         let needle = concat!("TransactionBehavior", "::Immediate");
-        for entry in [
-            concat!("pub fn commit_source", "_file("),
-            concat!("pub fn commit_source", "_refresh("),
+        for (file, entry) in [
+            (
+                include_str!("unit.rs"),
+                concat!("pub fn commit_source", "_file("),
+            ),
+            (
+                include_str!("unit.rs"),
+                concat!("pub fn commit_source", "_refresh("),
+            ),
+            (
+                include_str!("runs.rs"),
+                concat!("pub fn commit_run", "_create("),
+            ),
+            (
+                include_str!("runs.rs"),
+                concat!("pub fn commit_run", "_start("),
+            ),
+            (
+                include_str!("runs.rs"),
+                concat!("pub fn commit_run", "_retrieval("),
+            ),
+            (
+                include_str!("runs.rs"),
+                concat!("pub fn commit_run", "_context("),
+            ),
+            (
+                include_str!("runs.rs"),
+                concat!("pub fn commit_run", "_llm_turn("),
+            ),
+            (
+                include_str!("runs.rs"),
+                concat!("pub fn commit_run", "_verifications("),
+            ),
+            (
+                include_str!("runs.rs"),
+                concat!("pub fn commit_run", "_answer("),
+            ),
+            (
+                include_str!("runs.rs"),
+                concat!("pub fn commit_run", "_terminal("),
+            ),
         ] {
             let start = file.find(entry).expect("the unit exists");
             let body = &file[start..];

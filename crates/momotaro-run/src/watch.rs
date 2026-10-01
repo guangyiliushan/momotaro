@@ -28,7 +28,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use momotaro_ingest::{attributes_of, source_key_for};
 use notify::event::{EventKind, ModifyKind, RenameMode};
@@ -593,13 +593,10 @@ fn record_moves(root: &Path, vault_root: &Path, events: &[DebouncedEvent]) -> Re
         return Ok(());
     }
     let mut store = Store::open(database_path(root))?;
-    // Same collision shape as `Batch::new`: milliseconds for a human reading
-    // the table, the nanosecond half to keep two rename batches inside one
-    // second apart. A shared second and a per-call index collided on
-    // `UNIQUE (batch_id, seq)` and took the watcher down with it.
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    // The shared stamp id (see `stamp_id`): a shared second and a per-call
+    // index collided on `UNIQUE (batch_id, seq)` and took the watcher
+    // down with it.
+    let base = crate::stamp_id("move");
     for (index, debounced) in paired.iter().enumerate() {
         let from = &debounced.event.paths[0];
         let to = &debounced.event.paths[1];
@@ -613,11 +610,7 @@ fn record_moves(root: &Path, vault_root: &Path, events: &[DebouncedEvent]) -> Re
         };
         store.append_store_event(&NewStoreEvent {
             occurred_at: now_epoch_secs(),
-            batch_id: &format!(
-                "move-{}-{:x}-{index}",
-                stamp.as_millis(),
-                stamp.subsec_nanos()
-            ),
+            batch_id: &format!("{base}-{index}"),
             seq: 1,
             domain: "ingest",
             event_type: "source_moved",

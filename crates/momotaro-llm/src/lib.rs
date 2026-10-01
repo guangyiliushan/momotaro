@@ -54,8 +54,8 @@ use response::parse_response;
 /// failure is the last attempt's and `attempts` is what records the retry.
 /// One call is one `llm_turns` row: a silent retry is not a second turn
 /// (reference.md, "LLM turn").
-pub fn complete(
-    transport: &impl ProviderTransport,
+pub fn complete<T: ProviderTransport + ?Sized>(
+    transport: &T,
     request: &LlmRequest,
 ) -> Result<LlmOutput, LlmError> {
     let body = request.canonical_json();

@@ -138,6 +138,18 @@ pub enum WorkspaceStatus {
     Invalid,
 }
 
+impl WorkspaceStatus {
+    /// The wire spelling, as stored and as printed: the two outlets of every
+    /// surface share it (两出口字段一致).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Uninitialized => "uninitialized",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
 /// Durable health facts about the local workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthReport {
@@ -1006,6 +1018,617 @@ pub fn estimate_tokens(text: &str) -> u32 {
     cjk + other.div_ceil(4)
 }
 
+/// What kind of work one run performs (`architecture.md` §9: the closed set).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunMode {
+    /// A question answered from evidence with citations.
+    Ask,
+    /// An explicit search submission.
+    Search,
+    /// Paper ingestion.
+    PaperAdd,
+    /// Spark card generation.
+    Spark,
+}
+
+impl RunMode {
+    /// The wire spelling, as stored in `runs.mode`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Search => "search",
+            Self::PaperAdd => "paper_add",
+            Self::Spark => "spark",
+        }
+    }
+}
+
+/// Which provider endpoint one turn uses (`reference.md`, "Model slot" —
+/// D25's closed semantic enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSlot {
+    /// The answering model.
+    Answer,
+    /// The cheap utility model (rewrites, titles, compaction).
+    Utility,
+}
+
+impl ModelSlot {
+    /// The wire spelling, as stored in `llm_turns.slot`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Answer => "answer",
+            Self::Utility => "utility",
+        }
+    }
+}
+
+/// The semantic thinking tier (`reference.md`, "Model slot" — D26's four
+/// semantic steps, frozen into the RunSpec; provider parameter names live
+/// and die with the adapter, these do not).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingTier {
+    /// Thinking off.
+    Off,
+    /// The low tier.
+    Low,
+    /// The medium tier (the answer slot's default).
+    Medium,
+    /// The high tier.
+    High,
+}
+
+impl ThinkingTier {
+    /// The wire spelling, as frozen into `runs.run_spec_json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+/// The three events that drive a run's terminal status (`harness.md` §1:
+/// `runs.status` is a projection of exactly one of these, landed in the same
+/// transaction as the status update).
+///
+/// Not serialized: the wire holds the event name ([`TerminalEvent::as_str`],
+/// on `run_events`) or the projected status ([`TerminalEvent::projected_status`],
+/// on `runs.status`) — never this type itself, so it carries no third
+/// spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalEvent {
+    /// The run succeeded (`run.finished`).
+    Finished,
+    /// The run failed (`run.failed`).
+    Failed,
+    /// The run was cancelled (`run.cancelled`).
+    Cancelled,
+}
+
+impl TerminalEvent {
+    /// The event name from the stable vocabulary (`reference.md`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Finished => "run.finished",
+            Self::Failed => "run.failed",
+            Self::Cancelled => "run.cancelled",
+        }
+    }
+
+    /// The `runs.status` value this event projects to.
+    pub fn projected_status(self) -> &'static str {
+        match self {
+            Self::Finished => "finished",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// The stable run-event vocabulary (`reference.md`, "Event vocabulary") as
+/// one spelling source. `run.finished` / `run.failed` / `run.cancelled` are
+/// spelled by [`TerminalEvent`] and not repeated here.
+pub mod run_event {
+    /// The run was accepted.
+    pub const ACCEPTED: &str = "run.accepted";
+    /// Execution began.
+    pub const STARTED: &str = "run.started";
+    /// A retrieval began.
+    pub const RETRIEVAL_STARTED: &str = "retrieval.started";
+    /// A retrieval's hits were saved.
+    pub const RETRIEVAL_FINISHED: &str = "retrieval.finished";
+    /// The model's context was built and saved.
+    pub const CONTEXT_BUILT: &str = "context.built";
+    /// A provider exchange began.
+    pub const LLM_STARTED: &str = "llm.started";
+    /// A provider exchange landed.
+    pub const LLM_FINISHED: &str = "llm.finished";
+    /// Citation verification concluded.
+    pub const CITATION_VALIDATED: &str = "citation.validated";
+    /// The answer was finalized and saved.
+    pub const ANSWER_FINALIZED: &str = "answer.finalized";
+}
+
+/// The frozen specification of one run (`architecture.md` §6.4 / §10.1
+/// step 3): every knob that shaped the work, snapshotted at acceptance so a
+/// later config edit cannot rewrite what this run was asked to do.
+///
+/// The serialization is the freeze: `runs.run_spec_json` holds exactly
+/// `serde_json::to_string` of this struct (field order fixed by the
+/// declaration below, enum spellings pinned by the witness tests), and
+/// `runs.run_spec_hash` is taken over those exact bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunSpec {
+    /// What kind of work this run does.
+    pub mode: RunMode,
+    /// The asked question, as the user wrote it.
+    pub query: String,
+    /// Which model slot serves this run (D25: `ask` maps to `answer`).
+    pub slot: ModelSlot,
+    /// The thinking tier frozen for this run (D26).
+    pub thinking: ThinkingTier,
+    /// The provider model id, as configured for the slot.
+    pub model: String,
+    /// Output ceiling handed to the provider.
+    pub max_output_tokens: u32,
+    /// Context budget of the build (§2 预算分配).
+    pub max_context_tokens: u32,
+    /// Whether tools may touch the network (Beta 默认保守: false).
+    pub allow_network: bool,
+    /// Whether tools may write files (Beta 默认保守: false).
+    pub allow_write: bool,
+}
+
+/// Why a [`RunSpec`] was refused. Typed so the caller reports the field,
+/// not a string to pattern-match (`architecture.md` §19: "RunSpec 校验失败
+/// 有明确错误").
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RunSpecError {
+    /// The question is empty.
+    #[error("run spec: query is empty")]
+    EmptyQuery,
+    /// The model id is empty.
+    #[error("run spec: model is empty")]
+    EmptyModel,
+    /// The output ceiling is zero — the provider would be asked for nothing.
+    #[error("run spec: max_output_tokens is zero")]
+    ZeroOutput,
+    /// The context budget is zero — the build could not keep its own
+    /// fixed levels honest (§6.6).
+    #[error("run spec: max_context_tokens is zero")]
+    ZeroContext,
+}
+
+impl RunSpec {
+    /// Checks the frozen spec against its own invariants.
+    pub fn validate(&self) -> Result<(), RunSpecError> {
+        if self.query.trim().is_empty() {
+            return Err(RunSpecError::EmptyQuery);
+        }
+        if self.model.trim().is_empty() {
+            return Err(RunSpecError::EmptyModel);
+        }
+        if self.max_output_tokens == 0 {
+            return Err(RunSpecError::ZeroOutput);
+        }
+        if self.max_context_tokens == 0 {
+            return Err(RunSpecError::ZeroContext);
+        }
+        Ok(())
+    }
+}
+
+/// The severity of an expected error on the run timeline (`architecture.md`
+/// §18: expected errors land in `run_events` with `category / severity /
+/// attribution / retryable`).
+///
+/// The spelling is a closed lowercase set in this repository's wire style and
+/// maps mechanically onto OpenTelemetry's log severity ranges (the
+/// `SeverityNumber` bands: 1-4 TRACE, 5-8 DEBUG, 9-12 INFO, 13-16 WARN,
+/// 17-20 ERROR, 21-24 FATAL, each band taking its smallest value on
+/// mapping), so the OTel export seam converts with zero invention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    /// A fine-grained debugging event (OTel TRACE, 1-4).
+    Trace,
+    /// A debugging event (OTel DEBUG, 5-8).
+    Debug,
+    /// An informational event (OTel INFO, 9-12).
+    Info,
+    /// Not an error, but more important than informational (OTel WARN, 13-16).
+    Warn,
+    /// An error event: something went wrong (OTel ERROR, 17-20).
+    Error,
+    /// A fatal error (OTel FATAL, 21-24).
+    Fatal,
+}
+
+impl Severity {
+    /// Every severity, in declaration order. Witness for "the vocabulary is
+    /// exactly these six" — add a variant and this array must be edited.
+    pub const ALL: [Self; 6] = [
+        Self::Trace,
+        Self::Debug,
+        Self::Info,
+        Self::Warn,
+        Self::Error,
+        Self::Fatal,
+    ];
+
+    /// The wire spelling of this severity.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+            Self::Fatal => "fatal",
+        }
+    }
+
+    /// Reads a stored spelling back; `None` for anything unrecognised.
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|severity| severity.as_str() == code)
+    }
+
+    /// The smallest OTel `SeverityNumber` of this severity's band — the
+    /// export seam's mechanical mapping (OTel: "assign that severity the
+    /// smallest value of the range").
+    pub fn otel_severity_number(self) -> u8 {
+        match self {
+            Self::Trace => 1,
+            Self::Debug => 5,
+            Self::Info => 9,
+            Self::Warn => 13,
+            Self::Error => 17,
+            Self::Fatal => 21,
+        }
+    }
+}
+
+/// The six key spellings of `run_context_items.source_ref_json` — the
+/// evidence reference produced by `momotaro-context`'s `evidence_source_ref`
+/// and read by the store's retention queries and the run layer's citation
+/// resolution.
+///
+/// One spelling source for all three sides: a producer that renames a key
+/// without changing these constants breaks its own witness test here instead
+/// of silently emptying a consumer (the drift class behind
+/// `source_ref_json`'s cross-crate registration).
+pub mod source_ref {
+    /// Canonical source identity.
+    pub const SOURCE_KEY: &str = "source_key";
+    /// The revision the reference binds to.
+    pub const REVISION_HASH: &str = "revision_hash";
+    /// The chunk the reference points at.
+    pub const CHUNK_ID: &str = "chunk_id";
+    /// The content hash the reference claims.
+    pub const CHUNK_HASH: &str = "chunk_hash";
+    /// The locator exactly as the store recorded it.
+    pub const LOCATOR_JSON: &str = "locator_json";
+    /// The trust origin the fragment must carry end to end.
+    pub const ORIGIN_CLASS: &str = "origin_class";
+}
+
+/// One `runs` row, exactly as stored (`architecture.md` §8.1) — the frozen
+/// record of an accepted unit of work. Shared by the store's read path and
+/// every surface that renders a trace (`reference.md`, "Run").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRecord {
+    /// Run identity (opaque, traceable).
+    pub run_id: String,
+    /// Session this run belongs to, when it belongs to one.
+    pub session_id: Option<String>,
+    /// The run this one is an explicit retry of (harness §2).
+    pub parent_run_id: Option<String>,
+    /// Bound project, when there is one.
+    pub project_id: Option<String>,
+    /// Task-graph coordinates (v0.9; unused by 0.x ask).
+    pub graph_id: Option<String>,
+    /// Task-graph coordinates (v0.9; unused by 0.x ask).
+    pub node_id: Option<String>,
+    /// Which attempt of the parent this is (harness: retries are new runs).
+    pub attempt: i64,
+    /// What kind of work this run performs.
+    pub mode: String,
+    /// The asked question, as the user wrote it.
+    pub query: String,
+    /// `accepted | running | finished | failed | cancelled` — a projection of
+    /// the terminal event (harness §1), never written beside it.
+    pub status: String,
+    /// The idempotency key, when the caller supplied one.
+    pub client_request_id: Option<String>,
+    /// Hash of the frozen `run_spec_json` bytes.
+    pub run_spec_hash: String,
+    /// The frozen RunSpec (`RunSpec` serialization, byte-stable).
+    pub run_spec_json: String,
+    /// Provider name recorded at freeze.
+    pub provider: Option<String>,
+    /// Model id recorded at freeze.
+    pub model: Option<String>,
+    /// Context window recorded at freeze.
+    pub context_window: Option<i64>,
+    /// Output ceiling recorded at freeze.
+    pub max_output_tokens: Option<i64>,
+    /// Graph-node distillate (v0.9; unused by 0.x).
+    pub result_digest: Option<String>,
+    /// What a failed run still produced, annotated (multi-agent §5.1:
+    /// 失败必标注部分产出).
+    pub failure_note: Option<String>,
+    /// Explicit deadline (graph nodes; unused by 0.x).
+    pub deadline_at: Option<i64>,
+    /// When the run was accepted.
+    pub created_at: i64,
+    /// When the run reached a terminal state.
+    pub finished_at: Option<i64>,
+}
+
+/// One `run_events` row: the run timeline (`harness.md` §6 — `run_events` 是
+/// 事实，`runs.status` 是投影).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunEventRecord {
+    /// Position in the run's timeline, monotonic per run.
+    pub seq: i64,
+    /// Event name from the stable vocabulary (`reference.md`, "Event
+    /// vocabulary"): `run.accepted`, `context.built`, …
+    pub event_type: String,
+    /// The event's payload. JSON by convention; the store does not parse it.
+    pub data_json: String,
+    /// When the event was written.
+    pub created_at: i64,
+}
+
+/// One `retrievals` row with its ranked hits (`architecture.md` §8.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalRecord {
+    /// Retrieval identity.
+    pub retrieval_id: String,
+    /// The run that ran it.
+    pub run_id: String,
+    /// The query as asked.
+    pub query: String,
+    /// The query the engine actually searched.
+    pub normalized_query: String,
+    /// Frozen retrieval strategy (engine, k, mode).
+    pub strategy_json: String,
+    /// When the retrieval ran.
+    pub created_at: i64,
+    /// The ranked hits, in rank order.
+    pub hits: Vec<RetrievalHitRecord>,
+}
+
+/// One `retrieval_hits` row, exactly as stored (`architecture.md` §8.1):
+/// the hit's citation key set plus what the context stage later decided about
+/// it (included in the model's context, or omitted and why). The display
+/// extras a [`RetrievalHit`] carries (`ordinal`, `heading_path`) are chunk
+/// facts and are not columns here — the row is the audit record of what the
+/// retrieval returned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalHitRecord {
+    /// 1-based rank in result order.
+    pub rank: u32,
+    /// Canonical source identity.
+    pub source_key: String,
+    /// Revision the hit resolves to.
+    pub revision_hash: String,
+    /// Chunk identifier.
+    pub chunk_id: String,
+    /// Chunk content hash.
+    pub chunk_hash: String,
+    /// JSON locator for the chunk.
+    pub locator_json: String,
+    /// The engine's relevance score, when it reports one.
+    pub score: Option<f64>,
+    /// Whether this hit became a `run_context_items` fragment.
+    pub included: bool,
+    /// Why it did not, when it did not (a typed `OmittedReason` spelling).
+    pub omitted_reason: Option<String>,
+}
+
+/// One `run_context_items` row: what the model actually saw (`architecture.md`
+/// §8.1, aligned with `momotaro-context`'s `ContextFragment`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextItemRecord {
+    /// The run whose context this was.
+    pub run_id: String,
+    /// Position in the build's render order.
+    pub ordinal: i64,
+    /// Session-unique citation handle (`f0001`, …).
+    pub fragment_id: String,
+    /// `policy | tool_definitions | history | evidence | instructions |
+    /// question`.
+    pub kind: String,
+    /// `system | user | assistant`.
+    pub role: String,
+    /// `text | summary.v1`.
+    pub content_kind: String,
+    /// The fragment body verbatim (what the provider saw).
+    pub body: String,
+    /// The six-key evidence reference, when this is an evidence fragment.
+    pub source_ref_json: Option<String>,
+    /// Estimated tokens of `body`.
+    pub token_estimate: i64,
+    /// Hash of the `body` bytes (the store layer's algorithm, documented
+    /// there).
+    pub body_hash: String,
+    /// multi-agent §5.1 埋点（≤50 token 决策摘要）.
+    pub decision_rationale: Option<String>,
+    /// multi-agent §5.1 埋点.
+    pub assumptions: Option<String>,
+    /// multi-agent §5.1 埋点：指向被取代工件.
+    pub supersedes: Option<String>,
+}
+
+/// One `llm_turns` row: exactly one provider exchange, however many attempts
+/// it took (`reference.md`, "LLM turn").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmTurnRecord {
+    /// Turn identity.
+    pub turn_id: String,
+    /// The run that made the exchange.
+    pub run_id: String,
+    /// Position in the run's turn order.
+    pub seq: i64,
+    /// Provider name.
+    pub provider: String,
+    /// Model id.
+    pub model: String,
+    /// Hash over the canonical request bytes.
+    pub request_hash: String,
+    /// `started | finished | failed`.
+    pub status: String,
+    /// Input tokens as reported (NULL = not reported).
+    pub input_tokens: Option<i64>,
+    /// Output tokens as reported (NULL = not reported).
+    pub output_tokens: Option<i64>,
+    /// Provider-reported cache-hit input tokens (0.3 起).
+    pub cached_tokens: Option<i64>,
+    /// The provider's actual billing basis, when it reports one.
+    pub billable_tokens: Option<i64>,
+    /// `answer | utility` — the frozen RunSpec's slot (D25).
+    pub slot: Option<String>,
+    /// Thinking tokens inside the output (D26; billed at output rates).
+    pub reasoning_tokens: Option<i64>,
+    /// The provider's response id, when it exposes one (recorded verbatim).
+    pub raw_ref: Option<String>,
+    /// When the exchange was recorded.
+    pub created_at: i64,
+    /// When the exchange finished.
+    pub finished_at: Option<i64>,
+}
+
+/// One `verifications` row: an independent deterministic result
+/// (`reference.md`, "Verification").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationRecord {
+    /// Verification identity.
+    pub verification_id: String,
+    /// The run under verification.
+    pub run_id: String,
+    /// The answer it judges, when it judges one.
+    pub answer_id: Option<String>,
+    /// `citation | source_integrity | math`.
+    pub kind: String,
+    /// `passed | failed | unsupported | skipped`.
+    pub status: String,
+    /// Which judgement fired and what it saw (JSON).
+    pub details_json: String,
+    /// When the verdict was recorded.
+    pub created_at: i64,
+}
+
+/// One `answers` row: the durable output of a run (`reference.md`, "Answer").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerRecord {
+    /// Answer identity.
+    pub answer_id: String,
+    /// The run that produced it.
+    pub run_id: String,
+    /// The answer body as output.
+    pub text: String,
+    /// Hash of the prompt bytes the answer answered.
+    pub prompt_hash: String,
+    /// When it was written.
+    pub created_at: i64,
+    /// multi-agent §5.1 埋点（≤50 token 决策摘要）.
+    pub decision_rationale: Option<String>,
+    /// multi-agent §5.1 埋点.
+    pub assumptions: Option<String>,
+    /// multi-agent §5.1 埋点：指向被取代工件.
+    pub supersedes: Option<String>,
+    /// The citations this answer asserts, in citation order.
+    pub citations: Vec<AnswerCitationRecord>,
+}
+
+/// One `answer_citations` row: the five-tuple binding of one claim
+/// (`reference.md`, "Answer citation" — only the five-tuple makes a citation
+/// verifiable).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerCitationRecord {
+    /// Position of this citation in the answer.
+    pub citation_index: i64,
+    /// Canonical source identity.
+    pub source_key: String,
+    /// The revision the citation binds to.
+    pub revision_hash: String,
+    /// The chunk the citation points at.
+    pub chunk_id: String,
+    /// The content hash the citation claims.
+    pub chunk_hash: String,
+    /// The locator exactly as the store recorded it.
+    pub locator_json: String,
+    /// The text the answer claims to be quoting.
+    pub quoted_text: String,
+    /// Whether deterministic verification passed this citation at save time.
+    pub verified: bool,
+}
+
+/// One `history_items` row: an appended conversation turn (`architecture.md`
+/// §6.5 — history 只追加).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryItemRecord {
+    /// Stable identity (survives across session replay).
+    pub history_id: String,
+    /// The session this turn belongs to, when there is one.
+    pub session_id: Option<String>,
+    /// The run that wrote this row.
+    pub run_id: String,
+    /// Run-internal write order (not the round axis — see `momotaro-context`'s
+    /// `HistoryItem`).
+    pub seq: i64,
+    /// `turn | summary`.
+    pub kind: String,
+    /// `user | assistant`.
+    pub role: String,
+    /// `text | summary.v1`.
+    pub content_kind: String,
+    /// The body replayed verbatim (§6.5 History 不重写).
+    pub body: String,
+    /// Carries `referenced_chunk_hashes` (and a `summary.v1` mirror).
+    pub payload_json: String,
+    /// Citation reference when the row is an evidence-backed turn.
+    pub source_ref_json: Option<String>,
+    /// Estimated tokens of `body`.
+    pub token_estimate: i64,
+    /// When the row was appended.
+    pub created_at: i64,
+    /// When the turn happened (replay/import may differ from `created_at`).
+    pub occurred_at: Option<i64>,
+}
+
+/// The full replay bundle of one run: every row one run wrote, in read order
+/// (`harness.md` §6.2 — `run_events` + canonical tables rebuild the complete
+/// timeline; `trace`'s implementation is that property's acceptance).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunTrace {
+    /// The run row itself (query, frozen spec, status).
+    pub run: RunRecord,
+    /// The run's timeline, in `seq` order.
+    pub events: Vec<RunEventRecord>,
+    /// Retrievals with their ranked hits, in run order.
+    pub retrievals: Vec<RetrievalRecord>,
+    /// What the model saw, in render order.
+    pub context_items: Vec<ContextItemRecord>,
+    /// The provider exchanges, in turn order.
+    pub llm_turns: Vec<LlmTurnRecord>,
+    /// The verification results, in record order.
+    pub verifications: Vec<VerificationRecord>,
+    /// The answer and its citations, when the run produced one.
+    pub answer: Option<AnswerRecord>,
+    /// The history rows this run appended, in write order.
+    pub history: Vec<HistoryItemRecord>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1020,9 +1643,23 @@ mod tests {
 
     #[test]
     fn workspace_status_uses_stable_names() {
-        let encoded =
-            serde_json::to_string(&WorkspaceStatus::Uninitialized).expect("encode status");
-        assert_eq!(encoded, r#""uninitialized""#);
+        // No wildcard: a fourth state must be spelled here and in `as_str`.
+        for status in [
+            WorkspaceStatus::Ready,
+            WorkspaceStatus::Uninitialized,
+            WorkspaceStatus::Invalid,
+        ] {
+            match status {
+                WorkspaceStatus::Ready
+                | WorkspaceStatus::Uninitialized
+                | WorkspaceStatus::Invalid => {}
+            }
+            assert_eq!(
+                serde_json::to_string(&status).expect("encode status"),
+                format!("{:?}", status.as_str()),
+                "{status:?} spells differently in JSON and in as_str"
+            );
+        }
     }
 
     #[test]
@@ -1623,5 +2260,192 @@ mod tests {
         // `:` is legal on POSIX; D42 indexes such names and warns, so the key
         // layer must not rewrite or reject them.
         assert_eq!(note_source_key("a:b.md").unwrap(), "note:a:b.md");
+    }
+
+    #[test]
+    fn the_run_enums_spell_the_same_on_the_wire() {
+        // No wildcard in these matches: a new variant fails to compile here,
+        // and the serde pin below then forces its spelling to agree.
+        for mode in [
+            RunMode::Ask,
+            RunMode::Search,
+            RunMode::PaperAdd,
+            RunMode::Spark,
+        ] {
+            match mode {
+                RunMode::Ask | RunMode::Search | RunMode::PaperAdd | RunMode::Spark => {}
+            }
+            assert_eq!(
+                serde_json::to_string(&mode).expect("serialize"),
+                format!("\"{}\"", mode.as_str())
+            );
+        }
+        for slot in [ModelSlot::Answer, ModelSlot::Utility] {
+            match slot {
+                ModelSlot::Answer | ModelSlot::Utility => {}
+            }
+            assert_eq!(
+                serde_json::to_string(&slot).expect("serialize"),
+                format!("\"{}\"", slot.as_str())
+            );
+        }
+        for tier in [
+            ThinkingTier::Off,
+            ThinkingTier::Low,
+            ThinkingTier::Medium,
+            ThinkingTier::High,
+        ] {
+            match tier {
+                ThinkingTier::Off
+                | ThinkingTier::Low
+                | ThinkingTier::Medium
+                | ThinkingTier::High => {}
+            }
+            assert_eq!(
+                serde_json::to_string(&tier).expect("serialize"),
+                format!("\"{}\"", tier.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_events_name_both_the_event_and_the_status_they_project() {
+        // The one place "terminal event ⇒ status" is allowed to be derived:
+        // the store's terminal unit projects through `projected_status`, and
+        // this test pins both halves of every spelling.
+        for (event, name, status) in [
+            (TerminalEvent::Finished, "run.finished", "finished"),
+            (TerminalEvent::Failed, "run.failed", "failed"),
+            (TerminalEvent::Cancelled, "run.cancelled", "cancelled"),
+        ] {
+            match event {
+                TerminalEvent::Finished | TerminalEvent::Failed | TerminalEvent::Cancelled => {}
+            }
+            assert_eq!(event.as_str(), name);
+            assert_eq!(event.projected_status(), status);
+        }
+    }
+
+    #[test]
+    fn every_severity_spells_the_same_on_the_wire() {
+        // No wildcard in this match: a seventh severity fails to compile
+        // here, and the count assertion then forces it into `ALL`.
+        for severity in Severity::ALL {
+            match severity {
+                Severity::Trace
+                | Severity::Debug
+                | Severity::Info
+                | Severity::Warn
+                | Severity::Error
+                | Severity::Fatal => {}
+            }
+            assert_eq!(
+                serde_json::to_string(&severity).expect("serialize"),
+                format!("{:?}", severity.as_str()),
+                "{severity:?} spells differently in JSON and in as_str"
+            );
+            assert_eq!(
+                Severity::from_code(severity.as_str()),
+                Some(severity),
+                "as_str and from_code are inverses"
+            );
+        }
+        assert_eq!(Severity::ALL.len(), 6, "extend ALL, not just as_str");
+        assert_eq!(
+            Severity::from_code("ERROR"),
+            None,
+            "case is part of the spelling"
+        );
+        assert_eq!(
+            Severity::from_code("warning"),
+            None,
+            "warn is the spelling, not warning"
+        );
+        // The OTel bands, pinned: each maps to the smallest number of its range.
+        assert_eq!(Severity::Trace.otel_severity_number(), 1);
+        assert_eq!(Severity::Debug.otel_severity_number(), 5);
+        assert_eq!(Severity::Info.otel_severity_number(), 9);
+        assert_eq!(Severity::Warn.otel_severity_number(), 13);
+        assert_eq!(Severity::Error.otel_severity_number(), 17);
+        assert_eq!(Severity::Fatal.otel_severity_number(), 21);
+    }
+
+    #[test]
+    fn the_run_event_vocabulary_is_pinned_by_its_literals() {
+        assert_eq!(run_event::ACCEPTED, "run.accepted");
+        assert_eq!(run_event::STARTED, "run.started");
+        assert_eq!(run_event::RETRIEVAL_STARTED, "retrieval.started");
+        assert_eq!(run_event::RETRIEVAL_FINISHED, "retrieval.finished");
+        assert_eq!(run_event::CONTEXT_BUILT, "context.built");
+        assert_eq!(run_event::LLM_STARTED, "llm.started");
+        assert_eq!(run_event::LLM_FINISHED, "llm.finished");
+        assert_eq!(run_event::CITATION_VALIDATED, "citation.validated");
+        assert_eq!(run_event::ANSWER_FINALIZED, "answer.finalized");
+    }
+
+    #[test]
+    fn a_frozen_run_spec_serializes_in_declaration_order() {
+        // The freeze is the serialization: `runs.run_spec_json` holds these
+        // exact bytes, so field names and order are contract, not style.
+        let spec = RunSpec {
+            mode: RunMode::Ask,
+            query: "q".to_owned(),
+            slot: ModelSlot::Answer,
+            thinking: ThinkingTier::Medium,
+            model: "m".to_owned(),
+            max_output_tokens: 4096,
+            max_context_tokens: 8192,
+            allow_network: false,
+            allow_write: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&spec).expect("serialize"),
+            "{\"mode\":\"ask\",\"query\":\"q\",\"slot\":\"answer\",\"thinking\":\"medium\",\
+             \"model\":\"m\",\"max_output_tokens\":4096,\"max_context_tokens\":8192,\
+             \"allow_network\":false,\"allow_write\":false}"
+        );
+    }
+
+    #[test]
+    fn run_spec_validation_names_the_field_it_refused() {
+        let good = RunSpec {
+            mode: RunMode::Ask,
+            query: "q".to_owned(),
+            slot: ModelSlot::Answer,
+            thinking: ThinkingTier::Medium,
+            model: "m".to_owned(),
+            max_output_tokens: 1,
+            max_context_tokens: 1,
+            allow_network: false,
+            allow_write: false,
+        };
+        assert_eq!(good.validate(), Ok(()));
+
+        let mut bad = good.clone();
+        bad.query = "  ".to_owned();
+        assert_eq!(bad.validate(), Err(RunSpecError::EmptyQuery));
+        let mut bad = good.clone();
+        bad.model.clear();
+        assert_eq!(bad.validate(), Err(RunSpecError::EmptyModel));
+        let mut bad = good.clone();
+        bad.max_output_tokens = 0;
+        assert_eq!(bad.validate(), Err(RunSpecError::ZeroOutput));
+        let mut bad = good;
+        bad.max_context_tokens = 0;
+        assert_eq!(bad.validate(), Err(RunSpecError::ZeroContext));
+    }
+
+    #[test]
+    fn the_source_ref_keys_are_pinned_by_their_literals() {
+        // The literal pin: every consumer of `source_ref_json` spells through
+        // these constants, so an accidental edit here breaks this test instead
+        // of silently emptying a JSON path on the other side of a crate
+        // boundary (the `source_ref_json` drift registration).
+        assert_eq!(source_ref::SOURCE_KEY, "source_key");
+        assert_eq!(source_ref::REVISION_HASH, "revision_hash");
+        assert_eq!(source_ref::CHUNK_ID, "chunk_id");
+        assert_eq!(source_ref::CHUNK_HASH, "chunk_hash");
+        assert_eq!(source_ref::LOCATOR_JSON, "locator_json");
+        assert_eq!(source_ref::ORIGIN_CLASS, "origin_class");
     }
 }

@@ -17,11 +17,13 @@ pub mod events;
 mod graph;
 mod migration;
 pub mod revisions;
+pub mod runs;
 mod unit;
 
 pub use chunks::SourceCounts;
 pub use events::{NewStoreEvent, StoreEvent};
 pub use revisions::NewSourceRevision;
+pub use runs::{CreateRunOutcome, NewRun, NewRunEvent};
 
 /// Table holding multi-value store metadata. Never the schema version: that
 /// lives in `PRAGMA user_version` (D46).
@@ -114,6 +116,13 @@ pub enum StoreError {
         revision_hash: String,
     },
 
+    /// A run write named a run that is not in the store.
+    #[error("no run {run_id}")]
+    RunMissing {
+        /// Run id the caller asked for.
+        run_id: String,
+    },
+
     /// The store was written before `PRAGMA user_version` became the version
     /// carrier, so its rows may hold pre-scheme source keys.
     #[error(
@@ -143,6 +152,11 @@ pub enum StoreError {
     /// moved between read and commit.
     #[error("write guard refused the transaction: {0}")]
     GuardRejected(String),
+
+    /// An internal invariant broke: a bug in Momotaro, never a state the
+    /// caller's data can cause.
+    #[error("invariant violated: {0}")]
+    Invariant(&'static str),
 }
 
 pub(crate) fn invalid_value(column: &'static str, value: impl Into<String>) -> StoreError {

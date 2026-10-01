@@ -786,7 +786,9 @@ name = "momotaro-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "momotaro-llm",
  "momotaro-run",
+ "momotaro-store",
  "serde_json",
  "tempfile",
 ]
@@ -859,16 +861,21 @@ dependencies = [
 name = "momotaro-run"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "momotaro-context",
  "momotaro-contracts",
  "momotaro-ingest",
+ "momotaro-llm",
  "momotaro-platform",
  "momotaro-retrieve",
  "momotaro-store",
+ "momotaro-verify",
  "notify",
  "notify-debouncer-full",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "toml",

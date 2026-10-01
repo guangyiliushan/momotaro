@@ -95,7 +95,7 @@ const SELECT: &str = "SELECT
         outcome, reason_code, message, data_json, external_id
     FROM store_events";
 
-fn now_epoch_secs() -> i64 {
+pub(crate) fn now_epoch_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)

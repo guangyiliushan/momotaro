@@ -104,6 +104,16 @@ momotaro ask "解释谱定理和 PCA 的关系"
 4. 这一次 LLM turn；
 5. 引用校验结果。
 
+## Stats
+
+```bash
+momotaro stats
+```
+
+Counts for the local store: workspace status, schema version, database path,
+initialized, sources, chunks. `--json` prints the same fields; a count that is not
+known prints `unknown` on both outlets (never a fabricated `0`).
+
 ## Inspect a run
 
 ```bash
@@ -230,6 +240,10 @@ run `init` — and if the directory is not a workspace at all (no `momotaro.toml
 `--coverage` reports that instead, because `init` would fail there too.
 
 Other commands exit `1` only when they fail.
+
+`ask` exits `1` when its run failed — a failed citation fails the run
+(`architecture.md` §10.1) — and still prints the answer and its explicit failure
+marks on both outlets.
 
 `reconcile` follows the ordinary rule: `0` when the walk ran, `1` when the vault
 or the store was unusable. `watch` runs until it is stopped, so its exit code

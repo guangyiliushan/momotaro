@@ -35,8 +35,11 @@ fn copy_tree(source: &Path, target: &Path) {
 
 /// Writes the workspace configuration pointing at the staged vault.
 fn write_config(workspace: &Path) {
-    std::fs::write(workspace.join("momotaro.toml"), "[vault]\npath = 'vault'\n")
-        .expect("write momotaro.toml");
+    std::fs::write(
+        workspace.join("momotaro.toml"),
+        "[vault]\npath = 'vault'\n\n[model]\nprovider = 'fake'\nmodel_id = 'fake-model'\n",
+    )
+    .expect("write momotaro.toml");
 }
 
 fn run_cli(cwd: &std::path::Path, args: &[&str]) -> (String, String, bool) {

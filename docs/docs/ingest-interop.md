@@ -416,7 +416,7 @@ parse_error。
    `outcome=error` + `reason_code=key_collision`，是 [ADR 0002](adr/source-key-is-scheme-prefixed.md) /
    [ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 如实标注的临时护栏）：NFC 键相同而原始字节不同 →
    两条目都保留 + 消歧后缀 + `key_collision` 事件；**「绝不静默合并」只作用于身份键**（内容寻址的
-   revision 集、同策略幂等替换的 chunk 集与 `graph_links` 行集允许静默并——
+   revision 集、同策略幂等替换的 chunk 集（可含被引用保留的历史行）与 `graph_links` 行集允许静默并——
    [ADR 0027](adr/graph-links-rows-are-a-rebuilt-projection.md)）；
 5. **同步盘预警（D42 三条，词表 `Warning`）**：
    - **OneDrive placeholder**：判据**只认** `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`——

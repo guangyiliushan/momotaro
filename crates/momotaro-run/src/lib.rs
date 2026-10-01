@@ -7,6 +7,12 @@ mod index_service;
 mod reconcile;
 mod watch;
 
+pub mod ask;
+
+pub use ask::{
+    AskOptions, AskReport, CitationVerdict, IntegrityVerdict, ProviderTransport, ask_workspace,
+    format_ask, format_trace, trace_workspace, validate_ask_policy,
+};
 pub use index_service::{
     RebuildReport, SearchHit, SearchOutput, coverage_report, index_workspace, index_workspace_with,
     rebuild_index, search_workspace,
@@ -142,6 +148,30 @@ pub enum RunError {
         /// What the platform said, already carrying any network-volume caveat.
         reason: String,
     },
+
+    /// The frozen RunSpec was refused (`architecture.md` §19: 校验失败有明确
+    /// 错误).
+    #[error(transparent)]
+    SpecInvalid(#[from] momotaro_contracts::RunSpecError),
+
+    /// The active policy forbids the requested work (e.g. `ask` under
+    /// `--no-llm`).
+    #[error("policy refused the request: {0}")]
+    PolicyRefused(&'static str),
+
+    /// The run a read named does not exist.
+    #[error("no run {run_id}")]
+    RunNotFound {
+        /// The run id the caller asked for.
+        run_id: String,
+    },
+
+    /// This build carries no production provider transport (`momotaro-llm`'s
+    /// seam: "production wires a real transport later"). The engine is proven
+    /// end to end by the fake-LLM integration suite; wiring the real
+    /// transport is a registered dependency decision, not a silent gap.
+    #[error("no provider transport in this build: {0}")]
+    ProviderUnavailable(&'static str),
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,6 +179,104 @@ struct WorkspaceConfig {
     vault: VaultConfig,
     #[serde(default)]
     index: IndexPolicy,
+    #[serde(default)]
+    model: ModelConfig,
+    #[serde(default)]
+    policy: PolicySection,
+}
+
+/// The `[model]` section (architecture §7 — `momotaro.toml`): the answer
+/// slot's endpoint description. Only what this build consumes is typed here;
+/// pricing and slot matrices arrive with their own consumers.
+#[derive(Debug, Default, Deserialize)]
+struct ModelConfig {
+    /// The protocol the endpoint speaks (recorded on the run row).
+    #[serde(default)]
+    provider: Option<String>,
+    /// The provider model id (the `LlmRequest` model).
+    #[serde(default)]
+    model_id: Option<String>,
+    /// The provider's context window, when known.
+    #[serde(default)]
+    context_window: Option<u64>,
+    /// Output ceiling handed to the provider.
+    #[serde(default = "default_max_output_tokens")]
+    max_output_tokens: u32,
+    /// The thinking tier (`off | low | medium | high`, or `auto` for the
+    /// slot's default — D26).
+    #[serde(default = "default_thinking")]
+    thinking: String,
+}
+
+/// The `[policy]` section (architecture §7): Beta 保守默认 — network and
+/// file writes are off unless explicitly allowed.
+#[derive(Debug, Deserialize)]
+struct PolicySection {
+    /// Whether tools may touch the network.
+    #[serde(default)]
+    allow_network: bool,
+    /// Whether tools may write files.
+    #[serde(default)]
+    allow_write: bool,
+    /// The context budget.
+    #[serde(default = "default_max_context_tokens")]
+    max_context_tokens: u32,
+}
+
+impl Default for PolicySection {
+    fn default() -> Self {
+        Self {
+            allow_network: false,
+            allow_write: false,
+            max_context_tokens: default_max_context_tokens(),
+        }
+    }
+}
+
+fn default_max_output_tokens() -> u32 {
+    4096
+}
+
+fn default_thinking() -> String {
+    "auto".to_owned()
+}
+
+fn default_max_context_tokens() -> u32 {
+    8192
+}
+
+impl WorkspaceConfig {
+    /// The model id an ask runs on; refusing without one is a config error,
+    /// not a default.
+    fn model_id(&self) -> Result<&str, RunError> {
+        self.model
+            .model_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                RunError::ConfigInvalid("[model].model_id is required to run ask".to_owned())
+            })
+    }
+
+    /// The thinking tier frozen into the RunSpec (D26: `auto` = the answer
+    /// slot's default, `medium`).
+    fn model_thinking(&self) -> Result<momotaro_contracts::ThinkingTier, RunError> {
+        use momotaro_contracts::ThinkingTier;
+        match self.model.thinking.as_str() {
+            "auto" => Ok(ThinkingTier::Medium),
+            "off" => Ok(ThinkingTier::Off),
+            "low" => Ok(ThinkingTier::Low),
+            "medium" => Ok(ThinkingTier::Medium),
+            "high" => Ok(ThinkingTier::High),
+            other => Err(RunError::ConfigInvalid(format!(
+                "[model].thinking {other:?} is not a semantic tier; use off | low | medium | high | auto"
+            ))),
+        }
+    }
+}
+
+fn default_vault_name() -> String {
+    "default".to_owned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,10 +284,6 @@ struct VaultConfig {
     path: PathBuf,
     #[serde(default = "default_vault_name")]
     name: String,
-}
-
-fn default_vault_name() -> String {
-    "default".to_owned()
 }
 
 /// Validates a configured [`IndexPolicy`] against the capabilities this
@@ -191,7 +315,7 @@ fn validate_policy(policy: &IndexPolicy) -> Result<(), RunError> {
     Ok(())
 }
 
-fn config_path(root: &Path) -> PathBuf {
+pub(crate) fn config_path(root: &Path) -> PathBuf {
     root.join(CONFIG_FILE)
 }
 
@@ -199,11 +323,11 @@ fn data_dir(root: &Path) -> PathBuf {
     root.join(DATA_DIR)
 }
 
-fn database_path(root: &Path) -> PathBuf {
+pub(crate) fn database_path(root: &Path) -> PathBuf {
     data_dir(root).join(DATABASE_FILE)
 }
 
-fn load_config(root: &Path) -> Result<WorkspaceConfig, RunError> {
+pub(crate) fn load_config(root: &Path) -> Result<WorkspaceConfig, RunError> {
     let path = config_path(root);
     let source = fs::read_to_string(&path).map_err(|source| RunError::ConfigRead {
         path: path.clone(),
@@ -238,6 +362,51 @@ fn vault_scope(root: &Path, config: &WorkspaceConfig) -> Result<VaultScope, RunE
         root: path,
         name: config.vault.name.clone(),
     })
+}
+
+/// Wall-clock seconds on the caller's clock — the `created_at` stamp the run
+/// layer hands the store (like `ingested_at`, the caller owns its clock).
+pub(crate) fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+/// A timestamp id that reads as what it is: the millisecond is for a human,
+/// the nanosecond half separates two ids inside the same millisecond.
+///
+/// Unique without a new dependency. One implementation for every id the run
+/// layer mints (batches, runs, retrievals) — the batch-id stamp used to be
+/// spelled twice (watch and index), which is the drift this closes.
+pub(crate) fn stamp_id(prefix: &str) -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{prefix}-{}-{:x}", stamp.as_millis(), stamp.subsec_nanos())
+}
+
+/// Opens the store the run engine writes to, asking the same health question
+/// every run-side entry asks (the store discipline's read-side rule: reuse
+/// `store_fault`, do not fork a second open+health branch).
+///
+/// A database that does not exist yet is not created here — building the
+/// store is `init`'s job, and the advice says so (the runnable-advice rule).
+pub(crate) fn open_run_store(root: &Path) -> Result<momotaro_store::Store, RunError> {
+    match index_service::store_file(root) {
+        index_service::StoreFile::Present => {}
+        index_service::StoreFile::Absent | index_service::StoreFile::Empty => {
+            return Err(RunError::StoreUnhealthy(
+                "this workspace is not initialized, run `momotaro init` first".to_owned(),
+            ));
+        }
+    }
+    if let Some(reason) = index_service::store_fault(root) {
+        return Err(RunError::StoreUnhealthy(reason));
+    }
+    let mut store = momotaro_store::Store::open(database_path(root))?;
+    store.init_schema()?;
+    Ok(store)
 }
 
 /// Initializes the local SQLite store and returns a small stats report.
@@ -443,7 +612,7 @@ const EXCERPT_LINE_CHARS: usize = 100;
 /// unprintable characters are dropped — C0/C1 controls can drive the terminal,
 /// and the bidi / zero-width format characters can hide or reorder the rest of
 /// the line.
-fn sanitize(text: &str) -> String {
+pub(crate) fn sanitize(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_whitespace() { ' ' } else { c })
         .filter(|c| !is_unprintable(*c))
@@ -590,6 +759,30 @@ pub fn format_search_hit(hit: &SearchHit) -> String {
     format!(
         "{}. {:?}#{}  {:?}  score={:.3}",
         hit.hit.rank, hit.hit.source_key, hit.hit.ordinal, title, hit.hit.score
+    )
+}
+
+/// The human rendering of one stats report.
+///
+/// Every field the JSON outlet carries is named here (两出口字段一致): a
+/// script reading `--json` and a human reading the terminal see the same
+/// facts. `unknown` stays `unknown` — a missing count is never `0`
+/// (architecture §5.2 rule 12).
+pub fn format_stats(report: &StatsReport) -> String {
+    let shown = |value: Option<u64>| match value {
+        Some(value) => value.to_string(),
+        None => "unknown".to_owned(),
+    };
+    format!(
+        "status: {}\nschema version: {}\ndatabase: {}\ninitialized: {}\nsources: {}\nchunks: {}\n",
+        report.status.as_str(),
+        report
+            .schema_version
+            .map_or_else(|| "unknown".to_owned(), |version| version.0.to_string()),
+        sanitize(&report.database_path.display().to_string()),
+        report.initialized,
+        shown(report.sources),
+        shown(report.chunks),
     )
 }
 

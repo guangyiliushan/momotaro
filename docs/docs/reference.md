@@ -150,6 +150,17 @@ An answer citation binds one claim in the answer to exact source evidence.
 Only `source_key + revision_hash + chunk_id + chunk_hash + locator` can make a
 citation verifiable.
 
+The surface protocol: the answer cites evidence fragments inline as `[f0001]`-style
+markers and ends with a `Citations:` block, one line per citation — `[f0001] the
+exact quoted span from that fragment`. The quote must appear verbatim in the cited
+chunk (architecture §14.1.3). Failures are explicit: a marker whose quote is missing
+or not locatable is a `text_not_locatable` failure, a block line that is not
+`[fDDDD] …` becomes a `citation_invalid` claim rather than prose, and a marker
+naming no context item is `citation_invalid` (§14.1.4). The marker format belongs to
+the run layer; `momotaro-verify` treats the id as opaque. (Shape note: quote-carrying
+citations follow the `cited_text` family of provider citation APIs rather than
+numeric-only `[1]` markers, because §14.1.3 requires the quote to be locatable.)
+
 ### Verification
 
 A verification is an independent result produced by deterministic code.

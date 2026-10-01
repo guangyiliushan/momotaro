@@ -103,19 +103,8 @@ pub(crate) struct Batch {
 impl Batch {
     /// Opens a batch whose id reads as what it is.
     pub fn new(plan: EventPlan) -> Self {
-        // Unique without a new dependency: the millisecond is for a human
-        // reading the table, the nanosecond half separates two batches inside
-        // the same millisecond.
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
         Self {
-            id: format!(
-                "{}-{}-{:x}",
-                plan.prefix,
-                stamp.as_millis(),
-                stamp.subsec_nanos()
-            ),
+            id: crate::stamp_id(plan.prefix),
             plan,
             seq: 0,
         }
@@ -468,7 +457,7 @@ fn index_fault(root: &Path) -> Option<String> {
 ///
 /// `Store::open` creates the file it does not find and switches a 0-byte file to
 /// WAL, so a read path may not hand it anything it has not looked at first.
-enum StoreFile {
+pub(crate) enum StoreFile {
     /// No database at all.
     Absent,
     /// The file exists with no content: a database that was never written.
@@ -478,7 +467,7 @@ enum StoreFile {
 }
 
 /// Classifies the database file without opening it.
-fn store_file(root: &Path) -> StoreFile {
+pub(crate) fn store_file(root: &Path) -> StoreFile {
     match fs::metadata(database_path(root)) {
         Err(_) => StoreFile::Absent,
         Ok(metadata) if metadata.len() == 0 => StoreFile::Empty,
@@ -490,7 +479,7 @@ fn store_file(root: &Path) -> StoreFile {
 ///
 /// `None` covers both "healthy" and "no database at all": an absent store is
 /// `Uninitialized`, which reads as "run `init`".
-fn store_fault(root: &Path) -> Option<String> {
+pub(crate) fn store_fault(root: &Path) -> Option<String> {
     match store_file(root) {
         StoreFile::Absent => None,
         // An empty file is uninitialized by definition — and saying so must not
@@ -1090,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn every_ingest_write_goes_through_the_unit() {
+    fn every_store_write_goes_through_its_unit() {
         // The wiring cannot be driven through the public API (production passes
         // the real store), so it is counted, on the precedent just above:
         // reverting a call site to `append_revision` + `replace_chunks` must go
@@ -1100,6 +1089,13 @@ mod tests {
         // ingest write site, and a needle that missed it let a mutation splice
         // three separate commits into `commit_source_refresh`'s place with the
         // whole suite green.
+        //
+        // Deliberate extension (W3.7, the run units): the ask module's run
+        // write sites are counted here too, with the same teeth — a call site
+        // that drops a save, duplicates one, or hand-splices its own writes
+        // moves these numbers. The counts are the current shape on purpose:
+        // `commit_run_llm_turn` is two because a failed exchange still lands
+        // its turn row.
         let source = include_str!("index_service.rs");
         let writes = concat!("store.commit_source", "_file(");
         let refresh = concat!("store.commit_source", "_refresh(");
@@ -1113,6 +1109,29 @@ mod tests {
             1,
             "the refresh write site commits through its unit too"
         );
+
+        let ask_source = include_str!("ask.rs");
+        let ask = ask_source
+            .split(concat!("#[cfg(", "test)]"))
+            .next()
+            .expect("the source has a start");
+        for (needle, expected) in [
+            (concat!("store.commit_run", "_create("), 1),
+            (concat!("store.commit_run", "_start("), 1),
+            (concat!("store.commit_run", "_retrieval("), 1),
+            (concat!("store.commit_run", "_context("), 1),
+            (concat!("store.commit_run", "_llm_turn("), 2),
+            (concat!("store.commit_run", "_verifications("), 1),
+            (concat!("store.commit_run", "_answer("), 1),
+            (concat!("store.commit_run", "_terminal("), 1),
+            (concat!("store.append_run", "_event("), 2),
+        ] {
+            assert_eq!(
+                ask.matches(needle).count(),
+                expected,
+                "the ask module's write sites run through their units ({needle:?})"
+            );
+        }
     }
 
     #[test]

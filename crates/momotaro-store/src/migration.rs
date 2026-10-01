@@ -93,9 +93,13 @@ CREATE INDEX IF NOT EXISTS idx_store_events_source
     // present (source_revisions, chunks, store_events) are not rebuilt.
     //
     // The PRIMARY KEY / UNIQUE declarations carry their own autoindexes, and
-    // those already serve every leftmost prefix the tables need. The one
-    // explicit index is `graph_links(from_source_key)` — that table declares no
-    // key, and every projection replace deletes by `from_source_key` (ADR 0027).
+    // those serve the keyed lookups these tables were designed around. Four
+    // `run_id` lookups (retrievals, llm_turns, verifications, answers) are
+    // NOT served by them — `run_trace` scans those tables per run — and a
+    // future migration may add the four indexes when scale demands (the DDL
+    // is the contract; this is a note, not a step). The one explicit index is
+    // `graph_links(from_source_key)` — that table declares no key, and every
+    // projection replace deletes by `from_source_key` (ADR 0027).
     (
         5,
         "CREATE TABLE IF NOT EXISTS sessions (

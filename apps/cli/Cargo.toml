@@ -12,3 +12,5 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+momotaro-llm = { workspace = true, features = ["test-util"] }
+momotaro-store = { workspace = true }
