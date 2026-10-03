@@ -14,7 +14,7 @@ use momotaro_contracts::{Chunk, OriginClass, RetrievalHit};
 use crate::RetrieveError;
 use crate::boost;
 use crate::cjk::{CJK_TOKENIZER_NAME, cjk_analyzer};
-use crate::query::{escape_query, normalize_query};
+use crate::query::{escape_query, is_searchable, normalize_query};
 use crate::schema::{self, Fields};
 
 /// Sentinel file tantivy writes on index creation.
@@ -234,7 +234,13 @@ impl SearchIndex {
     /// 1-based.
     pub fn search(&self, query: &str, top_k: usize) -> Result<Vec<RetrievalHit>, RetrieveError> {
         let normalized = normalize_query(query);
-        if top_k == 0 || !normalized.chars().any(char::is_alphanumeric) {
+        // Two halves, for two different reasons. `!is_searchable` is the
+        // predicate `--mode expand` shares (see `is_searchable`), and the
+        // parser's own empty-result path would cover it if it were removed.
+        // `top_k == 0` is load-bearing instead: `TopDocs::with_limit(0)`
+        // panics (`assert_ne!(limit, 0, "Limit must be greater than 0")`)
+        // and the CLI takes `--top 0`. Neither half is removable.
+        if top_k == 0 || !is_searchable(&normalized) {
             return Ok(Vec::new());
         }
         self.reader.reload()?;

@@ -1499,6 +1499,244 @@ mod tests {
     }
 
     #[test]
+    fn a_store_stamped_v6_migrates_to_exactly_the_fresh_shape() {
+        // The two supported paths into schema 7: migrating a v6 store and
+        // initializing a brand-new file. v6 is what every build before step 7
+        // left behind — the run tables with no `run_id` index — so the v6
+        // shape is the fresh shape minus exactly those four indexes.
+        let fresh_dir = tempfile::tempdir().expect("create temp dir");
+        let fresh_path = fresh_dir.path().join("momotaro.db");
+        let mut fresh = Store::open(&fresh_path).expect("open fresh store");
+        fresh.init_schema().expect("initialize fresh");
+
+        let v6_dir = tempfile::tempdir().expect("create temp dir");
+        let v6_path = v6_dir.path().join("momotaro.db");
+        {
+            let mut v6 = Store::open(&v6_path).expect("open v6 store");
+            v6.init_schema().expect("initialize");
+            v6.connection
+                .execute_batch(
+                    "DROP INDEX idx_retrievals_run;
+                     DROP INDEX idx_llm_turns_run;
+                     DROP INDEX idx_answers_run;
+                     DROP INDEX idx_verifications_run;
+                     PRAGMA user_version = 6;",
+                )
+                .expect("rewind to the v6 shape");
+        }
+        assert_eq!(
+            declared_indexes(&Store::open(&v6_path).expect("read v6")),
+            [
+                "idx_chunks_rev",
+                "idx_graph_links_from",
+                "idx_revisions_current",
+                "idx_store_events_external",
+                "idx_store_events_source",
+            ],
+            "the v6 fixture really is v6: no run_id index yet"
+        );
+
+        let mut v6 = Store::open(&v6_path).expect("reopen v6 store");
+        v6.init_schema().expect("migrate to current");
+
+        assert_eq!(
+            v6.user_version().expect("read user_version"),
+            CURRENT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            schema_shape(&fresh),
+            schema_shape(&v6),
+            "the v6 path and the fresh path land on the same schema"
+        );
+        // The migration is preceded by a verified backup (D46), named from the
+        // version constants rather than from a literal.
+        assert!(
+            !backup_files(
+                v6_dir.path(),
+                &format!("backup-v6-to-v{CURRENT_SCHEMA_VERSION}-")
+            )
+            .is_empty(),
+            "a migration from v6 is backed up first"
+        );
+    }
+
+    #[test]
+    fn a_colliding_index_name_does_not_leave_a_table_uncovered() {
+        // `CREATE INDEX IF NOT EXISTS` keys on the name across the whole
+        // schema, not on the table: a store where `idx_answers_run` already sat
+        // on another table would skip the creation, stamp v7, and leave
+        // `answers` uncovered while `doctor` reported ready. Step 7 drops first,
+        // so the state converges.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("momotaro.db");
+        {
+            let mut store = Store::open(&path).expect("open fresh store");
+            store.init_schema().expect("initialize");
+            store
+                .connection
+                .execute_batch(
+                    "DROP INDEX idx_retrievals_run;
+                     DROP INDEX idx_llm_turns_run;
+                     DROP INDEX idx_answers_run;
+                     DROP INDEX idx_verifications_run;
+                     CREATE INDEX idx_answers_run ON chunks(source_key);
+                     PRAGMA user_version = 6;",
+                )
+                .expect("rewind to a colliding v6");
+        }
+
+        let mut store = Store::open(&path).expect("reopen");
+        store.init_schema().expect("migrate to current");
+
+        assert_eq!(
+            store.user_version().expect("read user_version"),
+            CURRENT_SCHEMA_VERSION
+        );
+        for table in ["retrievals", "llm_turns", "answers", "verifications"] {
+            assert!(
+                has_run_id_index(&store, table),
+                "{table} must be covered even when its index name was already taken"
+            );
+        }
+    }
+
+    #[test]
+    fn the_run_id_child_tables_are_covered_by_a_run_id_index() {
+        // The inventory is read from the live schema rather than from a
+        // hand-written list: a table that grows a `run_id` column without a
+        // covering index fails here, not at query time.
+        let (_dir, mut store) = open_temp_store();
+        store.init_schema().expect("initialize schema");
+
+        let tables: Vec<String> = store
+            .connection
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .and_then(|mut s| s.query_map([], |row| row.get(0))?.collect())
+            .expect("list tables");
+
+        let mut child_tables = Vec::new();
+        for table in tables {
+            let columns: Vec<String> = store
+                .connection
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .and_then(|mut s| s.query_map([], |row| row.get(0))?.collect())
+                .expect("list columns");
+            if !columns.iter().any(|column| column == "run_id") {
+                continue;
+            }
+            child_tables.push(table.clone());
+            assert!(
+                has_run_id_index(&store, &table),
+                "{table} declares run_id but no non-partial index starts with it"
+            );
+        }
+
+        // Pinned to what this schema actually holds, so dropping a table (or
+        // adding one) is a decision someone has to take here first.
+        assert_eq!(
+            child_tables,
+            [
+                "answers",
+                "history_items",
+                "llm_turns",
+                "retrievals",
+                "run_context_items",
+                "run_events",
+                "runs",
+                "verifications",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_four_run_id_indexes_are_declared_on_their_own_table() {
+        // sqlite_master only: the name, the table it belongs to and the column
+        // list it covers. Query plans (`EXPLAIN QUERY PLAN`) are deliberately
+        // not pinned — the plan is the engine's, the declaration is ours.
+        let (_dir, mut store) = open_temp_store();
+        store.init_schema().expect("initialize schema");
+
+        for (index, table) in [
+            ("idx_answers_run", "answers"),
+            ("idx_llm_turns_run", "llm_turns"),
+            ("idx_retrievals_run", "retrievals"),
+            ("idx_verifications_run", "verifications"),
+        ] {
+            let (owner, sql): (String, String) = store
+                .connection
+                .query_row(
+                    "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [index],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap_or_else(|error| panic!("index {index} is declared: {error}"));
+            assert_eq!(owner, table, "{index} belongs to {owner}");
+            assert!(
+                sql.to_uppercase().contains("(RUN_ID)"),
+                "{index} covers run_id: {sql}"
+            );
+        }
+    }
+
+    /// Whether `table` has a non-partial index whose first column is `run_id`.
+    ///
+    /// A partial index cannot answer an unqualified `WHERE run_id = ?`, so it
+    /// does not count as coverage.
+    fn has_run_id_index(store: &Store, table: &str) -> bool {
+        let indexes: Vec<(String, i64)> = store
+            .connection
+            .prepare(&format!(
+                "SELECT name, partial FROM pragma_index_list('{table}')"
+            ))
+            .and_then(|mut s| {
+                s.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .expect("list indexes");
+        for (index, partial) in indexes {
+            if partial != 0 {
+                continue;
+            }
+            let columns: Vec<String> = store
+                .connection
+                .prepare(&format!(
+                    "SELECT name FROM pragma_index_info('{index}') ORDER BY seqno"
+                ))
+                .and_then(|mut s| s.query_map([], |row| row.get(0))?.collect())
+                .expect("list index columns");
+            if columns.first().map(String::as_str) == Some("run_id") {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Every index the schema declares, by name, excluding the autoindexes that
+    /// come with a PRIMARY KEY or UNIQUE constraint (`sql` is NULL for those).
+    fn declared_indexes(store: &Store) -> Vec<String> {
+        let mut names = Vec::new();
+        {
+            let mut statement = store
+                .connection
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'index' AND sql IS NOT NULL ORDER BY name",
+                )
+                .expect("prepare");
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query");
+            for row in rows {
+                names.push(row.expect("row"));
+            }
+        }
+        names
+    }
+
+    #[test]
     fn a_legacy_store_is_refused_with_a_clear_message() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("momotaro.db");
@@ -1846,34 +2084,23 @@ mod tests {
         // with their constraints and are excluded (`sql` is NULL for them), so
         // this asserts what the schema *declares* — a new or dropped explicit
         // index is a schema change this test must see (the step-5 assertion the
-        // v5 batch deferred to W2.4).
+        // v5 batch deferred to W2.4, extended by step 7's four `run_id`
+        // indexes).
         let dir = tempfile::tempdir().expect("temp dir");
         let mut store = Store::open(dir.path().join("momotaro.db")).expect("open");
         store.init_schema().expect("init");
-        let mut names = Vec::new();
-        {
-            let mut statement = store
-                .connection
-                .prepare(
-                    "SELECT name FROM sqlite_master
-                     WHERE type = 'index' AND sql IS NOT NULL ORDER BY name",
-                )
-                .expect("prepare");
-            let rows = statement
-                .query_map([], |row| row.get::<_, String>(0))
-                .expect("query");
-            for row in rows {
-                names.push(row.expect("row"));
-            }
-        }
         assert_eq!(
-            names,
+            declared_indexes(&store),
             [
+                "idx_answers_run",
                 "idx_chunks_rev",
                 "idx_graph_links_from",
+                "idx_llm_turns_run",
+                "idx_retrievals_run",
                 "idx_revisions_current",
                 "idx_store_events_external",
                 "idx_store_events_source",
+                "idx_verifications_run",
             ]
         );
     }

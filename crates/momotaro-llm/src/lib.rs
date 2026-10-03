@@ -18,11 +18,12 @@
 //! * **Usage is recorded, not invented.** Token figures the provider omits
 //!   stay `None` (= NULL in `llm_turns`); a reported zero stays `Some(0)`.
 //!
-//! Zero-network guarantee: this crate contains no HTTP client. Every exchange
-//! goes through the injected [`ProviderTransport`] seam, and tests drive it
-//! with the `fake::FakeLlm` rig (behind the `test-util` feature for
-//! downstream crates; built-in for this crate's own tests), so CI cannot
-//! reach the network.
+//! Zero-network guarantee: no test in this workspace opens a socket. Every
+//! exchange in tests goes through the injected [`ProviderTransport`] seam with
+//! the `fake::FakeLlm` rig (behind the `test-util` feature for downstream
+//! crates; built-in for this crate's own tests). [`http`] is the one production
+//! implementation of that seam; it is built and configured by tests, never
+//! called, so CI cannot reach the network.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -30,11 +31,13 @@
 pub mod error;
 #[cfg(any(test, feature = "test-util"))]
 pub mod fake;
+pub mod http;
 pub mod request;
 pub mod response;
 pub mod transport;
 
 pub use error::{LlmError, LlmErrorKind};
+pub use http::{HttpTransport, TransportConfigError};
 pub use request::{LlmRequest, Message, Role, ToolDef};
 pub use response::{FinishReason, LlmOutput, Usage};
 pub use transport::{ProviderTransport, TransportError, TransportReply};

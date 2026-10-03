@@ -136,7 +136,8 @@ CLI shim 示例（业务不写在 package.json 里）：
 更宽测试前，至少：
 
 1. `momotaro index` 能索引 fixture vault；
-2. `momotaro search` 无 API key 可用，且不消耗 token；
+2. `momotaro search`（lexical）无 API key 可用，且不消耗 token——
+   `--mode expand` 例外，它发一次改写调用（§10.2）；
 3. `momotaro ask` 返回带引用答案；
 4. `momotaro trace` 能回放 run；
 5. 无效引用被显式标记失败；

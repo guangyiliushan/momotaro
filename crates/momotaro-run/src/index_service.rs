@@ -11,8 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use momotaro_contracts::{
     AnchorKind, Chunk, CoverageCounts, CoverageFailure, CoverageReport, Degradation, GraphLink,
-    IndexFileError, IndexFileErrorKind, IndexPolicy, IndexReport, OriginClass, RetrievalHit,
-    SourceKind, Warning, WorkspaceStatus,
+    IndexFileError, IndexFileErrorKind, IndexPolicy, IndexReport, LlmTurnRecord, ModelSlot,
+    OriginClass, RetrievalHit, RetrievalHitRecord, RetrievalRecord, RunSpec, SourceKind,
+    TerminalEvent, Warning, WorkspaceStatus, run_event,
 };
 use momotaro_ingest::frontmatter::{self, FrontmatterParse};
 use momotaro_ingest::{
@@ -23,11 +24,14 @@ use momotaro_ingest::{
     scene_spans, source_key_for, walk_entries, windows_incompatible_components,
 };
 use momotaro_retrieve::{IndexWriterHandle, RetrieveError, SearchIndex};
-use momotaro_store::{NewSourceRevision, NewStoreEvent, Store, StoreError};
+use momotaro_store::{NewRun, NewRunEvent, NewSourceRevision, NewStoreEvent, Store, StoreError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::{RunError, WorkspaceConfig, database_path, load_config, validate_policy, vault_scope};
+use crate::{
+    RunError, WorkspaceConfig, database_path, load_config, sha256_hex, to_i64, validate_policy,
+    vault_scope,
+};
 
 /// Tool tag embedded in every revision fingerprint.
 const FINGERPRINT_TOOL: &str = "momotaro-index-v1";
@@ -768,6 +772,109 @@ mod tests {
     }
 
     #[test]
+    fn a_json_array_is_read_as_the_queries_to_run() {
+        // The prompt's contract: a JSON array of strings, nothing else.
+        let queries = expanded_queries("[\"one\", \"two\"]", 4);
+        assert_eq!(queries, ["one", "two"]);
+    }
+
+    #[test]
+    fn a_fenced_json_array_still_counts_as_json() {
+        // Models wrap the array they were asked for often enough that failing
+        // here would fail in practice, not just in the test.
+        for text in [
+            "```json\n[\"one\", \"two\"]\n```",
+            "```\n[\"one\", \"two\"]\n```",
+            "```json\n[\"one\", \"two\"]",
+        ] {
+            assert_eq!(expanded_queries(text, 4), ["one", "two"], "{text:?}");
+        }
+    }
+
+    #[test]
+    fn plain_lines_are_the_fallback_when_the_reply_is_not_json() {
+        // One query per non-empty line; a fence-only line is not a query.
+        let queries = expanded_queries("  first  \n\n```json\nsecond\n```\n", 4);
+        assert_eq!(queries, ["first", "second"]);
+    }
+
+    #[test]
+    fn duplicates_and_the_width_cap_are_enforced_by_the_parser() {
+        // The cap is what keeps an unbounded reply from becoming an unbounded
+        // number of searches, and a repeated query would otherwise count as
+        // two lists in the fusion.
+        let queries = expanded_queries("[\"a\", \"a\", \"b\", \"c\", \"d\"]", 2);
+        assert_eq!(queries, ["a", "b"], "deduplicated, then capped");
+
+        assert!(expanded_queries("[]", 4).is_empty());
+        assert!(expanded_queries("   ", 4).is_empty());
+        assert!(expanded_queries("[\"\", \"  \"]", 4).is_empty());
+    }
+
+    #[test]
+    fn the_prompt_names_the_same_width_the_parser_enforces() {
+        // A number in a prompt is a promise: if it drifts from
+        // EXPANDED_QUERY_COUNT the model is asked for one width and the parser
+        // enforces another.
+        let prompt = REWRITE_SYSTEM.replace("{n}", &EXPANDED_QUERY_COUNT.to_string());
+        assert!(
+            prompt.contains(&format!("exactly {EXPANDED_QUERY_COUNT} strings")),
+            "{prompt}"
+        );
+        assert_eq!(EXPANDED_QUERY_COUNT, 4);
+        // And the placeholder really is substituted, never left literal.
+        assert!(!prompt.contains("{n}"), "{prompt}");
+    }
+
+    #[test]
+    fn a_named_failure_carries_its_row_and_an_unnameable_one_carries_nothing() {
+        // The terminal write only lands a §18 payload for a failure this layer
+        // can name — `failure_row`'s catch-all is `unreachable!`, so guessing a
+        // category would panic rather than invent an attribution. Both halves
+        // of that decision are pure and therefore testable without a store.
+        let auth = momotaro_llm::LlmError {
+            kind: momotaro_llm::LlmErrorKind::Auth,
+            status: Some(401),
+            provider_code: None,
+            message: "the provider call for model m failed: HTTP 401".to_owned(),
+            output_observed: false,
+            attempts: 1,
+            usage: None,
+        };
+        let (data, note) = expand_failure_payload(&RunError::Llm(auth)).expect("named");
+        let row: serde_json::Value = serde_json::from_str(&data).expect("payload is JSON");
+        assert_eq!(row["category"], "llm_auth", "the §18 category");
+        assert_eq!(row["attribution"], "user", "and its attribution");
+        assert_eq!(row["retryable"], false, "and its retryability");
+        assert_eq!(
+            row["severity"],
+            momotaro_contracts::Severity::Error.as_str()
+        );
+        assert!(
+            note.expect("a note says what failed").contains("HTTP 401"),
+            "the note carries the failure"
+        );
+
+        let (data, note) = expand_failure_payload(&RunError::RewriteUnusable).expect("named");
+        let row: serde_json::Value = serde_json::from_str(&data).expect("payload is JSON");
+        // A 2xx that searched nothing is a malformed completion, not a provider
+        // outage — that is what §18 spells for it.
+        assert_eq!(row["category"], "llm_malformed");
+        assert!(
+            note.expect("the note names the failure")
+                .contains("no usable query"),
+            "and it says which failure"
+        );
+
+        // Anything this layer cannot name must not be dressed in a category the
+        // taxonomy never decided: the run is abandoned to the sweep instead.
+        assert!(
+            expand_failure_payload(&RunError::IndexNotBuilt("gone".to_owned())).is_none(),
+            "an index fault carries no §18 row"
+        );
+    }
+
+    #[test]
     fn the_row_payload_carries_each_list_only_when_it_has_one() {
         // The shape the coverage row's `data_json` carries, pinned on the pure
         // function that builds it — the empty payload is exactly `{}`, each list
@@ -1130,6 +1237,28 @@ mod tests {
                 ask.matches(needle).count(),
                 expected,
                 "the ask module's write sites run through their units ({needle:?})"
+            );
+        }
+
+        // This module's own run write sites, counted the same way. Without
+        // them the loop above is a statement about `ask.rs` alone and a call
+        // site added here is never seen — which is precisely how "the run
+        // records a STARTED event" survived a mutation that deleted it.
+        // The counts are the current shape on purpose: `commit_run_terminal`
+        // is two because a success and a named failure each land one, and
+        // `commit_run_llm_turn` is two because a failed exchange still lands
+        // its turn row.
+        for (needle, expected) in [
+            (concat!("store.commit_run", "_create("), 1),
+            (concat!("store.commit_run", "_start("), 1),
+            (concat!("store.commit_run", "_terminal("), 2),
+            (concat!("store.commit_run", "_llm_turn("), 2),
+            (concat!("store.commit_run", "_retrieval("), 1),
+        ] {
+            assert_eq!(
+                source.matches(needle).count(),
+                expected,
+                "this module's run write sites go through their units ({needle:?})"
             );
         }
     }
@@ -4005,20 +4134,20 @@ pub struct SearchOutput {
     pub query: String,
     /// Ranked hits.
     pub hits: Vec<SearchHit>,
+    /// The run this search created, when it created one: `--mode expand`
+    /// records one (`architecture.md` §10.2), lexical creates none. Absent from
+    /// the JSON when there is none, so the lexical payload is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
-/// Searches the built index; the index must exist.
+/// Opens the built index for reading; the index must exist.
 ///
 /// Errors with [`RunError::IndexNotBuilt`] when there is no index at all (the
-/// store has no chunks to put in one), [`RunError::IndexUnusable`] when an index
-/// directory exists but cannot be used, and [`RunError::StoreUnhealthy`] when the
-/// store itself is the thing that is not ready.
-pub fn search_workspace(
-    root: impl AsRef<Path>,
-    query: &str,
-    top_k: usize,
-) -> Result<SearchOutput, RunError> {
-    let root = root.as_ref();
+/// store has no chunks to put in one) and [`RunError::IndexUnusable`] when an
+/// index directory exists but cannot be used. Every search path asks these
+/// questions first, so a refusal never costs an LLM call.
+fn open_search_index(root: &Path) -> Result<SearchIndex, RunError> {
     let dir = index_dir(root);
 
     // An index directory that exists but cannot be used is not "never built": the
@@ -4035,12 +4164,15 @@ pub fn search_workspace(
         return Err(RunError::IndexNotBuilt(dir.display().to_string()));
     }
 
-    let search_index = SearchIndex::open_or_create(&dir)?;
-    let hits = search_index.search(query, top_k)?;
+    Ok(SearchIndex::open_or_create(&dir)?)
+}
 
-    // The hits are citations: the store is what gives them a title and an
-    // excerpt, so a query in a workspace whose database is gone has nothing to
-    // cite — and this command may not create the database it would read.
+/// Opens the store that gives hits their title and excerpt.
+///
+/// The hits are citations, so a query in a workspace whose database is gone has
+/// nothing to cite — and a read command may not create the database it would
+/// read.
+fn open_search_store(root: &Path) -> Result<Store, RunError> {
     if !matches!(store_file(root), StoreFile::Present) {
         return Err(RunError::StoreUnhealthy(
             "the database is missing or empty; run `momotaro index` to rebuild it and the index it feeds"
@@ -4049,7 +4181,11 @@ pub fn search_workspace(
     }
     let mut store = Store::open(database_path(root))?;
     store.init_schema()?;
+    Ok(store)
+}
 
+/// Attaches the title and excerpt every displayed hit carries.
+fn enrich_hits(store: &mut Store, hits: Vec<RetrievalHit>) -> Result<Vec<SearchHit>, RunError> {
     let mut enriched = Vec::with_capacity(hits.len());
     for hit in hits {
         let stored = store.get_chunk(&hit.chunk_id)?;
@@ -4061,11 +4197,446 @@ pub fn search_workspace(
             excerpt,
         });
     }
+    Ok(enriched)
+}
+
+/// Searches the built index; the index must exist.
+///
+/// Pure Tantivy BM25: no LLM call, no token spent (`architecture.md` §10.2).
+/// Refuses exactly as the shared `open_search_index` / `open_search_store`
+/// helpers describe, both of which run before a single query is executed.
+pub fn search_workspace(
+    root: impl AsRef<Path>,
+    query: &str,
+    top_k: usize,
+) -> Result<SearchOutput, RunError> {
+    let root = root.as_ref();
+    let search_index = open_search_index(root)?;
+    let mut store = open_search_store(root)?;
+
+    let hits = search_index.search(query, top_k)?;
+    let hits = enrich_hits(&mut store, hits)?;
 
     Ok(SearchOutput {
         query: query.to_owned(),
-        hits: enriched,
+        hits,
+        run_id: None,
     })
+}
+
+/// How many queries `--mode expand` asks the model for (§10.2's "N").
+///
+/// A constant, not a knob: architecture §7 lists the workspace's configuration
+/// surface and the rewrite width is not on it.
+const EXPANDED_QUERY_COUNT: usize = 4;
+
+/// Output ceiling for the rewrite turn — four short queries, not prose.
+const REWRITE_MAX_TOKENS: u32 = 256;
+
+/// The rewrite instruction. `{n}` is replaced with
+/// [`EXPANDED_QUERY_COUNT`] so the number in the prompt cannot drift from the
+/// number the parser enforces.
+const REWRITE_SYSTEM: &str = "You rewrite one search query into several alternative queries \
+for a lexical BM25 search over a personal note vault. Reply with a JSON array of exactly {n} \
+strings and nothing else: no prose, no code fence. Each entry is one short query, in the same \
+language as the user's query, and none of them repeats the input verbatim.";
+
+/// Runs `--mode expand`: one short LLM rewrite → N queries → BM25 each → RRF
+/// (`architecture.md` §10.2).
+///
+/// Every gate runs **before** the provider is called: `--no-llm`, the network
+/// policy (`--allow-network` ∨ `[policy].allow_network`), and a usable index
+/// and store. Any of them refusing means no token and no connection are spent —
+/// a request the policy forbids never reaches the endpoint.
+///
+/// The result is ranked by [`momotaro_retrieve::fuse_rrf`], whose tie-break is
+/// documented and tested there: same input lists, same order.
+///
+/// Recorded as the `mode = search` run it is (`architecture.md` §10.2), so the
+/// rewrite, its retrieval and its token usage are all replayable with
+/// `momotaro trace <run_id>` and the `run_id` comes back on [`SearchOutput`].
+/// Once accepted the run always reaches a terminal event (D15): an expected
+/// failure lands its §18 row, anything else is abandoned to the next sweep,
+/// exactly as `ask` abandons an unexpected store error.
+pub fn expand_search_workspace<T: momotaro_llm::ProviderTransport + ?Sized>(
+    root: impl AsRef<Path>,
+    query: &str,
+    top_k: usize,
+    no_llm: bool,
+    allow_network: bool,
+    transport: &T,
+) -> Result<SearchOutput, RunError> {
+    // ---- the gates, every one of them before a run row exists --------------
+    crate::validate_expand_policy(no_llm)?;
+    let root = root.as_ref();
+    let search_index = open_search_index(root)?;
+    let mut store = open_search_store(root)?;
+    let config = load_config(root)?;
+    crate::ensure_network_allowed(&config, allow_network)?;
+    let model = config.model_id()?.to_owned();
+
+    // ---- acceptance: a search *is* a run (`runs.mode = search`) ------------
+    let spec = search_spec(query, &config, &model, allow_network)?;
+    let spec_json = serde_json::to_string(&spec).expect("run spec serializes");
+    let spec_hash = sha256_hex(spec_json.as_bytes());
+    let run_id = crate::stamp_id("run");
+    let now = crate::now_secs();
+
+    store.commit_run_create(
+        &NewRun {
+            run_id: run_id.clone(),
+            session_id: None,
+            parent_run_id: None,
+            project_id: None,
+            attempt: 1,
+            mode: spec.mode.as_str().to_owned(),
+            query: query.to_owned(),
+            client_request_id: None,
+            run_spec_hash: spec_hash,
+            run_spec_json: spec_json,
+            provider: Some(provider_of(&config)),
+            model: Some(model.clone()),
+            context_window: config
+                .model
+                .context_window
+                .map(|window| i64::try_from(window).unwrap_or_default()),
+            max_output_tokens: Some(i64::from(REWRITE_MAX_TOKENS)),
+            created_at: now,
+        },
+        &NewRunEvent {
+            event_type: run_event::ACCEPTED.to_owned(),
+            data_json: serde_json::json!({ "mode": spec.mode.as_str() }).to_string(),
+            created_at: now,
+        },
+    )?;
+    store.commit_run_start(
+        &run_id,
+        &NewRunEvent {
+            event_type: run_event::STARTED.to_owned(),
+            data_json: "{}".to_owned(),
+            created_at: now,
+        },
+    )?;
+
+    // ---- the work ---------------------------------------------------------
+    let result = run_expand(
+        &mut store,
+        &search_index,
+        &run_id,
+        query,
+        top_k,
+        &config,
+        &model,
+        transport,
+        now,
+    );
+
+    // ---- terminal: a run that was accepted always ends (D15) --------------
+    match result {
+        Ok(hits) => {
+            store.commit_run_terminal(&run_id, TerminalEvent::Finished, "{}", None, now)?;
+            Ok(SearchOutput {
+                query: query.to_owned(),
+                hits,
+                run_id: Some(run_id),
+            })
+        }
+        Err(error) => {
+            // A failure this layer can name lands its §18 row. Anything else —
+            // a store or index error — is abandoned to the next sweep, exactly
+            // as `ask` abandons an unexpected store error: the sweep's
+            // condition is "ended without terminal".
+            if let Some((data, note)) = expand_failure_payload(&error) {
+                store.commit_run_terminal(
+                    &run_id,
+                    TerminalEvent::Failed,
+                    &data,
+                    note.as_deref(),
+                    now,
+                )?;
+            }
+            Err(error)
+        }
+    }
+}
+
+/// The frozen spec of a search run (§10.1 step 3), carrying the knobs this
+/// command actually used.
+///
+/// D25 maps `expand` onto the `utility` slot at `low`; that slot has no
+/// configuration yet, so the rewrite runs on the answer slot's model — the spec
+/// records **what ran**, not what the mapping will one day choose.
+fn search_spec(
+    query: &str,
+    config: &WorkspaceConfig,
+    model: &str,
+    allow_network: bool,
+) -> Result<RunSpec, RunError> {
+    let spec = RunSpec {
+        mode: momotaro_contracts::RunMode::Search,
+        query: query.to_owned(),
+        slot: ModelSlot::Answer,
+        thinking: config.model_thinking()?,
+        model: model.to_owned(),
+        max_output_tokens: REWRITE_MAX_TOKENS,
+        max_context_tokens: config.policy.max_context_tokens,
+        allow_network: crate::network_permitted(config, allow_network),
+        allow_write: config.policy.allow_write,
+    };
+    spec.validate()?;
+    Ok(spec)
+}
+
+/// The endpoint string recorded on the run row, before a single call is made.
+fn provider_of(config: &WorkspaceConfig) -> String {
+    config
+        .model
+        .provider
+        .clone()
+        .unwrap_or_else(|| "openai-compatible".to_owned())
+}
+
+/// The §18 payload for a failure this layer can name, or `None` for one it
+/// cannot — `failure_row`'s catch-all is `unreachable!`, so passing a category
+/// the taxonomy has not decided would panic rather than invent an attribution.
+fn expand_failure_payload(error: &RunError) -> Option<(String, Option<String>)> {
+    let category = match error {
+        RunError::Llm(failure) => failure.kind.category(),
+        RunError::RewriteUnusable => "llm_malformed",
+        _ => return None,
+    };
+    let (attribution, retryable) = crate::ask::failure_row(category);
+    Some((
+        crate::ask::failure_data(category, &attribution, retryable),
+        Some(error.to_string()),
+    ))
+}
+
+/// Steps after acceptance: the rewrite, the searches, the fusion, the rows.
+#[allow(clippy::too_many_arguments)]
+fn run_expand<T: momotaro_llm::ProviderTransport + ?Sized>(
+    store: &mut Store,
+    search_index: &SearchIndex,
+    run_id: &str,
+    query: &str,
+    top_k: usize,
+    config: &WorkspaceConfig,
+    model: &str,
+    transport: &T,
+    now: i64,
+) -> Result<Vec<SearchHit>, RunError> {
+    let request = momotaro_llm::LlmRequest {
+        model: model.to_owned(),
+        messages: vec![
+            momotaro_llm::Message {
+                role: momotaro_llm::Role::System,
+                content: REWRITE_SYSTEM.replace("{n}", &EXPANDED_QUERY_COUNT.to_string()),
+            },
+            momotaro_llm::Message {
+                role: momotaro_llm::Role::User,
+                content: query.to_owned(),
+            },
+        ],
+        tools: Vec::new(),
+        max_tokens: REWRITE_MAX_TOKENS,
+    };
+    let request_hash = request.request_hash();
+
+    // The turn lands on failure too: its usage columns are what the attempt
+    // spent, and that is the whole reason this run exists.
+    let turn_id = crate::stamp_id("turn");
+    let mut turn = LlmTurnRecord {
+        turn_id: turn_id.clone(),
+        run_id: run_id.to_owned(),
+        seq: 1,
+        provider: provider_of(config),
+        model: model.to_owned(),
+        request_hash: request_hash.clone(),
+        status: String::new(),
+        input_tokens: None,
+        output_tokens: None,
+        cached_tokens: None,
+        billable_tokens: None,
+        slot: Some(ModelSlot::Answer.as_str().to_owned()),
+        reasoning_tokens: None,
+        raw_ref: None,
+        created_at: now,
+        finished_at: Some(now),
+    };
+
+    let rewrite = match momotaro_llm::complete(transport, &request) {
+        Ok(output) => {
+            turn.status = "finished".to_owned();
+            turn.input_tokens = output.usage.input_tokens.and_then(to_i64);
+            turn.output_tokens = output.usage.output_tokens.and_then(to_i64);
+            turn.cached_tokens = output.usage.cached_tokens.and_then(to_i64);
+            turn.billable_tokens = output.usage.billable_tokens.and_then(to_i64);
+            turn.raw_ref = output.raw_ref.clone();
+            let data = serde_json::json!({
+                "billable_tokens": output.usage.billable_tokens,
+                "cached_tokens": output.usage.cached_tokens,
+                "finish_reason": output.finish_reason.as_str(),
+                "slot": ModelSlot::Answer.as_str(),
+                "turn_id": turn_id,
+            })
+            .to_string();
+            store.commit_run_llm_turn(
+                run_id,
+                &turn,
+                &NewRunEvent {
+                    event_type: run_event::LLM_FINISHED.to_owned(),
+                    data_json: data,
+                    created_at: now,
+                },
+            )?;
+            output
+        }
+        Err(error) => {
+            turn.status = "failed".to_owned();
+            let (attribution, retryable) = crate::ask::failure_row(error.kind.category());
+            let data = serde_json::json!({
+                "error": {
+                    "attribution": attribution,
+                    "category": error.kind.category(),
+                    "retryable": retryable,
+                    "severity": momotaro_contracts::Severity::Error.as_str(),
+                },
+                "slot": ModelSlot::Answer.as_str(),
+                "turn_id": turn_id,
+            })
+            .to_string();
+            store.commit_run_llm_turn(
+                run_id,
+                &turn,
+                &NewRunEvent {
+                    event_type: run_event::LLM_FINISHED.to_owned(),
+                    data_json: data,
+                    created_at: now,
+                },
+            )?;
+            return Err(RunError::Llm(error));
+        }
+    };
+
+    let queries = expanded_queries(&rewrite.text, EXPANDED_QUERY_COUNT);
+    // "No usable query" is the *retriever's* question, not "the list is empty":
+    // a reply of `["!!!"]` parses fine and searches nothing, and reporting that
+    // as a successful expand that found zero hits would be the lie §10.2 rules
+    // out. The predicate is the same one `SearchIndex::search` uses.
+    if !queries
+        .iter()
+        .any(|query| momotaro_retrieve::is_searchable(query))
+    {
+        // Falling back to the input query would report an expand that did not
+        // happen.
+        return Err(RunError::RewriteUnusable);
+    }
+
+    let mut lists = Vec::with_capacity(queries.len());
+    for rewritten in &queries {
+        lists.push(search_index.search(rewritten, top_k)?);
+    }
+
+    let mut fused = momotaro_retrieve::fuse_rrf(&lists);
+    fused.truncate(top_k);
+
+    // One retrieval row: this search ran once, and `strategy_json` keeps the N
+    // queries it was made of together with the fusion that ranked them — the
+    // per-query hit sets are one ranked answer, not N answers.
+    let hit_records: Vec<RetrievalHitRecord> = fused
+        .iter()
+        .map(|hit| RetrievalHitRecord {
+            rank: hit.rank,
+            source_key: hit.source_key.clone(),
+            revision_hash: hit.revision_hash.clone(),
+            chunk_id: hit.chunk_id.clone(),
+            chunk_hash: hit.chunk_hash.clone(),
+            locator_json: hit.locator_json.clone(),
+            score: Some(hit.score),
+            // No context stage runs for a search: nothing was *included*, and
+            // nothing was omitted by a decision either. `None` says so — an
+            // omission reason would name a stage that never ran.
+            included: false,
+            omitted_reason: None,
+        })
+        .collect();
+    let hit_count = hit_records.len();
+    let retrieval_id = crate::stamp_id("ret");
+    store.commit_run_retrieval(
+        run_id,
+        &RetrievalRecord {
+            retrieval_id: retrieval_id.clone(),
+            run_id: run_id.to_owned(),
+            query: query.to_owned(),
+            normalized_query: momotaro_retrieve::normalize_query(query),
+            strategy_json: serde_json::json!({
+                "engine": "tantivy_bm25",
+                "mode": "expand",
+                "queries": queries,
+                "rrf_k": momotaro_retrieve::RRF_K,
+                "k": top_k,
+            })
+            .to_string(),
+            created_at: now,
+            hits: hit_records,
+        },
+        &NewRunEvent {
+            event_type: run_event::RETRIEVAL_FINISHED.to_owned(),
+            data_json: serde_json::json!({ "hits": hit_count, "retrieval_id": retrieval_id })
+                .to_string(),
+            created_at: now,
+        },
+    )?;
+
+    enrich_hits(store, fused)
+}
+
+/// Reads the rewritten queries out of a model reply.
+///
+/// The prompt asks for a JSON array; a model that wraps it in a code fence, or
+/// answers in plain lines, still gets heard. Order of attempt: the JSON array
+/// (after stripping one surrounding fence), then one query per non-empty line.
+/// Either way entries are trimmed, fence lines dropped, duplicates removed on
+/// first sight and the list capped at `limit` — an unbounded reply must not
+/// turn into an unbounded number of searches.
+fn expanded_queries(text: &str, limit: usize) -> Vec<String> {
+    let body = strip_code_fence(text.trim());
+    let candidates: Vec<String> = match serde_json::from_str::<Vec<String>>(body) {
+        Ok(list) => list,
+        Err(_) => body.lines().map(str::to_owned).collect(),
+    };
+
+    let mut queries: Vec<String> = Vec::new();
+    for candidate in candidates {
+        let candidate = candidate.trim();
+        // A fence line (` ``` `, ` ```json `) is markup the parser failed to
+        // peel, never something worth sending to the index.
+        if candidate.is_empty() || candidate.starts_with("```") {
+            continue;
+        }
+        if queries.iter().any(|seen| seen == candidate) {
+            continue;
+        }
+        queries.push(candidate.to_owned());
+        if queries.len() == limit {
+            break;
+        }
+    }
+    queries
+}
+
+/// Removes one surrounding ``` fence, which is how models often wrap a JSON
+/// array they were asked for: the whole opening line (```` ```json ````) goes,
+/// and so does the closing one. Text without a fence is returned untouched.
+fn strip_code_fence(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix("```") else {
+        return text;
+    };
+    let Some(body) = rest.find('\n').map(|at| &rest[at + 1..]) else {
+        // A fence with nothing after it on the same line holds no body.
+        return "";
+    };
+    body.strip_suffix("```").unwrap_or(body)
 }
 
 /// First 200 characters of `text`, cut on a char boundary, ellipsis when cut.

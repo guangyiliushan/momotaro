@@ -95,8 +95,16 @@ fn planted_run(tempdir: &tempfile::TempDir) -> String {
     })
     .to_string();
     fake.enqueue_reply(200, body);
-    let report =
-        ask_workspace(tempdir.path(), "谱定理", &AskOptions::default(), &fake).expect("ask runs");
+    let report = ask_workspace(
+        tempdir.path(),
+        "谱定理",
+        &AskOptions {
+            allow_network: true,
+            ..AskOptions::default()
+        },
+        &fake,
+    )
+    .expect("ask runs");
     assert_eq!(report.status, "finished", "{report:?}");
     report.run_id
 }
@@ -199,12 +207,12 @@ fn ask_refuses_under_no_llm_before_anything_else() {
 }
 
 #[test]
-fn ask_names_the_missing_provider_transport() {
+fn ask_without_a_configured_endpoint_is_refused_before_any_run_row() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     ready_workspace(&tempdir);
 
-    // The five policy flags parse; the refusal is the
-    // transport seam, not a parse failure.
+    // The five policy flags parse; the refusal is the missing endpoint, not a
+    // parse failure.
     let (stdout, stderr, ok) = run_cli(
         tempdir.path(),
         &[
@@ -217,38 +225,152 @@ fn ask_names_the_missing_provider_transport() {
             "谱定理",
         ],
     );
-    assert!(!ok, "ask without a transport exits 1: {stdout}{stderr}");
+    assert!(!ok, "ask without an endpoint exits 1: {stdout}{stderr}");
     let message = format!("{stdout}{stderr}");
     assert!(
-        message.contains("no provider transport in this build"),
-        "the seam is named: {message}"
+        message.contains("provider unavailable"),
+        "the refusal is named: {message}"
     );
-    // And nothing was accepted: the refusal happens before any run row —
-    // checked by enumeration (a created run would dangle and sweep out
-    // here), not by looking up an id no code path could have minted.
+    assert!(
+        message.contains("[model].base_url_env"),
+        "and it says which key would fix it: {message}"
+    );
+    // And nothing was accepted: the refusal happens before any run row. The
+    // count is the witness — the sweep only ever sees `accepted` / `running`,
+    // so a run that got as far as finishing would slip past it.
     let mut store =
         momotaro_store::Store::open(tempdir.path().join(".momotaro/momotaro.db")).expect("open");
+    assert_eq!(
+        store.run_count().expect("count"),
+        0,
+        "no run row was created"
+    );
     let dangling = store.sweep_interrupted_runs().expect("sweep");
-    assert!(dangling.is_empty(), "no run row was created: {dangling:?}");
+    assert!(dangling.is_empty(), "and nothing dangled: {dangling:?}");
 }
 
 #[test]
-fn expand_search_is_refused_by_name() {
+fn ask_names_the_variable_it_could_not_read() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    ready_workspace(&tempdir);
+    // The config names a variable; the process does not export it. The
+    // refusal must name both halves, and still before any run row exists.
+    let mut config =
+        std::fs::read_to_string(tempdir.path().join("momotaro.toml")).expect("read config");
+    config.push_str("base_url_env = 'MOMOTARO_TEST_BASE_URL'\n");
+    std::fs::write(tempdir.path().join("momotaro.toml"), config).expect("write config");
+
+    let (stdout, stderr, ok) = run_cli(
+        tempdir.path(),
+        &["ask", "--allow-network", "--json", "谱定理"],
+    );
+    assert!(!ok, "ask without the variable exits 1: {stdout}{stderr}");
+    let message = format!("{stdout}{stderr}");
+    assert!(
+        message.contains("MOMOTARO_TEST_BASE_URL"),
+        "the missing variable is named: {message}"
+    );
+    assert!(
+        message.contains("[model].base_url_env"),
+        "and the config key that names it: {message}"
+    );
+}
+
+#[test]
+fn expand_search_without_an_endpoint_is_refused_before_any_llm_call() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     ready_workspace(&tempdir);
 
     let (stdout, stderr, ok) = run_cli(
         tempdir.path(),
-        &["search", "--mode", "expand", "--json", "谱定理"],
+        &[
+            "search",
+            "--mode",
+            "expand",
+            "--allow-network",
+            "--json",
+            "谱定理",
+        ],
     );
     assert!(
         !ok,
-        "expand search exits 1 without a transport: {stdout}{stderr}"
+        "expand search exits 1 without an endpoint: {stdout}{stderr}"
     );
     let message = format!("{stdout}{stderr}");
     assert!(
-        message.contains("search --mode expand"),
-        "the mode is named in the refusal: {message}"
+        message.contains("provider unavailable"),
+        "the refusal is named: {message}"
+    );
+    assert!(
+        message.contains("[model].base_url_env"),
+        "and it says which key would fix it: {message}"
+    );
+}
+
+#[test]
+fn expand_search_refuses_under_no_llm_by_name() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    ready_workspace(&tempdir);
+
+    // The policy refusal must win over whatever the endpoint configuration
+    // says: `--no-llm` is a statement about the request, not about this
+    // workspace's setup.
+    let (stdout, stderr, ok) = run_cli(
+        tempdir.path(),
+        &["search", "--mode", "expand", "--no-llm", "--json", "谱定理"],
+    );
+    assert!(!ok, "expand under --no-llm exits 1: {stdout}{stderr}");
+    let message = format!("{stdout}{stderr}");
+    assert!(message.contains("--mode expand"), "{message}");
+    assert!(message.contains("--no-llm"), "{message}");
+    assert!(
+        !message.contains("provider unavailable"),
+        "policy is answered before configuration: {message}"
+    );
+}
+
+#[test]
+fn ask_and_expand_refuse_without_allow_network() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    ready_workspace(&tempdir);
+
+    // architecture §7: network is off until it is asked for, and a provider
+    // call is a network call. The refusal must be the policy one, not whatever
+    // the endpoint configuration would have said.
+    for args in [
+        vec!["ask", "--json", "谱定理"],
+        vec!["search", "--mode", "expand", "--json", "谱定理"],
+    ] {
+        let (stdout, stderr, ok) = run_cli(tempdir.path(), &args);
+        assert!(
+            !ok,
+            "{args:?} exits 1 without --allow-network: {stdout}{stderr}"
+        );
+        let message = format!("{stdout}{stderr}");
+        assert!(message.contains("--allow-network"), "{message}");
+        assert!(
+            !message.contains("provider unavailable"),
+            "policy is answered before configuration: {message}"
+        );
+    }
+
+    // Lexical search never dials, so the gate does not apply to it.
+    let (stdout, stderr, ok) = run_cli(tempdir.path(), &["search", "--json", "谱定理"]);
+    assert!(
+        ok,
+        "lexical search needs no network permission: {stdout}{stderr}"
+    );
+}
+
+#[test]
+fn lexical_search_is_unaffected_by_no_llm() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    ready_workspace(&tempdir);
+
+    let (stdout, stderr, ok) = run_cli(tempdir.path(), &["search", "--no-llm", "--json", "谱定理"]);
+    assert!(
+        ok,
+        "lexical search spends no tokens and must not be refused: {stdout}{stderr}"
     );
 }
 
@@ -257,6 +379,17 @@ fn trace_replays_a_run_in_both_outlets() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     ready_workspace(&tempdir);
     let run_id = planted_run(&tempdir);
+
+    // The positive control for `run_count`: a finished run really is counted.
+    // Without it the refusal tests would pass against a counter that always
+    // answers zero.
+    let store =
+        momotaro_store::Store::open(tempdir.path().join(".momotaro/momotaro.db")).expect("open");
+    assert_eq!(
+        store.run_count().expect("count"),
+        1,
+        "planted_run created exactly one run"
+    );
 
     let (stdout, stderr, ok) = run_cli(tempdir.path(), &["trace", &run_id, "--json"]);
     assert!(ok, "trace --json should succeed: {stderr}");

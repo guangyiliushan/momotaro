@@ -93,13 +93,12 @@ CREATE INDEX IF NOT EXISTS idx_store_events_source
     // present (source_revisions, chunks, store_events) are not rebuilt.
     //
     // The PRIMARY KEY / UNIQUE declarations carry their own autoindexes, and
-    // those serve the keyed lookups these tables were designed around. Four
-    // `run_id` lookups (retrievals, llm_turns, verifications, answers) are
-    // NOT served by them — `run_trace` scans those tables per run — and a
-    // future migration may add the four indexes when scale demands (the DDL
-    // is the contract; this is a note, not a step). The one explicit index is
-    // `graph_links(from_source_key)` — that table declares no key, and every
-    // projection replace deletes by `from_source_key` (ADR 0027).
+    // those serve the keyed lookups these tables were designed around. The four
+    // `run_id` lookups they do NOT serve (retrievals, llm_turns, verifications,
+    // answers) got their indexes in step 7 — `run_trace` scans those tables per
+    // run. The one explicit index declared here is `graph_links(from_source_key)`
+    // — that table declares no key, and every projection replace deletes by
+    // `from_source_key` (ADR 0027).
     (
         5,
         "CREATE TABLE IF NOT EXISTS sessions (
@@ -273,6 +272,41 @@ CREATE INDEX IF NOT EXISTS idx_graph_links_from ON graph_links (from_source_key)
     (
         6,
         "CREATE INDEX IF NOT EXISTS idx_graph_links_from ON graph_links (from_source_key);",
+    ),
+    // 6 -> 7: an index on the child key of each `run_id` relationship.
+    //
+    // sqlite.org/foreignkeys.html §3 ("Required and Suggested Database
+    // Indexes") is the standing guidance: "Indices are not required for child
+    // key columns but they are almost always beneficial." … "So, in most real
+    // systems, an index should be created on the child key columns of each
+    // foreign key constraint."
+    //
+    // Read against this schema, precisely: the DDL declares no `REFERENCES`
+    // clause, so SQLite does not enforce these as foreign keys — they are
+    // child keys by construction, and `run_trace` is what reads them
+    // (`WHERE run_id = ?1` on all four). Without an index §3 says such queries
+    // "are forced to do a linear scan of the entire child table". The other
+    // `run_id` tables already have a covering index of their own: `runs`
+    // (primary key), `run_events` / `run_context_items` / `history_items`
+    // (a key whose leftmost column is `run_id`).
+    //
+    // Each index is dropped before it is created: `CREATE INDEX IF NOT EXISTS`
+    // checks the *name* across the whole schema, not the table, so a store
+    // where `idx_answers_run` already existed on some other table would skip
+    // the creation, stamp v7, and leave `answers` uncovered while `doctor`
+    // reported ready. A name this build owns in a database this build owns is
+    // ours to replace; an index is derived, and rebuilding it inside the step's
+    // transaction costs nothing on the ordinary path where it does not exist.
+    (
+        7,
+        "DROP INDEX IF EXISTS idx_retrievals_run;
+CREATE INDEX idx_retrievals_run ON retrievals(run_id);
+DROP INDEX IF EXISTS idx_llm_turns_run;
+CREATE INDEX idx_llm_turns_run ON llm_turns(run_id);
+DROP INDEX IF EXISTS idx_answers_run;
+CREATE INDEX idx_answers_run ON answers(run_id);
+DROP INDEX IF EXISTS idx_verifications_run;
+CREATE INDEX idx_verifications_run ON verifications(run_id);",
     ),
 ];
 

@@ -24,6 +24,20 @@ pub fn normalize_query(raw: &str) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Whether `raw` can match anything at all.
+///
+/// A query with no alphanumeric character parses into no term, so
+/// [`crate::SearchIndex::search`] returns an empty list for it — "searched, and
+/// found nothing" rather than "not a query". This is the one predicate both
+/// halves share: `--mode expand` has to decide the same question about a
+/// rewrite, and answering it differently there is what turns a punctuation-only
+/// reply into a search that silently reports zero hits instead of failing.
+///
+/// Normalization is idempotent, so an already-normalized string may be passed.
+pub fn is_searchable(raw: &str) -> bool {
+    normalize_query(raw).chars().any(char::is_alphanumeric)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

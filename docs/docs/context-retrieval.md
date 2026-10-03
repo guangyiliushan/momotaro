@@ -247,7 +247,10 @@ BM25（默认） -> expand(RRF) -> dense(LanceDB, derived) -> hybrid fusion -> r
    顺序 > 首次重要性首尾）——检索分数决定「谁进来」，三层规则决定「怎么摆」；
 5. rerank 候选池 ≤50（Drowning in Documents：池越大 rerank 越差）；
 6. 近似重复软去重：同文档相邻 chunk 覆盖度起步，后置 MMR / token Jaccard
-   （不引入 embedding 依赖）。
+   （不引入 embedding 依赖）；
+7. **expand(RRF) 已落地**（2026-10-01）：`N`、`k`、平局规则与「换序不改排序」的
+   确定性口径**只写在** [Architecture](architecture.md) §10.2，本文不复述第二份——
+   两处口径一旦分叉，以 §10.2 为准并把另一处改掉。
 
 ### 4.1 查询意图路由（v0.3 ask 的接缝，v1.x 再实现）
 

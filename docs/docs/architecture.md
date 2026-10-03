@@ -718,6 +718,19 @@ CREATE TABLE verifications (
 
 `verifications.kind` 初期以 `citation` 和 `source_integrity` 为主；`math` 留枚举。`answers.text` 是最终回答，`answer_citations` 是回答的引用证据，`verifications` 是独立于模型声称的验证结果。
 
+**`run_id` 子表的索引（schema v7）**：`retrievals` / `llm_turns` / `answers` /
+`verifications` 四张表各带一个 `run_id` 索引
+（`idx_retrievals_run` / `idx_llm_turns_run` / `idx_answers_run` /
+`idx_verifications_run`）。DDL 不声明 `REFERENCES`，所以 SQLite 并不强制这些外键——
+它们按构造是子表，读它们的是 `run_trace`（四张表各一次 `WHERE run_id = ?1`）。索引按
+[sqlite.org/foreignkeys.html](https://www.sqlite.org/foreignkeys.html) §3 的口径建：「Indices are not required for child key
+columns but they are almost always beneficial.」「So, in most real systems, an index
+should be created on the child key columns of each foreign key constraint.」——§3 同时
+说明这类查询没有索引时 "are forced to do a linear scan of the entire child table"。
+本 schema 其余的 `run_id` 表已由自己的键覆盖：`runs` 是主键，`run_events` /
+`run_context_items` / `history_items` 的键最左列就是 `run_id`（§8.1 另有本库尚未
+实现的 `tool_calls` / `sparks`，不在本清点内）。
+
 #### feeds
 
 ```sql
@@ -887,6 +900,19 @@ expand:  one short LLM rewrite -> N queries -> BM25 each -> RRF
 ```
 
 默认 lexical，零 token。expand 必须显式。
+
+expand 的落地口径（已实现，`momotaro-retrieve::fuse_rrf` / `momotaro-run::expand_search_workspace`）：
+
+| 项 | 口径 |
+|---|---|
+| `N`（重写成几条查询） | **目标 4、上限 4**，常数——§7 的配置面没有这一项，它不是旋钮；解析器去重，故实际条数 ≤ 4 |
+| 融合 | `score = Σ 1/(k + rank)`，**`k = 60`**（RRF 文献的常规取值）；`rank` 是该块在**单条查询**结果中的 1-based 位次 |
+| 平局 | `score` 降序 → `source_key` 升序 → `ordinal` 升序 → `chunk_id` 升序。**前三级与 lexical 路径的平局规则一致**，末级把序补成**全序**——比较器自己定得住序，不依赖累加容器的迭代顺序，也就不依赖 `sort_by` 的稳定性 |
+| 确定性 | 同一组输入列表 ⇒ 同一排序（§6.1）。各列表的贡献**先按值排序再求和**，浮点加法的结合性因此不进入结果：把 N 条查询换个先后，融合分数逐位相同 |
+| 重写不可用 | 2xx 回来但**没有一条可搜的查询** ⇒ 报错（`the query rewrite produced no usable query`）。不退回单条原查询：没扩就不许报告自己扩过 |
+| 写入 | **建一条 `mode = search` 的 run**：四道门（`--no-llm`、网络授权、索引与库、spec 校验）**全部先于 run 创建**，所以被拒时零行、一个 token 也不花。接受之后落 `runs` + `retrievals`（一次；`strategy_json` 记下 N 条重写查询与 `rrf_k`）+ `retrieval_hits` + `llm_turns`（重写那一个 turn，含 provider 报的 usage）+ 终态事件，因此 `trace <run_id>` 可以回放、token 有账可查；无法归类的存储错误按 `ask` 的同一规则留给下次 open 的 sweep 收尾。lexical 不建 run，`SearchOutput.run_id` 不出现；`stats` 仍只数 sources/chunks |
+| 门禁 | `--no-llm`、网络策略（`--allow-network` ∨ `[policy].allow_network`）、索引与库可用——**三道都过了才拨号**。任何一道不过，都是一次 token、一次连接都不花。三道之间的先后是实现细节，本文不承诺 |
+| 端点 | 端点与密钥来自 `[model]`（§7）：配置只写变量名、值在环境里；缺配置在拨号前以 `provider unavailable` 拒绝（见 usage.md "Provider endpoint"） |
 
 ### 10.3 paper add
 
@@ -1074,6 +1100,9 @@ fetch/parse 安全五件套与四态 reason-code 映射（D38）见
 `momotaro-llm` 无状态：输入 model / messages / tools / max_tokens；输出 text / usage / finish_reason / raw_ref 或 typed failure。
 
 不知道 vault，不访问 SQLite。只在可观察输出前 retry。不做多 provider registry。
+
+传输层持有的连接池是**连接**复用，不是会话状态：它不进 `request_hash`，也不构成
+任何跨请求的模型上下文。
 
 缓存记账（2026-09-15 调查）：`usage` 结构带 `cached_tokens` / `billable_tokens`
 （provider 报什么记什么，不报为 NULL）；tools 定义 canonical 序列化（列表序=
@@ -1661,7 +1690,7 @@ minidump**（栈内存夹带用户内容）。任何未来上报必须 opt-in �
 
 ```text
 1. momotaro index 可索引 fixture vault。
-2. momotaro search 无 API key，零 LLM。
+2. momotaro search（lexical）无 API key，零 LLM；--mode expand 发一次改写调用。
 3. momotaro ask 返回带引用答案。
 4. 每个引用可定位到 source revision 和 chunk。
 5. 每个回答有 run_id。

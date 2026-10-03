@@ -11,11 +11,11 @@ pub mod ask;
 
 pub use ask::{
     AskOptions, AskReport, CitationVerdict, IntegrityVerdict, ProviderTransport, ask_workspace,
-    format_ask, format_trace, trace_workspace, validate_ask_policy,
+    format_ask, format_trace, trace_workspace,
 };
 pub use index_service::{
-    RebuildReport, SearchHit, SearchOutput, coverage_report, index_workspace, index_workspace_with,
-    rebuild_index, search_workspace,
+    RebuildReport, SearchHit, SearchOutput, coverage_report, expand_search_workspace,
+    index_workspace, index_workspace_with, rebuild_index, search_workspace,
 };
 pub use reconcile::{ReconcileReport, format_reconcile, reconcile};
 pub use watch::{WatchLine, format_watch_line, watch};
@@ -29,9 +29,11 @@ use momotaro_contracts::{
     SchemaVersion, SqliteFacts, StatsReport, VaultScope, WorkspaceStatus,
 };
 use momotaro_ingest::IngestError;
+use momotaro_llm::HttpTransport;
 use momotaro_retrieve::RetrieveError;
 use momotaro_store::{Store, StoreError};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::index_service::index_unusable_message;
@@ -166,12 +168,27 @@ pub enum RunError {
         run_id: String,
     },
 
-    /// This build carries no production provider transport (`momotaro-llm`'s
-    /// seam: "production wires a real transport later"). The engine is proven
-    /// end to end by the fake-LLM integration suite; wiring the real
-    /// transport is a registered dependency decision, not a silent gap.
-    #[error("no provider transport in this build: {0}")]
-    ProviderUnavailable(&'static str),
+    /// This workspace has no usable provider endpoint. The transport itself
+    /// exists (`momotaro_llm::HttpTransport`); what is missing is the
+    /// configuration that points it at a provider — `[model] base_url_env`
+    /// (architecture §7) is unset, the variable it names is not exported, or
+    /// the endpoint/key it produced is not a shape the transport accepts.
+    /// Always refused before any run row exists.
+    #[error("provider unavailable: {0}")]
+    ProviderUnavailable(String),
+
+    /// A provider call failed. The classification on the error
+    /// (`LlmErrorKind`, and through it the architecture §18 category) is what
+    /// upstream reads — never the message text.
+    #[error(transparent)]
+    Llm(#[from] momotaro_llm::LlmError),
+
+    /// The provider answered the query rewrite, but the answer held no query a
+    /// search could run. Reported instead of quietly falling back to the input
+    /// query: a search that did not expand must not report itself as one that
+    /// did.
+    #[error("the query rewrite produced no usable query; ask again, or search with --mode lexical")]
+    RewriteUnusable,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,6 +213,25 @@ struct ModelConfig {
     /// The provider model id (the `LlmRequest` model).
     #[serde(default)]
     model_id: Option<String>,
+    /// Name of the environment variable holding the provider's base URL.
+    ///
+    /// The *name* lives in the config so the value never does: keys and URLs
+    /// stay out of `momotaro.toml` (architecture §7 rule 1).
+    #[serde(default)]
+    base_url_env: Option<String>,
+    /// Name of the environment variable holding the API key, when the endpoint
+    /// needs one. Unset means "no credential" — right for a local endpoint,
+    /// and a public one will simply answer 401.
+    #[serde(default)]
+    api_key_env: Option<String>,
+    /// Name of the key-chain service holding the API key (architecture §7's
+    /// `api_key_keychain`, D28's desktop level).
+    ///
+    /// Parsed but refused: this build reads the key from a variable only, and
+    /// silently ignoring the keychain would produce a transport with no
+    /// credential at all — refused later, as an unexplained 401 at the socket.
+    #[serde(default)]
+    api_key_keychain: Option<String>,
     /// The provider's context window, when known.
     #[serde(default)]
     context_window: Option<u64>,
@@ -371,6 +407,15 @@ pub(crate) fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or_default()
+}
+
+/// `sha256`, hex — the house digest (the same one `revision_hash` uses).
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+pub(crate) fn to_i64(value: u64) -> Option<i64> {
+    i64::try_from(value).ok()
 }
 
 /// A timestamp id that reads as what it is: the millisecond is for a human,
@@ -574,6 +619,152 @@ pub fn stats(root: impl AsRef<Path>) -> Result<StatsReport, RunError> {
     }
 
     Ok(Store::open(database_path)?.stats()?)
+}
+
+/// The policy half of request validation (§10.1 step 1): `ask` answers with
+/// an LLM, and a policy that forbids one refuses the request before any run
+/// exists. Shared with the CLI surface so the refusal has one spelling.
+pub fn validate_ask_policy(options: &AskOptions) -> Result<(), RunError> {
+    if options.no_llm {
+        return Err(RunError::PolicyRefused(
+            "ask answers with an LLM, which --no-llm forbids",
+        ));
+    }
+    Ok(())
+}
+
+/// The one refusal the network gate hands out (architecture §7 `[policy]`).
+/// §18's `network_disabled` is the row this refusal *would* carry mid-run; it
+/// is raised before a run exists, so no `run_events` row is ever written for
+/// it.
+const NETWORK_REFUSAL: &str = "`ask` and `search --mode expand` reach the network: pass \
+--allow-network, or set [policy].allow_network in momotaro.toml";
+
+/// The network half of request validation: a provider call is a network call,
+/// and `architecture.md` §7 promises network is off until it is asked for.
+///
+/// `allow_network` is the `--allow-network` flag; when it is off the
+/// workspace's `[policy].allow_network` is consulted, so a user can allow it
+/// once in `momotaro.toml` instead of on every command. One spelling for the
+/// CLI and the engine, and it runs before any run row exists.
+pub fn validate_network_policy(
+    root: impl AsRef<Path>,
+    allow_network: bool,
+) -> Result<(), RunError> {
+    if allow_network {
+        // The flag settles it: no need to read the workspace at all.
+        return Ok(());
+    }
+    ensure_network_allowed(&crate::load_config(root.as_ref())?, false)
+}
+
+/// Whether a request may reach the network at all — the `--allow-network` flag
+/// or the workspace's own `[policy].allow_network`. The **one** expression
+/// behind both the gate below and the `RunSpec.allow_network` frozen onto the
+/// run row; a second copy of it is how the two drift apart.
+fn network_permitted(config: &WorkspaceConfig, allow_network: bool) -> bool {
+    allow_network || config.policy.allow_network
+}
+
+/// [`validate_network_policy`] for a caller that already holds the config, so
+/// the rule stays in one place instead of growing a second copy.
+pub(crate) fn ensure_network_allowed(
+    config: &WorkspaceConfig,
+    allow_network: bool,
+) -> Result<(), RunError> {
+    if network_permitted(config, allow_network) {
+        return Ok(());
+    }
+    Err(RunError::PolicyRefused(NETWORK_REFUSAL))
+}
+
+/// The policy half of `--mode expand` (§10.2): expanding spends one LLM call
+/// to rewrite the query, and `--no-llm` forbids LLM calls. One spelling for
+/// the CLI and the engine, refused before the endpoint is even read.
+pub fn validate_expand_policy(no_llm: bool) -> Result<(), RunError> {
+    if no_llm {
+        return Err(RunError::PolicyRefused(
+            "--mode expand rewrites the query with an LLM, which --no-llm forbids",
+        ));
+    }
+    Ok(())
+}
+
+/// Builds the production provider transport for this workspace.
+///
+/// This is the seam's one real implementation (`momotaro_llm::HttpTransport`).
+/// Callers still receive it as a parameter — `ask` and `search --mode expand`
+/// both take a generic `T: ProviderTransport` — so every test in the workspace
+/// keeps driving `FakeLlm` and CI never opens a socket.
+///
+/// The endpoint and the credential come from `[model]` (architecture §7): the
+/// config names the *variables*, the environment carries the *values*, so
+/// `momotaro.toml` never holds a secret. Every failure here happens before a
+/// connection is attempted and before any run row exists.
+pub fn provider_transport(root: impl AsRef<Path>) -> Result<Box<dyn ProviderTransport>, RunError> {
+    Ok(Box::new(http_transport_with(root, read_env)?))
+}
+
+/// Reads one configuration-named variable out of the process environment.
+///
+/// The refusal says *which* variable and *why* it could not be read, and never
+/// quotes the value — a non-UTF-8 value is exactly the shape a binary secret
+/// takes.
+fn read_env(name: &str) -> Result<String, String> {
+    match std::env::var(name) {
+        Ok(value) => Ok(value),
+        Err(std::env::VarError::NotPresent) => Err(format!("{name} is not set")),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid UTF-8")),
+    }
+}
+
+/// [`provider_transport`] with the variable lookup injected, returning the
+/// concrete transport so a test can read back what it was built from.
+///
+/// The seam exists because a test cannot set an environment variable the way a
+/// user would: `std::env::set_var` is `unsafe` in edition 2024 and this crate
+/// is `forbid(unsafe_code)`. Production passes [`read_env`]; tests pass a
+/// table.
+fn http_transport_with(
+    root: impl AsRef<Path>,
+    lookup: impl Fn(&str) -> Result<String, String>,
+) -> Result<HttpTransport, RunError> {
+    let config = load_config(root.as_ref())?;
+
+    let base_url_env = config.model.base_url_env.as_deref().ok_or_else(|| {
+        RunError::ProviderUnavailable(
+            "[model].base_url_env is not set in momotaro.toml; set it to the name of the \
+             variable that holds your provider's base URL (architecture §7)"
+                .to_owned(),
+        )
+    })?;
+    let base_url = lookup(base_url_env).map_err(|why| {
+        RunError::ProviderUnavailable(format!(
+            "cannot read the endpoint: {why}; momotaro.toml names it as [model].base_url_env"
+        ))
+    })?;
+    if let Some(name) = config.model.api_key_keychain.as_deref() {
+        // §7 offers `api_key_env` *or* `api_key_keychain`. This build reads
+        // only the first, and a config that asks for the keychain would
+        // otherwise get a transport with no credential — failing not here but
+        // at the socket, as an unexplained 401.
+        return Err(RunError::ProviderUnavailable(format!(
+            "[model].api_key_keychain = {name:?} is the desktop key-chain level \
+             of the D28 read chain, which this build does not read; set \
+             [model].api_key_env to the name of a variable instead"
+        )));
+    }
+    let api_key = match config.model.api_key_env.as_deref() {
+        None => None,
+        Some(name) => Some(lookup(name).map_err(|why| {
+            RunError::ProviderUnavailable(format!(
+                "cannot read the API key: {why}; momotaro.toml names it as [model].api_key_env"
+            ))
+        })?),
+    };
+
+    HttpTransport::new(&base_url, api_key.as_deref())
+        .map_err(|error| RunError::ProviderUnavailable(error.to_string()))
 }
 
 /// Renders the human one-line summary of an index run.
@@ -1074,6 +1265,745 @@ mod tests {
             ),
         )
         .expect("write config");
+    }
+
+    /// A workspace whose `[model]` section is exactly `model_toml`.
+    fn write_model_config(root: &Path, vault: &Path, model_toml: &str) {
+        write_config(root, vault);
+        let mut config = fs::read_to_string(config_path(root)).expect("read config");
+        config.push_str(model_toml);
+        fs::write(config_path(root), config).expect("extend config");
+    }
+
+    /// A workspace with no `[model]` section at all.
+    fn modelless_workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_config(dir.path(), &dir.path().join("vault"));
+        dir
+    }
+
+    #[test]
+    fn the_real_variable_lookup_reads_a_variable_that_exists_and_names_one_that_does_not() {
+        // The reader production uses. A test cannot *set* a variable —
+        // `std::env::set_var` is `unsafe` in edition 2024 and this crate is
+        // `forbid(unsafe_code)` — but reading one the process already has, and
+        // one that certainly is not exported, needs no write at all.
+        read_env("PATH").expect("every test process has PATH");
+
+        let error =
+            read_env("MOMOTARO_DEFINITELY_NOT_EXPORTED_9F2A").expect_err("nothing exports this");
+        assert!(
+            error.contains("MOMOTARO_DEFINITELY_NOT_EXPORTED_9F2A"),
+            "the variable is named: {error}"
+        );
+        assert!(error.contains("is not set"), "{error}");
+    }
+
+    #[test]
+    fn a_workspace_with_no_model_section_is_refused_before_any_variable_is_read() {
+        // The config decides first: no endpoint configured means no lookup, no
+        // dial and no run row. `panic!` proves the environment is never
+        // consulted on this path.
+        let dir = modelless_workspace();
+        let error = http_transport_with(dir.path(), |_| {
+            panic!("the environment must not be read before [model] is checked")
+        })
+        .expect_err("no endpoint configured");
+        let text = error.to_string();
+        assert!(text.contains("[model].base_url_env"), "{text}");
+        assert!(text.contains("momotaro.toml"), "{text}");
+    }
+
+    #[test]
+    fn the_endpoint_and_key_come_from_the_variables_the_config_names() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_model_config(
+            dir.path(),
+            &dir.path().join("vault"),
+            "[model]\nmodel_id = \"m\"\nbase_url_env = \"MM_BASE\"\napi_key_env = \"MM_KEY\"\n",
+        );
+
+        let transport = http_transport_with(dir.path(), |name| match name {
+            "MM_BASE" => Ok("https://api.example.com/v1".to_owned()),
+            "MM_KEY" => Ok("sk-secret-value".to_owned()),
+            // A name the config did not ask for is an error, which is what
+            // catches a lookup reading the wrong variable.
+            other => Err(format!("{other} is not set")),
+        })
+        .expect("transport");
+
+        assert_eq!(
+            transport.endpoint(),
+            "https://api.example.com/v1/chat/completions"
+        );
+        // The message half of the transport carries the origin only.
+        assert_eq!(transport.origin(), "https://api.example.com");
+        assert!(transport.has_api_key());
+    }
+
+    #[test]
+    fn a_named_variable_that_cannot_be_read_names_itself_and_the_key_that_named_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_model_config(
+            dir.path(),
+            &dir.path().join("vault"),
+            "[model]\nbase_url_env = \"MM_BASE\"\napi_key_env = \"MM_KEY\"\n",
+        );
+        let lookup = |name: &str| -> Result<String, String> { Err(format!("{name} is not set")) };
+
+        let endpoint =
+            http_transport_with(dir.path(), lookup).expect_err("the endpoint is missing");
+        let text = endpoint.to_string();
+        assert!(text.contains("MM_BASE"), "{text}");
+        assert!(text.contains("[model].base_url_env"), "{text}");
+
+        let key = http_transport_with(dir.path(), |name| match name {
+            "MM_BASE" => Ok("https://api.example.com/v1".to_owned()),
+            other => lookup(other),
+        })
+        .expect_err("the key is missing");
+        let text = key.to_string();
+        assert!(text.contains("MM_KEY"), "{text}");
+        assert!(text.contains("[model].api_key_env"), "{text}");
+    }
+
+    #[test]
+    fn a_workspace_that_names_no_key_variable_gets_a_keyless_transport() {
+        // A local endpoint needs no credential; only a variable the config
+        // names becomes an obligation.
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_model_config(
+            dir.path(),
+            &dir.path().join("vault"),
+            "[model]\nbase_url_env = \"MM_BASE\"\n",
+        );
+
+        let transport = http_transport_with(dir.path(), |name| match name {
+            "MM_BASE" => Ok("http://127.0.0.1:11434/v1".to_owned()),
+            other => Err(format!("{other} is not set")),
+        })
+        .expect("transport");
+
+        assert!(!transport.has_api_key(), "no key variable, no credential");
+        assert_eq!(
+            transport.endpoint(),
+            "http://127.0.0.1:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_the_transport_cannot_speak_is_refused_with_its_own_reason() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_model_config(
+            dir.path(),
+            &dir.path().join("vault"),
+            "[model]\nbase_url_env = \"MM_BASE\"\n",
+        );
+
+        let error = http_transport_with(dir.path(), |_| Ok("api.example.com/v1".to_owned()))
+            .expect_err("a schemeless endpoint is not speakable");
+        assert!(error.to_string().contains("absolute http"), "{error}");
+    }
+
+    /// Appends the `[model]` section an expand search reads its model from.
+    fn add_model_config(root: &Path, model_id: &str) {
+        let path = config_path(root);
+        let mut config = fs::read_to_string(&path).expect("read config");
+        config.push_str(&format!("\n[model]\nmodel_id = \"{model_id}\"\n"));
+        fs::write(&path, config).expect("write config");
+    }
+
+    /// A completion body whose assistant content is `text`.
+    fn completion(text: &str) -> String {
+        serde_json::json!({
+            "id": "chatcmpl-1",
+            "choices": [{"message": {"content": text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 5},
+        })
+        .to_string()
+    }
+
+    /// An initialized fixture workspace with its index built.
+    fn indexed_fixture() -> tempfile::TempDir {
+        let (dir, _vault) = fixture_workspace();
+        index_workspace(dir.path(), None).expect("index");
+        dir
+    }
+
+    #[test]
+    fn expand_search_runs_the_rewritten_queries_and_not_the_input() {
+        let dir = indexed_fixture();
+        add_model_config(dir.path(), "test-model");
+        let fake = momotaro_llm::fake::FakeLlm::new();
+        fake.enqueue_reply(200, completion("[\"谱定理 特征值\", \"PCA 协方差矩阵\"]"));
+
+        let output = expand_search_workspace(dir.path(), "zzqqvvsstt", 5, false, true, &fake)
+            .expect("expand search");
+
+        assert_eq!(fake.call_count(), 1, "one short rewrite, exactly");
+        assert_eq!(output.query, "zzqqvvsstt", "the query as received");
+        assert!(
+            !output.hits.is_empty(),
+            "the rewritten queries found something"
+        );
+        // The lexical path on the very same input finds nothing — so every hit
+        // above came from a query the model wrote, not from the input.
+        assert!(
+            search_workspace(dir.path(), "zzqqvvsstt", 5)
+                .expect("lexical")
+                .hits
+                .is_empty(),
+            "the fixture input must not match anything on its own"
+        );
+        // What went out: the configured model, the original query, and the
+        // width the parser enforces.
+        let body = fake.sent_body(0);
+        assert!(body.contains("\"model\":\"test-model\""), "{body}");
+        assert!(body.contains("zzqqvvsstt"), "{body}");
+        assert!(body.contains("exactly 4 strings"), "{body}");
+    }
+
+    #[test]
+    fn expand_fuses_the_lists_it_ran_and_truncates_to_the_requested_width() {
+        let dir = indexed_fixture();
+        add_model_config(dir.path(), "test-model");
+        let fake = momotaro_llm::fake::FakeLlm::new();
+        fake.enqueue_reply(200, completion("[\"谱定理\", \"PCA\"]"));
+
+        let width = 3;
+        let output = expand_search_workspace(dir.path(), "input query", width, false, true, &fake)
+            .expect("expand");
+        assert!(
+            output.hits.len() <= width,
+            "never more than top_k fused rows: {}",
+            output.hits.len()
+        );
+        // Ranks are contiguous and 1-based.
+        for (position, hit) in output.hits.iter().enumerate() {
+            assert_eq!(hit.hit.rank as usize, position + 1, "{position}");
+        }
+
+        // The fusion is over exactly the lists those two queries produce at
+        // that width: rebuilding them from the lexical path and fusing them
+        // the same way must reproduce the answer row for row. (The fusion
+        // maths itself is pinned separately in `momotaro_retrieve::fusion`.)
+        let lists: Vec<Vec<momotaro_contracts::RetrievalHit>> = ["谱定理", "PCA"]
+            .iter()
+            .map(|rewritten| {
+                search_workspace(dir.path(), rewritten, width)
+                    .expect("one rewritten query")
+                    .hits
+                    .into_iter()
+                    .map(|hit| hit.hit)
+                    .collect()
+            })
+            .collect();
+        for (rewritten, hits) in ["谱定理", "PCA"].iter().zip(&lists) {
+            assert!(
+                !hits.is_empty(),
+                "{rewritten} must match this fixture, or the check is empty"
+            );
+        }
+        let mut expected = momotaro_retrieve::fuse_rrf(&lists);
+        expected.truncate(width);
+
+        let actual: Vec<momotaro_contracts::RetrievalHit> =
+            output.hits.iter().map(|hit| hit.hit.clone()).collect();
+        assert_eq!(actual, expected, "the answer is the fusion of those lists");
+    }
+
+    #[test]
+    fn the_same_rewrite_ranks_the_same_way_twice() {
+        // Determinism is the contract (architecture §6.1): same input lists,
+        // same order — asserted on the whole output, ties included.
+        let dir = indexed_fixture();
+        add_model_config(dir.path(), "test-model");
+
+        let run = || {
+            let fake = momotaro_llm::fake::FakeLlm::new();
+            fake.enqueue_reply(200, completion("[\"谱定理\", \"PCA\", \"kernel\"]"));
+            expand_search_workspace(dir.path(), "anything at all", 5, false, true, &fake)
+                .expect("expand")
+        };
+        let first = run();
+        let second = run();
+        assert!(!first.hits.is_empty());
+        // Compared on the ranking: each search mints its own `run_id`.
+        assert_eq!(first.hits, second.hits, "same input, same ranking");
+    }
+
+    #[test]
+    fn expand_refuses_under_no_llm_without_calling_the_provider() {
+        let dir = indexed_fixture();
+        add_model_config(dir.path(), "test-model");
+        let fake = momotaro_llm::fake::FakeLlm::new();
+        // Nothing enqueued: a call would panic the rig rather than pass.
+        let error = expand_search_workspace(dir.path(), "谱定理", 5, true, true, &fake)
+            .expect_err("--no-llm forbids it");
+        assert!(matches!(error, RunError::PolicyRefused(_)), "{error}");
+        assert_eq!(fake.call_count(), 0, "no token is spent on a refusal");
+    }
+
+    #[test]
+    fn a_key_chain_the_build_does_not_read_is_refused_not_ignored() {
+        // §7 offers `api_key_env` *or* `api_key_keychain`. Honouring neither
+        // silently would mean dialing without a credential and reporting the
+        // failure as an unexplained 401.
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_model_config(
+            dir.path(),
+            &dir.path().join("vault"),
+            "[model]\nbase_url_env = \"MM_BASE\"\napi_key_keychain = \"momotaro.answer\"\n",
+        );
+
+        let error =
+            http_transport_with(dir.path(), |_| Ok("https://api.example.com/v1".to_owned()))
+                .expect_err("the keychain is not implemented here");
+        assert!(matches!(error, RunError::ProviderUnavailable(_)), "{error}");
+        let text = error.to_string();
+        assert!(text.contains("api_key_keychain"), "{text}");
+        assert!(text.contains("api_key_env"), "{text}");
+    }
+
+    #[test]
+    fn expand_refuses_without_network_permission_and_spends_nothing() {
+        // architecture §7 promises network is off until it is asked for; the
+        // provider call is a network call, so the gate applies to it.
+        let dir = indexed_fixture();
+        add_model_config(dir.path(), "test-model");
+        let fake = momotaro_llm::fake::FakeLlm::new();
+
+        let error = expand_search_workspace(dir.path(), "谱定理", 5, false, false, &fake)
+            .expect_err("--allow-network is required");
+        assert!(matches!(error, RunError::PolicyRefused(_)), "{error}");
+        let text = error.to_string();
+        assert!(text.contains("--allow-network"), "{text}");
+        assert!(text.contains("[policy].allow_network"), "{text}");
+        assert_eq!(fake.call_count(), 0, "a refusal spends no token");
+
+        // The workspace policy is the same gate answered the other way: one
+        // line in momotaro.toml stands in for the flag on every command.
+        let path = config_path(dir.path());
+        let mut config = fs::read_to_string(&path).expect("read config");
+        config.push_str("\n[policy]\nallow_network = true\n");
+        fs::write(&path, config).expect("write config");
+
+        fake.enqueue_reply(200, completion("[\"谱定理\"]"));
+        let output =
+            expand_search_workspace(dir.path(), "谱定理", 5, false, false, &fake).expect("allowed");
+        assert_eq!(fake.call_count(), 1, "the config line permits the call");
+        assert!(!output.hits.is_empty());
+    }
+
+    #[test]
+    fn expand_is_refused_under_no_llm_before_the_provider_is_consulted() {
+        let error = validate_expand_policy(true).expect_err("--no-llm forbids it");
+        assert!(matches!(error, RunError::PolicyRefused(_)), "{error}");
+        let text = error.to_string();
+        assert!(text.contains("--mode expand"), "{text}");
+        assert!(text.contains("--no-llm"), "{text}");
+        // Lexical search has no such restriction.
+        validate_expand_policy(false).expect("lexical work is allowed");
+    }
+
+    #[test]
+    fn the_network_gate_is_one_predicate_for_the_cli_and_the_engine() {
+        // The flag settles it without touching the workspace at all — a path
+        // that does not exist still answers `--allow-network`.
+        validate_network_policy(Path::new("Z:/definitely/not/a/workspace"), true)
+            .expect("the flag wins outright");
+
+        // Without it, the workspace has to say so — and the refusal names both
+        // ways out. Its own fixture: the `[model]`-less helper belongs to the
+        // endpoint tests, which are a different commit.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("vault");
+        write_config(dir.path(), &vault);
+        let error =
+            validate_network_policy(dir.path(), false).expect_err("the workspace never allowed it");
+        assert!(matches!(error, RunError::PolicyRefused(_)), "{error}");
+        let text = error.to_string();
+        assert!(text.contains("--allow-network"), "{text}");
+        assert!(text.contains("[policy].allow_network"), "{text}");
+
+        // …and one line in momotaro.toml answers for the flag on every command.
+        let path = config_path(dir.path());
+        let mut config = fs::read_to_string(&path).expect("read config");
+        config.push_str("\n[policy]\nallow_network = true\n");
+        fs::write(&path, config).expect("write config");
+        validate_network_policy(dir.path(), false).expect("the workspace allows it");
+    }
+
+    #[test]
+    fn expand_fails_before_the_provider_when_the_index_is_missing() {
+        // The guards run first so a doomed search never costs a rewrite.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("vault");
+        write_config(dir.path(), &vault);
+        init_workspace(dir.path()).expect("init");
+        add_model_config(dir.path(), "test-model");
+
+        let fake = momotaro_llm::fake::FakeLlm::new();
+        let error = expand_search_workspace(dir.path(), "谱定理", 5, false, true, &fake)
+            .expect_err("nothing is indexed");
+        assert!(matches!(error, RunError::IndexNotBuilt(_)), "{error}");
+        assert_eq!(fake.call_count(), 0, "the rewrite never happens");
+    }
+
+    #[test]
+    fn a_rewrite_that_holds_no_query_is_reported_not_papered_over() {
+        let dir = indexed_fixture();
+        add_model_config(dir.path(), "test-model");
+
+        for unusable in ["[]", "   ", "[\"\", \"  \"]", ""] {
+            let fake = momotaro_llm::fake::FakeLlm::new();
+            fake.enqueue_reply(200, completion(unusable));
+            let error = expand_search_workspace(dir.path(), "谱定理", 5, false, true, &fake)
+                .expect_err("no query to run");
+            assert!(
+                matches!(error, RunError::RewriteUnusable),
+                "{unusable:?} → {error}"
+            );
+            assert_eq!(fake.call_count(), 1, "{unusable:?}");
+        }
+    }
+
+    /// The fusion of `queries` at `width`, built the way the expand path
+    /// builds it — the expectation side of an expand assertion, so a test can
+    /// state "these lists and no others".
+    fn fused_from(
+        root: &Path,
+        queries: &[&str],
+        width: usize,
+    ) -> Vec<momotaro_contracts::RetrievalHit> {
+        let lists: Vec<Vec<momotaro_contracts::RetrievalHit>> = queries
+            .iter()
+            .map(|rewritten| {
+                search_workspace(root, rewritten, width)
+                    .expect("one query")
+                    .hits
+                    .into_iter()
+                    .map(|hit| hit.hit)
+                    .collect()
+            })
+            .collect();
+        let mut fused = momotaro_retrieve::fuse_rrf(&lists);
+        fused.truncate(width);
+        fused
+    }
+
+    /// The ranked rows of one expand, ready to compare against `fused_from`.
+    fn rows_of(output: &SearchOutput) -> Vec<momotaro_contracts::RetrievalHit> {
+        output.hits.iter().map(|hit| hit.hit.clone()).collect()
+    }
+
+    #[test]
+    fn the_fusion_holds_no_list_the_model_did_not_return() {
+        // Every other expand test drives an input that matches nothing, so a
+        // fourth list built from the *input* would be invisible there: an
+        // empty list contributes nothing. Here the input matches, which is
+        // what makes "only the model's queries are fused" falsifiable.
+        let dir = indexed_fixture();
+        add_model_config(dir.path(), "test-model");
+        assert!(
+            !search_workspace(dir.path(), "傅里叶", 5)
+                .expect("lexical")
+                .hits
+                .is_empty(),
+            "the fixture input must match, or an extra list would be invisible"
+        );
+
+        let fake = momotaro_llm::fake::FakeLlm::new();
+        fake.enqueue_reply(200, completion("[\"谱定理\"]"));
+        let output =
+            expand_search_workspace(dir.path(), "傅里叶", 5, false, true, &fake).expect("expand");
+
+        assert_eq!(
+            rows_of(&output),
+            fused_from(dir.path(), &["谱定理"], 5),
+            "only the query the model returned is fused"
+        );
+    }
+
+    #[test]
+    fn the_queries_past_the_ceiling_are_dropped_instead_of_searched() {
+        // The prompt promises 4 and the parser is told 4; this is the only
+        // thing that stops the *call site* handing it a wider cap while the
+        // prompt keeps saying 4.
+        let dir = indexed_fixture();
+        add_model_config(dir.path(), "test-model");
+
+        let six = ["谱定理", "PCA", "kernel", "Dirichlet", "Fourier", "QR 算法"];
+        // The two queries past the ceiling have to match on their own, or
+        // dropping them would change nothing and the assertion would be empty.
+        for extra in &six[4..] {
+            assert!(
+                !search_workspace(dir.path(), extra, 5)
+                    .expect("query")
+                    .hits
+                    .is_empty(),
+                "{extra} must match this fixture, or the ceiling is invisible"
+            );
+        }
+
+        let run = |body: String| {
+            let fake = momotaro_llm::fake::FakeLlm::new();
+            fake.enqueue_reply(200, body);
+            expand_search_workspace(dir.path(), "谱定理", 5, false, true, &fake).expect("expand")
+        };
+        let within = run(completion(&serde_json::to_string(&six[..4]).expect("json")));
+        let over = run(completion(&serde_json::to_string(&six[..6]).expect("json")));
+
+        assert!(!within.hits.is_empty(), "the four fit and must be searched");
+        // `run_id` is minted per search and is not what this asserts — the
+        // ranking is.
+        assert_eq!(
+            over.hits, within.hits,
+            "queries past the ceiling are dropped, not searched"
+        );
+    }
+
+    #[test]
+    fn a_search_records_one_run_carrying_its_rewrite_turn() {
+        // §10.2's 写入 row: a search *is* a run, and the run is what carries
+        // the rewrite's token usage. The witness has to be the terminal count,
+        // not the sweep — the sweep only ever sees `accepted` / `running`, and
+        // a successful run leaves `finished`.
+        let dir = indexed_fixture();
+        add_model_config(dir.path(), "test-model");
+        let fake = momotaro_llm::fake::FakeLlm::new();
+        fake.enqueue_reply(200, completion("[\"谱定理\"]"));
+        let output =
+            expand_search_workspace(dir.path(), "谱定理", 5, false, true, &fake).expect("expand");
+
+        let run_id = output.run_id.expect("expand records the run it ran");
+        let mut store = Store::open(dir.path().join(".momotaro/momotaro.db")).expect("open");
+        assert_eq!(store.run_count().expect("count"), 1, "one search, one run");
+        assert!(
+            store.sweep_interrupted_runs().expect("sweep").is_empty(),
+            "already terminal, so nothing dangles"
+        );
+
+        let trace = store
+            .run_trace(&run_id)
+            .expect("the trace reads back")
+            .expect("the run exists");
+        assert_eq!(trace.run.mode, "search", "recorded as the search it is");
+        assert_eq!(trace.run.status, "finished", "and it reached its terminal");
+
+        assert_eq!(trace.llm_turns.len(), 1, "the rewrite is exactly one turn");
+        let turn = &trace.llm_turns[0];
+        assert_eq!(turn.status, "finished");
+        assert_eq!(
+            (turn.input_tokens, turn.output_tokens),
+            (Some(3), Some(5)),
+            "the usage the provider reported is what the row carries"
+        );
+        assert_eq!(turn.model, "test-model", "the model that actually ran");
+
+        assert_eq!(trace.retrievals.len(), 1, "one retrieval for one search");
+        let strategy: serde_json::Value =
+            serde_json::from_str(&trace.retrievals[0].strategy_json).expect("strategy is JSON");
+        assert_eq!(strategy["mode"], "expand");
+        assert_eq!(strategy["queries"], serde_json::json!(["谱定理"]));
+        assert_eq!(strategy["rrf_k"], 60);
+        assert_eq!(
+            trace.retrievals[0].hits.len(),
+            output.hits.len(),
+            "the row holds exactly the ranked answer"
+        );
+    }
+
+    #[test]
+    fn a_refused_search_still_records_no_run() {
+        // The *network* leg of §10.2's claim that every gate answers before
+        // the run row: the count, not the sweep, is the witness. The other
+        // three legs are the four tests that follow — the "usable index and
+        // store" gate gets one test on each half. One test driving one path
+        // cannot carry a claim about all four.
+        let dir = indexed_fixture();
+        add_model_config(dir.path(), "test-model");
+        let fake = momotaro_llm::fake::FakeLlm::new();
+
+        let error = expand_search_workspace(dir.path(), "谱定理", 5, false, false, &fake)
+            .expect_err("no network permission");
+        assert!(matches!(error, RunError::PolicyRefused(_)), "{error}");
+        assert_eq!(fake.call_count(), 0, "not one token");
+
+        let store = Store::open(dir.path().join(".momotaro/momotaro.db")).expect("open");
+        assert_eq!(store.run_count().expect("count"), 0, "no run row either");
+    }
+
+    /// The other three gates, each proved by the rows it must not leave.
+    ///
+    /// `architecture.md` §10.2 and `usage.md` both say *every* gate answers
+    /// before the run row, so no refusal can leave a phantom run behind for
+    /// the sweep to close as `failed(interrupted)`. Proving only "zero tokens"
+    /// would still let `commit_run_create` move above a gate with a green
+    /// suite — that reordering is exactly the mutation these exist to kill.
+    #[test]
+    fn a_search_refused_by_no_llm_records_no_run() {
+        let dir = indexed_fixture();
+        add_model_config(dir.path(), "test-model");
+        let fake = momotaro_llm::fake::FakeLlm::new();
+
+        let error = expand_search_workspace(dir.path(), "谱定理", 5, true, true, &fake)
+            .expect_err("--no-llm forbids --mode expand");
+        assert!(matches!(error, RunError::PolicyRefused(_)), "{error}");
+        assert_eq!(fake.call_count(), 0, "not one token");
+
+        let store = Store::open(dir.path().join(".momotaro/momotaro.db")).expect("open");
+        assert_eq!(
+            store.run_count().expect("count"),
+            0,
+            "the no-llm leg must not leave a run"
+        );
+    }
+
+    #[test]
+    fn a_search_refused_for_a_missing_index_records_no_run() {
+        // `fixture_workspace` inits the store and never builds the index, so
+        // this reaches the "usable index" gate and no other.
+        let (dir, _vault) = fixture_workspace();
+        add_model_config(dir.path(), "test-model");
+        let fake = momotaro_llm::fake::FakeLlm::new();
+
+        let error = expand_search_workspace(dir.path(), "谱定理", 5, false, true, &fake)
+            .expect_err("the index was never built");
+        assert!(matches!(error, RunError::IndexNotBuilt(_)), "{error}");
+        assert_eq!(fake.call_count(), 0, "not one token");
+
+        let store = Store::open(dir.path().join(".momotaro/momotaro.db")).expect("open");
+        assert_eq!(
+            store.run_count().expect("count"),
+            0,
+            "the index leg must not leave a run"
+        );
+    }
+
+    #[test]
+    fn a_search_refused_for_a_missing_database_records_no_run() {
+        // The store half of that same gate. "Zero rows" is literal here: the
+        // command may not create the database it just refused to read, so the
+        // witness is the file's absence rather than a count inside it.
+        let dir = indexed_fixture();
+        add_model_config(dir.path(), "test-model");
+        let fake = momotaro_llm::fake::FakeLlm::new();
+        let database = dir.path().join(".momotaro/momotaro.db");
+        fs::remove_file(&database).expect("remove the database");
+
+        let error = expand_search_workspace(dir.path(), "谱定理", 5, false, true, &fake)
+            .expect_err("the database is gone");
+        assert!(matches!(error, RunError::StoreUnhealthy(_)), "{error}");
+        assert_eq!(fake.call_count(), 0, "not one token");
+        assert!(
+            !database.exists(),
+            "the refusal must not create the database it refused to read"
+        );
+    }
+
+    #[test]
+    fn a_search_refused_by_spec_validation_records_no_run() {
+        // Nothing rejects a blank query before `spec.validate()` does, so this
+        // is the leg that would stop refusing outright if validation moved
+        // below `commit_run_create`.
+        let dir = indexed_fixture();
+        add_model_config(dir.path(), "test-model");
+        let fake = momotaro_llm::fake::FakeLlm::new();
+
+        let error = expand_search_workspace(dir.path(), "   ", 5, false, true, &fake)
+            .expect_err("an empty query cannot be run");
+        assert!(matches!(error, RunError::SpecInvalid(_)), "{error}");
+        assert_eq!(fake.call_count(), 0, "not one token");
+
+        let store = Store::open(dir.path().join(".momotaro/momotaro.db")).expect("open");
+        assert_eq!(
+            store.run_count().expect("count"),
+            0,
+            "the spec leg must not leave a run"
+        );
+    }
+
+    #[test]
+    fn a_lexical_search_output_carries_no_run_id() {
+        // `run_id` is `skip_serializing_if = "Option::is_none"`, and lexical
+        // writes no run — so the payload a script has always parsed must be
+        // unchanged. Without this, `search_workspace` could start minting a
+        // run and every consumer's shape would shift unnoticed.
+        let dir = indexed_fixture();
+        let output = search_workspace(dir.path(), "谱定理", 5).expect("lexical search");
+        assert!(!output.hits.is_empty(), "the fixture answers that query");
+        assert!(output.run_id.is_none(), "lexical creates no run");
+
+        let json = serde_json::to_string(&output).expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("an object");
+        assert!(value.is_object(), "an object: {json}");
+        assert!(value.get("query").is_some(), "query survives: {json}");
+        assert!(value.get("hits").is_some(), "hits survive: {json}");
+        assert!(
+            value.get("run_id").is_none(),
+            "no run_id key in the lexical payload: {json}"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_of_punctuation_alone_is_reported_as_unusable() {
+        // "No usable query" is the *retriever's* question. `["!!!"]` parses
+        // into a list just fine and every list in it searches nothing, so
+        // without this the command exits 0 with zero hits while §10.2 promises
+        // a failure.
+        let dir = indexed_fixture();
+        add_model_config(dir.path(), "test-model");
+
+        for unusable in ["[\"!!!\"]", "[\"...\", \"---\"]"] {
+            let fake = momotaro_llm::fake::FakeLlm::new();
+            fake.enqueue_reply(200, completion(unusable));
+            let error = expand_search_workspace(dir.path(), "谱定理", 5, false, true, &fake)
+                .expect_err("nothing in that reply can be searched");
+            assert!(
+                matches!(error, RunError::RewriteUnusable),
+                "{unusable} → {error}"
+            );
+        }
+
+        // One searchable query among noise is enough to search.
+        let fake = momotaro_llm::fake::FakeLlm::new();
+        fake.enqueue_reply(200, completion("[\"谱定理\", \"!!!\"]"));
+        let output = expand_search_workspace(dir.path(), "谱定理", 5, false, true, &fake)
+            .expect("one query was searchable");
+        assert!(!output.hits.is_empty());
+    }
+
+    #[test]
+    fn a_failed_rewrite_is_reported_as_a_typed_llm_failure() {
+        let dir = indexed_fixture();
+        add_model_config(dir.path(), "test-model");
+        let fake = momotaro_llm::fake::FakeLlm::new();
+        fake.enqueue_reply(401, r#"{"error": {"message": "bad key"}}"#);
+
+        let error = expand_search_workspace(dir.path(), "谱定理", 5, false, true, &fake)
+            .expect_err("the provider refused");
+        let RunError::Llm(error) = &error else {
+            panic!("a provider failure is typed, not stringly: {error}");
+        };
+        assert_eq!(error.kind, momotaro_llm::LlmErrorKind::Auth);
+        assert_eq!(
+            error.kind.category(),
+            "llm_auth",
+            "the §18 category survives"
+        );
+
+        // The run was accepted before the provider was called, so it must have
+        // reached a terminal event too (D15) — the sweep would otherwise pick
+        // it up as interrupted.
+        let mut store = Store::open(dir.path().join(".momotaro/momotaro.db")).expect("open");
+        assert_eq!(store.run_count().expect("count"), 1, "the run was accepted");
+        assert!(
+            store.sweep_interrupted_runs().expect("sweep").is_empty(),
+            "and it is terminal, not dangling"
+        );
     }
 
     #[test]

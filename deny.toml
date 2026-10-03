@@ -1,6 +1,18 @@
 # Supply-chain policy (D39). `cargo deny check` runs in CI on every change and
 # on a daily schedule, so a new advisory against an already-pinned dependency is
 # disclosed without anyone having to remember to look.
+#
+# One class is only weakly covered, stated here because the sentence above
+# cannot. `unsound = "Workspace"` is the default we run, and under it an
+# advisory is surfaced when the affected crate is a *direct* dependency of this
+# workspace — so `ureq`, `clap`, `tantivy`… would be disclosed, a transitive
+# one would not, and a workspace member is never reported at all (it has no
+# package source, so it is dropped before scope is even considered).
+# `lru 0.16.4` (RUSTSEC-2026-0253, fixed >= 0.18.2, unreachable while tantivy
+# pins `^0.16.3`) is transitive — via `tantivy` — so it is silent today;
+# `unsound = "all"` is what would surface it, and that run goes red until the
+# tantivy upgrade lands. That upgrade is registered as its own task — this is
+# the disclosure that covers it until then.
 
 [graph]
 # Every target we build for, so a Windows-only or test-only dependency cannot
@@ -28,6 +40,13 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "MPL-2.0",
+    # Mozilla's root-certificate bundle as published by the webpki maintainers:
+    # a permissive *data* license with no copyleft. It reaches this graph only
+    # through rustls-platform-verifier's `cfg(target_arch = "wasm32")` branch
+    # (`webpki-root-certs`), which no target this project builds ever compiles —
+    # kept in the graph on purpose so cargo-deny keeps auditing it. The runtime
+    # trust root is the platform's (`RootCerts::PlatformVerifier`), never this.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 # An allowance nobody uses yet is policy (the list is the licences this project
@@ -39,6 +58,16 @@ private = { ignore = true }
 
 [bans]
 multiple-versions = "warn"
+# Duplicates are reported, not denied — a `warn` that nobody can explain is
+# drift, so the current set is attributed here. The four this round added all
+# come from the ureq TLS stack and are un-unifiable by construction:
+#   base64    0.22 (tantivy) vs 0.23 (ureq, ureq-proto)
+#   getrandom 0.4 (cc/jobserver) vs 0.2 (ring)
+#   syn       3 (serde_derive) vs 2 (jni-macros, an android-only branch)
+#   windows-sys 0.52 (`ring` pins ^0.52), a fourth version beside the
+#   0.59/0.60/0.61 the workspace already carried
+# The `windows_*` target crates, `hashbrown`, `winnow` and `windows-targets`
+# were already duplicated before this round.
 wildcards = "deny"
 # Every crate here depends on its workspace siblings by path, with no version
 # to check; `workspace = true` is not a wildcard to be afraid of.

@@ -511,6 +511,21 @@ impl Store {
         Ok(())
     }
 
+    /// How many runs this store holds, in any status.
+    ///
+    /// The witness for a *read-only* command. [`Self::sweep_interrupted_runs`]
+    /// only ever sees `accepted` / `running` rows, so a finished run — exactly
+    /// what a successful one leaves behind — is invisible to it; asking whether
+    /// `--mode expand` or a refused `ask` created a run needs the terminal
+    /// count, not the sweep.
+    pub fn run_count(&self) -> Result<u64, StoreError> {
+        // Same shape as `count_batch`: SQLite counts come back signed.
+        let count = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get::<_, i64>(0))?;
+        Ok(u64::try_from(count).unwrap_or(u64::MAX))
+    }
+
     /// The deterministic crash sweep (`harness.md` §2): every run left
     /// `accepted` or `running` with no terminal event is closed as
     /// `failed(interrupted)` — the terminal unit per run, so an interrupted
@@ -1075,6 +1090,38 @@ mod tests {
     /// rest share one event-landing path (`insert_event_tx`) and are held by
     /// the structural needles (one `BEGIN IMMEDIATE` per unit, every write
     /// site through its unit).
+    #[test]
+    fn run_count_sees_the_rows_the_sweep_cannot() {
+        // `sweep_interrupted_runs` only ever looks at `accepted` / `running`,
+        // so a finished run — what a *successful* one leaves — is invisible to
+        // it. `run_count` exists for exactly that case, and this pins both the
+        // count and the difference.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = Store::open(dir.path().join("momotaro.db")).expect("open");
+        store.init_schema().expect("init");
+        assert_eq!(store.run_count().expect("count"), 0, "an empty store");
+
+        create(&mut store, "run-1");
+        assert_eq!(store.run_count().expect("count"), 1, "a live run counts");
+
+        store
+            .connection
+            .execute(
+                "UPDATE runs SET status = 'finished' WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("finish the run");
+        assert_eq!(
+            store.run_count().expect("count"),
+            1,
+            "a finished run counts too"
+        );
+        assert!(
+            store.sweep_interrupted_runs().expect("sweep").is_empty(),
+            "and the sweep still cannot see it — which is why count is the witness"
+        );
+    }
+
     #[test]
     fn an_event_that_cannot_land_takes_the_rows_with_it() {
         let (_dir, mut store) = temp_store();

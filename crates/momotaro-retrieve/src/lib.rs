@@ -8,13 +8,15 @@
 
 pub(crate) mod boost;
 pub mod cjk;
+pub mod fusion;
 pub mod index;
 pub mod query;
 pub mod schema;
 
 pub use cjk::{CJK_TOKENIZER_NAME, CjkTokenizer, cjk_analyzer};
+pub use fusion::{RRF_K, fuse_rrf};
 pub use index::{IndexWriterHandle, SearchIndex};
-pub use query::{escape_query, normalize_query};
+pub use query::{escape_query, is_searchable, normalize_query};
 pub use schema::{Fields, build_schema, doc_from_chunk, fields};
 
 use tantivy::TantivyError;
@@ -105,6 +107,46 @@ mod tests {
         let fields = schema::fields(&index.schema()).expect("own schema resolves");
         let reader = index.reader().expect("reader");
         SearchIndex::from_parts(index, fields, reader)
+    }
+
+    /// A width of zero means "find nothing", not a tantivy assertion.
+    ///
+    /// The `top_k == 0` half of `SearchIndex::search`'s guard is not
+    /// redundant with the parser: `TopDocs::with_limit(0)` panics
+    /// (`assert_ne!(limit, 0, "Limit must be greater than 0")`) and the CLI
+    /// takes `--top 0`. The control half is load-bearing too — without it
+    /// this test would pass against a `search` that returns nothing ever.
+    #[test]
+    fn a_width_of_zero_returns_no_hits_instead_of_panicking() {
+        let si = ram_index();
+        let mut writer = si.writer(20_000_000).expect("writer");
+        let chunks = [chunk(
+            "fourier-1",
+            "ml/fourier.md",
+            0,
+            None,
+            "傅里叶变换将信号从时域映射到频域。",
+        )];
+        upsert_owner(
+            &mut writer,
+            si.fields(),
+            "ml/fourier.md",
+            "傅里叶笔记",
+            &chunks[..],
+        )
+        .expect("upsert");
+        writer.commit().expect("commit");
+
+        assert!(
+            si.search("傅里叶", 0)
+                .expect("zero width is not an error")
+                .is_empty(),
+            "asking for zero hits returns none"
+        );
+        assert!(
+            !si.search("傅里叶", 5).expect("search").is_empty(),
+            "control: the same query at width five finds the chunk"
+        );
     }
 
     #[test]

@@ -55,6 +55,8 @@
 
 use std::path::Path;
 
+use crate::{sha256_hex, to_i64};
+
 use momotaro_contracts::run_event;
 use momotaro_contracts::{
     AnswerCitationRecord, AnswerRecord, ContextItemRecord, HistoryItemRecord, LlmTurnRecord,
@@ -68,7 +70,6 @@ use momotaro_verify::{
     VerifyPolicy, verify_answer,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::index_service::search_workspace;
 use crate::{RunError, WorkspaceConfig};
@@ -115,8 +116,9 @@ pub struct AskOptions {
     pub client_request_id: Option<String>,
     /// Forbid every LLM call — `ask` is refused up front under it.
     pub no_llm: bool,
-    /// Whether tools may touch the network (frozen into the RunSpec; 0.x has
-    /// no tools).
+    /// Whether this request may reach the network (frozen into the RunSpec).
+    /// A provider call is one: `ask` and `search --mode expand` are refused
+    /// without it, before any run row exists.
     pub allow_network: bool,
     /// Whether tools may write files (frozen into the RunSpec; 0.x has no
     /// tools).
@@ -378,7 +380,7 @@ fn parse_citations(answer: &str) -> Vec<ParsedCitation> {
 /// `category / severity / attribution / retryable` — the four fields). Every
 /// failure this layer emits is error-level today; a lesser severity lands
 /// when a warning-class event first exists, not before.
-fn failure_data(category: &str, attribution: &str, retryable: bool) -> String {
+pub(crate) fn failure_data(category: &str, attribution: &str, retryable: bool) -> String {
     serde_json::json!({
         "attribution": attribution,
         "category": category,
@@ -390,7 +392,7 @@ fn failure_data(category: &str, attribution: &str, retryable: bool) -> String {
 
 /// The §18 row behind each category this layer can emit: (attribution,
 /// retryable), with `maybe` priced as `true` (a retry may help).
-fn failure_row(category: &str) -> (String, bool) {
+pub(crate) fn failure_row(category: &str) -> (String, bool) {
     match category {
         "interrupted" => ("system".to_owned(), true),
         "index_unavailable" => ("system".to_owned(), true),
@@ -466,18 +468,6 @@ impl FlowOutcome {
     }
 }
 
-/// The policy half of request validation (§10.1 step 1): `ask` answers with
-/// an LLM, and a policy that forbids one refuses the request before any run
-/// exists. Shared with the CLI surface so the refusal has one spelling.
-pub fn validate_ask_policy(options: &AskOptions) -> Result<(), RunError> {
-    if options.no_llm {
-        return Err(RunError::PolicyRefused(
-            "ask answers with an LLM, which --no-llm forbids",
-        ));
-    }
-    Ok(())
-}
-
 /// Runs one `ask` and reports its outcome.
 ///
 /// Once the run is created the flow always lands its terminal event — the
@@ -495,8 +485,11 @@ pub fn ask_workspace<T: ProviderTransport + ?Sized>(
     let root = root.as_ref();
 
     // 1. validate request.
-    validate_ask_policy(options)?;
+    crate::validate_ask_policy(options)?;
     let config = crate::load_config(root)?;
+    // The network half of the same gate, before the spec is frozen and long
+    // before a run row exists — a refused request must never spend a token.
+    crate::ensure_network_allowed(&config, options.allow_network)?;
     let spec = frozen_spec(query, options, &config)?;
     let provider = config
         .model
@@ -1122,7 +1115,7 @@ fn frozen_spec(
         max_context_tokens: options
             .max_context_tokens
             .unwrap_or(config.policy.max_context_tokens),
-        allow_network: options.allow_network || config.policy.allow_network,
+        allow_network: crate::network_permitted(config, options.allow_network),
         allow_write: options.allow_write || config.policy.allow_write,
     };
     spec.validate()?;
@@ -1208,6 +1201,23 @@ pub fn format_ask(report: &AskReport) -> String {
     out
 }
 
+/// How one retrieved hit was treated, in the words `trace` prints.
+///
+/// `included` and `omitted_reason` are an ordered pair, not two independent
+/// facts. `false` with no reason is what a search's retrieval writes: no
+/// context stage ran, so nothing was omitted by any decision. Rendering that
+/// as `omitted (unrecorded)` claimed both a decision and a lost record of it,
+/// on a command whose whole point is that neither exists.
+fn hit_inclusion(included: bool, omitted_reason: Option<&str>) -> String {
+    if included {
+        return "included".to_owned();
+    }
+    match omitted_reason {
+        Some(reason) => format!("omitted ({reason})"),
+        None => "not included".to_owned(),
+    }
+}
+
 /// The human rendering of one trace: the four questions `usage.md` names —
 /// what the retrieval found, what the model saw, which citations were used,
 /// and whether they verified — plus the timeline that joins them.
@@ -1253,14 +1263,7 @@ pub fn format_trace(trace: &RunTrace) -> String {
             crate::sanitize(&retrieval.normalized_query)
         ));
         for hit in &retrieval.hits {
-            let inclusion = if hit.included {
-                "included".to_owned()
-            } else {
-                format!(
-                    "omitted ({})",
-                    hit.omitted_reason.as_deref().unwrap_or("unrecorded")
-                )
-            };
+            let inclusion = hit_inclusion(hit.included, hit.omitted_reason.as_deref());
             out.push_str(&format!(
                 "    {:>2}. {}@{} {} — {} score {:?}\n",
                 hit.rank,
@@ -1415,15 +1418,6 @@ fn sanitize_lines(text: &str) -> String {
         .join("\n")
 }
 
-/// `sha256`, hex — the house digest (the same one `revision_hash` uses).
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
-fn to_i64(value: u64) -> Option<i64> {
-    i64::try_from(value).ok()
-}
-
 /// The stored-verdict side of the rebuild: one row to one judgement. An
 /// unparseable row is `None`, which fails the rebuild closed.
 fn verification_from_row(row: &VerificationRecord) -> Option<Verification> {
@@ -1452,6 +1446,24 @@ fn verification_from_row(row: &VerificationRecord) -> Option<Verification> {
 mod tests {
     use super::*;
     use momotaro_llm::LlmErrorKind;
+
+    #[test]
+    fn a_hit_no_context_stage_touched_is_not_reported_as_an_omission() {
+        // A search's retrieval writes `included: false` with no reason:
+        // nothing was omitted, because no context stage ever ran. The old
+        // wording printed `omitted (unrecorded)` there — a decision nobody
+        // made and a record that was never supposed to exist.
+        assert_eq!(hit_inclusion(false, None), "not included");
+
+        // A context stage that did decide keeps its typed reason, spelled as
+        // it always was.
+        assert_eq!(hit_inclusion(false, Some("budget")), "omitted (budget)");
+
+        // `included` wins over any reason, so a carried-over reason cannot
+        // turn an included hit into an omission.
+        assert_eq!(hit_inclusion(true, None), "included");
+        assert_eq!(hit_inclusion(true, Some("budget")), "included");
+    }
 
     fn ids(parsed: &[ParsedCitation]) -> Vec<&str> {
         parsed.iter().map(|c| c.context_item_id.as_str()).collect()

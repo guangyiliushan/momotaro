@@ -204,6 +204,50 @@ fn index_and_search_round_trip() {
 }
 
 #[test]
+fn a_lexical_search_prints_the_human_outlet_on_every_platform() {
+    // The hits half of the human outlet had one witness in this crate and it
+    // is `#[cfg(target_os = "linux")]`, so on the Windows CI leg deleting the
+    // rendering left the whole suite green. This one is not cfg-gated, and it
+    // asserts shape rather than a substring a JSON payload could satisfy
+    // (`"source_key": "note:..."` also contains `note:`).
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    stage_vault(tempdir.path());
+    write_config(tempdir.path());
+
+    let (_, stderr, ok) = run_cli(tempdir.path(), &["init"]);
+    assert!(ok, "init should succeed: {stderr}");
+    let (_, stderr, ok) = run_cli(tempdir.path(), &["index"]);
+    assert!(ok, "index should succeed: {stderr}");
+
+    let (stdout, stderr, ok) = run_cli(tempdir.path(), &["search", "傅里叶"]);
+    assert!(ok, "human search should succeed: {stderr}");
+    assert!(
+        !stdout.trim_start().starts_with('{'),
+        "the human outlet is not the JSON one: {stdout}"
+    );
+    assert!(
+        stdout.contains("score="),
+        "a hit line from format_search_hit: {stdout}"
+    );
+    assert!(
+        stdout.contains("note:"),
+        "the source key that hit line names: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.starts_with("    ")),
+        "the excerpt line under each hit is indented: {stdout}"
+    );
+
+    let (stdout, stderr, ok) = run_cli(tempdir.path(), &["search", "qqqqzzzz"]);
+    assert!(ok, "an empty search still exits 0: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "no results",
+        "the empty outlet is one plain line: {stdout}"
+    );
+}
+
+#[test]
 fn rebuild_index_reports_chunks() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     stage_vault(tempdir.path());

@@ -7,12 +7,13 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use momotaro_run::{
-    AskOptions, ProviderTransport, RunError, SearchOutput, WatchLine, ask_workspace,
-    coverage_report, doctor, format_ask, format_coverage, format_error, format_health,
+    AskOptions, RunError, SearchOutput, WatchLine, ask_workspace, coverage_report, doctor,
+    expand_search_workspace, format_ask, format_coverage, format_error, format_health,
     format_index_error, format_index_summary, format_rebuild, format_reconcile,
     format_search_excerpt, format_search_hit, format_stats, format_trace, format_watch_line,
-    index_workspace, init_workspace, is_healthy, is_uninitialized, rebuild_index, reconcile,
-    search_workspace, stats, trace_workspace, validate_ask_policy, watch,
+    index_workspace, init_workspace, is_healthy, is_uninitialized, provider_transport,
+    rebuild_index, reconcile, search_workspace, stats, trace_workspace, validate_ask_policy,
+    validate_expand_policy, validate_network_policy, watch,
 };
 
 /// A personal knowledge engine for serious learners.
@@ -27,11 +28,13 @@ struct Cli {
     #[arg(long, global = true)]
     profile: bool,
 
-    /// Forbid every LLM call (`ask` refuses; `search` stays lexical).
+    /// Forbid every LLM call (`ask` and `--mode expand` refuse; lexical
+    /// `search` is unaffected).
     #[arg(long, global = true)]
     no_llm: bool,
 
-    /// Allow tools to touch the network (Beta 保守默认: off).
+    /// Allow network access (Beta 保守默认: off): `ask` and
+    /// `--mode expand` are refused without it.
     #[arg(long, global = true)]
     allow_network: bool,
 
@@ -87,7 +90,8 @@ enum Command {
         path: Option<PathBuf>,
     },
 
-    /// Search indexed notes with Tantivy BM25 (zero LLM).
+    /// Search indexed notes with Tantivy BM25 (`--mode expand` spends one LLM
+    /// rewrite before retrieving).
     Search {
         /// Search terms (joined with spaces, so quotes are not required).
         query: Vec<String>,
@@ -260,26 +264,45 @@ fn main() -> ExitCode {
             }
         }
         Command::Search { query, top } => {
-            if cli.mode == SearchMode::Expand {
-                // `--mode expand` is one short LLM rewrite over the query
-                // (usage.md): it needs the provider transport this build does
-                // not wire — the same seam `ask` names, refused by name.
-                return print_error(
-                    cli.json,
-                    RunError::ProviderUnavailable(
-                        "search --mode expand needs the LLM rewrite step",
-                    ),
-                );
-            }
             let query = query.join(" ");
-            match search_workspace(&root, &query, top) {
+            let output = match cli.mode {
+                SearchMode::Lexical => search_workspace(&root, &query, top),
+                SearchMode::Expand => {
+                    // Policy before endpoint: `--no-llm` and the network gate
+                    // are refusals about the request itself, and must not be
+                    // reported as whatever this workspace happens to be missing.
+                    if let Err(error) = validate_expand_policy(cli.no_llm) {
+                        return print_error(cli.json, error);
+                    }
+                    if let Err(error) = validate_network_policy(&root, cli.allow_network) {
+                        return print_error(cli.json, error);
+                    }
+                    // Built here and passed in, so tests drive the fake rig and
+                    // this process never dials on its own.
+                    let transport = match provider_transport(&root) {
+                        Ok(transport) => transport,
+                        Err(error) => return print_error(cli.json, error),
+                    };
+                    expand_search_workspace(
+                        &root,
+                        &query,
+                        top,
+                        cli.no_llm,
+                        cli.allow_network,
+                        &*transport,
+                    )
+                }
+            };
+            match output {
                 Ok(output) => {
                     if cli.json {
                         let payload = serde_json::to_string_pretty(&output)
                             .expect("search output serializes");
                         print_success(cli.json, payload, "")
                     } else {
-                        print_hits(&output);
+                        for line in search_output_lines(&output) {
+                            println!("{line}");
+                        }
                         ExitCode::SUCCESS
                     }
                 }
@@ -309,7 +332,15 @@ fn main() -> ExitCode {
             if let Err(error) = validate_ask_policy(&options) {
                 return print_error(cli.json, error);
             }
-            let transport = match provider_transport() {
+            // Same two gates expand uses, in the same order: policy first, so a
+            // refused request is never reported as a missing endpoint.
+            if let Err(error) = validate_network_policy(&root, cli.allow_network) {
+                return print_error(cli.json, error);
+            }
+            // The transport is built from `[model]` + the environment
+            // (`momotaro_run::provider_transport`), and a workspace with no
+            // endpoint configured is refused here — before any run row exists.
+            let transport = match provider_transport(&root) {
                 Ok(transport) => transport,
                 Err(error) => return print_error(cli.json, error),
             };
@@ -398,27 +429,107 @@ fn main() -> ExitCode {
     }
 }
 
-fn print_hits(output: &SearchOutput) {
+/// What a human sees for one search, in order.
+///
+/// First the run `--mode expand` created — there is no "list runs", so for a
+/// search run this line is the only way to reach it — then the hits, or
+/// `no results`.
+///
+/// Returned rather than printed so a test can drive it: the hits half through
+/// the binary on every platform, the run line through
+/// `a_search_that_created_a_run_names_it_in_the_human_outlet`, and the hop to
+/// the terminal through `the_outlet_prints_the_renderer_whole`.
+fn search_output_lines(output: &SearchOutput) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(run_id) = &output.run_id {
+        lines.push(format!("run {run_id}"));
+    }
     if output.hits.is_empty() {
-        println!("no results");
-        return;
+        lines.push("no results".to_owned());
+        return lines;
     }
 
     for hit in &output.hits {
-        println!("{}", format_search_hit(hit));
-        println!("    {}", format_search_excerpt(&hit.excerpt));
+        lines.push(format_search_hit(hit));
+        lines.push(format!("    {}", format_search_excerpt(&hit.excerpt)));
     }
+    lines
 }
 
-/// The provider seam (the CLI's only LLM wiring point).
-///
-/// `momotaro-llm` deliberately holds no HTTP client — every exchange goes
-/// through this trait ("production wires a real transport later"), and this
-/// build ships no production transport: wiring one (an OpenAI-compatible
-/// client behind `--allow-network`) is a registered dependency decision.
-/// Until it lands, `ask` and `search --mode expand` refuse by name here —
-/// before any run row exists — while the engine itself is proven end to end
-/// by the fake-LLM integration suite (`architecture.md` §23 DoD 9).
-fn provider_transport() -> Result<Box<dyn ProviderTransport>, RunError> {
-    Err(RunError::ProviderUnavailable("ask answers with an LLM"))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_search_that_created_a_run_names_it_in_the_human_outlet() {
+        let output = SearchOutput {
+            query: "谱定理".to_owned(),
+            hits: Vec::new(),
+            run_id: Some("run-1-2".to_owned()),
+        };
+        assert_eq!(
+            search_output_lines(&output),
+            vec!["run run-1-2".to_owned(), "no results".to_owned()],
+            "the run line comes first, so a reader sees it before the hits"
+        );
+    }
+
+    /// The outlet prints every line the renderer returns, whole.
+    ///
+    /// Structural, on the same precedent as this repo's `include_str!` pins:
+    /// nothing in-process can capture `println!`, and an end-to-end witness
+    /// for `--mode expand` would need a real provider endpoint, which the
+    /// zero-network rule keeps out. The renderer itself is pinned by
+    /// `a_search_that_created_a_run_names_it_in_the_human_outlet` and
+    /// `a_lexical_search_names_no_run_it_never_created`, and the hits half by
+    /// the binary-level test in `apps/cli/tests/cli.rs`; this pins the single
+    /// hop between renderer and terminal — deleting the `run` line at the call
+    /// site, filtering it out of the loop, or routing around the renderer
+    /// entirely is what it exists to catch. What stays registered is an
+    /// *end-to-end* witness for `--mode expand` itself.
+    #[test]
+    fn the_outlet_prints_the_renderer_whole() {
+        // Needles are `concat!`-built so this test's own source cannot satisfy
+        // them (the counting rule).
+        let source = include_str!("main.rs");
+        let route = concat!("for line in search", "_output_lines(&output) {");
+        let at = source
+            .find(route)
+            .expect("the human outlet routes through the renderer");
+        let tail = &source[at..];
+        let stop = tail
+            .find(concat!("ExitCode::", "SUCCESS"))
+            .expect("the arm ends there");
+        let block = &tail[..stop];
+        // Past the header: whatever sits between `{` and the closing brace.
+        // Dropping the header's text loses `route` above and never gets here;
+        // changing what follows changes this slice.
+        let after_header = &block[route.len()..];
+        let lines: Vec<&str> = after_header
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+
+        assert_eq!(
+            lines,
+            vec![concat!("println!", "(\"{line}\");"), "}"],
+            "the loop's only statement is the print, so the outlet shows the \
+             renderer whole — no filter, no guard, no second path: {block}"
+        );
+    }
+
+    #[test]
+    fn a_lexical_search_names_no_run_it_never_created() {
+        let output = SearchOutput {
+            query: "谱定理".to_owned(),
+            hits: Vec::new(),
+            run_id: None,
+        };
+        assert_eq!(
+            search_output_lines(&output),
+            vec!["no results".to_owned()],
+            "lexical writes no run, so it must not print a line pointing at one"
+        );
+    }
 }

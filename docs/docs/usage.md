@@ -90,6 +90,16 @@ momotaro search "transformer reasoning" --mode expand
 
 `--mode expand` 显式开启一次短 LLM 调用，把输入扩成多个查询再检索聚合。这是搜索模式，不是 Agent 循环。
 
+`--mode expand` 会建立一条 `mode = search` 的 run：`--json` 输出里带 `run_id`
+（人类可读输出也会先打一行 `run <run_id>`），可以用 `momotaro trace <run_id>` 回放——
+重写的那一次 LLM turn 与它报的 token 用量都在里面。拒绝态（`--no-llm`、未授权网络、
+索引不可用、端点未配）都在建 run **之前**，所以被拒时不会留下任何行。
+
+`--no-llm` 下 `--mode expand` 直接拒绝并点名两者
+（`policy refused the request: --mode expand rewrites the query with an LLM, which
+--no-llm forbids`）；lexical 搜索不受影响——它本来就零 token，`--no-llm` 对它是
+同义反复。
+
 ## Ask with citations
 
 ```bash
@@ -103,6 +113,31 @@ momotaro ask "解释谱定理和 PCA 的关系"
 3. 实际送给模型的 context fragments；
 4. 这一次 LLM turn；
 5. 引用校验结果。
+
+## Provider endpoint
+
+`ask` 与 `search --mode expand` 各要一次 provider turn（§16：可观察输出之前至多
+重发一次，仍是一次 turn）；本版其余命令零网络。这两个命令还受网络策略约束：
+默认拒绝，需 `--allow-network` 或 `[policy] allow_network = true`——与下面
+Policy flags 的「Beta 默认保守」是同一条。
+端点与密钥都**不写进 `momotaro.toml`**：配置只写变量名，值留在环境里
+（architecture §7）。
+
+```toml
+[model]
+model_id     = "qwen3"
+base_url_env = "MOMOTARO_BASE_URL"  # 变量名；值 = API 根地址，如 https://api.example.com/v1
+api_key_env  = "MOMOTARO_API_KEY"   # 可省略：本地端点无需密钥
+```
+
+```bash
+export MOMOTARO_BASE_URL="https://api.example.com/v1"
+export MOMOTARO_API_KEY="sk-…"
+```
+
+未设置 `[model].base_url_env`、或它指向的变量没有导出时，命令在**建立连接之前**
+以 `provider unavailable: …` 拒绝（退出码 1），并且不产生 run 行。
+`api_key_env` 省略 = 不带密钥；写了而变量没导出，同样在拨号前拒绝。
 
 ## Stats
 

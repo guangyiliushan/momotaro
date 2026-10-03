@@ -64,12 +64,17 @@ accepted -> running -> finished | failed | cancelled
 
 MVP 刻意简单：
 
-1. SQLite WAL：并发读不受限；**写是单写者**——进程内一个写队列，run 串行
-   提交事务；
-2. 一个 session 同时至多一个活跃 run；跨 session 的 `search`（只读）可并行；
+1. SQLite WAL：并发读不受限；**写是单写者**——同一时刻只有一个写者，锁由
+   每条写路径自己取（`commit_*` 单元开 `BEGIN IMMEDIATE`），`busy_timeout`
+   5s，run 串行提交事务；
+2. 一个 session 同时至多一个活跃 run；跨 session 的 `search` 可并行——
+   lexical 不写 run / retrieval / turn 行（`--mode expand` 会写，见 §10.2
+   写入行），但两者都不是零写：打开库要走一次 `init_schema` 的元数据
+   UPSERT、拿一次写锁。改写期间不进事务，所以两个 `expand` 的改写调用
+   会重叠；
 3. 0.x 不做跨进程写协调：CLI 短生命周期、桌面单进程是前提。若未来出现第二个
    常驻写者，再引入 lock 文件或升级方案，不提前抽象；
-4. feed 轮询、索引重建等后台任务在桌面端走同一写队列，不另开旁路写。
+4. feed 轮询、索引重建等后台任务在桌面端走条目 1 那个单写者，不另开旁路写。
 
 ## 6. 事件顺序与重放
 

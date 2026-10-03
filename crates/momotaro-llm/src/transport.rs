@@ -1,9 +1,11 @@
 //! The provider-call seam.
 //!
 //! The client itself never opens a socket: every exchange goes through a
-//! [`ProviderTransport`]. Tests inject `fake::FakeLlm`; production wires a
-//! real transport later. This crate therefore builds and parses provider
-//! traffic but cannot generate any — the zero-network guarantee CI relies on.
+//! [`ProviderTransport`]. Tests inject `fake::FakeLlm`; production uses this
+//! crate's own [`crate::http`] implementation. The zero-network guarantee is
+//! about the **test suite** — no test in this workspace builds or sends a
+//! request, so CI never touches the network — and not about the crate being
+//! incapable of one.
 //!
 //! Two boundary rules for production implementations:
 //!
@@ -15,8 +17,8 @@
 //!   to identity belong in the request body before hashing, not in the
 //!   transport.
 //! * **The transport is a trusted component.** It sees the request body and
-//!   holds the credentials; the zero-network guarantee covers this crate and
-//!   its test rig, not the transport. [`TransportError::message`] must never
+//!   holds the credentials; the zero-network guarantee covers this crate's
+//!   tests, not the transport. [`TransportError::message`] must never
 //!   carry credentials, headers, or URLs with secrets — the client's sanitize
 //!   pass strips control characters, not secrets.
 

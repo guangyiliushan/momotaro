@@ -50,6 +50,16 @@ fn write_config(workspace: &Path) {
 }
 
 /// A ready-to-ask workspace: staged vault, indexed store.
+/// The options a test asks with: network permission granted, everything else
+/// default. `ask` is a provider call, and architecture §7 keeps the network
+/// off until it is allowed — a test that wants an answer has to allow it.
+fn network_allowed() -> AskOptions {
+    AskOptions {
+        allow_network: true,
+        ..AskOptions::default()
+    }
+}
+
 fn ready_workspace(tempdir: &tempfile::TempDir) {
     let workspace = tempdir.path();
     stage_vault(workspace);
@@ -124,7 +134,7 @@ fn the_fifteen_steps_land_the_tables_and_the_answer_verifies() {
     let quote = enqueue_cited_reply(&fake, tempdir.path(), "谱定理");
 
     let report =
-        ask_workspace(tempdir.path(), "谱定理", &AskOptions::default(), &fake).expect("ask runs");
+        ask_workspace(tempdir.path(), "谱定理", &network_allowed(), &fake).expect("ask runs");
     assert_eq!(report.status, "finished", "{report:?}");
     assert!(report.fully_verified, "{report:?}");
     assert_eq!(fake.call_count(), 1, "ask calls the provider exactly once");
@@ -193,6 +203,7 @@ fn replaying_the_same_client_request_returns_the_same_run() {
 
     let options = AskOptions {
         client_request_id: Some("req-1".to_owned()),
+        allow_network: true,
         ..AskOptions::default()
     };
     let first = ask_workspace(tempdir.path(), "谱定理", &options, &fake).expect("first ask");
@@ -220,6 +231,7 @@ fn ask_under_no_llm_is_refused_before_a_run_exists() {
     let options = AskOptions {
         no_llm: true,
         client_request_id: Some("policy-1".to_owned()),
+        allow_network: true,
         ..AskOptions::default()
     };
     let error = ask_workspace(tempdir.path(), "谱定理", &options, &fake)
@@ -235,6 +247,41 @@ fn ask_under_no_llm_is_refused_before_a_run_exists() {
     let mut store = Store::open(tempdir.path().join(".momotaro/momotaro.db")).expect("open");
     assert_eq!(
         store.run_id_for_client_request("policy-1").expect("read"),
+        None,
+        "no run was created"
+    );
+    assert!(store.sweep_interrupted_runs().expect("sweep").is_empty());
+}
+
+#[test]
+fn ask_without_network_permission_is_refused_before_a_run_exists() {
+    // architecture §7 keeps the network off until it is allowed, and an `ask`
+    // is a provider call. The engine must enforce that itself: the CLI has its
+    // own gate, so only this test can tell the two apart.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    ready_workspace(&tempdir);
+
+    let fake = FakeLlm::new(); // nothing enqueued: a call would panic the rig
+    let options = AskOptions {
+        client_request_id: Some("policy-network".to_owned()),
+        ..AskOptions::default()
+    };
+    let error = ask_workspace(tempdir.path(), "谱定理", &options, &fake)
+        .expect_err("policy refuses a call that would reach the network");
+    assert!(
+        matches!(error, momotaro_run::RunError::PolicyRefused(_)),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("--allow-network"), "{message}");
+    assert!(message.contains("[policy].allow_network"), "{message}");
+    assert_eq!(fake.call_count(), 0, "no provider call was made");
+
+    let mut store = Store::open(tempdir.path().join(".momotaro/momotaro.db")).expect("open");
+    assert_eq!(
+        store
+            .run_id_for_client_request("policy-network")
+            .expect("read"),
         None,
         "no run was created"
     );
@@ -275,6 +322,7 @@ fn crash_child_parks_the_ask_mid_run() {
     };
     let options = AskOptions {
         client_request_id: Some("crash-1".to_owned()),
+        allow_network: true,
         ..AskOptions::default()
     };
     let _ = ask_workspace(&workspace, "谱定理", &options, &ParkingTransport);
@@ -372,7 +420,7 @@ mod citation_failures {
     fn ask_with_content(workspace: &Path, content: &str) -> momotaro_run::AskReport {
         let fake = FakeLlm::new();
         fake.enqueue_reply(200, completion_body(content));
-        ask_workspace(workspace, "谱定理", &AskOptions::default(), &fake).expect("ask runs")
+        ask_workspace(workspace, "谱定理", &network_allowed(), &fake).expect("ask runs")
     }
 
     #[test]
@@ -464,7 +512,7 @@ Citations:
         let report = ask_workspace(
             tempdir.path(),
             "zzz-no-such-term-anywhere",
-            &AskOptions::default(),
+            &network_allowed(),
             &fake,
         )
         .expect("ask runs");
@@ -525,7 +573,7 @@ fn a_provider_failure_is_recorded_and_categorised() {
     fake.enqueue_failure(false, "connection reset");
     fake.enqueue_failure(false, "connection reset again");
     let report =
-        ask_workspace(tempdir.path(), "谱定理", &AskOptions::default(), &fake).expect("ask runs");
+        ask_workspace(tempdir.path(), "谱定理", &network_allowed(), &fake).expect("ask runs");
     assert_eq!(report.status, "failed");
     assert_eq!(
         report.failure_note.as_deref(),
@@ -555,7 +603,7 @@ fn an_unusable_index_fails_the_run_as_index_unavailable() {
 
     let fake = FakeLlm::new();
     let report =
-        ask_workspace(tempdir.path(), "谱定理", &AskOptions::default(), &fake).expect("ask runs");
+        ask_workspace(tempdir.path(), "谱定理", &network_allowed(), &fake).expect("ask runs");
     assert_eq!(report.status, "failed");
     assert_eq!(
         report.failure_note.as_deref(),
@@ -582,7 +630,7 @@ fn rebuilding_the_index_leaves_run_history_untouched() {
     let fake = FakeLlm::new();
     let quote = enqueue_cited_reply(&fake, tempdir.path(), "谱定理");
     let report =
-        ask_workspace(tempdir.path(), "谱定理", &AskOptions::default(), &fake).expect("ask runs");
+        ask_workspace(tempdir.path(), "谱定理", &network_allowed(), &fake).expect("ask runs");
     assert!(report.fully_verified, "{report:?}");
     let before = trace_workspace(tempdir.path(), &report.run_id).expect("trace");
 

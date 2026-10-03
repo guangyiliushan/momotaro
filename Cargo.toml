@@ -51,3 +51,33 @@ notify-debouncer-full = "0.7"
 # exposes no volume kind), so a network-mount warning needs these bindings.
 # Consumers declare it under `[target.'cfg(windows)'.dependencies]`.
 windows-sys = "0.61"
+# Grill ruling Q3 (2026-09-30): the production provider transport. Blocking
+# I/O only — no async runtime behind a blocking facade.
+#
+# The feature set is part of the decision: ureq's plain `rustls` feature also
+# pulls `webpki-roots` (a static Mozilla bundle that ignores the OS store and
+# never rotates), so this build takes `rustls-no-provider` + `_ring` (the
+# provider rustls needs) + `platform-verifier` (system certificate store).
+# Two gates hold that choice in place: `cargo test -p momotaro-llm` asserts
+# `webpki-roots` never enters `Cargo.lock`, and CI's `cargo … --locked` fails
+# the moment any of these three features is dropped — every one of them changes
+# the lock (`rustls`, `ring`, `rustls-platform-verifier` respectively).
+#
+# `gzip` looks optional and is not. Without it ureq does not advertise
+# `Accept-Encoding`, and a `Content-Encoding: gzip` reply is handed straight
+# through (`body/mod.rs`: `PassThrough` under `#[cfg(not(feature = "gzip"))]`) —
+# which RFC 9110 §12.5.3 permits — "If no Accept-Encoding header field is
+# present in a request, an origin server MAY assume that the client is willing
+# to accept any content coding." (RFC 9112 is message syntax; it does not
+# define that negotiation rule.) We would then hand gzip's `1f 8b` to
+# `read_to_string`, which consumes the body and only then fails UTF-8
+# validation — surfaced as a `Provider` transport failure whose message says
+# the stream did not contain valid UTF-8, a fault that reads as the provider's
+# and never reaches the JSON parser. Four lock entries (flate2, miniz_oxide,
+# adler2, simd-adler32) against exactly that.
+ureq = { version = "3.4", default-features = false, features = [
+  "rustls-no-provider",
+  "_ring",
+  "platform-verifier",
+  "gzip",
+] }
