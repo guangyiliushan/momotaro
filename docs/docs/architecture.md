@@ -1278,6 +1278,58 @@ Windows / macOS / Linux 桌面安装包 + CLI。文档仍 GitHub Pages。营销�
 | `apps/www` | 独立站 | 需要营销页 |
 | docs 迁入 www | 明确单一域名时 | 默认不迁 |
 
+### W3.10 接线波遗留（评审登记，待修）
+
+本波三轮钉点评审（分别钉 `c269ebf`、`b5569a1`、`66c625a`）与九维度评审合计登记
+23 项未修事项。它们此前只写在提交信息里——照文档办事的人看不到——故全部收档于此，
+**全部待后续修复**：每一项在「登记于」那列的提交体内有完整论证与读数，修掉一项就从
+表里删一行（或把「卡在哪」改成完成时的读数）。本表只登记**确实没做**的，本波还清的
+（expand 的 token 记账、零宽守卫、人类出口 lexical 半边见证等）不在此列。
+
+**A. 代码与契约（4）**
+
+| 项 | 卡在哪 | 登记于 |
+|---|---|---|
+| `lru 0.16.4` 的 RUSTSEC-2026-0253（修复版 ≥0.18.2） | tantivy 0.26.2 钉 `^0.16.3`，`cargo update --precise 0.18.2` 被拒；默认 `unsound = "Workspace"` 把它盖住，打开 `unsound = "all"` 立刻红（已在 `deny.toml` 头部写明该豁免） | `c269ebf`，裁决「另开任务升 tantivy」 |
+| D25 的 `expand → utility(low)` 槽映射 | `[model_slots.utility]` 尚无配置；重写现跑 answer 槽，`RunSpec` 记的是实际跑的而非映射将选的 | `c269ebf` |
+| `strategy_json` 的 `ask` 侧缺 `mode` | 契约写 `(engine, k, mode)`，expand 写全四键而 `ask` 只写 `{engine, k}`；改动会动 `ask` 的存储 JSON | `b5569a1` |
+| `expand_search_workspace` 的 `(no_llm, allow_network)` 裸 bool 对与 CLI 两步校验 | 纯重构，本波未排期 | `c269ebf` |
+
+**B. 测试见证（8）**
+
+| 项 | 卡在哪 | 登记于 |
+|---|---|---|
+| expand 失败的**终态种类**（`Failed` vs `Finished`） | `expand_search_workspace` 失败返回 `Err` 不交回 `run_id`，`Store` 只有 `run_count` / `sweep_interrupted_runs` / `run_id_for_client_request` / `run_trace`，**没有按 run 查 status 的口**；要么加 store 访问器，要么给 search run 一个 `client_request_id`——契约决定 | `b5569a1` |
+| 「不可命名错误弃给下一个 sweep」 | 要在 run 行**之后**制造一个不可命名的存储错误，需要注入缝，本波没加 | `b5569a1` |
+| `--mode expand` 人类出口的**端到端**见证 | 需要二进制真的完成一次 expand，即需要 provider 端点；loopback 服务器会打破「一切测试走 fake transport、CI 不真打网络」的硬约束。**注意这条理由不覆盖 lexical 那半**，那半已由不带 `#[cfg]` 的测试补上 | `66c625a` |
+| `hit_inclusion` 无 `format_trace` 端到端 | 只有单元断言，没驱动整条 trace 渲染 | `66c625a` |
+| 缺库那条拒绝测试名里有 `records_no_run` 却从不读 `run_count` | 靠「文件不存在」传递，与名字声称的不完全一致 | `66c625a` |
+| 写点计数扫整个 `index_service.rs` | `ask.rs` 那半切在 `#[cfg(test)]`，本模块这半没有；只影响过度约束风险（它不数自己的针） | `66c625a` |
+| 结构针锚在 `for` 上 | 循环**之前**多插一行打印能活；claim 只覆盖循环体 | `9fd1d6b` |
+| 两条等价变异体 | `RRF_K` 硬编码（与常量位相同）、融合累加器 `BTreeMap→HashMap`（比较器全序时观察不可见）——杀不掉，登记而非补测试 | `b5569a1` |
+
+**C. 文档（10）**
+
+| 项 | 卡在哪 | 登记于 |
+|---|---|---|
+| `scale-lifecycle.md` 的「连接池 max=1 的写通道」 | **第三种**不存在的写机制（`harness.md` 的已修，这条是另一份文档的另一个说法） | `66c625a` |
+| `architecture.md` §10.2 自己跟自己打架的门数 | 写入行说四道、门禁行说三道、`usage.md` 又是第三种 | `66c625a` |
+| §5 未定义「session」是否进程内 | 正是条目 3 声明不做的跨进程协调那一轴，两读法都讲得通 | `66c625a` |
+| `harness.md` 说 sweep「打开库时跑」 | 实际只有 ask/trace 会 sweep，expand 打开库不 sweep；本波让这个缺口变得可达 | `b5569a1` |
+| §18 表缺 `interrupted` 行 | `ask.rs` 与 `harness.md` 都在用这个值 | `b5569a1` |
+| ADR 0017「submitting search is a Run」与 §10.2 lexical 不建 run | 读作模式词汇表则无冲突，读作行为声明则矛盾；本波收窄了但没改 ADR | `b5569a1` |
+| `deny.toml` 的 `syn 3 (serde_derive)` 是举例不是枚举 | `syn 3` 实有 ≥9 个依赖方，`serde_derive` 只是其一；版本号与 android 归因都是对的 | `b5569a1` |
+| 「一次改写调用」数的是 turn 还是 HTTP send | turn 级为真；429/5xx/408 重试时是 2 次 send，两份孪生句用了同一措辞 | `66c625a` |
+| 新增的 `§10.2` 裸引用 | `harness.md` 与 `development.md` 各自惯例都带限定，新句没跟 | `66c625a` |
+| `66c625a` 提交信息把 `db.rs` 写成 213 行 | 实为 **218**（213 是 `.flat_map`）；机制本身两轮复核均正确 | `9fd1d6b` |
+
+**D. 供应链与工程（1）**
+
+| 项 | 卡在哪 | 登记于 |
+|---|---|---|
+| CLI 先建 transport 再过引擎的索引门 | 构造零 I/O；§10.2 已改成只承诺三道门都先于拨号、不承诺彼此先后 | W3.10 波次行 |
+
+
 ## 21. 明确拒绝的设计
 
 1. 不做通用多 Agent 框架，不移植 32 工具注册表和 LangGraph。
