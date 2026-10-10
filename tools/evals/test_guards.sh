@@ -70,6 +70,8 @@ refuses "the filesystem root" "/"
 # above (no .git, no Cargo.toml at its root) and rm -rf deletes source. The
 # fake's tools/ holds the canary, so a failed guard also destroys the proof.
 refuses "a directory inside the repository" "$fake/inner"
+refuses "dot-dot reaching inside the repository" "$sandbox/outside/../fake/inner"
+refuses "double-slash inside the repository" "$fake//inner"
 
 # Positive control: a plain scratch directory is accepted, so the guard is not
 # simply refusing everything. (`rm` is stubbed here too, and the scratch is

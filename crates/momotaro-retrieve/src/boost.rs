@@ -176,6 +176,17 @@ mod tests {
     }
 
     #[test]
+    fn the_ladder_is_pinned_to_its_numbers() {
+        // The ADR's ladder in numbers: owner 2.0 / paper 1.0 / web 0.6. The
+        // ratio tests around this one only *bound* the web weight from above;
+        // a `0.6 -> 0.9` mutation survived every one of them.
+        let close = |value: f32, want: f32| (value - want).abs() < 1e-6;
+        assert!(close(weight_of(OriginClass::Owner).expect("owner"), 2.0));
+        assert!(close(weight_of(OriginClass::Paper).expect("paper"), 1.0));
+        assert!(close(weight_of(OriginClass::Web).expect("web"), 0.6));
+    }
+
+    #[test]
     fn owner_chunk_outranks_equal_scoring_paper_chunk() {
         let si = index_of(&[
             ("note:owner.md", OriginClass::Owner, "alpha alpha"),

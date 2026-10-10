@@ -56,10 +56,11 @@ Fragments are typed and versioned, for example:
 
 1. `policy.v1`;
 2. `evidence.v1`;
-3. `question.v1`;
-4. `verification.v1`;
-5. `summary.v1`;
-6. `spark.v1`.
+3. `question.v1`.
+
+`summary.v1` is not a fourth type: it is a **content kind**, labelling the
+body of a `history` fragment on `run_context_items.content_kind`
+(`context-retrieval.md` §3.1).
 
 ### Run
 
@@ -174,7 +175,10 @@ A model slot is a semantic reference to one OpenAI-compatible endpoint. The
 enum is closed: `answer | utility`. Modes map to slots statically and the
 mapping is frozen into the RunSpec together with a thinking-tier snapshot
 (`off | low | medium | high`). An unconfigured utility slot falls back to
-answer; an empty string disables it explicitly. The verifier has no slot and
+answer; an empty string disables it explicitly. (**1.x only** — this build has no
+`[model_slots.*]` configuration surface at all, so neither branch is reachable
+yet and every mode is pinned to `answer`; §20 registers the slot matrix as
+awaiting its consumer.) The verifier has no slot and
 never spends tokens.
 
 ## Event vocabulary
@@ -186,33 +190,84 @@ run.accepted
 run.started
 run.finished
 run.failed
-run.cancelled
 retrieval.started
 retrieval.finished
 context.built
 llm.started
 llm.finished
-tool.started
-tool.finished
 citation.validated
 answer.finalized
-spark.proposed
-spark.pinned
-spark.dismissed
 ```
+
+Six more spellings are reserved with no producer yet — `run.cancelled`
+(it has a `TerminalEvent` variant and a round-trip test; only `finished`
+and `failed` are ever written), `tool.started`,
+`tool.finished`, `spark.proposed`, `spark.pinned` and `spark.dismissed`.
+**This list is the reservation** — it is what stops a seam from landing under a
+different name. Of the six, only `run.cancelled` is *declared* in code
+(`TerminalEvent::Cancelled`, with a round-trip test and no producer); the
+other five are names and nothing more until their seams land, and a seam that
+lands must take these spellings rather than invent its own. Until something
+writes them they are not stable events.
 
 `math.validated` remains reserved. Citation verification ships first; a CAS
 backend is a later seam, not a 1.0 requirement.
 
+`context.built` is the one event here whose `data_json` carries a payload
+worth naming, because it is where §4's 观测三指标 will be counted from:
+
+```jsonc
+{
+  "fragments": 12,                 // fragments the build kept
+  "compaction": {
+    "triggered": true,             // did this build cross the line?
+    "raw_total": 1640,             // the estimate, before the coefficient
+    "adjusted_total": 2050,        // …after it — what the line is compared against
+    "max_context_tokens": 8192,    // the ceiling the verdict is priced in
+    "trigger": 1638,               // min(max_context_tokens - reserve, …)
+    "reserve": 0                   // min(compact_reserve_abs, 25% × budget)
+  }
+}
+```
+
+The numbers above are **illustrative at an invented `[policy]`** (ratio 0.2,
+reserve 0), not at the documented defaults — at the documented defaults (budget and
+coefficient from `context-retrieval.md` §2.1, trigger ratio and reserve from
+§4) the same build would report `trigger: 6144`, `reserve: 2048` and
+`triggered: false`, which shows every field moving but is a duller picture.
+The shapes and the relationships are what the sample pins.
+
+`triggered` is a **recorded verdict, not a derivation**: `adjusted_total >=
+trigger` is how it was decided, but the fact is written down so a later
+metric can count firings without re-running the arithmetic against a budget
+that has since changed. **Both sides are `adjusted`** — `trigger` is
+expressed in `max_context_tokens`, which is the *adjusted* ceiling (the same
+unit `exceeded` and the budget's own claims use); comparing `raw_total`
+against it would move the firing point by the coefficient, and at
+`context-retrieval.md` §2.1's default 1.25 a line documented as 75% of the
+budget would only fire at
+93.75%. `adjusted_total` rides along so the verdict can be checked against
+the number it was decided from. `max_context_tokens` rides along for the
+mirror reason: it is the ceiling that comparison is priced in, and neither
+`adjusted_total` nor `triggered` can be read back out of. It is also the only
+thing in the payload that says **which** budget the run was frozen against —
+`trigger` and `reserve` are derived from it, so a later reader holding a
+changed `[policy]` can still tell what the line meant at the time.
+
+Nothing compacts yet — [ADR 0010](adr/session-ask-retrieves-fresh.md)'s status
+marker says generation waits for `kb_read` — so today the field is always an
+observation of a line the build did not act on.
+
 `llm.finished` carries a cache summary (`cached_tokens` / `billable_tokens`
-when the provider reports them). Stage-level trace names intentionally align
-with the OTel GenAI semantic conventions (`gen_ai.conversation.id` ←
-session_id, `conversation.compacted` ← summary present, `previous_response.id`
-← preceding run); keep the export seam, rename only if the standard diverges.
+when the provider reports them). Three OTel GenAI names are **reserved, not
+emitted**: this build has no export seam, no dependency and no referent for
+`gen_ai.conversation.id` (session_id), `conversation.compacted` (summary
+present) or `previous_response.id` (preceding run) — an export seam, when one
+lands, should adopt them; rename only if the standard diverges by then.
 
 ### Ingest / feed events (not run events)
 
-Index, feed poll, watch, and reconcile emit store events, not Runs:
+Index, watch, and reconcile emit store events, not Runs:
 
 ```text
 ingest.started
@@ -222,9 +277,13 @@ source_moved
 vault.reconcile.started
 vault.reconcile.coverage
 vault.reconcile.finished
-feed.poll.started
-feed.poll.finished
 ```
+
+Two more spellings are reserved with no producer yet — `feed.poll.started`
+and `feed.poll.finished`. This build has no feed polling at all (`[feeds]`
+is unimplemented, architecture §7), so the only places they are written are
+tests that pin ADR 0026's vocabulary; they are listed in that vocabulary for
+the same reason `run.cancelled` is listed among the run events above.
 
 `index` and `watch` both write the `ingest` domain — a watcher batch is an
 ingest batch, so `doctor --coverage` reports whichever of them wrote last.

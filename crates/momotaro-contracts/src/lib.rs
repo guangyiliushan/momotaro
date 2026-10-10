@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 /// The schema version understood by this build.
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+pub const CURRENT_SCHEMA_VERSION: u32 = 9;
 
 /// A versioned SQLite schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -532,13 +532,19 @@ pub struct IndexFileError {
 
 /// What a file lost on the way into the index (D41).
 ///
-/// These ride on **`indexed`** rows: the file *was* indexed, so the outcome stays
-/// `indexed` and this code says what it lost. All ten of D41's are here; the
-/// Every one of the ten has a producer as of W2.4 (§5 第 5–10 条); what each
-/// code means is its own variant's sentence.
-/// Having them typed is what keeps
-/// `degradation_message` exhaustive and stops a sentence from claiming to be about
-/// the wrong code.
+/// The code rides the row it happened to; the row's state is a separate axis.
+/// Most of them ride an `indexed` row — most losses are about a file that went
+/// in anyway — but `symlink_encountered` only ever rides a `skipped` link
+/// (recorded, never followed) and `attachment_unindexed` rides whichever row
+/// the attachment earned: `skipped`, `metadata_refreshed` or `indexed`,
+/// depending on why it was visited. [`CoverageReport::degradations`] counts on
+/// exactly those two axes, because a summary that guessed the state from the
+/// code contradicted its own counts (D41 / §5 第 8 条 ⑤).
+///
+/// Every one of D41's ten has a producer as of W2.4 (§5 第 5–10 条); what each
+/// code means is its own variant's sentence. Having them typed is what keeps
+/// `degradation_message` exhaustive and stops a sentence from claiming to be
+/// about the wrong code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Degradation {
@@ -965,12 +971,19 @@ pub struct IndexReport {
     /// Identifier of this indexing batch, as written to `store_events`
     /// (ADR 0026): one `index` run, one batch.
     pub batch_id: String,
-    /// Files the vault walk kept — notes, canvases, attachments, links and
-    /// eviction stubs alike, since all of them get rows (§5 第 10 条).
+    /// Files this batch accounted for: every file the vault walk kept — notes,
+    /// canvases, attachments, links and eviction stubs alike, since all of them
+    /// get rows (第 10 条 for the attachment/symlink half, 第 6 条 for the one
+    /// the blacklist lets through) — plus each key the walk no longer names,
+    /// because a removal gets a row too (D40 §4.2) and `files_skipped` counts
+    /// that row (ADR 0026).
     pub files_scanned: u64,
     /// Files nothing was read for: the fingerprint was unchanged, the walk saw a
-    /// link it does not follow, or the file is an eviction stub or a cloud
-    /// placeholder. All are skips, and the row's code says which.
+    /// link it does not follow, the file is an eviction stub or a cloud
+    /// placeholder, or the source's file is gone altogether (D40 §4.2 — that row
+    /// carries `Warning::SourceRemoved`, and it counts here so this field and
+    /// [`Self::files_scanned`] stay a partition of it). All are skips, and the
+    /// row's code says which.
     pub files_skipped: u64,
     /// Files that produced a new revision or refresh.
     pub files_indexed: u64,
@@ -1112,7 +1125,11 @@ pub enum TerminalEvent {
 }
 
 impl TerminalEvent {
-    /// The event name from the stable vocabulary (`reference.md`).
+    /// The event name as `reference.md` spells it.
+    ///
+    /// `Cancelled` is in the enum and **not** in that document's stable list:
+    /// it has a round-trip test and no producer, so `reference.md` files it
+    /// with the reserved spellings rather than the shipped ones.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Finished => "run.finished",
@@ -1131,9 +1148,11 @@ impl TerminalEvent {
     }
 }
 
-/// The stable run-event vocabulary (`reference.md`, "Event vocabulary") as
-/// one spelling source. `run.finished` / `run.failed` / `run.cancelled` are
-/// spelled by [`TerminalEvent`] and not repeated here.
+/// The run-event vocabulary (`reference.md`, "Event vocabulary") as one
+/// spelling source. `run.finished` / `run.failed` / `run.cancelled` are
+/// spelled by [`TerminalEvent`] and not repeated here — `cancelled` among
+/// them because it is the same *spelling*, not because it is shipped; see
+/// [`TerminalEvent::as_str`].
 pub mod run_event {
     /// The run was accepted.
     pub const ACCEPTED: &str = "run.accepted";
@@ -1280,20 +1299,6 @@ impl Severity {
             .into_iter()
             .find(|severity| severity.as_str() == code)
     }
-
-    /// The smallest OTel `SeverityNumber` of this severity's band — the
-    /// export seam's mechanical mapping (OTel: "assign that severity the
-    /// smallest value of the range").
-    pub fn otel_severity_number(self) -> u8 {
-        match self {
-            Self::Trace => 1,
-            Self::Debug => 5,
-            Self::Info => 9,
-            Self::Warn => 13,
-            Self::Error => 17,
-            Self::Fatal => 21,
-        }
-    }
 }
 
 /// The six key spellings of `run_context_items.source_ref_json` — the
@@ -1301,10 +1306,15 @@ impl Severity {
 /// and read by the store's retention queries and the run layer's citation
 /// resolution.
 ///
-/// One spelling source for all three sides: a producer that renames a key
-/// without changing these constants breaks its own witness test here instead
-/// of silently emptying a consumer (the drift class behind
-/// `source_ref_json`'s cross-crate registration).
+/// One spelling source, and every Rust side is linked to it by the compiler:
+/// `momotaro-context`'s producer and its completeness check, and the run
+/// layer's two readers — the citation resolution and the session-ledger
+/// evidence hash — all spell these constants, so a producer that renames a key
+/// breaks the pin below instead of silently emptying a consumer (the drift
+/// class behind `source_ref_json`'s cross-crate registration). The
+/// store's retention queries are the exception: they name the keys inside SQL
+/// string literals, where `prepare_cached` rules out interpolation, and are
+/// pinned by the tests that read those paths.
 pub mod source_ref {
     /// Canonical source identity.
     pub const SOURCE_KEY: &str = "source_key";
@@ -1429,7 +1439,10 @@ pub struct RetrievalHitRecord {
     pub locator_json: String,
     /// The engine's relevance score, when it reports one.
     pub score: Option<f64>,
-    /// Whether this hit became a `run_context_items` fragment.
+    /// Whether this hit became a `run_context_items` fragment. Among hits
+    /// sharing one `chunk_hash` this is per hit, not per content: the
+    /// surviving copy reports `true` and the dropped twin reports `false`
+    /// with `omitted_reason = "duplicate_chunk_hash"`.
     pub included: bool,
     /// Why it did not, when it did not (a typed `OmittedReason` spelling).
     pub omitted_reason: Option<String>,
@@ -1594,7 +1607,8 @@ pub struct HistoryItemRecord {
     pub content_kind: String,
     /// The body replayed verbatim (§6.5 History 不重写).
     pub body: String,
-    /// Carries `referenced_chunk_hashes` (and a `summary.v1` mirror).
+    /// Carries `referenced_chunk_hashes` (a `summary.v1` mirror is reserved
+    /// for a later schema — this build neither writes nor reads it).
     pub payload_json: String,
     /// Citation reference when the row is an evidence-backed turn.
     pub source_ref_json: Option<String>,
@@ -2151,6 +2165,25 @@ mod tests {
     }
 
     #[test]
+    fn note_key_folds_nothing_a_ligature_is_its_own_identity() {
+        // U+FB01 LATIN SMALL LIGATURE FI: NFC keeps it; NFKC folds it to
+        // `fi` — merging two distinct files into one identity, the
+        // data-loss-class accident the key rule forbids. The
+        // `cafe\u{0301}` / `caf\u{00e9}` pair cannot see the difference:
+        // both halves are NFKC-stable, so an `.nfc()` -> `.nfkc()` mutation
+        // read every assertion as true.
+        assert_eq!(
+            note_source_key("\u{FB01}le.md").unwrap(),
+            "note:\u{FB01}le.md"
+        );
+        assert_ne!(
+            note_source_key("\u{FB01}le.md").unwrap(),
+            note_source_key("file.md").unwrap(),
+            "the ligature is a different identity, not a spelling of `fi`"
+        );
+    }
+
+    #[test]
     fn note_key_rejects_empty_and_parent_dir() {
         assert!(matches!(note_source_key(""), Err(SourceKeyError::Empty)));
         assert!(matches!(note_source_key("./"), Err(SourceKeyError::Empty)));
@@ -2260,6 +2293,20 @@ mod tests {
         // `:` is legal on POSIX; D42 indexes such names and warns, so the key
         // layer must not rewrite or reject them.
         assert_eq!(note_source_key("a:b.md").unwrap(), "note:a:b.md");
+        // The length guard is the thing that keeps `bytes[2]` readable: a
+        // tail of exactly `X:` has a colon at index 1 and nothing after it,
+        // so relaxing `> 2` to `>= 2` reads one byte past the end.
+        assert!(
+            !is_absolute_tail("C:"),
+            "a bare drive prefix is not an absolute tail: it has no root to \
+             be absolute against"
+        );
+        assert!(!is_absolute_tail("C"), "…nor is a single letter");
+        assert!(
+            !is_absolute_tail("ab"),
+            "…nor is anything two bytes long, which is the whole point of \
+             checking the length before indexing"
+        );
     }
 
     #[test]
@@ -2361,13 +2408,6 @@ mod tests {
             None,
             "warn is the spelling, not warning"
         );
-        // The OTel bands, pinned: each maps to the smallest number of its range.
-        assert_eq!(Severity::Trace.otel_severity_number(), 1);
-        assert_eq!(Severity::Debug.otel_severity_number(), 5);
-        assert_eq!(Severity::Info.otel_severity_number(), 9);
-        assert_eq!(Severity::Warn.otel_severity_number(), 13);
-        assert_eq!(Severity::Error.otel_severity_number(), 17);
-        assert_eq!(Severity::Fatal.otel_severity_number(), 21);
     }
 
     #[test]
@@ -2437,10 +2477,15 @@ mod tests {
 
     #[test]
     fn the_source_ref_keys_are_pinned_by_their_literals() {
-        // The literal pin: every consumer of `source_ref_json` spells through
-        // these constants, so an accidental edit here breaks this test instead
-        // of silently emptying a JSON path on the other side of a crate
-        // boundary (the `source_ref_json` drift registration).
+        // The literal pin. Every Rust writer and reader of `source_ref_json`
+        // spells through these constants — the producer in `momotaro-context`,
+        // its completeness check, and the run layer's two readers (citation
+        // resolution, session-ledger evidence hash) — so an
+        // accidental edit here breaks this test instead of silently emptying a
+        // JSON path on the other side of a crate boundary. (The store's
+        // retention queries name the same keys *inside SQL string literals*,
+        // where `prepare_cached` rules out interpolating them; those are pinned
+        // by the tests that read those paths.)
         assert_eq!(source_ref::SOURCE_KEY, "source_key");
         assert_eq!(source_ref::REVISION_HASH, "revision_hash");
         assert_eq!(source_ref::CHUNK_ID, "chunk_id");

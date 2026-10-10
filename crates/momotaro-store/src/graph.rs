@@ -169,29 +169,7 @@ impl crate::Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NewSourceRevision, Store};
-    use momotaro_contracts::{OriginClass, SourceKind};
-
-    fn open_temp_store() -> Store {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let mut store = Store::open(dir.path().join("momotaro.db")).expect("open store");
-        store.init_schema().expect("initialize schema");
-        store
-            .append_revision(&NewSourceRevision {
-                source_key: "note:a.md",
-                revision_hash: "h1",
-                kind: SourceKind::Note,
-                title: Some("A"),
-                uri: None,
-                local_path: Some("a.md"),
-                raw_name: Some("a.md"),
-                origin_class: OriginClass::Owner,
-                metadata_json: "{}",
-                ingested_at: 7,
-            })
-            .expect("append revision");
-        store
-    }
+    use crate::test_support::temp_store;
 
     fn edge(target: Option<&str>, raw: &str) -> GraphLink {
         GraphLink {
@@ -208,7 +186,7 @@ mod tests {
 
     #[test]
     fn replace_edges_is_wholesale_and_idempotent() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         let rows = vec![
             edge(Some("note:b.md"), "b"),
             edge(None, "gone"),
@@ -249,7 +227,7 @@ mod tests {
 
     #[test]
     fn replacing_one_source_leaves_other_sources_alone() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         store
             .replace_edges_many(&[("note:b.md".to_owned(), vec![edge(None, "from-b")])])
             .expect("b rows");
@@ -271,7 +249,7 @@ mod tests {
 
     #[test]
     fn a_row_with_an_unknown_spelling_is_an_error_not_a_panic() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         store
             .replace_edges_many(&[("note:a.md".to_owned(), vec![edge(None, "x")])])
             .expect("write");

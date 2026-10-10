@@ -261,15 +261,9 @@ impl crate::Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::temp_store;
     use crate::{NewSourceRevision, Store};
     use momotaro_contracts::{OriginClass, SourceKind};
-
-    fn open_temp_store() -> Store {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let mut store = Store::open(dir.path().join("momotaro.db")).expect("open store");
-        store.init_schema().expect("initialize schema");
-        store
-    }
 
     fn ingest_current(store: &mut Store, source_key: &str, revision_hash: &str) {
         store
@@ -364,7 +358,7 @@ mod tests {
 
     #[test]
     fn replace_chunks_writes_and_replaces() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         ingest_current(&mut store, "a.md", "hash1");
 
         let first = vec![
@@ -394,7 +388,7 @@ mod tests {
 
     #[test]
     fn get_chunk_round_trips() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         ingest_current(&mut store, "a.md", "hash1");
         let expected = chunk("c1", "a.md", "hash1", 0);
         store
@@ -408,7 +402,7 @@ mod tests {
 
     #[test]
     fn all_current_chunks_filters_and_orders() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         ingest_current(&mut store, "b.md", "b2");
         ingest_current(&mut store, "a.md", "a1");
         ingest_current(&mut store, "a.md", "a2");
@@ -436,7 +430,7 @@ mod tests {
 
     #[test]
     fn counts_reflect_rows() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         ingest_current(&mut store, "a.md", "a1");
         ingest_current(&mut store, "a.md", "a2");
         ingest_current(&mut store, "b.md", "b1");
@@ -453,7 +447,7 @@ mod tests {
 
     #[test]
     fn counts_are_zero_on_fresh_schema() {
-        let store = open_temp_store();
+        let (_dir, store) = temp_store();
         let counts = store.counts().expect("counts");
         assert_eq!(
             counts,
@@ -474,7 +468,7 @@ mod tests {
     /// named row and goes red.
     #[test]
     fn a_referenced_chunk_survives_a_reingest_that_drops_it() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         ingest_current(&mut store, "a.md", "hash1");
         store
             .replace_chunks(
@@ -528,7 +522,7 @@ mod tests {
     /// five-tuple's `chunk_hash` may not silently go invalid.
     #[test]
     fn a_reingest_may_not_rewrite_a_referenced_chunks_hash() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         ingest_current(&mut store, "a.md", "hash1");
         store
             .replace_chunks(
@@ -568,7 +562,7 @@ mod tests {
     /// replace replaces it.
     #[test]
     fn deleting_an_unreferenced_chunk_is_still_allowed() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         ingest_current(&mut store, "a.md", "hash1");
         store
             .replace_chunks(
@@ -606,7 +600,7 @@ mod tests {
     /// their rows.
     #[test]
     fn a_whole_table_wipe_is_reported_as_drift_not_silent_reverification() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         ingest_current(&mut store, "a.md", "hash1");
         store
             .replace_chunks(
@@ -659,7 +653,7 @@ mod tests {
     /// extractor reads through `json_valid`).
     #[test]
     fn a_malformed_context_ref_neither_pins_nor_breaks_the_replace() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         ingest_current(&mut store, "a.md", "hash1");
         store
             .replace_chunks("a.md", "hash1", &[chunk("c0", "a.md", "hash1", 0)], &[])
@@ -693,7 +687,7 @@ mod tests {
     /// reading those as text would poison every future replace of the pair.
     #[test]
     fn an_alien_typed_context_ref_neither_pins_nor_breaks_the_replace() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         ingest_current(&mut store, "a.md", "hash1");
         store
             .replace_chunks("a.md", "hash1", &[chunk("c0", "a.md", "hash1", 0)], &[])
@@ -743,7 +737,7 @@ mod tests {
     /// chunk would make deleting unreferenced rows impossible.
     #[test]
     fn retrieval_hits_do_not_pin_rows() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         ingest_current(&mut store, "a.md", "hash1");
         store
             .replace_chunks("a.md", "hash1", &[chunk("c0", "a.md", "hash1", 0)], &[])
@@ -778,7 +772,7 @@ mod tests {
     /// against foreign rows).
     #[test]
     fn a_reference_to_another_pair_never_pins_and_never_drifts_here() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         ingest_current(&mut store, "a.md", "hash1");
         ingest_current(&mut store, "b.md", "hash2");
         store

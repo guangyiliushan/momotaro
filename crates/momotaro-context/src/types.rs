@@ -23,6 +23,11 @@ pub enum QueryIntent {
 }
 
 impl QueryIntent {
+    /// Every variant of this enum. Witness tables that promise full
+    /// coverage (`wire_spellings`) iterate this and pin its length; a
+    /// new variant means extending this list, not just `as_str`.
+    pub const ALL: [Self; 3] = [Self::Fact, Self::Comparison, Self::Survey];
+
     /// The wire spelling of this intent (`fact`, `comparison`, `survey`).
     pub fn as_str(self) -> &'static str {
         match self {
@@ -56,6 +61,11 @@ pub enum HistoryRole {
 }
 
 impl HistoryRole {
+    /// Every variant of this enum. Witness tables that promise full
+    /// coverage (`wire_spellings`) iterate this and pin its length; a
+    /// new variant means extending this list, not just `as_str`.
+    pub const ALL: [Self; 2] = [Self::User, Self::Assistant];
+
     /// The wire spelling of this role.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -81,6 +91,11 @@ pub enum Role {
 }
 
 impl Role {
+    /// Every variant of this enum. Witness tables that promise full
+    /// coverage (`wire_spellings`) iterate this and pin its length; a
+    /// new variant means extending this list, not just `as_str`.
+    pub const ALL: [Self; 3] = [Self::System, Self::User, Self::Assistant];
+
     /// The wire spelling of this role.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -111,6 +126,18 @@ pub enum FragmentKind {
 }
 
 impl FragmentKind {
+    /// Every variant of this enum. Witness tables that promise full
+    /// coverage (`wire_spellings`) iterate this and pin its length; a
+    /// new variant means extending this list, not just `as_str`.
+    pub const ALL: [Self; 6] = [
+        Self::Policy,
+        Self::ToolDefinitions,
+        Self::History,
+        Self::Evidence,
+        Self::Instructions,
+        Self::Question,
+    ];
+
     /// The wire spelling of this kind.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -134,6 +161,11 @@ pub enum ContentKind {
 }
 
 impl ContentKind {
+    /// Every variant of this enum. Witness tables that promise full
+    /// coverage (`wire_spellings`) iterate this and pin its length; a
+    /// new variant means extending this list, not just `as_str`.
+    pub const ALL: [Self; 2] = [Self::Text, Self::SummaryV1];
+
     /// The wire spelling of this content kind.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -154,6 +186,11 @@ pub enum Visibility {
 }
 
 impl Visibility {
+    /// Every variant of this enum. Witness tables that promise full
+    /// coverage (`wire_spellings`) iterate this and pin its length; a
+    /// new variant means extending this list, not just `as_str`.
+    pub const ALL: [Self; 2] = [Self::Provider, Self::Trace];
+
     /// The wire spelling of this visibility (`architecture.md` §6.6:
     /// `visibility=provider|trace_only`).
     pub fn as_str(self) -> &'static str {
@@ -173,7 +210,7 @@ pub struct UnknownWireSpelling(String);
 ///
 /// `parameters_json` must hold a JSON object; it is embedded verbatim into the
 /// canonical tools serialization (field order fixed, list order = the caller's
-/// — 序即身份, §1.3).
+/// — 序即身份, §1 第 3 条).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolDefinition {
     /// Tool name (unique within one request).
@@ -184,16 +221,49 @@ pub struct ToolDefinition {
     pub parameters_json: String,
 }
 
+/// What the history row's `summary` slot holds (`context-retrieval.md` §4).
+///
+/// Three states on purpose: a `summary.v1` row whose stored text did not
+/// parse has to be distinguishable from "this row is not a summary at all".
+/// Collapsing both into an absent record would replay the raw JSON body as a
+/// normal turn and put it in front of the model, and §4 rule 3 requires the
+/// failure to be recorded rather than silently swallowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SummarySlot {
+    /// A normal `turn`: there is no summary on this row.
+    None,
+    /// A `summary.v1` row whose stored text parsed. Fail-closed validation
+    /// against [`HistoryItem::body`] still runs in the `select_history`
+    /// stage — parsing and validating are two different promises.
+    Parsed(SummaryV1),
+    /// A `summary.v1` row whose stored text is not `summary.v1` JSON.
+    Malformed,
+}
+
+impl SummarySlot {
+    /// Whether this row *is* a summary rather than a plain turn — the one
+    /// spelling of "is this row a summary?", for every site that asks.
+    ///
+    /// Worth centralising because both `Malformed` and `Parsed` are summaries
+    /// and `None` is not: a fourth state would have to be decided here and
+    /// nowhere else, and three `matches!` arms that happen to agree today is
+    /// how that stops being true.
+    pub fn is_summary(&self) -> bool {
+        !matches!(self, SummarySlot::None)
+    }
+}
+
 /// One replayed history item.
 ///
 /// Bodies are replayed **verbatim** (`architecture.md` §6.5 History 不重写):
 /// a turn rendered by an earlier run must reappear byte-identical, which is
 /// what keeps the request prefix stable across adjacent runs.
 ///
-/// `history_items` mapping (recommended shape, 待 docs 收口): `kind` =
-/// `"turn"` for a normal turn, `"summary"` when [`Self::summary`] is
-/// `Some`; `payload_json` carries `referenced_chunk_hashes` (and a
-/// `summary.v1` mirror when present); `token_estimate` =
+/// `history_items` mapping (`context-retrieval.md` §3): `kind` = `"turn"` for
+/// a normal turn, `"summary"` when [`Self::summary`] is not
+/// [`SummarySlot::None`]; `payload_json` carries `referenced_chunk_hashes`
+/// (a `summary.v1` mirror is reserved for a later schema — this build neither writes
+/// nor reads it); `token_estimate` =
 /// `momotaro_contracts::estimate_tokens(body)`; `round` has no column — the
 /// run layer re-derives it from the session's run order (`seq` is the
 /// run-internal write order, a different axis); a summary row is appended
@@ -209,9 +279,15 @@ pub struct HistoryItem {
     pub role: HistoryRole,
     /// The exact body to replay.
     pub body: String,
-    /// `Some` when this item *is* a `summary.v1` compaction record; the
-    /// record is validated fail-closed against `body`.
-    pub summary: Option<SummaryV1>,
+    /// Whether this row carries a summary: a turn, a summary that parsed, or
+    /// a summary that did not. **Derived from `history_items.content_kind`
+    /// (`"summary.v1"`), not from `history_items.kind`** — the two columns are
+    /// separate vocabularies (`kind`: `turn | summary`; `content_kind`:
+    /// `text | summary.v1`, `HistoryItemRecord`'s field docs) and neither has
+    /// a CHECK, so a reader that picks the wrong one still gets a legal row
+    /// back and fails silently. Validated fail-closed against `body` when it
+    /// is [`SummarySlot::Parsed`].
+    pub summary: SummarySlot,
     /// `chunk_hash` values whose full text this turn already carries (its
     /// embedded evidence blocks); used by the dedup stage.
     pub referenced_chunk_hashes: Vec<String>,
@@ -233,27 +309,43 @@ pub struct EvidenceItem {
 }
 
 /// Session-level pure state the ordering and dedup rules read
-/// (`context-retrieval.md` §1.1 layer 1 + §3 item 4).
+/// (`context-retrieval.md` §1.1 layer 1 + §3 第 4 条).
 ///
-/// Persistence timing (contract note, awaiting its `§10.1` docs step):
-/// persist [`ContextBuildResult::next_session`] **only after the provider
-/// request was actually sent** (its `llm_turns` row exists). A failed turn
-/// retries with the pre-request session: `injected` means "already in a
-/// request", so persisting it early would permanently drop evidence that
-/// never left the machine.
+/// **Production does not persist this.** [`ContextBuildResult::next_session`]
+/// is what *this* build would carry forward; the run layer discards it and
+/// recomputes the ledger from the rows above on the next turn instead —
+/// canonical is append-only, so recomputation cannot drift, and a stored
+/// copy would be the second truth §1.1 forbids. The consequence is worth
+/// naming: `injected` means "already in a request", so a run that failed
+/// *before* the provider call contributes nothing — that costs a repeat
+/// budget line and never costs content.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionState {
     /// Cumulative first-appearance order of `chunk_hash` values across the
-    /// session's builds (appearance = entered the rank stage). A reappearing
-    /// chunk keeps this slot; new chunks append after.
+    /// session's builds. A reappearing chunk keeps this slot; new chunks
+    /// append after.
     ///
-    /// Witnessed interpretation (待契约收口): 「出现」 = entered the rank
-    /// stage's ordered list, whether or not the budget later trims it.
+    /// 见证口径（`context-retrieval.md` §1.1）：「出现」= 该 chunk 的全文真的进了
+    /// provider 请求，即 `run_context_items` 落下的那一条——不是「进了 rank 阶段」。
+    /// 被预算裁掉、从未发出的 chunk 不入账：它不在任何请求前缀里，给它一个槽位既不
+    /// 影响字节稳定，还会让本账本与 canonical 行成为两份真相。
+    ///
+    /// 这三个字段是 canonical 行的**纯函数**：`first_seen_order` ←
+    /// `run_context_items` 的 evidence 行按 (轮次序, ordinal) 取首现；`injected`
+    /// ← `history_items` 里 `role = user` 轮的 payload；`fragment_seq` ← 已渲染
+    /// `fragment_id` 的最大值（数值解析，不是字典序）。排查顺序异常时去这三处重算，
+    /// 不看任何落库副本。
     pub first_seen_order: Vec<String>,
     /// `chunk_hash` values whose full text already entered a provider
     /// request — including full text carried by replayed history turns.
     /// Deduped out of later evidence selections (`context-retrieval.md`
-    /// §3 item 4).
+    /// §3 第 4 条).
+    ///
+    /// The base **narrows when a summary covers a turn**: the covered turn's
+    /// hashes are released, because its text left the replay window with the
+    /// demotion and a permanent blacklist would make that content unreachable
+    /// in 0.x (no `kb_read`). The release only hands fresh retrieve a chance;
+    /// it does not promise the chunk comes back.
     pub injected: Vec<String>,
     /// Next fragment-id sequence. Fragment ids are session-unique citation
     /// handles: a build numbers its fragments `f{seq + 1}`… and advances
@@ -274,7 +366,7 @@ pub struct ContextInput {
     /// The `policy.v1` resident text. Constraints belong inside it
     /// (§2 预算分配 level 1: policy + tool definitions + constraints).
     pub policy_text: String,
-    /// Tool definitions, in the caller's order (§1.3: 序即身份 — rendering
+    /// Tool definitions, in the caller's order (§1 第 3 条: 序即身份 — rendering
     /// fixes the field order but never reorders the list).
     pub tool_definitions: Vec<ToolDefinition>,
     /// The fixed instruction tail (§2 level 5).
@@ -335,9 +427,9 @@ pub enum OmittedReason {
     BudgetExhausted,
     /// Same `chunk_hash` as an earlier fragment in this build.
     DuplicateChunkHash,
-    /// Full text already injected in an earlier turn (§3.4).
+    /// Full text already injected in an earlier turn (§3 第 4 条).
     PreviouslyInjected,
-    /// A valid `summary.v1` covers this raw turn (§3.2).
+    /// A valid `summary.v1` covers this raw turn (§3 第 2 条).
     CoveredBySummary,
     /// The summary record failed fail-closed validation; the raw history
     /// falls back instead.
@@ -353,6 +445,21 @@ pub enum OmittedReason {
 }
 
 impl OmittedReason {
+    /// Every variant of this enum. Witness tables that promise full
+    /// coverage (`wire_spellings`) iterate this and pin its length; a
+    /// new variant means extending this list, not just `as_str`.
+    pub const ALL: [Self; 9] = [
+        Self::BudgetExhausted,
+        Self::DuplicateChunkHash,
+        Self::PreviouslyInjected,
+        Self::CoveredBySummary,
+        Self::SummaryValidationFailed,
+        Self::IncompleteCitation,
+        Self::BeyondTierMax,
+        Self::DelimiterViolation,
+        Self::InvalidToolSchema,
+    ];
+
     /// The wire spelling of this reason.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -404,6 +511,22 @@ pub enum Stage {
 }
 
 impl Stage {
+    /// Every variant of this enum. Witness tables that promise full
+    /// coverage (`wire_spellings`) iterate this and pin its length; a
+    /// new variant means extending this list, not just `as_str`.
+    pub const ALL: [Self; 10] = [
+        Self::NormalizeQuery,
+        Self::LoadPolicy,
+        Self::SelectHistory,
+        Self::SelectEvidence,
+        Self::RenderFragments,
+        Self::Deduplicate,
+        Self::Rank,
+        Self::EnforceTokenBudget,
+        Self::RenderProviderMessages,
+        Self::ValidateCitations,
+    ];
+
     /// The wire spelling of this stage (the §12 name verbatim).
     pub fn as_str(self) -> &'static str {
         match self {
@@ -448,8 +571,6 @@ pub struct BudgetReport {
     pub raw_total: u64,
     /// `ceil(raw_total * coefficient)` — the estimate used for trimming.
     pub adjusted_total: u64,
-    /// The estimation coefficient that was applied (calibratable).
-    pub coefficient: f64,
     /// True when the included content still exceeds `max_context_tokens`
     /// (fixed parts are never silently dropped).
     pub exceeded: bool,
@@ -471,10 +592,16 @@ pub struct ContextBuildResult {
     pub stages: Vec<StageRecord>,
     /// Budget accounting.
     pub budget: BudgetReport,
-    /// Session state to persist for the next build.
+    /// The ledger as this build would leave it. **Not persisted** — the run
+    /// layer recomputes it from canonical rows on the next turn (see
+    /// [`SessionState`]); this is the build's own answer, kept so a caller
+    /// can compare or test it.
     pub next_session: SessionState,
     /// `chunk_hash` order of the final evidence fragments.
     pub(crate) evidence_chunk_hashes: Vec<String>,
+    /// The same fragments' indices into the build's `input.evidence`
+    /// (parallel to `evidence_chunk_hashes`).
+    pub(crate) evidence_indices: Vec<usize>,
 }
 
 impl ContextBuildResult {
@@ -526,5 +653,12 @@ impl ContextBuildResult {
     /// `chunk_hash` values of the final evidence fragments, in render order.
     pub fn evidence_order(&self) -> impl Iterator<Item = &str> {
         self.evidence_chunk_hashes.iter().map(String::as_str)
+    }
+
+    /// Index order of the final evidence fragments into the build's
+    /// `input.evidence` — parallel to [`Self::evidence_order`], so a caller
+    /// holding the input list can tell which hit survived a dedup.
+    pub fn evidence_indices(&self) -> impl Iterator<Item = usize> {
+        self.evidence_indices.iter().copied()
     }
 }

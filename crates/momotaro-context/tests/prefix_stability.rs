@@ -9,8 +9,8 @@
 //! 代码的突变都必须让本文件变红。
 
 use momotaro_context::{
-    BudgetPolicy, ContextInput, EvidenceItem, HistoryItem, OmittedReason, QueryIntent,
-    SessionState, ToolDefinition, build_context, build_context_with_clock,
+    BudgetPolicy, ContextInput, EvidenceItem, HistoryItem, HistoryRole, OmittedReason, QueryIntent,
+    SessionState, SummarySlot, ToolDefinition, build_context, build_context_with_clock,
 };
 use momotaro_contracts::{OriginClass, RetrievalHit};
 
@@ -74,8 +74,12 @@ fn lcp_len(a: &[u8], b: &[u8]) -> usize {
 /// 硬验收:相邻 run 的公共前缀字节级一致——上一 run 的**完整请求字节**必须是
 /// 下一 run 请求字节的前缀(未压缩窗口内)。
 ///
-/// 杀的突变:① 时间戳/run_id 泄进 system 级内容;② tools 列表不按名排序;
-/// ③ 历史轮被重渲染而不是逐字节重放;④ 新一轮把 evidence 挪到 history 之前。
+/// 杀的突变:① 时间戳/run_id 泄进 system 级内容;② 历史轮被重渲染而不是逐字节
+/// 重放;③ 新一轮把 evidence 挪到 history 之前。
+///
+/// tools 列表序的牙不在这里:本文件的 tools 恰好已按名有序,「按名排序」突变与
+/// 「永不排序」在此同形(实测 16/16 全绿);那条由 `render.rs` 的
+/// `tools_keep_the_callers_order` 杀。
 #[test]
 fn adjacent_runs_keep_their_common_prefix_byte_stable() {
     // run 1:无历史,两条 evidence,问题 q1。
@@ -108,7 +112,7 @@ fn adjacent_runs_keep_their_common_prefix_byte_stable() {
             round: 1,
             role: momotaro_context::HistoryRole::User,
             body: run1.final_user_body().to_string(),
-            summary: None,
+            summary: SummarySlot::None,
             referenced_chunk_hashes: vec!["h1".to_string(), "h2".to_string()],
         },
         HistoryItem {
@@ -116,7 +120,7 @@ fn adjacent_runs_keep_their_common_prefix_byte_stable() {
             round: 1,
             role: momotaro_context::HistoryRole::Assistant,
             body: "the fourier transform is…".to_string(),
-            summary: None,
+            summary: SummarySlot::None,
             referenced_chunk_hashes: Vec::new(),
         },
     ];
@@ -188,7 +192,7 @@ fn a_chain_of_runs_grows_by_append_only() {
                 round: 1,
                 role: momotaro_context::HistoryRole::User,
                 body: r1.final_user_body().to_string(),
-                summary: None,
+                summary: SummarySlot::None,
                 referenced_chunk_hashes: vec!["h1".to_string()],
             },
             HistoryItem {
@@ -196,7 +200,7 @@ fn a_chain_of_runs_grows_by_append_only() {
                 round: 1,
                 role: momotaro_context::HistoryRole::Assistant,
                 body: "answer one".to_string(),
-                summary: None,
+                summary: SummarySlot::None,
                 referenced_chunk_hashes: Vec::new(),
             },
         ],
@@ -215,7 +219,7 @@ fn a_chain_of_runs_grows_by_append_only() {
                 round: 1,
                 role: momotaro_context::HistoryRole::User,
                 body: r1.final_user_body().to_string(),
-                summary: None,
+                summary: SummarySlot::None,
                 referenced_chunk_hashes: vec!["h1".to_string()],
             },
             HistoryItem {
@@ -223,7 +227,7 @@ fn a_chain_of_runs_grows_by_append_only() {
                 round: 1,
                 role: momotaro_context::HistoryRole::Assistant,
                 body: "answer one".to_string(),
-                summary: None,
+                summary: SummarySlot::None,
                 referenced_chunk_hashes: Vec::new(),
             },
             HistoryItem {
@@ -231,7 +235,7 @@ fn a_chain_of_runs_grows_by_append_only() {
                 round: 2,
                 role: momotaro_context::HistoryRole::User,
                 body: r2.final_user_body().to_string(),
-                summary: None,
+                summary: SummarySlot::None,
                 referenced_chunk_hashes: vec!["h2".to_string()],
             },
             HistoryItem {
@@ -239,7 +243,7 @@ fn a_chain_of_runs_grows_by_append_only() {
                 round: 2,
                 role: momotaro_context::HistoryRole::Assistant,
                 body: "answer two".to_string(),
-                summary: None,
+                summary: SummarySlot::None,
                 referenced_chunk_hashes: Vec::new(),
             },
         ],
@@ -415,7 +419,462 @@ fn every_stage_reports_and_no_omission_is_silent() {
     );
 }
 
-/// §3.4:已注入过的 evidence 按 chunk_hash 去重,不因多轮重复占预算。
+/// The stage accounting has to survive **every** branch that reverses it.
+///
+/// `delta_sum == sum(fragment bodies)` is checked by
+/// `every_stage_reports_and_no_omission_is_silent`, but that fixture enters
+/// none of the six places where a stage subtracts what it dropped instead of
+/// adding what it kept — the history load, the render-time drop, the two
+/// dedup arms, the citation drop, and the kind filter on stage 10's
+/// `included`. Eleven mutants across those branches left the workspace green,
+/// because a branch never entered cannot be observed by the invariant it
+/// participates in.
+#[test]
+fn the_stage_deltas_sum_to_the_fragments_across_every_reverse_accounting_branch() {
+    let mut input = base_input();
+    input.budget = BudgetPolicy {
+        // Wide on purpose: this fixture drives the branches that *reverse*
+        // accounting (history load, render drop, both dedup arms, the citation
+        // drop, stage 10's kind filter) — none of them is the budget, and a
+        // budget tight enough to cut evidence would drop the incomplete-citation
+        // item before stage 10 ever saw it.
+        max_context_tokens: 4096,
+        ..BudgetPolicy::default()
+    };
+    // Comparison's tier is (4, 6): all six candidates have to reach their
+    // stages — the render drop included — and fact's 5 cut the web item at
+    // `select_evidence` (beyond_tier_max) before `render` ever saw it.
+    input.intent = QueryIntent::Comparison;
+    // `h1` was injected last turn: the dedup arm that subtracts it fires.
+    input.session = SessionState {
+        first_seen_order: vec!["h1".to_string()],
+        injected: vec!["h1".to_string()],
+        fragment_seq: 0,
+    };
+    // One turn inside the recency band (kept) and one far outside it
+    // (dropped by `select_history`), so the history stage both adds and
+    // subtracts.
+    input.history = vec![
+        HistoryItem {
+            history_id: "h-out".to_string(),
+            round: 1,
+            role: HistoryRole::User,
+            body: "an older question".to_string(),
+            summary: SummarySlot::None,
+            referenced_chunk_hashes: Vec::new(),
+        },
+        HistoryItem {
+            history_id: "h-in".to_string(),
+            round: 9,
+            role: HistoryRole::User,
+            body: "the latest question".to_string(),
+            summary: SummarySlot::None,
+            referenced_chunk_hashes: Vec::new(),
+        },
+        HistoryItem {
+            history_id: "h-ans".to_string(),
+            round: 9,
+            role: HistoryRole::Assistant,
+            body: "an answer".to_string(),
+            summary: SummarySlot::None,
+            referenced_chunk_hashes: Vec::new(),
+        },
+    ];
+    input.evidence = vec![
+        // already injected: the dedup arm that subtracts it fires.
+        evidence(
+            hit(1, "c1", "h1", "note:a.md", 9.0),
+            "seen last turn",
+            OriginClass::Owner,
+            None,
+        ),
+        // the same `chunk_hash` twice: the other dedup arm.
+        evidence(
+            hit(2, "c2", "h2", "note:b.md", 8.0),
+            "first copy",
+            OriginClass::Owner,
+            None,
+        ),
+        evidence(
+            hit(3, "c2", "h2", "note:b.md", 7.0),
+            "second copy",
+            OriginClass::Owner,
+            None,
+        ),
+        // the only one that survives all of it.
+        evidence(
+            hit(4, "c3", "h3", "note:c.md", 6.0),
+            "new material",
+            OriginClass::Owner,
+            None,
+        ),
+        // Web content with an empty source label: the render stage drops it
+        // — a marker carrying an empty label is outside the escaped grammar
+        // (`validate_untrusted_regions`'s `UnescapedLabel`), so the block is
+        // never emitted — and the stage has to reverse its own accounting on
+        // the way. (The previous stand-in — a raw `<<<` in the body — could
+        // never fire from here: escaping neutralized the sentinel, and the
+        // item was cut at `select_evidence` before `render` saw it.)
+        evidence(
+            hit(5, "c4", "h4", "", 5.0),
+            "a web block whose label is empty",
+            OriginClass::Web,
+            Some("web"),
+        ),
+        // A hit whose citation key set is not complete: stage 10 drops it
+        // before it can reach the request, and has to hand its tokens back.
+        evidence(
+            // Rank 0 so `select_evidence`'s rank order keeps it: the tier band
+            // and the budget share are what decide the cut, and a late rank
+            // never survives them.
+            hit(0, "c5", "", "note:d.md", 9.5),
+            "a hit with no chunk hash",
+            OriginClass::Owner,
+            None,
+        ),
+    ];
+
+    let result = build_context_with_clock(input, &|| 7u64);
+
+    let reasons: Vec<&str> = result
+        .stages
+        .iter()
+        .flat_map(|s| s.omitted.iter().map(|o| o.reason.as_str()))
+        .collect();
+    assert!(
+        reasons.contains(&"previously_injected"),
+        "the arm that subtracts an injected chunk must fire: {reasons:?}"
+    );
+    assert!(
+        reasons.contains(&"duplicate_chunk_hash"),
+        "…and so must the arm that subtracts a repeat: {reasons:?}"
+    );
+    assert!(
+        reasons.contains(&"delimiter_violation"),
+        "the render-time drop has to fire: a web block whose label is empty \
+         is never emitted: {reasons:?}"
+    );
+
+    // Stage 10's `included` is filtered to evidence: anything else in `work`
+    // (policy, instructions, question, history) must not be listed as a
+    // citation the answer could have made.
+    let citations = result
+        .stages
+        .iter()
+        .find(|s| s.stage.as_str() == "validate_citations")
+        .expect("the citation stage runs");
+    assert!(
+        !citations.included.is_empty(),
+        "…and it has something to report: {citations:?}"
+    );
+    assert!(
+        citations
+            .omitted
+            .iter()
+            .any(|omission| omission.reason.as_str() == "incomplete_citation"),
+        "the fail-closed citation check has to fire: {:?}",
+        citations.omitted
+    );
+    assert!(
+        citations.token_delta <= 0,
+        "dropping a fragment gives its tokens back, it does not claim more: {}",
+        citations.token_delta
+    );
+    assert!(
+        citations.included.iter().all(|key| key.starts_with('h')),
+        "only chunk hashes are citations — the filter keeps the other kinds out: {:?}",
+        citations.included
+    );
+
+    // The invariant itself, over a fixture that actually reverses accounting.
+    let delta_sum: i64 = result.stages.iter().map(|s| s.token_delta).sum();
+    let independent: u64 = result
+        .fragments
+        .iter()
+        .map(|f| u64::from(momotaro_contracts::estimate_tokens(&f.body)))
+        .sum();
+    assert_eq!(
+        independent, result.budget.raw_total,
+        "the budget report must match the fragment bodies themselves"
+    );
+    assert_eq!(
+        delta_sum as u64, independent,
+        "stage token deltas account for exactly the fragment bodies, after the \\
+         history load, both dedup arms and the citation drop have all run"
+    );
+}
+
+/// The budget stage's accounting matches drops by slot, not by
+/// first-match-by-key: a dropped history turn whose id spells a dropped
+/// evidence fragment's `chunk_hash` used to have the wrong object's tokens
+/// subtracted (probe P4: −150 where −107 was due), and the stage deltas then
+/// stopped totalling the fragment bodies. The invariant at the end is the
+/// tooth: discount either collision drop with the other's tokens and it
+/// fails.
+#[test]
+fn the_budget_delta_uses_the_dropped_object_not_its_key_namesake() {
+    let mut input = base_input();
+    // The resident layer alone exceeds the budget, so every non-forced claim
+    // below (the history turn, the fourth evidence item) fails on the spot —
+    // which is what puts two colliding drops in one stage record.
+    input.policy_text = "policy word ".repeat(62);
+    input.budget = BudgetPolicy {
+        max_context_tokens: 200,
+        ..BudgetPolicy::default()
+    };
+    input.history = vec![HistoryItem {
+        history_id: "same".to_string(),
+        round: 9,
+        role: HistoryRole::User,
+        body: "turn ".repeat(75),
+        summary: SummarySlot::None,
+        referenced_chunk_hashes: Vec::new(),
+    }];
+    input.evidence = vec![
+        evidence(
+            hit(1, "c1", "h1", "note:x.md", 9.0),
+            "tiny one",
+            OriginClass::Owner,
+            None,
+        ),
+        evidence(
+            hit(2, "c2", "h2", "note:x.md", 8.0),
+            "tiny two",
+            OriginClass::Owner,
+            None,
+        ),
+        evidence(
+            hit(3, "c3", "h3", "note:x.md", 7.0),
+            "tiny three",
+            OriginClass::Owner,
+            None,
+        ),
+        // The namesake: its `chunk_hash` spells the history turn's id.
+        evidence(
+            hit(4, "c4", "same", "note:x.md", 6.0),
+            "the namesake block",
+            OriginClass::Owner,
+            None,
+        ),
+    ];
+
+    let result = build_context_with_clock(input, &|| 7u64);
+
+    let budget_stage = result
+        .stages
+        .iter()
+        .find(|stage| stage.stage.as_str() == "enforce_token_budget")
+        .expect("the budget stage runs");
+    let same_key_drops = budget_stage
+        .omitted
+        .iter()
+        .filter(|omission| omission.item == "same")
+        .count();
+    assert_eq!(
+        same_key_drops, 2,
+        "the collision has to be dropped twice for this test to mean anything: {budget_stage:?}"
+    );
+    let delta_sum: i64 = result.stages.iter().map(|s| s.token_delta).sum();
+    let independent: u64 = result
+        .fragments
+        .iter()
+        .map(|f| u64::from(momotaro_contracts::estimate_tokens(&f.body)))
+        .sum();
+    assert_eq!(
+        delta_sum as u64, independent,
+        "a namesake drop must not discount the wrong object's tokens"
+    );
+}
+
+/// The budget's release set is scoped to the history class: a dropped
+/// *evidence* fragment whose `chunk_hash` spells a kept turn's `history_id`
+/// must not pull that turn's hashes out of `injected` — the turn is still in
+/// the request, and content still in front of the model stays blacklisted
+/// (§3 第 4 条; probe P4 measured the namesake releasing it).
+#[test]
+fn a_dropped_evidence_namesake_does_not_release_a_kept_turns_hashes() {
+    let mut input = base_input();
+    // Wide enough for the history turn, over the line before the fourth
+    // evidence item (floor 3 keeps the other three alive).
+    input.policy_text = "policy word ".repeat(28);
+    input.budget = BudgetPolicy {
+        max_context_tokens: 200,
+        ..BudgetPolicy::default()
+    };
+    input.history = vec![HistoryItem {
+        history_id: "same".to_string(),
+        round: 9,
+        role: HistoryRole::User,
+        body: "the kept turn".to_string(),
+        summary: SummarySlot::None,
+        referenced_chunk_hashes: vec!["carry1".to_string()],
+    }];
+    input.session = SessionState {
+        first_seen_order: vec![],
+        injected: vec!["carry1".to_string()],
+        fragment_seq: 0,
+    };
+    input.evidence = vec![
+        evidence(
+            hit(1, "c1", "h1", "note:x.md", 9.0),
+            "tiny one",
+            OriginClass::Owner,
+            None,
+        ),
+        evidence(
+            hit(2, "c2", "h2", "note:x.md", 8.0),
+            "tiny two",
+            OriginClass::Owner,
+            None,
+        ),
+        evidence(
+            hit(3, "c3", "h3", "note:x.md", 7.0),
+            "tiny three",
+            OriginClass::Owner,
+            None,
+        ),
+        // The namesake, dropped by the budget: four evidence items, floor 3.
+        evidence(
+            hit(4, "c4", "same", "note:x.md", 6.0),
+            "the namesake evidence block with a longer body to push the budget over the line, and a second copy of that sentence so the block is big enough to fail the claim",
+            OriginClass::Owner,
+            None,
+        ),
+    ];
+
+    let result = build_context_with_clock(input, &|| 7u64);
+
+    let budget_stage = result
+        .stages
+        .iter()
+        .find(|stage| stage.stage.as_str() == "enforce_token_budget")
+        .expect("the budget stage runs");
+    assert_eq!(
+        budget_stage
+            .omitted
+            .iter()
+            .filter(|omission| omission.item == "same")
+            .count(),
+        1,
+        "exactly the namesake evidence item is dropped — the kept turn is not: {budget_stage:?}"
+    );
+    assert!(
+        result.next_session.injected.contains(&"carry1".to_string()),
+        "the kept turn still carries carry1 — releasing it breaks the rule: {:?}",
+        result.next_session.injected
+    );
+}
+
+/// The stage-1/2/5 deltas count the **escaped** text the fragments actually
+/// carry: caller content containing `<<<` is rewritten by
+/// `escape_content_sentinels` on the way into a body, and counting the raw
+/// input drifted the deltas and `raw_total` apart (probe P2: 40 vs 47) —
+/// audit-only, but an audit that lies is not one.
+#[test]
+fn sentinel_text_in_caller_content_does_not_drift_the_deltas() {
+    let mut input = base_input();
+    input.query = "what is <<< fourier".to_string();
+    input.policy_text = "policy.v1: cite sources. <<< untrusted".to_string();
+    input.instructions = "Answer with citations <<<now>>>".to_string();
+
+    let result = build_context_with_clock(input, &|| 7u64);
+
+    let delta_sum: i64 = result.stages.iter().map(|s| s.token_delta).sum();
+    let independent: u64 = result
+        .fragments
+        .iter()
+        .map(|f| u64::from(momotaro_contracts::estimate_tokens(&f.body)))
+        .sum();
+    assert_eq!(
+        independent, result.budget.raw_total,
+        "the budget report must match the fragment bodies themselves"
+    );
+    assert_eq!(
+        delta_sum as u64, independent,
+        "the deltas must count the escaped bodies, not the raw caller text"
+    );
+}
+
+/// The build reports survivor **indices**, so the run layer can tell which
+/// of two hits sharing one `chunk_hash` became the fragment (probe R3a-F2):
+/// hash membership read the dropped twin as included, and the
+/// `duplicate_chunk_hash` code could never land on a row because the twin
+/// was indistinguishable from its survivor.
+#[test]
+fn the_build_keeps_the_survivors_index_not_its_hash() {
+    let mut input = base_input();
+    input.evidence = vec![
+        evidence(
+            hit(1, "c1", "same-hash", "note:a.md", 9.0),
+            "first copy",
+            OriginClass::Owner,
+            None,
+        ),
+        // The twin: same `chunk_hash`, different identity — the first
+        // occurrence is the one dedup keeps.
+        evidence(
+            hit(2, "c2", "same-hash", "note:b.md", 8.0),
+            "second copy",
+            OriginClass::Owner,
+            None,
+        ),
+    ];
+
+    let result = build_context_with_clock(input, &|| 7u64);
+
+    assert_eq!(
+        result.evidence_order().collect::<Vec<_>>(),
+        vec!["same-hash"],
+        "one survivor carries the hash"
+    );
+    assert_eq!(
+        result.evidence_indices().collect::<Vec<_>>(),
+        vec![0],
+        "and the index says it is *this* hit's fragment, not the twin's"
+    );
+    let dedup = result
+        .stages
+        .iter()
+        .find(|stage| stage.stage.as_str() == "deduplicate")
+        .expect("the dedup stage runs");
+    assert!(
+        dedup.omitted.iter().any(|omission| {
+            omission.item == "same-hash" && omission.reason.as_str() == "duplicate_chunk_hash"
+        }),
+        "the twin's code exists to land on its row: {dedup:?}"
+    );
+}
+
+/// A fragment without a `chunk_hash` is dropped by the citation check, and
+/// its omission row must still be nameable: the audit outlet showed
+/// `(,incomplete_citation)` before (probe A4-C1).
+#[test]
+fn an_empty_chunk_hash_omission_still_has_a_name() {
+    let mut input = base_input();
+    input.evidence = vec![evidence(
+        hit(1, "c1", "", "note:a.md", 9.0),
+        "no hash",
+        OriginClass::Owner,
+        None,
+    )];
+
+    let result = build_context_with_clock(input, &|| 7u64);
+
+    let citations = result
+        .stages
+        .iter()
+        .find(|stage| stage.stage.as_str() == "validate_citations")
+        .expect("the citation stage runs");
+    assert!(
+        citations
+            .omitted
+            .iter()
+            .any(|omission| omission.item == "<no-hash>"),
+        "the omission carries a name: {citations:?}"
+    );
+}
+
+/// §3 第 4 条:已注入过的 evidence 按 chunk_hash 去重,不因多轮重复占预算。
 #[test]
 fn already_injected_evidence_never_re_enters() {
     let mut input = base_input();
@@ -558,7 +1017,7 @@ fn history_budget_claims_recent_turns_first() {
             round: 1,
             role: momotaro_context::HistoryRole::User,
             body: "x".repeat(80),
-            summary: None,
+            summary: SummarySlot::None,
             referenced_chunk_hashes: Vec::new(),
         },
         HistoryItem {
@@ -566,7 +1025,7 @@ fn history_budget_claims_recent_turns_first() {
             round: 2,
             role: momotaro_context::HistoryRole::User,
             body: "y".repeat(80),
-            summary: None,
+            summary: SummarySlot::None,
             referenced_chunk_hashes: Vec::new(),
         },
     ];
@@ -596,7 +1055,7 @@ fn history_budget_claims_recent_turns_first() {
     );
 }
 
-/// §3.4 的第二半:history 已携带全文的 chunk(hash 记在 referenced_chunk_hashes)
+/// §3 第 4 条 的第二半:history 已携带全文的 chunk(hash 记在 referenced_chunk_hashes)
 /// 即使 session.injected 为空,也不得重复进 evidence 占预算。
 #[test]
 fn history_referenced_chunks_dedup_without_session_injection() {
@@ -607,7 +1066,7 @@ fn history_referenced_chunks_dedup_without_session_injection() {
         round: 1,
         role: momotaro_context::HistoryRole::User,
         body: "earlier turn already carrying the full text of h1".to_string(),
-        summary: None,
+        summary: SummarySlot::None,
         referenced_chunk_hashes: vec!["h1".to_string()],
     }];
     input.evidence = vec![
@@ -656,7 +1115,7 @@ fn an_older_turn_never_survives_when_a_newer_one_was_dropped() {
             round: 1,
             role: momotaro_context::HistoryRole::User,
             body: "x".repeat(40),
-            summary: None,
+            summary: SummarySlot::None,
             referenced_chunk_hashes: Vec::new(),
         },
         HistoryItem {
@@ -664,7 +1123,7 @@ fn an_older_turn_never_survives_when_a_newer_one_was_dropped() {
             round: 2,
             role: momotaro_context::HistoryRole::User,
             body: "y".repeat(320),
-            summary: None,
+            summary: SummarySlot::None,
             referenced_chunk_hashes: Vec::new(),
         },
     ];
@@ -777,6 +1236,31 @@ fn budget_exceeded_is_reported_both_ways() {
         !result.budget.exceeded,
         "tiny content fits the default budget"
     );
+
+    // The cell neither direction above lands on. `adjusted_total` is
+    // `ceil(raw * coefficient)`, so a ceiling set to the value it produces is
+    // constructible — and `>` and `>=` disagree on exactly that one input:
+    // equal to the ceiling is *not* over it.
+    let ceiling = result.budget.adjusted_total;
+    assert!(ceiling > 0, "the fixture has something to measure");
+    let mut edge = base_input();
+    edge.policy_text = "p".to_string();
+    edge.tool_definitions = Vec::new();
+    edge.instructions = "i".to_string();
+    edge.query = "q".to_string();
+    edge.budget = BudgetPolicy {
+        max_context_tokens: u32::try_from(ceiling).expect("a small ceiling"),
+        ..BudgetPolicy::default()
+    };
+    let edge = build_context_with_clock(edge, &|| 0u64);
+    assert_eq!(
+        edge.budget.adjusted_total, ceiling,
+        "the fixed parts are never dropped, so the boundary really is this"
+    );
+    assert!(
+        !edge.budget.exceeded,
+        "on the line is not over the line — only `>` gets that cell right"
+    );
 }
 
 /// 预算 level 4 的锁存(floor 之后):第 4 条大到必败,第 5 条小到本可塞入,
@@ -797,7 +1281,7 @@ fn evidence_level_stops_claiming_after_the_first_failure() {
         round: 1,
         role: momotaro_context::HistoryRole::User,
         body: "h".repeat(120),
-        summary: None,
+        summary: SummarySlot::None,
         referenced_chunk_hashes: Vec::new(),
     }];
     // 分数安排让 rank 阶段产出 [h1, h2, h3, h4, h5]:h4(大)在申领第 4 位

@@ -191,7 +191,7 @@ parse_error。
    （[ADR 0014](adr/note-rename-is-a-new-source.md)）；解析规则升级后可从存量
    抽取离线重放、不需重读 vault。canvas 建边（file 节点 / 连线 / text 节点
    内链）**本批不出生产者**：`canvas_card`/`canvas_edge` 两值随枚举闭合
-   （§8.2），生产者待 canvas 建边件；引用网络边（论文参考文献）留 v0.4 的
+   （[architecture](architecture.md) §8.2），生产者待 canvas 建边件；引用网络边（论文参考文献）留 v0.4 的
    paper add。**现状（2026-09-26）**：建边、dangling、投影与回填**已落**；
    canvas 建边与引用网络边**未做**。**迁移注记**：先于 `links` 键写入的行里
    没有抽取记录，指纹未变的文件不重写 blob（`skipped` 也不会重抽取）——那些
@@ -311,8 +311,9 @@ parse_error。
    `data_json` 列已存在，**不需要 schema 迁移**；④ `CoverageReport` 按码**计数**
    暴露（`doctor --coverage` 因此不再把带码的行只算作 `indexed` 而把码吞掉）。
    ⑤ **预警与降级是两个词表、同一行**（2026-09-24）：同步盘三条（`onedrive_placeholder` /
-   `icloud_placeholder` / `windows_incompatible_name` / `source_removed`）是 `Warning` 而不是
-   `Degradation`——十类仍是十类（预警不是「丢了什么」，是「换一台平台活不下去」）。
+   `icloud_placeholder` / `windows_incompatible_name`）是 `Warning` 而不是
+   `Degradation`——十类仍是十类（预警不是「丢了什么」，是「换一台平台活不下去」）；词表里
+   还有第四个 `Warning` 即 `source_removed`，但它与同步盘无关，是 D40 §4.2 的 delete 半边。
    承载与降级同形：`reason_code` = 降级的首个，**无降级时才轮到**预警的首个（两份列表都按各自枚举的声明顺序——确定性，重跑同结果，首个即行主码）；
    `data_json` 增 `"warnings"` 键、非法名行另有 `"windows_incompatible_names"` 键
    （各自非空才写）。读者（`doctor --coverage` 与任何读行的人）必须**先查两个词表再判未知**——
@@ -350,9 +351,10 @@ parse_error。
    **Excalidraw 场景段不进索引**：`.excalidraw.md`（插件默认也写裸 `.md`）把整幅图存成
    一个围栏代码块（压缩态 info string 为 `compressed-json`、非压缩态为 `json`，整段被
    `%%` 包住——`%%` 只是渲染层隐藏，**字节全在**），今天它会被当正文切块并进 FTS。
-   判据**照 Excalidraw 插件自己的正则**（`src/shared/excalidrawMarkdownParsing.ts` 的
-   `DRAWING_COMPRESSED_REG` / `DRAWING_REG`；该文件的逐字文本在仓库外，本仓未引，故这里
-   写的是**口径**而不是逐字照抄）：段头 `##? Drawing` 必须在**列 0 且其后无别的字符**
+   判据**照 Excalidraw 插件（上游 excalidraw/excalidraw 仓库，不在本仓）自己的正则**：
+   插件源码里 `shared/excalidrawMarkdownParsing.ts` 的 `DRAWING_COMPRESSED_REG` /
+   `DRAWING_REG`。该文件属上游项目、逐字文本在仓库外，本仓未引，故这里写的是**口径**
+   而不是逐字照抄：段头 `##? Drawing` 必须在**列 0 且其后无别的字符**
    （正则锚在 `\n##? Drawing\n`），段头与围栏之间允许任意**非反引号**字符（正则里的
    `[^`]*`）——空行、散文、`%%` 都不会让判据失效；**第一个**带反引号的行决定其余：它的
    info string 为 `compressed-json` 或 `json` 才算命中（别的语言在这里就不是它的布局，

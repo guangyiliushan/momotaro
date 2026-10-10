@@ -88,12 +88,22 @@ momotaro search "transformer reasoning" --mode expand
 
 默认 `--mode lexical`：纯 Tantivy BM25，**不得消耗 LLM token**。
 
-`--mode expand` 显式开启一次短 LLM 调用，把输入扩成多个查询再检索聚合。这是搜索模式，不是 Agent 循环。
+返回条数默认 10；`-n/--top <N>` 改上限，**N > 1000 被拒绝**（`--top 0` 合法——返回空结果，不是错误）。
+
+`--mode expand` 显式开启一次短 LLM turn（可观察输出之前的重发仍算这一次），把输入扩成多个查询再检索聚合。这是搜索模式，不是 Agent 循环。
 
 `--mode expand` 会建立一条 `mode = search` 的 run：`--json` 输出里带 `run_id`
 （人类可读输出也会先打一行 `run <run_id>`），可以用 `momotaro trace <run_id>` 回放——
-重写的那一次 LLM turn 与它报的 token 用量都在里面。拒绝态（`--no-llm`、未授权网络、
-索引不可用、端点未配）都在建 run **之前**，所以被拒时不会留下任何行。
+重写的那一次 LLM turn 与它报的 token 用量都在里面。四道门（`--no-llm`、未授权网络、
+索引与库不可用、spec 构造与校验——端点未配、空 query）都在建 run **之前**，所以被拒时
+不会留下任何行；四道之间的先后是实现细节（清单与口径见
+[architecture](architecture.md) §10.2 的「写入 / 门禁」两行）。**层要分清**：这四道是
+`search --mode expand` 的，它进门就问、四道全在建 run 之前；**`ask` 只共享其中三道**（`--no-llm`、未授权网络、spec 构造与校验）。第四道
+「索引与库不可用」对 `ask` 要拆开看：**库**在建 run 之前问（`open_run_store`），
+**索引**在 [Architecture](architecture.md) §10.1 第 5 步、建 run **之后** —— 所以索引
+不可用对 `ask` 落的是一条 `failed` run（见
+`an_unusable_index_fails_the_run_as_index_unavailable`）而不是零行。**「端点未配」是 CLI 在组 transport 时问的**（`apps/cli`，也早于引擎被调用），
+`ask_workspace` 自己只校验 `[model].model_id`。
 
 `--no-llm` 下 `--mode expand` 直接拒绝并点名两者
 （`policy refused the request: --mode expand rewrites the query with an LLM, which
@@ -113,6 +123,32 @@ momotaro ask "解释谱定理和 PCA 的关系"
 3. 实际送给模型的 context fragments；
 4. 这一次 LLM turn；
 5. 引用校验结果。
+
+自动化里重试同一个提问时，带上 `--client-request-id <id>`：同一个 id 重放返回**同一条 run**
+（不重复建 run、不重复计费）；同一个 id 带不同的 query/spec 会被**点名拒绝**（幂等键冲突），
+空 id 也会被拒绝。
+
+## 多轮会话
+
+`ask` 默认每次新开一个会话。要接着上一轮问，带上会话 id：
+
+```bash
+momotaro ask --session <session_id> "再问一个"
+```
+
+id 从上一条 `ask` 的输出里取（人类行与 `--json` 都给，并打印一条可直接粘贴的下一条命令）。
+`--session` 的值**必填**；给一个不存在的 id 会**直接报错**，不会替你新建一个会话。
+该会话上一轮若因崩溃/中断悬挂着，**这一步会先清扫它再继续**（[Harness](harness.md)
+§2 规定清扫本身、§5 规定「先清扫、后判 session」这个顺序，`ask` / `trace` 打开库时清扫，
+`--session` 也不例外），所以中断的会话不需要先去别处跑一条命令才能续上；**没有**单独的「该会话正忙」拒绝（判不出活跃 run 背后是活进程
+还是死进程，见 Harness §5）。
+`AskReport` 因此多一个 `session_id` 字段（`--json` 与人类行各一处）。
+
+续接时旧轮按 [上下文与检索工程](context-retrieval.md) §3 选择：近 2 轮（且 ≥8K token）
+保底，取宽者；已注入过的证据按 `chunk_hash` 去重，所以重复问同一批笔记不会把同样的正文
+再占一遍预算。更早的轮次**在有 `summary.v1` 摘要记录时**才降级为该摘要——**0.x 不产生
+摘要记录**（[ADR 0010](adr/session-ask-retrieves-fresh.md) 的 status 段：生成等 `kb_read`），
+因此今天每一轮都是逐字重放。
 
 ## Provider endpoint
 
@@ -164,6 +200,9 @@ momotaro trace <run_id>
 
 ## Projects, annotations, sparks
 
+> **后置**：`project`、`annotate`、`spark` 尚无子命令——下面这些示例今天跑起来是
+> clap 的 `unrecognized subcommand`（后置清单见 [architecture](architecture.md) §17；§20 排期）。
+
 ```bash
 momotaro project new "谱方法选题"
 momotaro project add <project_id> --source arxiv:2401.12345
@@ -176,6 +215,9 @@ momotaro spark --project <project_id>
 - **Spark**：AI 给出的启发卡，默认 `proposed`。0.x 只有 pin / dismiss；未 pin 或不带五元组的卡不进入检索，也不变成 owner 事实。
 
 ## Papers and feeds
+
+> **后置**：`paper` 与 `feed` 的全部子命令（含 `feed poll`）尚无实现；`[feeds]` 配置段
+> 同样未实现（[architecture](architecture.md) §7；后置清单见 §17）。
 
 ```bash
 momotaro paper search "graph neural network reasoning"
@@ -202,7 +244,9 @@ to corrupt it. Sync the notes; leave `.momotaro/` alone.
 `index` reports what the run did: `indexed N of M files (X new revisions,
 Y skipped), C chunks, 0 errors (0 key collisions) in T ms`. `skipped` counts files nothing was read for:
 a fingerprint, stored path **and** raw name that all still match, a link the walk does
-not follow, an iCloud eviction stub, or a cloud placeholder. A pure directory
+not follow, an iCloud eviction stub, a cloud placeholder, or a source whose file is
+gone (its row carries `source_removed`) — a deletion is a row like any other, so
+`doctor --coverage` and this line count it the same way. A pure directory
 move refreshes the stored path and shows up as `indexed` with `0 new
 revisions`, because no new content revision was created.
 
@@ -274,7 +318,13 @@ exist yet is still "nothing has happened yet": the sentence tells its owner to
 run `init` — and if the directory is not a workspace at all (no `momotaro.toml`),
 `--coverage` reports that instead, because `init` would fail there too.
 
-Other commands exit `1` only when they fail.
+Other commands exit `1` only when they fail, with two measured branches
+spelled out here: **a usage error is clap's, exit `2`** (unknown subcommand,
+missing argument) — stdout is empty, and **even `--json` gets no JSON error
+body** (clap exits during parsing, before the program's own error outlet); and
+**`index` per-file errors do not fail the batch** — a summary reporting
+`N errors` (N > 0) still exits `0`, because each failure is recorded and the
+batch completed.
 
 `ask` exits `1` when its run failed — a failed citation fails the run
 (`architecture.md` §10.1) — and still prints the answer and its explicit failure

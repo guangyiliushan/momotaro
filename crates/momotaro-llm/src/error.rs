@@ -6,6 +6,8 @@
 //! must not land in [`LlmErrorKind::ContextOverflow`]. Downstream code branches
 //! on [`LlmErrorKind`], never on [`LlmError::message`] text.
 
+use std::time::Duration;
+
 use thiserror::Error as ThisError;
 
 /// Why one provider call failed.
@@ -26,7 +28,7 @@ pub enum LlmErrorKind {
     /// transport did not follow (3xx), or any status outside the wire contract.
     /// Resending the same bytes cannot fix it. Category `llm_rejected`.
     Rejected,
-    /// Transient provider-side trouble: a 5xx status, an HTTP 408, or a
+    /// Transient provider-side trouble: most 5xx statuses except 501, an HTTP 408, or a
     /// transport failure (a refused connection, a body stream that died before
     /// or during output). Category `llm_provider`; the stream-death timing
     /// lives in [`LlmError::output_observed`], not in this kind.
@@ -41,6 +43,14 @@ pub enum LlmErrorKind {
 /// comparison, so a code spliced with invisible characters cannot be
 /// normalized into a hit.
 const CONTEXT_OVERFLOW_CODE: &str = "context_length_exceeded";
+
+/// Fallback pause before replaying a throttled request.
+const DEFAULT_RATE_LIMIT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// RFC 1123 month spellings used by HTTP-date `Retry-After` values.
+const HTTP_MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 impl LlmErrorKind {
     /// The `docs/docs/architecture.md` §18 error-taxonomy category this kind
@@ -140,6 +150,9 @@ pub(crate) fn classify(status: u16, body: &str, model: &str) -> LlmError {
             LlmErrorKind::ContextOverflow
         }
         400..=499 => LlmErrorKind::Rejected,
+        // Not implemented is a contract mismatch, not a transient outage:
+        // resending the same bytes can only produce the same answer.
+        501 => LlmErrorKind::Rejected,
         500..=599 => LlmErrorKind::Provider,
         _ => LlmErrorKind::Rejected,
     };
@@ -188,11 +201,86 @@ pub(crate) fn transport_failure(
     }
 }
 
+/// Chooses the pause before replaying a throttled reply.
+///
+/// A decodable provider hint wins; otherwise the small constant keeps a retry
+/// from hammering a peer that has already said no. `zero` is intentional for
+/// tests and means "the provider said retry now".
+pub(crate) fn rate_limit_backoff(retry_after: Option<Duration>) -> Duration {
+    retry_after.unwrap_or(DEFAULT_RATE_LIMIT_BACKOFF)
+}
+
+/// Decodes an HTTP `Retry-After` value at one exchange's boundary.
+///
+/// Seconds are the cheap, exact form. HTTP-date is deliberately limited to
+/// RFC 1123 (`Wed, 25 Feb 2026 01:02:03 GMT`), the spelling the RFC names and
+/// providers send; anything else is treated as absent rather than guessed.
+pub(crate) fn retry_after(value: Option<&str>, now: std::time::SystemTime) -> Option<Duration> {
+    let value = value?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+
+    let now_epoch = now.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let retry_epoch = http_date_epoch(value)?;
+    Some(Duration::from_secs(retry_epoch.saturating_sub(now_epoch)))
+}
+
+/// Reads the fixed RFC 1123 HTTP-date shape into whole seconds since Unix.
+fn http_date_epoch(value: &str) -> Option<u64> {
+    let mut parts = value.split_whitespace();
+    let _day_name = parts.next()?;
+    let day = parts.next()?;
+    let month = parts.next()?;
+    let year = parts.next()?;
+    let clock = parts.next()?;
+    if parts.next()? != "GMT" || parts.next().is_some() {
+        return None;
+    }
+
+    let month_number = HTTP_MONTHS
+        .iter()
+        .position(|spelling| spelling.eq_ignore_ascii_case(month))?
+        + 1;
+    let (hour, minute, second) = {
+        let mut numbers = clock.split(':');
+        let hour = numbers.next()?.parse::<u64>().ok()?;
+        let minute = numbers.next()?.parse::<u64>().ok()?;
+        let second = numbers.next()?.parse::<u64>().ok()?;
+        if numbers.next().is_some() {
+            return None;
+        }
+        (hour, minute, second)
+    };
+    if day.len() != 2 || year.len() != 4 || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    let day = day.parse::<i64>().ok()?;
+    let year = year.parse::<i64>().ok()?;
+    if !(1..=31).contains(&day) {
+        return None;
+    }
+
+    // Howard Hinnant's civil-date formula: enough to decode an HTTP-date
+    // without inventing a calendar dependency for one optional header.
+    let adjusted_year = if month_number <= 2 { year - 1 } else { year };
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year.rem_euclid(400);
+    let month_number = month_number as i64;
+    let day_of_year =
+        (153 * (month_number + if month_number > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let seconds = days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64;
+    u64::try_from(seconds).ok()
+}
+
 /// Fold foreign text into a terminal-safe line: line breaks become spaces and
 /// unprintable characters are dropped — C0/C1 controls can drive the terminal,
 /// and the bidi / zero-width format characters can hide or reorder the rest of
 /// the line. Same rule as `momotaro-run`'s private `sanitize`.
-pub(crate) fn sanitize(text: &str) -> String {
+pub fn sanitize(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_whitespace() { ' ' } else { c })
         .filter(|c| !is_unprintable(*c))
@@ -201,7 +289,7 @@ pub(crate) fn sanitize(text: &str) -> String {
 
 /// Whether `c` must never reach a terminal: C0/C1 controls plus the format
 /// characters that reorder or hide text.
-fn is_unprintable(c: char) -> bool {
+pub fn is_unprintable(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
@@ -429,5 +517,33 @@ mod tests {
             );
         }
         assert!(error.message.contains("reset by peer"));
+    }
+
+    #[test]
+    fn not_implemented_is_not_a_transient_provider_failure() {
+        let error = classify(501, &body_with("", "no such endpoint"), "m");
+        assert_eq!(error.kind, LlmErrorKind::Rejected);
+        assert!(!error.kind.same_bytes_retryable());
+    }
+
+    #[test]
+    fn rate_limit_backoff_prefers_the_provider_hint_and_has_a_small_fallback() {
+        assert_eq!(
+            rate_limit_backoff(Some(Duration::from_secs(3))),
+            Duration::from_secs(3)
+        );
+        assert_eq!(rate_limit_backoff(None), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn retry_after_decodes_seconds_and_http_dates() {
+        let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_577_836_800);
+        assert_eq!(retry_after(Some("7"), now), Some(Duration::from_secs(7)));
+        assert_eq!(
+            retry_after(Some("Wed, 01 Jan 2020 00:01:41 GMT"), now),
+            Some(Duration::from_secs(101))
+        );
+        assert_eq!(retry_after(None, now), None);
+        assert_eq!(retry_after(Some("not a date"), now), None);
     }
 }

@@ -24,6 +24,31 @@ all-features = true
 # warning, because the fix is always "move off the yanked version".
 yanked = "deny"
 
+# `unsound = "all"` turns the class on for **transitive** dependencies too —
+# the default `workspace` scope cannot see one at all, so what we accept has to
+# be listed rather than merely silent.
+unsound = "all"
+# What is accepted, and why: an exemption anybody can read and audit, not a
+# blind spot nobody can see.
+ignore = [
+    # RUSTSEC-2026-0253 (`lru 0.16.4`) — INFO · Unsound, no CVSS. The UB is on
+    # a panic path: a key whose `Drop` panics inside `LruCache::pop()` skips
+    # `detach()`, leaving a dangling node that a later eviction writes through
+    # (UAF, possible double-free). It needs unwinding plus a `catch_unwind`
+    # plus a key type that panics on drop; nothing in this workspace has one.
+    #
+    # Fixed in `lru >= 0.18.2`. Every published tantivy pins `lru ^0.16.3`, so
+    # the only route to the fix is tantivy 0.27.0 — which exists on main and in
+    # no release. Remove this entry when that lands.
+    # This cargo-deny takes `id` + `reason` only (no `expiry`), so the review
+    # date lives here and in the register: **re-examine by 2027-01-07**, and
+    # immediately if tantivy 0.27.0 is released.
+    { id = "RUSTSEC-2026-0253", reason = "panic-path UB in lru (key Drop panics in pop -> skipped detach -> UAF); needs unwinding + catch_unwind + a panicking key, none of which this workspace has. Fixed in lru >= 0.18.2, unreachable: every published tantivy pins ^0.16.3 and 0.27.0 is unreleased. Review by 2027-01-07 or on 0.27.0." },
+]
+# An ignored advisory that outlives its reason is worse than one that is not
+# ignored at all: make the forgetting visible.
+unused-ignored-advisory = "warn"
+
 [licenses]
 # Permissive licenses only. Anything else needs a deliberate decision recorded
 # here, not a surprise in a lockfile.
@@ -63,7 +88,8 @@ multiple-versions = "warn"
 # come from the ureq TLS stack and are un-unifiable by construction:
 #   base64    0.22 (tantivy) vs 0.23 (ureq, ureq-proto)
 #   getrandom 0.4 (cc/jobserver) vs 0.2 (ring)
-#   syn       3 (serde_derive) vs 2 (jni-macros, an android-only branch)
+#   syn       3 (11 dependents, `serde_derive` one of them) vs 2
+#             (`jni-macros`, an android-only branch)
 #   windows-sys 0.52 (`ring` pins ^0.52), a fourth version beside the
 #   0.59/0.60/0.61 the workspace already carried
 # The `windows_*` target crates, `hashbrown`, `winnow` and `windows-targets`

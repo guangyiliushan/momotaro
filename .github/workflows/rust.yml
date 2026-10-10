@@ -43,48 +43,20 @@ jobs:
       - name: Install toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Every gate below is one `--only` of `tools/gates.sh`: the suite a
+      # contributor replays locally is the suite this job runs, so the two
+      # cannot drift apart. What the job keeps for itself is the *split* —
+      # separate steps, so a red is named — and the two checks the script does
+      # not own (`perf_smoke`, the eval harness self-tests).
       - name: Format
-        run: cargo fmt --all --check
+        run: bash tools/gates.sh --only fmt
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: bash tools/gates.sh --only clippy
       - name: Doc
-        # rustdoc is part of the public API; `-D warnings` catches broken
-        # intra-doc links and links to private items that every other gate
-        # ignores.
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps --locked
+        run: bash tools/gates.sh --only doc
       - name: Test
         shell: bash
-        run: |
-          set -euo pipefail
-          # The windows leg runs the same suite, and its test processes build
-          # tantivy indexes side by side: a file still being mapped gets refused
-          # (code 5 / 145) and the run goes red for reasons no change caused.
-          # Measured: parallel 5/40 and 2/12 red, serial 0/11. Serialising this
-          # leg is a stability trade, not a fix — a judge that cries wolf on
-          # trunk costs more than a slower one.
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            export RUST_TEST_THREADS=1
-          fi
-          cargo test --workspace --locked
-      - name: Path matrix (named target)
-        # W2.6 matrix home: re-runs the target by name on both legs (the
-        # workspace run above already covers the auto tier; this step exists so
-        # the matrix is one named, toggleable thing — not because a second run
-        # adds safety). F6: never widen it to `--ignored` — the manual tier
-        # panics without its env vars (red on windows for reasons no change
-        # caused; ignored counts are platform-skewed 6/1 as of this change and
-        # are not an invariant). Manual runs are local and by name; the recipe
-        # lives in the path_matrix.rs header.
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            export RUST_TEST_THREADS=1
-          fi
-          cargo test -p momotaro-ingest --test path_matrix --locked
-
+        run: bash tools/gates.sh --only test
   deny:
     # Supply chain: licenses, advisories, yanks, sources. A policy file nobody
     # runs is decoration.
@@ -101,10 +73,14 @@ jobs:
           command: check
 
   instruments:
-    # The two checks `cargo test` cannot see: the ignored performance smoke and
-    # the retrieval golden set. Both lived outside CI, which is how a ranking
-    # change could merge green.
-    runs-on: ubuntu-latest
+    # The three checks `cargo test` cannot see: the ignored performance smoke, the
+    # golden-set guards, and the retrieval golden set. All three lived outside CI, which is
+    # how a ranking change could merge green.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install toolchain
@@ -113,13 +89,17 @@ jobs:
       - name: Build the CLI
         run: cargo build --locked -p momotaro-cli
       - name: Performance smoke (1000 files)
+        if: matrix.os == 'ubuntu-latest'
         run: cargo test -p momotaro-run --lib --locked -- --ignored --nocapture perf_smoke
       - name: Golden-set guard tests
         # The guard is the only thing between this job and the repository; it
         # gets a test step of its own so it cannot rot silently.
-        run: bash tools/evals/test_guards.sh
+        run: bash tools/gates.sh --only guards
+      - name: Eval harness self-tests
+        # The gate wiring (miss accounting, known_miss whitelist, ceilings)
+        # is code like any other: a nobody-executed self-test is decoration.
+        run: python tools/evals/test_eval_search.py
       - name: Retrieval gate (golden set)
-        # The recipe and the thresholds live in the script, which the README
-        # documents: one copy, so the two cannot drift apart. Invoked through
-        # `bash` so the executable bit is not part of the contract.
-        run: bash tools/evals/run_golden.sh
+        # Windows runs the same 60-query contract; cross-platform path handling
+        # is part of the instrument, not an implementation detail.
+        run: bash tools/gates.sh --only golden

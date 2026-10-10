@@ -40,7 +40,7 @@ use serde::Serialize;
 
 use momotaro_store::{NewStoreEvent, Store};
 
-use crate::index_service::{BatchOutcome, BatchShape, WATCH_PLAN, now_epoch_secs, run_batch};
+use crate::index_service::{BatchOutcome, BatchShape, WATCH_PLAN, run_batch};
 use crate::reconcile::reconcile;
 use crate::{NETWORK_VOLUME_NOTE, RunError, database_path, load_config, vault_scope};
 
@@ -48,7 +48,7 @@ use crate::{NETWORK_VOLUME_NOTE, RunError, database_path, load_config, vault_sco
 ///
 /// `notify-debouncer-full` picks its own tick at a quarter of this unless told
 /// otherwise, which is what keeps a burst of saves to a single pass.
-pub const DEBOUNCE: Duration = Duration::from_millis(500);
+const DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// D40 §4.4: one debounce batch naming more paths than this is an event storm,
 /// and is answered with a full reconciliation rather than N rescans.
@@ -56,7 +56,7 @@ pub const DEBOUNCE: Duration = Duration::from_millis(500);
 /// A threshold, not a measurement — nothing in notify's contract describes
 /// one. It sits where a single pass over the named paths would cost about what
 /// a reconciliation costs, and it is a constant so a test can pin both sides.
-pub const STORM_PATHS: usize = 256;
+const STORM_PATHS: usize = 256;
 
 /// D40 §4.4: how long a reconcile waits for its cookie before carrying on.
 ///
@@ -64,25 +64,25 @@ pub const STORM_PATHS: usize = 256;
 /// does not. Waiting is an optimisation — walking without it is still correct,
 /// just one event behind — and a non-destructive command must not fail because
 /// a listener was slow.
-pub const COOKIE_TIMEOUT: Duration = Duration::from_secs(5);
+const COOKIE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// D40 §4.5: the delay queue's wait, after the five backoffs.
-pub const TORN_DELAY: Duration = Duration::from_secs(30);
+const TORN_DELAY: Duration = Duration::from_secs(30);
 
 /// D40 §4.5: the mtime has to hold still for at least this long between two
 /// stats before a torn read is retried, so a writer mid-flush cannot look
 /// stable for an instant and then move again.
-pub const MTIME_STABLE_GAP: Duration = Duration::from_millis(64);
+const MTIME_STABLE_GAP: Duration = Duration::from_millis(64);
 
 /// D40 §4.4's second trigger: once a day, from inside the running watcher.
-pub const DAILY: Duration = Duration::from_secs(24 * 60 * 60);
+const DAILY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The sentinel file's name, in the vault root (D40 §4.4).
 ///
 /// Dot-prefixed so the walker never indexes it and the blacklist never
 /// rescans it — and recognised *before* the blacklist, which is what makes it
 /// a protocol message rather than a file.
-pub const SENTINEL_NAME: &str = ".momotaro-reconcile-sentinel";
+const SENTINEL_NAME: &str = ".momotaro-reconcile-sentinel";
 
 /// D40 §4.6: dropped at the event layer, before any filesystem question.
 ///
@@ -98,7 +98,7 @@ pub const SENTINEL_NAME: &str = ".momotaro-reconcile-sentinel";
 /// scan in `run_reconcile`, which reads the raw event stream before any name
 /// rule is applied.
 #[must_use]
-pub fn blacklisted(vault_root: &Path, path: &Path) -> bool {
+fn blacklisted(vault_root: &Path, path: &Path) -> bool {
     let Ok(tail) = path.strip_prefix(vault_root) else {
         // Not inside the vault at all: nothing here is ours to scan.
         return true;
@@ -154,7 +154,7 @@ pub enum Trigger {
 
 /// What a debounced batch of events amounts to (D40 §4.2 / §4.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WatchAction {
+enum WatchAction {
     /// Nothing survived the blacklist: the events were about junk.
     Nothing,
     /// The platform says it dropped events, or the batch was a storm. Only
@@ -171,7 +171,7 @@ pub enum WatchAction {
 /// Pure and total: no filesystem question is asked here, because the blacklist
 /// (§4.6) is a name rule, and the rescan is where facts get established.
 #[must_use]
-pub fn actions_for(events: &[DebouncedEvent], vault_root: &Path) -> WatchAction {
+fn actions_for(events: &[DebouncedEvent], vault_root: &Path) -> WatchAction {
     if events.iter().any(|debounced| debounced.event.need_rescan()) {
         return WatchAction::Reconcile(Trigger::DroppedEvents);
     }
@@ -206,7 +206,7 @@ pub fn actions_for(events: &[DebouncedEvent], vault_root: &Path) -> WatchAction 
 /// Pure so the schedule can be pinned without sleeping: 100ms, 200ms, 400ms,
 /// 800ms, 1600ms — five attempts — then the 30s delay queue, then give up.
 #[must_use]
-pub fn retry_delay(failures: u32) -> Option<Duration> {
+fn retry_delay(failures: u32) -> Option<Duration> {
     match failures {
         0..=4 => Some(Duration::from_millis(100_u64 << failures)),
         5 => Some(TORN_DELAY),
@@ -218,7 +218,7 @@ pub fn retry_delay(failures: u32) -> Option<Duration> {
 ///
 /// Two stats that far apart and identical say the writer has stopped; anything
 /// else means the file is still moving and reading it now would tear again.
-pub fn mtime_stable(path: &Path) -> std::io::Result<bool> {
+fn mtime_stable(path: &Path) -> std::io::Result<bool> {
     let first = std::fs::metadata(path)?;
     thread::sleep(MTIME_STABLE_GAP);
     let second = std::fs::metadata(path)?;
@@ -231,7 +231,10 @@ pub fn mtime_stable(path: &Path) -> std::io::Result<bool> {
 /// Both halves are load-bearing: size alone misses a rewrite of equal length,
 /// and mtime alone misses a filesystem that stamps only seconds. Pinned by
 /// tests that need neither the sleep nor a racing writer.
-fn same_stat(first: &std::fs::Metadata, second: &std::fs::Metadata) -> bool {
+///
+/// Crate-visible because `index_service`'s tornness check is the same question
+/// asked about a re-read, and a second copy of it was how the two drifted.
+pub(crate) fn same_stat(first: &std::fs::Metadata, second: &std::fs::Metadata) -> bool {
     same_state(
         (first.len(), first.modified().ok()),
         (second.len(), second.modified().ok()),
@@ -264,6 +267,10 @@ pub enum WatchLine {
         /// The `ingest.*` batch these rows belong to (ADR 0026).
         batch_id: String,
         /// Paths the gate let through.
+        ///
+        /// A path whose key the batch finds gone still spends a scan here —
+        /// the walk resolves it, the compare skips it (`unchanged`) and the
+        /// batch records it in `removed`.
         rescanned: u64,
         /// Files whose bytes changed.
         rebuilt: u64,
@@ -274,15 +281,21 @@ pub enum WatchLine {
         /// `refreshed`).
         refreshed: u64,
         /// Files that turned out to need nothing.
+        ///
+        /// A deletion lands here too: nothing was rebuilt for a file that is
+        /// gone, and the removal itself is named by `removed`.
         unchanged: u64,
         /// Keys the walk no longer names, which this batch recorded as gone
         /// (D40 §4.2's delete half).
         removed: u64,
-        /// Paths the gate threw away and nothing else happened to *there*.
+        /// Paths the gate threw away — named paths the batch never processed
+        /// at all.
         ///
-        /// A path that is gone entirely appears here **and** in `removed`:
-        /// those answer different questions (the gate refused it; the vault no
-        /// longer has its key), and a single deleted file is both.
+        /// A deletion is *not* one of them: a deleted file the batch heard
+        /// about was let through, spent its scan and is counted in
+        /// `rescanned`/`unchanged`/`removed` — measured `dropped=0` on a
+        /// one-deletion batch. Every named path is one or the other
+        /// (`rescanned + dropped` names them all), never both.
         dropped: u64,
     },
     /// The recommended backend would not start and polling took over (D40 §4.1).
@@ -556,7 +569,31 @@ fn apply(
             run_reconcile(root, vault_root, sentinel, rx, trigger, emit, retries)
         }
         WatchAction::Rescan(paths) => {
-            let outcome = rescan(root, paths, emit)?;
+            // A transient store/fs failure must not kill the daemon. Requeue
+            // the same hints through the existing per-file backoff.
+            let outcome = match rescan(root, paths.clone(), emit) {
+                Ok(outcome) => outcome,
+                Err(error) if transient_watch_error(&error) => {
+                    emit(&WatchLine::Degraded {
+                        reason: crate::sanitize(&error.to_string()),
+                    });
+                    BatchOutcome {
+                        report: momotaro_contracts::IndexReport {
+                            batch_id: String::new(),
+                            files_scanned: 0,
+                            files_skipped: 0,
+                            files_indexed: 0,
+                            revisions_created: 0,
+                            chunks_written: 0,
+                            errors: Vec::new(),
+                            duration_ms: 0,
+                        },
+                        removed: 0,
+                        retry: paths,
+                    }
+                }
+                Err(error) => return Err(error),
+            };
             for path in outcome.retry {
                 let failures = failures_of(retries, &path);
                 schedule(retries, path, failures, emit);
@@ -608,8 +645,16 @@ fn record_moves(root: &Path, vault_root: &Path, events: &[DebouncedEvent]) -> Re
         ) else {
             continue;
         };
+        // A directory rename is not a source move: neither side is a Source
+        // identity (ADR 0014), and the hint would name two keys that never
+        // existed while the files that actually moved get none. The
+        // destination is the side that exists after the rename, so asking
+        // whether it is a directory is what separates the two cases.
+        if to.is_dir() {
+            continue;
+        }
         store.append_store_event(&NewStoreEvent {
-            occurred_at: now_epoch_secs(),
+            occurred_at: momotaro_store::now_epoch_secs(),
             batch_id: &format!("{base}-{index}"),
             seq: 1,
             domain: "ingest",
@@ -658,6 +703,82 @@ fn cookie_slot(path: &Path) -> CookieSlot {
             _ => CookieSlot::Foreign,
         },
     }
+}
+
+/// Writes the cookie through a handle that cannot have swapped behind the
+/// classification.
+///
+/// On Windows, `FILE_FLAG_OPEN_REPARSE_POINT` opens the reparse point itself,
+/// so a symlink/junction planted at the fixed name cannot redirect the write.
+/// The handle metadata and bytes are then checked against the same open
+/// object, closing the classify/open TOCTOU window.
+#[cfg(windows)]
+fn write_cookie(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .and_then(|mut file| {
+            if !file.metadata()?.file_type().is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "cookie slot is not a regular file",
+                ));
+            }
+            let mut existing = Vec::new();
+            file.read_to_end(&mut existing)?;
+            if existing.is_empty() || existing == SENTINEL_NAME.as_bytes() {
+                file.seek(SeekFrom::Start(0))?;
+                file.set_len(0)?;
+                file.write_all(SENTINEL_NAME.as_bytes())?;
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "cookie slot is foreign",
+                ))
+            }
+        })
+        .is_ok()
+}
+
+/// Unix uses the same refuse-foreign rule; symlink exclusion stays in
+/// `cookie_slot` via `symlink_metadata`.
+#[cfg(not(windows))]
+fn write_cookie(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    if matches!(cookie_slot(path), CookieSlot::Foreign) {
+        return false;
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .and_then(|mut file| {
+            let mut existing = Vec::new();
+            file.read_to_end(&mut existing)?;
+            if existing.is_empty() || existing == SENTINEL_NAME.as_bytes() {
+                file.seek(SeekFrom::Start(0))?;
+                file.set_len(0)?;
+                file.write_all(SENTINEL_NAME.as_bytes())?;
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "cookie slot is foreign",
+                ))
+            }
+        })
+        .is_ok()
 }
 
 /// One gated batch over the paths an event batch named (D40 §4.2).
@@ -736,6 +857,25 @@ fn schedule(
     });
 }
 
+/// Whether a batch-level failure is store/fs state the next backoff can cure.
+///
+/// SQLite busy/locked and retryable filesystem waits are transient; schema,
+/// index and config failures are not, and still stop the watcher.
+fn transient_watch_error(error: &RunError) -> bool {
+    match error {
+        RunError::Io { source } => matches!(
+            source.kind(),
+            std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+        ),
+        RunError::Store(error) => error.is_transient(),
+        _ => false,
+    }
+}
+
 /// How many times `path` has already failed, before it leaves the queue.
 fn failures_of(retries: &[Retry], path: &Path) -> u32 {
     retries
@@ -803,7 +943,7 @@ fn run_reconcile(
     // owns; see `cookie_slot` for what a vault could put there instead.
     let slot = cookie_slot(sentinel);
     let plain = slot != CookieSlot::Foreign;
-    let wrote = plain && std::fs::write(sentinel, SENTINEL_NAME).is_ok();
+    let wrote = plain && write_cookie(sentinel);
     let deadline = Instant::now() + COOKIE_TIMEOUT;
     // Without a cookie there is nothing to wait for — but there is still
     // something to report, and `caught_up` must stay false so it is reported.
@@ -875,6 +1015,162 @@ mod tests {
         DebouncedEvent::new(event, Instant::now())
     }
 
+    /// The two things `cookie_slot` refuses to write through.
+    ///
+    /// Its comment names the reason — "reading through the first could follow
+    /// it anywhere, and writing through it is the whole attack" — but neither
+    /// classification had a fixture, so `Foreign` was unreachable and
+    /// `run_reconcile` would have written the sentinel through whatever the
+    /// path turned out to be. A directory is the half a Windows runner can
+    /// always build; the symlink half needs privilege there and is exercised
+    /// on the unix leg.
+    #[test]
+    fn a_name_that_is_not_a_regular_file_is_refused_by_the_sentinel_slot() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let a_directory = dir.path().join("a-directory");
+        std::fs::create_dir(&a_directory).expect("make the directory");
+        assert_eq!(
+            cookie_slot(&a_directory),
+            CookieSlot::Foreign,
+            "a directory is never ours: writing through it is the whole attack"
+        );
+
+        let missing = dir.path().join("nothing-here");
+        assert_eq!(
+            cookie_slot(&missing),
+            CookieSlot::Absent,
+            "…and a name nobody holds is the one we are about to create"
+        );
+    }
+
+    /// The two classifications the type guard is actually load-bearing for.
+    ///
+    /// A directory is *not* one of them: without the guard it falls through
+    /// to `read`, which fails, and the catch-all arm says `Foreign` anyway.
+    /// What the guard exists for is a path that reads successfully but is not
+    /// a file we own — and the slot's own verdict on such a path is what
+    /// decides whether `run_reconcile` writes the sentinel through it.
+    #[test]
+    fn the_sentinel_slot_tells_ours_from_foreign_by_what_is_actually_there() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let ours = dir.path().join("ours");
+        std::fs::write(&ours, SENTINEL_NAME).expect("write our own sentinel");
+        assert_eq!(
+            cookie_slot(&ours),
+            CookieSlot::Ours,
+            "our own bytes at our own name — safe to overwrite"
+        );
+
+        let theirs = dir.path().join("theirs");
+        std::fs::write(&theirs, "something else entirely").expect("write");
+        assert_eq!(
+            cookie_slot(&theirs),
+            CookieSlot::Foreign,
+            "somebody else owns this name"
+        );
+
+        let missing = dir.path().join("nothing-here");
+        assert_eq!(
+            cookie_slot(&missing),
+            CookieSlot::Absent,
+            "…and a name nobody holds is the one we are about to create"
+        );
+    }
+
+    /// The half `read` cannot answer for itself: a reparse point is not a
+    /// file, but reading — and writing — through it lands somewhere else
+    /// entirely. Without the type guard this junction reads our own sentinel
+    /// back out of its target and the slot says `Ours`.
+    ///
+    /// Windows only: a directory junction needs no privilege there, while a
+    /// file symlink does, and the unix leg covers the same guard with a real
+    /// symlink (Q03 is the related platform survivor).
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_is_foreign_whatever_its_target_holds() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).expect("make the target");
+        std::fs::write(target.join(SENTINEL_NAME), SENTINEL_NAME).expect("write the far end");
+
+        let link = dir.path().join("link");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .status()
+            .expect("run mklink");
+        assert!(
+            status.success(),
+            "a directory junction needs no privilege here"
+        );
+
+        assert_eq!(
+            cookie_slot(&link),
+            CookieSlot::Foreign,
+            "a junction is never ours: writing through it is the whole attack"
+        );
+    }
+
+    /// `DAILY` is the interval the reconcile scheduler is promised
+    /// (D40 §4.4: at most once a day). Every arithmetic mutant of
+    /// `24 * 60 * 60` — `+`, `/`, or either operand changed — produced a
+    /// different interval and nothing in the workspace noticed: a `0` here
+    /// would reconcile the whole vault on every tick of the main loop.
+    #[test]
+    fn the_reconcile_interval_is_a_day() {
+        assert_eq!(DAILY.as_secs(), 86_400, "D40 §4.4 promises one a day");
+    }
+
+    /// A rename event that does not carry a pair is skipped, not indexed.
+    ///
+    /// `record_moves` guards with `matches!(…RenameMode::Both) && paths.len()
+    /// == 2`; relaxing the conjunction to `||` lets a one-path event into the
+    /// loop that then reads `paths[1]` — an out-of-bounds panic in a watcher.
+    #[test]
+    fn a_rename_that_carries_one_path_is_skipped_rather_than_indexed() {
+        let dir = tempfile::tempdir().expect("vault");
+        let root = dir.path().to_path_buf();
+        let one_path = debounced(
+            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                .add_path(root.join("only-one")),
+        );
+        record_moves(&root, &root, std::slice::from_ref(&one_path))
+            .expect("a mis-shaped rename is skipped, not an error");
+    }
+
+    /// `same_stat` is the rule `mtime_stable` applies to the two stats it
+    /// takes (D40 §4.5) — and its own doc claims it is "pinned by tests that
+    /// need neither the sleep nor a racing writer". Until now nothing called
+    /// it: only `same_state` was pinned, so `same_stat -> true` — which would
+    /// let the retry path read a file that is still moving — left the
+    /// workspace green.
+    ///
+    /// The second stat is taken after a **deterministic** change (a longer
+    /// body, so the size moves), which is what makes the claim testable
+    /// without a sleep and without a racing writer: no clock granularity can
+    /// hide a size difference.
+    #[test]
+    fn a_rewrite_that_changes_the_size_is_not_the_same_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("moving.md");
+        std::fs::write(&path, "one").expect("write");
+
+        let first = std::fs::metadata(&path).expect("first stat");
+        std::fs::write(&path, "a considerably longer body").expect("rewrite");
+        let second = std::fs::metadata(&path).expect("second stat");
+
+        assert!(
+            !same_stat(&first, &second),
+            "a rewrite that changes the size is a different state — this is              the rule the D40 §4.5 gate applies before a retry reads again"
+        );
+        assert!(
+            mtime_stable(&dir.path().join("missing")).is_err(),
+            "…and a path nobody holds is an error, not a verdict"
+        );
+    }
+
     /// The anomaly CI cannot produce: notify's own rescan notice (D40 §4.4).
     ///
     /// `IN_Q_OVERFLOW` and FSEvents `KernelDropped` both arrive as this flag,
@@ -909,12 +1205,25 @@ mod tests {
         assert!(blacklisted(&vault, &vault.join("note.md~")));
         assert!(blacklisted(&vault, &vault.join("note.md.tmp")));
         assert!(blacklisted(&vault, &vault.join(".~lock.note.md#")));
+        // …and the conjunct keeps both halves: `.~lock.` alone is not the rule.
+        // A name that merely ends in `#` is somebody's file — `draft#`,
+        // `notes.md#` — and dropping the prefix from the test would have them
+        // skipped for ever, never indexed.
+        assert!(!blacklisted(&vault, &vault.join("draft#")));
+        assert!(!blacklisted(&vault, &vault.join("notes.md#")));
         // Anything outside the vault is not ours to scan at all.
         assert!(blacklisted(&vault, Path::new("/elsewhere/note.md")));
         // Real content: not dropped.
         assert!(!blacklisted(&vault, &vault.join("note.md")));
         assert!(!blacklisted(&vault, &vault.join("sub/note.md")));
         assert!(!blacklisted(&vault, &vault.join("a~b.md")));
+        // The `leaf` conjunct on the stub rule: a hidden *directory* named
+        // like an iCloud stub is still a hidden directory, and its subtree
+        // drops like any dot-directory's — the walker prunes it there, and
+        // keeping it here would be the one-store-two-answers shape §4.6
+        // forbids. (`.x.icloud` as a whole path IS a stub shape, but never a
+        // directory in the middle of one.)
+        assert!(blacklisted(&vault, &vault.join(".x.icloud/sub.md")));
     }
 
     #[test]
@@ -1071,6 +1380,28 @@ mod tests {
             rows[0].data_json.contains("note:new.md"),
             "{}",
             rows[0].data_json
+        );
+
+        // A directory rename writes no hint at all (ADR 0014): it used to
+        // land as `source_moved(note:sub -> note:sub2)` — two keys that never
+        // existed as sources — while the files that actually moved got none.
+        std::fs::create_dir_all(vault.join("sub")).expect("dir");
+        std::fs::write(vault.join("sub/c.md"), "# C\n\nbody\n").expect("write");
+        std::fs::rename(vault.join("sub"), vault.join("sub2")).expect("rename dir");
+        let dir_rename = Event {
+            kind: EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            paths: vec![vault.join("sub"), vault.join("sub2")],
+            attrs: Default::default(),
+        };
+        record_moves(root, &vault, &[debounced(dir_rename)]).expect("no dir hint");
+        let rows = Store::open(crate::database_path(root))
+            .expect("open")
+            .latest_store_events(10)
+            .expect("read");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a directory rename writes no source_moved hint"
         );
     }
 
@@ -1256,6 +1587,148 @@ mod tests {
         );
     }
 
+    /// The five optional counts are the whole difference between "what did this
+    /// batch do" and a line that claims work nobody did: a zero that prints
+    /// `, 0 refreshed` says the batch refreshed something, and a count that
+    /// silently vanishes hides it. No test had ever built a `Batch` line —
+    /// the only other `format_watch_line` test drives the `NetworkVolume` arm.
+    #[test]
+    fn the_batch_line_names_only_the_counts_it_has() {
+        let line = |refreshed: u64, unchanged: u64, removed: u64, dropped: u64| WatchLine::Batch {
+            batch_id: "b1".to_owned(),
+            rescanned: 7,
+            rebuilt: 2,
+            refreshed,
+            unchanged,
+            removed,
+            dropped,
+        };
+
+        let some = format_watch_line(&line(3, 2, 1, 0));
+        assert!(some.contains(", 3 refreshed"), "{some}");
+        assert!(some.contains(", 2 unchanged"), "{some}");
+        assert!(some.contains(", 1 removed"), "{some}");
+        assert!(!some.contains("dropped"), "{some}");
+
+        let none = format_watch_line(&line(0, 0, 0, 0));
+        assert!(!none.contains("refreshed"), "a zero is not a fact: {none}");
+        assert!(!none.contains("unchanged"), "{none}");
+        assert!(!none.contains("removed"), "{none}");
+        assert!(!none.contains("dropped"), "{none}");
+    }
+
+    /// The counting contract of a real deletion batch: one deleted file is
+    /// one scan, one skip and one removal — and **zero** drops. (Removals
+    /// started counting into `files_scanned` with f800d71; the WatchLine-level
+    /// shape had no witness, which is how the field docs drifted.)
+    #[test]
+    fn a_deletion_batch_counts_a_scan_a_skip_and_a_removal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = workspace_under(dir.path());
+        crate::index_workspace(dir.path(), None).expect("index");
+        std::fs::remove_file(vault.join("a.md")).expect("delete");
+
+        let mut lines: Vec<WatchLine> = Vec::new();
+        rescan(dir.path(), vec![vault.join("a.md")], &mut |line| {
+            lines.push(line.clone())
+        })
+        .expect("rescan");
+
+        let counts = lines
+            .iter()
+            .find_map(|line| match line {
+                WatchLine::Batch {
+                    rescanned,
+                    rebuilt,
+                    unchanged,
+                    removed,
+                    dropped,
+                    ..
+                } => Some((*rescanned, *rebuilt, *unchanged, *removed, *dropped)),
+                _ => None,
+            })
+            .expect("a deletion is a batch");
+        assert_eq!(
+            counts,
+            (1, 0, 1, 1, 0),
+            "a deleted file is scanned, skipped and removed — never dropped"
+        );
+    }
+
+    /// The guard's two halves are two different promises: no rows *and* no
+    /// removals. The first was watched; the second was not, so a batch that
+    /// found nothing but did notice a deletion printed an id `store_events`
+    /// never held — exactly what the comment above the condition forbids.
+    #[test]
+    fn a_batch_that_named_nothing_prints_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = workspace_under(dir.path());
+        crate::index_workspace(dir.path(), None).expect("index");
+
+        let mut lines: Vec<WatchLine> = Vec::new();
+        rescan(
+            dir.path(),
+            vec![vault.join("never-existed.md")],
+            &mut |line| lines.push(line.clone()),
+        )
+        .expect("rescan");
+
+        assert!(
+            lines.is_empty(),
+            "nothing happened, so nothing gets an id: {lines:?}"
+        );
+    }
+
+    /// The retry queue's only read: how many times *this* path has already
+    /// failed. Getting it wrong is not cosmetic — zero restarts the escalation
+    /// on every attempt, which is how the delay queue and the give-up became
+    /// unreachable in the first place.
+    /// The cookie writer must never open a directory for writing; this is the
+    /// portable half of the adversarial-slot guard (the symlink half requires
+    /// platform symlink privilege and is pinned by the Windows reparse flag).
+    #[test]
+    fn transient_io_errors_are_retried_not_fatal() {
+        let error = RunError::Io {
+            source: std::io::Error::new(std::io::ErrorKind::Interrupted, "busy"),
+        };
+        assert!(transient_watch_error(&error));
+        assert!(!transient_watch_error(&RunError::ConfigInvalid(
+            "no".to_owned()
+        )));
+    }
+
+    #[test]
+    fn cookie_writer_refuses_a_directory_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let slot = dir.path().join(".momotaro-reconcile-sentinel");
+        std::fs::create_dir(&slot).expect("plant a directory");
+        assert!(!write_cookie(&slot));
+        assert!(
+            std::fs::read_dir(&slot).expect("directory remains").count() == 0,
+            "nothing was written through the hostile slot"
+        );
+    }
+
+    #[test]
+    fn failures_of_reads_the_queue_for_that_path_only() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let here = dir.path().join("a.md");
+        let elsewhere = dir.path().join("b.md");
+        let retries = vec![Retry {
+            path: here.clone(),
+            failures: 3,
+            when: Instant::now(),
+        }];
+
+        assert_eq!(failures_of(&retries, &here), 3, "the count the queue holds");
+        assert_eq!(
+            failures_of(&retries, &elsewhere),
+            0,
+            "a path with no entry has failed zero times, not one"
+        );
+        assert_eq!(failures_of(&[], &here), 0, "an empty queue answers nothing");
+    }
+
     #[test]
     fn events_about_junk_reach_nothing() {
         let vault = vault();
@@ -1312,5 +1785,40 @@ mod tests {
         let path = dir.path().join("quiet.md");
         std::fs::write(&path, "one").expect("write");
         assert!(mtime_stable(&path).expect("stat"));
+    }
+    /// The recheck measured this shape for real (A2-11): a `\ud800`-named
+    /// file made the watcher exit before the fix, and WTF-16 makes an
+    /// unpaired surrogate a legal Windows file name — so the witness is the
+    /// real thing, not a stand-in. It drives both repaired seams at once:
+    /// the gate's name half (a `?` there answers `Err`, not a batch) and the
+    /// `ForceRebuild` arm's downstream promise (nothing forced = nothing
+    /// processed = no row).
+    #[cfg(windows)]
+    #[test]
+    fn a_lone_surrogate_name_is_one_row_and_the_watcher_survives() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = workspace_under(dir.path());
+        crate::index_workspace(dir.path(), None).expect("index");
+        let wide: Vec<u16> = "bad-"
+            .encode_utf16()
+            .chain(std::iter::once(0xD800u16))
+            .chain(".md".encode_utf16())
+            .collect();
+        let name = <std::ffi::OsString as std::os::windows::ffi::OsStringExt>::from_wide(&wide);
+        let bad = vault.join(name);
+        std::fs::write(&bad, "# B\n\nbody\n").expect("a lone surrogate is a legal WTF-16 name");
+
+        let mut lines: Vec<WatchLine> = Vec::new();
+        let outcome = rescan(dir.path(), vec![bad], &mut |line| lines.push(line.clone()))
+            .expect("one unnameable path must not take the watcher down");
+        assert!(
+            outcome
+                .report
+                .errors
+                .iter()
+                .any(|error| error.kind == momotaro_contracts::IndexFileErrorKind::InvalidUtf8),
+            "the pass writes its row: {:?}",
+            outcome.report.errors
+        );
     }
 }

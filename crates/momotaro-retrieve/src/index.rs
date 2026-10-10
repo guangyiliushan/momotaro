@@ -3,9 +3,11 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{Query, QueryParser};
 use tantivy::schema::{Field, Value};
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
@@ -25,6 +27,8 @@ pub struct SearchIndex {
     index: Index,
     fields: Fields,
     reader: IndexReader,
+    parser: OnceLock<QueryParser>,
+    parse_fell_back: AtomicBool,
 }
 
 /// Thin newtype over [`tantivy::IndexWriter`].
@@ -100,6 +104,8 @@ impl SearchIndex {
             index,
             fields,
             reader,
+            parser: OnceLock::new(),
+            parse_fell_back: AtomicBool::new(false),
         }
     }
 
@@ -125,12 +131,21 @@ impl SearchIndex {
             index,
             fields,
             reader,
+            parser: OnceLock::new(),
+            parse_fell_back: AtomicBool::new(false),
         })
     }
 
     /// Schema field handles for this index.
     pub fn fields(&self) -> &Fields {
         &self.fields
+    }
+
+    /// Whether the last [`Self::search`] exhausted both query parses and
+    /// returned empty. Callers carrying a retrieval report can record it;
+    /// `false` is meaningful only for the immediately preceding call.
+    pub fn parse_fell_back(&self) -> bool {
+        self.parse_fell_back.load(AtomicOrdering::Relaxed)
     }
 
     /// The underlying index; test-only (the tests that read stored fields and
@@ -145,6 +160,17 @@ impl SearchIndex {
         Ok(IndexWriterHandle {
             inner: self.index.writer(heap_bytes)?,
         })
+    }
+
+    /// How many documents the index currently serves.
+    ///
+    /// The count the run layer compares against the store's current-chunk
+    /// count: the writer commits a batch's documents in one step after the
+    /// per-file store commits, so the two numbers disagree exactly when a
+    /// batch died in that window. The reader sees the last committed
+    /// generation.
+    pub fn doc_count(&self) -> u64 {
+        self.reader.searcher().num_docs()
     }
 
     /// Replaces all indexed chunks for one source with `chunks`.
@@ -226,13 +252,15 @@ impl SearchIndex {
     /// an empty hit list rather than an error. A query whose escaped form
     /// still fails to parse (e.g. a bare `OR` / `AND` / `NOT` keyword) is
     /// retried once with every whitespace-separated term quoted; if that
-    /// also fails, the search returns an empty hit list — a query that
-    /// cannot match anything is not an error. The internal reader is
+    /// also fails, the search returns an empty hit list and raises the
+    /// observable [`Self::parse_fell_back`] marker — a query that cannot be
+    /// parsed is not a match, but its fallback must be visible. The internal reader is
     /// reloaded first, so the last commit of this process is visible
     /// without any external reader handle. Equal scores tie-break by
     /// `source_key` ascending, then `ordinal` ascending; `rank` is
     /// 1-based.
     pub fn search(&self, query: &str, top_k: usize) -> Result<Vec<RetrievalHit>, RetrieveError> {
+        self.parse_fell_back.store(false, AtomicOrdering::Relaxed);
         let normalized = normalize_query(query);
         // Two halves, for two different reasons. `!is_searchable` is the
         // predicate `--mode expand` shares (see `is_searchable`), and the
@@ -244,34 +272,32 @@ impl SearchIndex {
             return Ok(Vec::new());
         }
         self.reader.reload()?;
-        let parser = QueryParser::for_index(
-            &self.index,
-            vec![
-                self.fields.text,
-                self.fields.title,
-                self.fields.heading_path,
-            ],
-        );
+        let parser = self.parser.get_or_init(|| {
+            QueryParser::for_index(
+                &self.index,
+                vec![
+                    self.fields.text,
+                    self.fields.title,
+                    self.fields.heading_path,
+                ],
+            )
+        });
         let escaped = escape_query(&normalized);
-        let parsed = match parser.parse_query(&escaped) {
-            Ok(parsed) => parsed,
-            Err(_) => {
-                let quoted = normalized
-                    .split_whitespace()
-                    .map(|term| format!("\"{}\"", escape_query(term)))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                match parser.parse_query(&quoted) {
-                    Ok(parsed) => parsed,
-                    Err(_) => return Ok(Vec::new()),
-                }
-            }
+        let (parsed, fell_back) = parse_query_with_fallback(parser, &escaped, &normalized);
+        self.parse_fell_back
+            .store(fell_back, AtomicOrdering::Relaxed);
+        let Some(parsed) = parsed else {
+            return Ok(Vec::new());
         };
         // Class scoping is the ranking backbone, not a filter bolted on after:
         // every hit is produced by exactly one weighted class branch.
         let parsed = boost::origin_scoped(&self.fields, parsed);
         let searcher = self.reader.searcher();
-        let top_docs = searcher.search(&parsed, &TopDocs::with_limit(top_k).order_by_score())?;
+        // TopDocs' own limit cuts ties before the documented tie-break can
+        // see them. Collect every match, apply the full total order, then cut.
+        let all_matches = searcher.num_docs().max(1) as usize;
+        let top_docs =
+            searcher.search(&parsed, &TopDocs::with_limit(all_matches).order_by_score())?;
 
         let mut rows: Vec<Row> = Vec::with_capacity(top_docs.len());
         for (score, address) in top_docs {
@@ -282,7 +308,7 @@ impl SearchIndex {
                 revision_hash: stored_text(&doc, self.fields.revision_hash),
                 chunk_id: stored_text(&doc, self.fields.chunk_id),
                 chunk_hash: stored_text(&doc, self.fields.chunk_hash),
-                ordinal: stored_ordinal(&doc, self.fields.ordinal),
+                ordinal: stored_ordinal(&doc, self.fields.ordinal)?,
                 heading_path: stored_optional_text(&doc, self.fields.heading_path),
                 locator_json: stored_text(&doc, self.fields.locator_json),
             });
@@ -294,6 +320,7 @@ impl SearchIndex {
                 .then_with(|| a.source_key.cmp(&b.source_key))
                 .then_with(|| a.ordinal.cmp(&b.ordinal))
         });
+        rows.truncate(top_k);
         Ok(rows
             .into_iter()
             .enumerate()
@@ -304,6 +331,27 @@ impl SearchIndex {
                 row.into_hit(rank)
             })
             .collect())
+    }
+}
+
+/// Parse the literal syntax, then the all-terms-quoted retry. The second bool
+/// is the observable fallback: `None` is an empty search, not a lexical miss.
+fn parse_query_with_fallback(
+    parser: &QueryParser,
+    escaped: &str,
+    raw: &str,
+) -> (Option<Box<dyn Query>>, bool) {
+    if let Ok(parsed) = parser.parse_query(escaped) {
+        return (Some(parsed), false);
+    }
+    let quoted = raw
+        .split_whitespace()
+        .map(|term| format!("\"{}\"", escape_query(term)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    match parser.parse_query(&quoted) {
+        Ok(parsed) => (Some(parsed), false),
+        Err(_) => (None, true),
     }
 }
 
@@ -318,9 +366,71 @@ fn stored_optional_text(doc: &TantivyDocument, field: Field) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
-fn stored_ordinal(doc: &TantivyDocument, field: Field) -> u32 {
+fn stored_ordinal(doc: &TantivyDocument, field: Field) -> Result<u32, RetrieveError> {
     doc.get_first(field)
         .and_then(|value| value.as_i64())
         .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(0)
+        .ok_or_else(|| {
+            RetrieveError::Tantivy(tantivy::TantivyError::SchemaError(
+                "stored ordinal is missing or outside u32".to_string(),
+            ))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_parser_failures_are_a_fallback_and_one_success_is_not() {
+        let si = crate::tests::ram_index();
+        // With no default fields, both the literal and phrase retry fail at
+        // parse time; this is the smallest way to drive the retry arm.
+        let none = QueryParser::for_index(si.index(), Vec::new());
+        let (query, fell_back) = parse_query_with_fallback(&none, "plain", "plain");
+        assert!(query.is_none());
+        assert!(fell_back, "both parser attempts failed");
+
+        let parser = QueryParser::for_index(
+            si.index(),
+            vec![
+                si.fields().text,
+                si.fields().title,
+                si.fields().heading_path,
+            ],
+        );
+        let (query, fell_back) = parse_query_with_fallback(&parser, "plain", "plain");
+        assert!(query.is_some());
+        assert!(!fell_back);
+    }
+
+    /// A schema can promise an i64 ordinal while a damaged stored document
+    /// lacks it. The decoder must fail the search, never synthesize position 0.
+    #[test]
+    fn a_missing_stored_ordinal_is_an_error_not_zero() {
+        let schema = crate::schema::build_schema();
+        let fields = crate::schema::fields(&schema).expect("own schema");
+        let doc = TantivyDocument::default();
+
+        let error = stored_ordinal(&doc, fields.ordinal).expect_err("missing ordinal");
+        assert!(
+            matches!(
+                error,
+                RetrieveError::Tantivy(tantivy::TantivyError::SchemaError(_))
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_searches_reset_the_parse_fallback_marker() {
+        let si = crate::tests::ram_index();
+        si.parse_fell_back.store(true, AtomicOrdering::Relaxed);
+        assert!(si.parse_fell_back());
+        assert!(si.search("nothing here", 10).expect("search").is_empty());
+        assert!(
+            !si.parse_fell_back(),
+            "a successful parse clears the marker"
+        );
+    }
 }

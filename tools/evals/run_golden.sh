@@ -24,6 +24,18 @@ scratch_posix="$scratch"
 if command -v cygpath >/dev/null 2>&1; then
   scratch_posix="$(cygpath -u "$scratch" 2>/dev/null || printf '%s' "$scratch")"
 fi
+# Compare resolved paths only: literal .., duplicate slashes, and symlinks must
+# not let a source tree masquerade as an outside scratch directory.
+if ! command -v realpath >/dev/null 2>&1 || ! scratch_posix="$(realpath -m -- "$scratch_posix" 2>/dev/null)"; then
+  echo "run_golden.sh: cannot canonicalize scratch directory '$scratch'" >&2
+  exit 2
+fi
+case "$scratch_posix" in
+  *".."*)
+    echo "run_golden.sh: scratch directory did not canonicalize cleanly: '$scratch'" >&2
+    exit 2
+    ;;
+esac
 case "$repo_posix/" in
   "$scratch_posix"/*)
     echo "run_golden.sh: refusing to delete '$scratch' — the repository lives inside it" >&2
@@ -43,8 +55,54 @@ if [ "$scratch_posix" = "/" ] || [ "$scratch_posix" = "$HOME" ] \
   exit 2
 fi
 
-cargo build -p momotaro-cli --locked
-binary="$repo_posix/target/debug/momotaro-cli"
+# python is resolved here and not later because the binary path below is read
+# out of `cargo metadata`, and that is JSON.
+python=""
+for candidate in "${PYTHON:-}" python3 python; do
+  [ -n "$candidate" ] || continue
+  # Run it, not just look for it: on Windows `python3` can be an App Execution
+  # Alias stub that exists on PATH and then exits non-zero without Python.
+  if "$candidate" -c "import sys" >/dev/null 2>&1; then
+    python="$candidate"
+    break
+  fi
+done
+[ -n "$python" ] || {
+  echo "run_golden.sh: no working python (set PYTHON=/path/to/python)" >&2
+  exit 1
+}
+
+# Where cargo actually put that binary. `cargo build` honours
+# `CARGO_TARGET_DIR` and `.cargo/config.toml`; a hard-coded `target/debug` does
+# not, so the moment they diverge this gate runs a binary this run never built
+# — and on a machine that already has one at the hard-coded path, silently runs
+# a stale one. `cargo metadata` is the same source of truth cargo uses.
+# Ask the build where it put the executable instead of re-deriving the path:
+# `target_directory` has no target-triple segment, so `CARGO_BUILD_TARGET` (or
+# `build.target` in a config file) would send the artifacts to
+# `<target>/<triple>/debug/` while a re-derived path still looked in
+# `<target>/debug/` — the same stale-binary hole this replaced, one level down.
+binary="$(cargo build -p momotaro-cli --locked --message-format=json \
+  | "$python" -c 'import json, sys
+last = ""
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        message = json.loads(line)
+    except Exception:
+        continue
+    if message.get("reason") == "compiler-artifact" and message.get("executable"):
+        last = message["executable"]
+print(last)')"
+[ -n "$binary" ] || {
+  echo "run_golden.sh: the build reported no momotaro-cli executable" >&2
+  exit 2
+}
+if command -v cygpath >/dev/null 2>&1; then
+  binary="$(cygpath -u "$binary" 2>/dev/null || printf '%s' "$binary")"
+fi
 [ -x "$binary" ] || binary="$binary.exe"
 
 # Never in the repository root: `init` writes `.momotaro/` where it runs.
@@ -69,33 +127,18 @@ if command -v cygpath >/dev/null 2>&1; then
   repo="$(cygpath -w "$repo_posix")"
 fi
 
-python=""
-for candidate in "${PYTHON:-}" python3 python; do
-  [ -n "$candidate" ] || continue
-  # Run it, not just look for it: on Windows `python3` can be an App Execution
-  # Alias stub that exists on PATH and then exits non-zero without Python.
-  if "$candidate" -c "import sys" >/dev/null 2>&1; then
-    python="$candidate"
-    break
-  fi
-done
-[ -n "$python" ] || {
-  echo "run_golden.sh: no working python (set PYTHON=/path/to/python)" >&2
-  exit 1
-}
-
 (cd "$scratch" && "$binary" init && "$binary" index)
 
 # The retrieval numbers say nothing about the ingest audit trail (ADR 0026): a
-# deleted `ingest.coverage` write would still score 0.9583. The batch is checked
+# deleted `ingest.coverage` write would still score 0.9167. The batch is checked
 # here so the instrument cannot call a broken indexer healthy.
 "$python" - "$scratch" <<'PY'
 import sqlite3, sys
 db = sys.argv[1].rstrip("/\\") + "/.momotaro/momotaro.db"
 connection = sqlite3.connect(db)
 counts = dict(connection.execute("select type, count(*) from store_events group by type"))
-# 5 vault fixtures + 7 eval fixtures + 1 icloud stub = 13 coverage rows.
-expected = {"ingest.started": 1, "ingest.finished": 1, "ingest.coverage": 13}
+# 5 vault fixtures + 9 eval fixtures + 1 icloud stub = 15 coverage rows.
+expected = {"ingest.started": 1, "ingest.finished": 1, "ingest.coverage": 15}
 if counts != expected:
     print(f"FAIL: store_events {counts!r}, expected {expected!r}")
     sys.exit(1)
@@ -113,32 +156,32 @@ if frontmatter != 1:
     sys.exit(1)
 print(f"store_events ok: {counts} (+1 icloud_placeholder, +1 frontmatter_parse_error)")
 PY
-# Report A floors and report B ceilings. The instrument is deterministic, so
-# these are tripwires, not tolerances: each floor sits below the measured
-# baseline by less than one minimal step, each ceiling sits exactly at it, so
-# any real regression trips it. Re-baselined 2026-09-26 on the expanded corpus
-# (post data-quality fix — `特征值 特征向量` sufficiency re-anchored on the
-# minimal set):
-#   - main recall@5 0.9583 -> 0.9167: hard negatives and poison samples now
-#     compete for top-5 seats (`PCA 方差` lost pca.md from top-5 entirely —
-#     documented hard-negative harm, not a retrieval change);
-#   - main mrr 0.9028 -> 0.8333: same cause;
-#   - injection numbers are the first measurement of this subset — see
-#     README.md for the two zero-recall shapes (whitespace-free queries hit as
-#     one unmatchable phrase; and hard negatives displacing pca.md). The
-#     subset's utility baseline starts low and honest;
-#   - seat counts (19 / 11 / 33) are exact; any growth trips.
-# Minimal steps (all sufficient sets are single-key now): recall 1/12 and
-# 1/36; mrr 0.05/12 and 0.05/36 (one query demoted rank-4 to rank-5).
+# Gates. The instrument is deterministic, so these are tripwires, not
+# tolerances. Hits are gated per row, not on averages: --fail-on-unexpected-miss
+# fails on ANY sub-1.0 row outside the golden set's known_miss whitelist, and
+# the whitelist's size is capped per reason (any growth trips). MRR floors sit
+# below the measured baseline by less than one minimal step (0.05/N: one query
+# demoted rank-4 to rank-5); seat ceilings sit exactly at baseline.
+# Re-baselined 2026-10-09 on the grown golden set (15 main / 45 injection;
+# eigenvalue.md + kernel-def.md added, `特征值 特征向量` / `kernel` re-anchored,
+# three multi-key sufficient sets):
+#   - main recall@5 0.9167 -> 0.9000 / mrr 0.8333 -> 0.8222: the two accepted
+#     displaced rows (`PCA 方差`, `特征值 定义 求法`) are whitelisted by name
+#     now — the average can no longer absorb a new miss;
+#   - injection: 12 fused (whitespace-free base queries; analyzer phrase
+#     fusion) + 12 displaced rows whitelisted; recall@5 0.5000 / mrr 0.3667
+#     stay the honest low baseline, but any NEW failure trips;
+#   - seat counts (24 / 8 / 38) are exact; any growth trips.
 "$python" "$repo/tools/evals/gen_annotations.py" --check
 "$python" "$repo/tools/evals/eval_search.py" \
   --workspace "$scratch" \
   --cli "$binary" \
   --k 5 \
-  --floor-recall 0.91 \
-  --floor-mrr 0.833 \
-  --floor-inj-recall 0.49 \
-  --floor-inj-mrr 0.351 \
-  --max-hn-seats 19 \
-  --max-poison-seats 11 \
-  --max-inj-poison-seats 33
+  --fail-on-unexpected-miss \
+  --max-known-miss-fused 12 \
+  --max-known-miss-displaced 14 \
+  --floor-mrr 0.822 \
+  --floor-inj-mrr 0.366 \
+  --max-hn-seats 24 \
+  --max-poison-seats 8 \
+  --max-inj-poison-seats 38

@@ -172,11 +172,22 @@ impl SummaryV1 {
         Ok(())
     }
 
-    /// Parse the stored summary text as a `summary.v1` JSON document and
-    /// run [`Self::validate_against_text`] against that same text.
+    /// Parse the stored summary text as a `summary.v1` document. **Syntax
+    /// only.**
+    ///
+    /// The replay path parses a row whose text it does not own, and a summary
+    /// it cannot parse is a malformed row rather than a claim to check — the
+    /// semantic half is [`Self::validate_against_text`], owned by
+    /// `select_history` (§4 rule 3). This is the one JSON parse on the type;
+    /// the two callers pick which half they need.
+    pub fn from_stored(stored_text: &str) -> Result<Self, SummaryError> {
+        serde_json::from_str(stored_text).map_err(|_| SummaryError::Malformed)
+    }
+
+    /// Parse the stored summary text and run [`Self::validate_against_text`]
+    /// against that same text.
     pub fn parse_stored(stored_text: &str) -> Result<Self, SummaryError> {
-        let record: Self =
-            serde_json::from_str(stored_text).map_err(|_| SummaryError::Malformed)?;
+        let record = Self::from_stored(stored_text)?;
         record.validate_against_text(stored_text)?;
         Ok(record)
     }
@@ -220,23 +231,38 @@ mod tests {
 
     #[test]
     fn every_field_is_required_by_the_type() {
-        // Removing a field from the JSON is a parse failure — the structure
-        // is assertable because no field is optional.
+        // Removing any one key from the JSON is a **deserialization**
+        // failure — no field is optional — and the key set is the fixture's
+        // own: a new SummaryV1 field must land here (the count pin) and
+        // survive removal. The assertion asks `from_stored`, the syntax half,
+        // and nothing else: `parse_stored` would not show what this claims.
+        // Its semantic half backstops three of the eight from a sneaked
+        // `#[serde(default)]` — a missing `version` deserializes to `""` and
+        // trips `VersionMismatch`, a missing `first_kept_item_id` or
+        // `next_action_hint` trips `EmptyField` — so a field could stop being
+        // required *by the type* and the composed gate would still refuse it.
+        // (Measured: `#[serde(default)]` on those three leaves
+        // `parse_stored(...).is_err()` green.)
         let stored = stored_text_of(&sample());
-        for field in [
-            "\"version\"",
-            "\"covered_turns\"",
-            "\"first_kept_item_id\"",
-            "\"tokens_before\"",
-            "\"user_decisions\"",
-            "\"open_questions\"",
-            "\"evidence_refs\"",
-            "\"next_action_hint\"",
-        ] {
-            assert!(stored.contains(field), "fixture must carry {field}");
+        let value: serde_json::Value =
+            serde_json::from_str(&stored).expect("fixture is valid JSON");
+        let object = value.as_object().expect("fixture serializes to an object");
+        let keys: Vec<String> = object.keys().cloned().collect();
+        assert_eq!(
+            keys.len(),
+            8,
+            "SummaryV1 grew or shrank a field: update this pin"
+        );
+        for key in keys {
+            let mut without = object.clone();
+            without.remove(&key);
+            let text = serde_json::to_string(&without).expect("re-encode");
+            assert!(
+                matches!(SummaryV1::from_stored(&text), Err(SummaryError::Malformed)),
+                "{key} must be required by the type: a missing key is a \
+                 deserialization failure, not a later validation one"
+            );
         }
-        let without_hint = stored.replace("\"next_action_hint\":\"compare with dense\"", "");
-        assert!(SummaryV1::parse_stored(&without_hint).is_err());
     }
 
     #[test]
@@ -254,6 +280,21 @@ mod tests {
         assert!(matches!(
             record.validate_against_text(&tampered),
             Err(SummaryError::HashNotVerbatim(hash)) if hash == "cafe1234"
+        ));
+    }
+
+    /// The verbatim check is a substring match against the **raw** stored
+    /// bytes, not the parsed values: a hash spelled with JSON escapes (e.g.
+    /// `caf\\u00651234` for `cafe1234`) decodes to the same value but never
+    /// appears in the raw text, so it must fail closed.
+    #[test]
+    fn a_hash_spelled_with_json_escapes_is_not_verbatim_in_the_raw_text() {
+        let stored = serde_json::to_string(&sample())
+            .expect("encode")
+            .replace("cafe1234", "caf\\u00651234");
+        assert!(matches!(
+            SummaryV1::parse_stored(&stored),
+            Err(SummaryError::HashNotVerbatim(_))
         ));
     }
 
@@ -291,7 +332,15 @@ mod tests {
     #[test]
     fn removing_any_single_field_makes_parsing_fail() {
         // 逐一删字段(含中间字段,避免残留尾逗号的假红),8 个字段都要被拒。
+        //
+        // 拒在**语法**这一层:少一个键必须是反序列化失败。这里同样不能用
+        // `parse_stored` —— 它的语义半边会替 `version` / `first_kept_item_id`
+        // / `next_action_hint` 兜底,`#[serde(default)]` 溜进来时这些断言照样
+        // 绿(实测过)。见 `every_field_is_required_by_the_type` 的同款说明。
         let stored = stored_text_of(&sample());
+        // The syntax half alone: see the note above.
+        let required =
+            |text: &str| matches!(SummaryV1::from_stored(text), Err(SummaryError::Malformed));
         for field in [
             "\"version\":\"v1\"",
             "\"covered_turns\":[\"h-1\",\"h-2\"]",
@@ -306,14 +355,36 @@ mod tests {
         }
         // Middle-field removal keeps the JSON syntactically close: tokens_before.
         let without_tokens = stored.replace(",\"tokens_before\":6543", "");
-        assert!(
-            SummaryV1::parse_stored(&without_tokens).is_err(),
-            "tokens_before must be required"
-        );
+        assert!(required(&without_tokens), "tokens_before must be required");
         let without_version = stored.replace("\"version\":\"v1\",", "");
-        assert!(SummaryV1::parse_stored(&without_version).is_err());
+        assert!(required(&without_version));
         let without_hint = stored.replace(",\"next_action_hint\":\"compare with dense\"", "");
-        assert!(SummaryV1::parse_stored(&without_hint).is_err());
+        assert!(required(&without_hint));
+        let without_covered = stored.replace(",\"covered_turns\":[\"h-1\",\"h-2\"]", "");
+        assert!(required(&without_covered), "covered_turns must be required");
+        let without_first_kept = stored.replace(",\"first_kept_item_id\":\"h-3\"", "");
+        assert!(
+            required(&without_first_kept),
+            "first_kept_item_id must be required"
+        );
+        let without_decisions = stored.replace(
+            ",\"user_decisions\":[{\"decision\":\"use BM25\",\"reason\":\"baseline first\"}]",
+            "",
+        );
+        assert!(
+            required(&without_decisions),
+            "user_decisions must be required"
+        );
+        let without_questions = stored.replace(",\"open_questions\":[\"what about dense?\"]", "");
+        assert!(
+            required(&without_questions),
+            "open_questions must be required"
+        );
+        let without_refs = stored.replace(
+            ",\"evidence_refs\":[{\"chunk_hash\":\"cafe1234\",\"title\":\"Fourier\",\"claim\":\"the transform is linear\"}]",
+            "",
+        );
+        assert!(required(&without_refs), "evidence_refs must be required");
     }
 
     #[test]

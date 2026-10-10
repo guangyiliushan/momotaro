@@ -172,11 +172,16 @@ GraphPlan { plan_id, root_mode, request, nodes, graph_budget, policy_version, in
 3. 节点 toolset ⊆ 当前 Profile。
 4. 存在唯一汇节点（compose 或终态 verify）。
 
-### 5.1 三个提前埋点（v0.3 起生效，免以后迁移；2026-09-15 调查）
+### 5.1 四个提前埋点（设计冻结于 v0.3；2026-09-15 调查）
 
-即使 v0.9 才实现图，以下字段/语义现在埋：
+即使 v0.9 才实现图，以下字段/语义的设计现在冻结。**只有第 1 项已经落库**：
+它的三列随 v0.3 迁移建好（`answers` / `run_context_items` 的
+`decision_rationale` / `assumptions` / `supersedes` 三列，`migration.rs` 查得到）。
+第 2–4 项今天在 `crates/` 里**零命中** —— 其中 `superseded_at` 与
+`architecture.md` D24 标注的「未实现」一致。**「免以后迁移」对第 2–4 项尚未兑现**：
+它们落库那天仍是一次迁移，措辞按此收窄，别把冻结的设计读成已埋的字段。
 
-1. **工件决策元数据**：`answers` / `run_context_items` 加
+1. **工件决策元数据**（**已落库**）：`answers` / `run_context_items` 加
    `decision_rationale`（≤50 token）/ `assumptions` / `supersedes`——把
    「动作携带隐式决策」显式化（Cognition 实践），下游节点读工件即可，无需
    重放轨迹；每节点成本几十 token，远低于共享完整轨迹（多智能体 ≈15× chat

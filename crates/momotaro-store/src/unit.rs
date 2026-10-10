@@ -21,8 +21,10 @@ impl Store {
     /// written unless the event lands with it, so a crash between data and
     /// event cannot exist inside this unit. A guard that wants its refusal
     /// distinguishable from a write failure returns
-    /// [`StoreError::GuardRejected`]; a caller with no end-of-transaction
-    /// check to make (the index batch) passes a no-op.
+    /// [`StoreError::GuardRejected`]; a caller that has no end-of-transaction
+    /// check to make passes a no-op, and the index batch is not one of them —
+    /// both of its write sites (note and attachment) re-check the file's stat
+    /// there, because D40 §4.7's unit is per file rather than per kind.
     ///
     /// Returns whether a revision row was actually *created*. Re-appending a
     /// pair that already exists re-adopts it instead — the shape a deleted file
@@ -37,10 +39,8 @@ impl Store {
     /// semantics for it stay the caller's (`batch_id` / `seq` / `external_id`).
     ///
     /// The replace's [`ChunkReplaceReport`](crate::chunks::ChunkReplaceReport)
-    /// (retained / drift) is **discarded here** — the replace computes it,
-    /// this wrapper drops it, and a drift signal dropped is a one-shot signal
-    /// lost. Surfacing whole-table-wipe drift to ingest callers is follow-up
-    /// work (wiring the report through to the coverage report).
+    /// (retained / drift) is returned beside the creation flag, so a drift
+    /// signal reaches the ingest caller instead of dying at this wrapper.
     pub fn commit_source_file(
         &mut self,
         revision: &NewSourceRevision<'_>,
@@ -48,7 +48,7 @@ impl Store {
         edges: &[GraphLink],
         event: Option<&NewStoreEvent<'_>>,
         guard: impl FnOnce() -> Result<(), StoreError>,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<(bool, crate::chunks::ChunkReplaceReport), StoreError> {
         if let Some(event) = event
             && event.source_key != Some(revision.source_key)
         {
@@ -57,15 +57,19 @@ impl Store {
                 event.source_key.unwrap_or("<none>"),
             ));
         }
-        // Transaction time is read outside the write transaction (ADR 0026);
-        // the guard below is the transaction's first step.
-        let pending_event = match event {
-            Some(event) => Some((event, self.next_recorded_at()?)),
-            None => None,
-        };
+        // BEGIN IMMEDIATE owns the newest-row read and the append together.
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = crate::events::now_epoch_secs();
+        let last: Option<i64> = tx
+            .query_row(
+                "SELECT recorded_at FROM store_events ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let pending_event = event.map(|event| (event, last.map_or(now, |last| now.max(last))));
         guard()?;
         // Asked inside the transaction, so the answer and the insert
         // cannot disagree about a row someone else wrote in between.
@@ -96,7 +100,7 @@ impl Store {
             None => edges,
         };
         crate::revisions::append_revision_tx(&tx, revision)?;
-        crate::chunks::replace_chunks_tx(
+        let report = crate::chunks::replace_chunks_tx(
             &tx,
             revision.source_key,
             revision.revision_hash,
@@ -112,7 +116,7 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok(!existed)
+        Ok((!existed, report))
     }
 
     /// Commits one file's *refresh* in exactly one `BEGIN IMMEDIATE`.
@@ -150,13 +154,19 @@ impl Store {
                 event.source_key.unwrap_or("<none>"),
             ));
         }
-        let pending_event = match event {
-            Some(event) => Some((event, self.next_recorded_at()?)),
-            None => None,
-        };
+        // BEGIN IMMEDIATE owns the newest-row read and the append together.
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = crate::events::now_epoch_secs();
+        let last: Option<i64> = tx
+            .query_row(
+                "SELECT recorded_at FROM store_events ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let pending_event = event.map(|event| (event, last.map_or(now, |last| now.max(last))));
         guard()?;
         let changed = crate::revisions::update_revision_fingerprint_tx(
             &tx,
@@ -189,14 +199,8 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::temp_store;
     use momotaro_contracts::{EdgeKind, LinkSource, OriginClass, SourceKind};
-
-    fn temp_store() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let mut store = Store::open(dir.path().join("momotaro.db")).expect("open store");
-        store.init_schema().expect("init schema");
-        (dir, store)
-    }
 
     fn revision<'a>(source_key: &'a str, revision_hash: &'a str) -> NewSourceRevision<'a> {
         NewSourceRevision {
@@ -664,6 +668,48 @@ mod tests {
 
     /// Guard refusal surfaces before any write failure — the guard cannot be
     /// moved after the writes without this test failing.
+    /// Drift is the out-of-band wipe's one-shot signal. The unit now returns
+    /// it beside its creation flag so the ingest layer can turn it into a row.
+    #[test]
+    fn commit_source_file_returns_chunk_replace_drift() {
+        let (_dir, mut store) = temp_store();
+        store
+            .replace_chunks("note:a", "h1", &[chunk("live", "note:a", "h1")], &[])
+            .expect("plant");
+        store
+            .connection
+            .execute(
+                "INSERT INTO answers (answer_id, run_id, text, prompt_hash, created_at)
+                 VALUES ('answer-1','run-1','text','hash',1)",
+                [],
+            )
+            .expect("plant an answer");
+        store
+            .connection
+            .execute(
+                "INSERT INTO answer_citations (
+                     answer_id, citation_index, source_key, revision_hash, chunk_id,
+                     chunk_hash, locator_json, quoted_text, verified
+                 ) VALUES ('answer-1',0,'note:a','h1','live','hash','{}','quote',0)",
+                [],
+            )
+            .expect("plant a citation");
+        store
+            .connection
+            .execute("DELETE FROM chunks WHERE chunk_id = 'live'", [])
+            .expect("simulate out-of-band wipe");
+        let (_, report) = store
+            .commit_source_file(
+                &revision("note:a", "h1"),
+                &[chunk("new", "note:a", "h1")],
+                &[],
+                None,
+                || Ok(()),
+            )
+            .expect("commit");
+        assert_eq!(report.drift, ["live".to_owned()]);
+    }
+
     #[test]
     fn guard_refusal_surfaces_before_write_failures() {
         let (_dir, mut store) = temp_store();
@@ -699,12 +745,14 @@ mod tests {
     ///
     /// Deliberate extension (W3.7, the run units): the search was widened to
     /// `runs.rs` and its eight `commit_run_*` units when they joined the
-    /// family — a new unit function is never invisible to this needle, which
-    /// is the point of one needle over the whole family.
+    /// family. The family half below enumerates the production halves'
+    /// `pub fn commit_*` units and requires a one-to-one match with this
+    /// needle's list — so "a new unit function is never invisible to this
+    /// needle" is enforced, not merely promised.
     #[test]
     fn the_unit_opens_with_begin_immediate() {
         let needle = concat!("TransactionBehavior", "::Immediate");
-        for (file, entry) in [
+        let units: [(&str, &str); 10] = [
             (
                 include_str!("unit.rs"),
                 concat!("pub fn commit_source", "_file("),
@@ -745,7 +793,8 @@ mod tests {
                 include_str!("runs.rs"),
                 concat!("pub fn commit_run", "_terminal("),
             ),
-        ] {
+        ];
+        for (file, entry) in units {
             let start = file.find(entry).expect("the unit exists");
             let body = &file[start..];
             let end = body.find("\n    }").expect("the function body ends");
@@ -755,6 +804,39 @@ mod tests {
                 "each unit opens its transaction with BEGIN IMMEDIATE ({entry:?})"
             );
         }
+        // Family enumeration half: scan the production halves (everything
+        // before the cfg(test) module, so this test's own text cannot count)
+        // for `pub fn commit_*` and require a one-to-one match with the
+        // needle list above — a unit added to the family without a row, or
+        // a row without its unit, turns this red.
+        let mut family = Vec::new();
+        for file in [include_str!("unit.rs"), include_str!("runs.rs")] {
+            let production = file
+                .split_once("#[cfg(test)]")
+                .expect("the test module is cfg-marked")
+                .0;
+            let mut rest = production;
+            while let Some(found) = rest.find("pub fn commit_") {
+                rest = &rest[found + "pub fn commit_".len()..];
+                let end = rest.find('(').expect("a unit name ends at its paren");
+                family.push(rest[..end].to_string());
+            }
+        }
+        family.sort();
+        let mut listed: Vec<String> = units
+            .iter()
+            .map(|(_, entry)| {
+                entry
+                    .trim_start_matches("pub fn commit_")
+                    .trim_end_matches('(')
+                    .to_string()
+            })
+            .collect();
+        listed.sort();
+        assert_eq!(
+            family, listed,
+            "the needle list must cover exactly the pub fn commit_* family"
+        );
     }
 
     /// An event that names another source — or names nobody — is refused by

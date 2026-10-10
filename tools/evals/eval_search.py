@@ -13,6 +13,11 @@ Two reports over one deterministic run (docs/docs/context-retrieval.md §3):
   counted separately for the main and injection query sets. Lower is better:
   these numbers measure how much of top-k the offenders own.
 
+Gates are per-row, not on averages: a row scoring below 1.0 must carry
+`known_miss` in the golden set (the explicit accepted-failure whitelist), and
+the whitelist's size is itself gated per reason (`fused` / `displaced`), so a
+new failure cannot hide inside a mean and a whitelist cannot quietly grow.
+
 Pure standard library, zero LLM. Exits 0 on pass, 1 when a gate is given and
 the metric crosses it (a metric regression), 3 when the harness itself fails
 (a search crash or bad golden file — so CI can tell the two apart). Without a
@@ -20,12 +25,12 @@ gate the run is advisory (the D16 baseline instrument).
 
 Usage:
     python tools/evals/eval_search.py --workspace <dir> --cli <path/to/momotaro-cli[.exe>] \
-        [--k 5] [--floor-recall R] [--floor-mrr R] [--floor-inj-recall R] \
-        [--floor-inj-mrr R] [--max-hn-seats N] [--max-poison-seats N] \
-        [--max-inj-poison-seats N]
+        [--k 5] [--floor-mrr R] [--floor-inj-mrr R] [--fail-on-unexpected-miss] \
+        [--max-known-miss-fused N] [--max-known-miss-displaced N] \
+        [--max-hn-seats N] [--max-poison-seats N] [--max-inj-poison-seats N]
 
 Floor/ceiling values live in run_golden.sh (with the measured baseline they
-were set against), not here — this usage line does not repeat them. ...
+were set against), not here — this usage line does not repeat them.
 
 `--cli` is the *command prefix* that runs the binary — a path here, but the
 default is `cargo run -p momotaro-cli --` — and each query is executed as
@@ -51,13 +56,57 @@ def run_search(cli_cmd: list[str], workspace: Path, query: str, k: int) -> list[
     if proc.returncode != 0:
         raise RuntimeError(f"search failed for {query!r}: {proc.stderr.strip()}")
     payload = json.loads(proc.stdout)
-    return payload.get("hits", [])
+    if not isinstance(payload, dict):
+        raise ValueError(f"search returned a non-object payload for {query!r}")
+    hits = payload.get("hits", [])
+    if not isinstance(hits, list) or any(not isinstance(hit, dict) for hit in hits):
+        raise ValueError(f"search returned malformed hits for {query!r}")
+    return hits
+
+
+def validate_entries(entries: object, label: str) -> None:
+    """Reject malformed golden data before it can escape as KeyError/TypeError."""
+    if not isinstance(entries, list):
+        raise ValueError(f"{label} must be a list")
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{label}[{index}] must be an object")
+        if not isinstance(entry.get("query"), str) or not entry["query"]:
+            raise ValueError(f"{label}[{index}].query must be a non-empty string")
+        sufficient = entry.get("sufficient")
+        if (
+            not isinstance(sufficient, list)
+            or not sufficient
+            or any(not isinstance(key, str) or not key for key in sufficient)
+        ):
+            raise ValueError(f"{label}[{index}].sufficient must be non-empty strings")
+        negatives = entry.get("hard_negatives", [])
+        if not isinstance(negatives, list):
+            raise ValueError(f"{label}[{index}].hard_negatives must be a list")
+        for position, label_row in enumerate(negatives):
+            if (
+                not isinstance(label_row, dict)
+                or not isinstance(label_row.get("key"), str)
+                or label_row.get("kind") not in ("semi_relevant", "no_info")
+            ):
+                raise ValueError(
+                    f"{label}[{index}].hard_negatives[{position}] is malformed"
+                )
+        known = entry.get("known_miss")
+        if known is not None and (
+            not isinstance(known, dict)
+            or known.get("reason") not in ("fused", "displaced")
+            or not isinstance(known.get("why"), str)
+            or not known["why"]
+        ):
+            raise ValueError(f"{label}[{index}].known_miss is malformed")
 
 
 def evaluate(
     entries: list[dict], cli_cmd: list[str], workspace: Path, k: int, poison_keys: set[str]
 ) -> dict:
     """Utility + per-query seat counts for one entry list."""
+    validate_entries(entries, "entries")
     recalls: list[float] = []
     rranks: list[float] = []
     hn_seats = {"semi_relevant": 0, "no_info": 0}
@@ -94,8 +143,10 @@ def evaluate(
                 "hn_seats": row_hn,
                 "poison_seats": row_poison,
                 "top_keys": got_keys[:k],
+                "known_miss": entry.get("known_miss"),
             }
         )
+    misses = miss_counts(per_query)
     return {
         "k": k,
         "n": len(entries),
@@ -103,8 +154,29 @@ def evaluate(
         "mrr": sum(rranks) / len(rranks) if rranks else 0.0,
         "hn_seats": hn_seats,
         "poison_seats": poison_seats,
+        "unexpected_misses": misses["unexpected"],
+        "known_misses": misses["known"],
         "per_query": per_query,
     }
+
+
+def miss_counts(per_query: list[dict]) -> dict:
+    """Split sub-1.0 rows into unwhitelisted (unexpected) vs known, by reason.
+
+    Pure: this is the accounting the gates read, kept out of the search loop
+    so it can be tested without a CLI.
+    """
+    unexpected = 0
+    known = {"fused": 0, "displaced": 0}
+    for row in per_query:
+        if row["recall"] >= 1.0:
+            continue
+        whitelisted = row.get("known_miss")
+        if whitelisted is None:
+            unexpected += 1
+        else:
+            known[whitelisted["reason"]] += 1
+    return {"unexpected": unexpected, "known": known}
 
 
 def print_report(title: str, report: dict) -> None:
@@ -114,7 +186,12 @@ def print_report(title: str, report: dict) -> None:
     print(f"mrr:       {report['mrr']:.4f}")
     print()
     for row in report["per_query"]:
-        mark = "ok " if row["recall"] == 1.0 else "MISS"
+        if row["recall"] == 1.0:
+            mark = "ok  "
+        elif row["known_miss"] is not None:
+            mark = "KNOWN " + row["known_miss"]["reason"]
+        else:
+            mark = "MISS"
         extras = []
         if sum(row["hn_seats"].values()):
             extras.append(
@@ -126,7 +203,50 @@ def print_report(title: str, report: dict) -> None:
         print(f"  [{mark}] {row['query']!r:30} recall={row['recall']:.2f} rr={row['rr']:.2f}{extra}")
         if row["recall"] < 1.0:
             print(f"         got: {row['top_keys']}")
+            if row["known_miss"] is not None:
+                print(f"         why: {row['known_miss']['why']}")
+    known = report["known_misses"]
+    print(
+        f"  misses: {report['unexpected_misses']} unexpected,"
+        f" {known['fused']} known-fused, {known['displaced']} known-displaced"
+    )
     print()
+
+
+def gate_failures(main_report: dict, inj_report: dict, args) -> list[str]:
+    """Gate lines to fail on; empty means pass. Pure — tested without a CLI.
+
+    MRR floors are tripwires on ranking. Hits are gated per row instead of by
+    mean: `--fail-on-unexpected-miss` refuses any sub-1.0 row outside the
+    known_miss whitelist, and the whitelist's own size is capped per reason so
+    accepted failures cannot quietly grow.
+    """
+    lines: list[str] = []
+
+    def floor(name: str, value: float | None, actual: float) -> None:
+        if value is not None and actual < value:
+            lines.append(f"FAIL: {name} {actual:.4f} < floor {value}")
+
+    def ceiling(name: str, value: int | None, actual: int) -> None:
+        if value is not None and actual > value:
+            lines.append(f"FAIL: {name} {actual} > ceiling {value}")
+
+    floor("mrr", args.floor_mrr, main_report["mrr"])
+    floor("injection mrr", args.floor_inj_mrr, inj_report["mrr"])
+    unexpected = main_report["unexpected_misses"] + inj_report["unexpected_misses"]
+    if args.fail_on_unexpected_miss and unexpected:
+        lines.append(
+            f"FAIL: {unexpected} unexpected miss(es) — sub-1.0 rows outside the known_miss whitelist"
+        )
+    fused = main_report["known_misses"]["fused"] + inj_report["known_misses"]["fused"]
+    displaced = main_report["known_misses"]["displaced"] + inj_report["known_misses"]["displaced"]
+    ceiling("known-miss fused (both sets)", args.max_known_miss_fused, fused)
+    ceiling("known-miss displaced (both sets)", args.max_known_miss_displaced, displaced)
+    hn_total = main_report["hn_seats"]["semi_relevant"] + main_report["hn_seats"]["no_info"]
+    ceiling("hard-negative seats (main)", args.max_hn_seats, hn_total)
+    ceiling("poison seats (main)", args.max_poison_seats, main_report["poison_seats"])
+    ceiling("poison seats (injection)", args.max_inj_poison_seats, inj_report["poison_seats"])
+    return lines
 
 
 def main() -> int:
@@ -135,10 +255,11 @@ def main() -> int:
     parser.add_argument("--workspace", type=Path, required=True, help="initialized momotaro workspace dir")
     parser.add_argument("--cli", nargs="+", default=["cargo", "run", "-p", "momotaro-cli", "--"])
     parser.add_argument("--k", type=int, default=5)
-    parser.add_argument("--floor-recall", type=float, default=None)
     parser.add_argument("--floor-mrr", type=float, default=None)
-    parser.add_argument("--floor-inj-recall", type=float, default=None)
     parser.add_argument("--floor-inj-mrr", type=float, default=None)
+    parser.add_argument("--fail-on-unexpected-miss", action="store_true")
+    parser.add_argument("--max-known-miss-fused", type=int, default=None)
+    parser.add_argument("--max-known-miss-displaced", type=int, default=None)
     parser.add_argument("--max-hn-seats", type=int, default=None)
     parser.add_argument("--max-poison-seats", type=int, default=None)
     parser.add_argument("--max-inj-poison-seats", type=int, default=None)
@@ -146,7 +267,16 @@ def main() -> int:
 
     try:
         golden = json.loads(args.golden.read_text(encoding="utf-8"))
-        poison_keys = set(golden.get("poison_keys", []))
+        if not isinstance(golden, dict):
+            raise ValueError("golden file must be an object")
+        for field in ("queries", "injection"):
+            validate_entries(golden.get(field), field)
+        poison_values = golden.get("poison_keys", [])
+        if not isinstance(poison_values, list) or any(
+            not isinstance(key, str) or not key for key in poison_values
+        ):
+            raise ValueError("golden.poison_keys must be non-empty strings")
+        poison_keys = set(poison_values)
         main_report = evaluate(golden["queries"], args.cli, args.workspace, args.k, poison_keys)
         inj_report = evaluate(golden["injection"], args.cli, args.workspace, args.k, poison_keys)
     except (RuntimeError, ValueError, OSError) as exc:
@@ -168,29 +298,10 @@ def main() -> int:
     print(f"poison seats (injection subset):  {inj_report['poison_seats']}")
     print()
 
-    failed = False
-
-    def floor(name: str, value: float | None, actual: float) -> None:
-        nonlocal failed
-        if value is not None and actual < value:
-            print(f"FAIL: {name} {actual:.4f} < floor {value}")
-            failed = True
-
-    def ceiling(name: str, value: int | None, actual: int) -> None:
-        nonlocal failed
-        if value is not None and actual > value:
-            print(f"FAIL: {name} {actual} > ceiling {value}")
-            failed = True
-
-    floor("recall@%d" % args.k, args.floor_recall, main_report["recall_at_k"])
-    floor("mrr", args.floor_mrr, main_report["mrr"])
-    floor("injection recall@%d" % args.k, args.floor_inj_recall, inj_report["recall_at_k"])
-    floor("injection mrr", args.floor_inj_mrr, inj_report["mrr"])
-    hn_total = main_report["hn_seats"]["semi_relevant"] + main_report["hn_seats"]["no_info"]
-    ceiling("hard-negative seats (main)", args.max_hn_seats, hn_total)
-    ceiling("poison seats (main)", args.max_poison_seats, main_report["poison_seats"])
-    ceiling("poison seats (injection)", args.max_inj_poison_seats, inj_report["poison_seats"])
-    return 1 if failed else 0
+    failures = gate_failures(main_report, inj_report, args)
+    for line in failures:
+        print(line)
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

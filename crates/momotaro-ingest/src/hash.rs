@@ -15,6 +15,15 @@ fn sha256_hex(parts: &[&[u8]]) -> String {
     hex::encode(digest)
 }
 
+/// `hex(sha256(bytes))` — the one-buffer form of the house digest.
+///
+/// `sha256_hex` is domain-separated and takes the parts; a caller that has a
+/// single buffer should not have to build a one-element array for it, and
+/// should not get to write the `Sha256` dance a second time somewhere else.
+pub fn sha256_of(bytes: &[u8]) -> String {
+    sha256_hex(&[bytes])
+}
+
 /// `hex(sha256("momotaro-revision-v1\0" + normalized))`.
 pub fn revision_hash(normalized: &str) -> String {
     sha256_hex(&[REVISION_DOMAIN, normalized.as_bytes()])

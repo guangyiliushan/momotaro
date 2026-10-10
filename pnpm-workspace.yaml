@@ -7,7 +7,3 @@ allowBuilds:
   '@swc/core': true
   core-js: true
   esbuild: true
-  msw: false
-
-minimumReleaseAgeExclude:
-  - body-parser@1.20.8

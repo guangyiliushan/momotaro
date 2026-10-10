@@ -36,7 +36,7 @@ pub mod request;
 pub mod response;
 pub mod transport;
 
-pub use error::{LlmError, LlmErrorKind};
+pub use error::{LlmError, LlmErrorKind, is_unprintable, sanitize};
 pub use http::{HttpTransport, TransportConfigError};
 pub use request::{LlmRequest, Message, Role, ToolDef};
 pub use response::{FinishReason, LlmOutput, Usage};
@@ -62,10 +62,14 @@ pub fn complete<T: ProviderTransport + ?Sized>(
     request: &LlmRequest,
 ) -> Result<LlmOutput, LlmError> {
     let body = request.canonical_json();
+    // One identity for every attempt: the hash already covers exactly the
+    // canonical bytes below, so a provider can tell a retry from a new ask.
+    let idempotency_key = request.request_hash();
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let mut error = match transport.send(&body) {
+        let mut retry_after = None;
+        let mut error = match transport.send_with_idempotency_key(&idempotency_key, &body) {
             Ok(reply) if (200..300).contains(&reply.status) => {
                 return parse_response(&reply.body)
                     .map(|mut output| {
@@ -78,11 +82,19 @@ pub fn complete<T: ProviderTransport + ?Sized>(
                         error
                     });
             }
-            Ok(reply) => error::classify(reply.status, &reply.body, &request.model),
+            Ok(reply) => {
+                retry_after = reply.retry_after;
+                error::classify(reply.status, &reply.body, &request.model)
+            }
             Err(failure) => error::transport_failure(failure, &request.model),
         };
         error.attempts = attempt;
         if attempt < 2 && !error.output_observed && error.kind.same_bytes_retryable() {
+            // The backoff belongs only to a throttled replay: 5xx is retried
+            // immediately, and the caller-facing failure stays unchanged.
+            if error.kind == LlmErrorKind::RateLimit {
+                std::thread::sleep(error::rate_limit_backoff(retry_after));
+            }
             continue;
         }
         return Err(error);
@@ -94,6 +106,7 @@ mod tests {
     use super::*;
     use crate::fake::FakeLlm;
     use serde_json::json;
+    use std::time::Duration;
 
     fn request() -> LlmRequest {
         LlmRequest {
@@ -261,5 +274,38 @@ mod tests {
         let error = complete(&fake, &request()).expect_err("fails");
         assert_eq!(error.kind, LlmErrorKind::ContextOverflow);
         assert_eq!(fake.call_count(), 1);
+    }
+
+    #[test]
+    fn retries_carry_the_request_hash_as_a_stable_idempotency_key() {
+        // The header is the provider-side twin of the wire-byte invariant:
+        // same canonical body, same key, even across the one permitted retry.
+        let fake = FakeLlm::new();
+        fake.enqueue_failure(false, "connection reset");
+        fake.enqueue_reply(200, completion_body("answer"));
+
+        let output = complete(&fake, &request()).expect("retry succeeds");
+        assert_eq!(output.attempts, 2);
+        let expected = request().request_hash();
+        assert_eq!(fake.sent_idempotency_key(0), expected);
+        assert_eq!(fake.sent_idempotency_key(1), expected);
+    }
+
+    #[test]
+    fn a_rate_limit_uses_the_provider_retry_after_before_replaying() {
+        // A zero delay keeps the test instant while still proving `complete`
+        // consumes the reply's delay before its replay (the fallback value is
+        // pinned by `error.rs`).
+        let fake = FakeLlm::new();
+        fake.enqueue_reply_after(
+            429,
+            r#"{"error": {"message": "slow down"}}"#,
+            Some(Duration::ZERO),
+        );
+        fake.enqueue_reply(200, completion_body("answer"));
+
+        let output = complete(&fake, &request()).expect("retry succeeds");
+        assert_eq!(output.text, "answer");
+        assert_eq!(fake.call_count(), 2);
     }
 }

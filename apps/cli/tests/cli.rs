@@ -4,56 +4,10 @@
 //! stored path is workspace-relative, so a vault outside the workspace root is
 //! refused by design.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use common::{run_cli, stage_vault, write_config};
 use std::process::Command;
-
-/// Copies the fixture vault into `<workspace>/vault` and returns its path.
-fn stage_vault(workspace: &Path) -> PathBuf {
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../crates/momotaro-run/tests/fixtures/vault")
-        .canonicalize()
-        .expect("fixture vault exists");
-    assert!(source.is_dir(), "fixture vault is a directory");
-
-    let target = workspace.join("vault");
-    copy_tree(&source, &target);
-    target
-}
-
-fn copy_tree(source: &Path, target: &Path) {
-    std::fs::create_dir_all(target).expect("create vault dir");
-    for entry in std::fs::read_dir(source).expect("read fixture vault") {
-        let entry = entry.expect("dir entry");
-        let to = target.join(entry.file_name());
-        if entry.file_type().expect("file type").is_dir() {
-            copy_tree(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).expect("copy fixture file");
-        }
-    }
-}
-
-/// Writes the workspace configuration pointing at the staged vault.
-fn write_config(workspace: &Path) {
-    std::fs::write(
-        workspace.join("momotaro.toml"),
-        "[vault]\npath = 'vault'\n\n[model]\nprovider = 'fake'\nmodel_id = 'fake-model'\n",
-    )
-    .expect("write momotaro.toml");
-}
-
-fn run_cli(cwd: &std::path::Path, args: &[&str]) -> (String, String, bool) {
-    let output = Command::new(env!("CARGO_BIN_EXE_momotaro-cli"))
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("cli binary runs");
-    (
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-        output.status.success(),
-    )
-}
 
 #[test]
 fn reconcile_exits_zero_on_a_healthy_workspace() {
@@ -82,6 +36,87 @@ fn reconcile_exits_zero_on_a_healthy_workspace() {
             .as_str()
             .unwrap()
             .starts_with("reconcile-")
+    );
+}
+
+/// `--mode` / `--allow-write` / `--max-context-tokens` are declared on the
+/// subcommands that read them, not globally (grill Q2). A global flag is
+/// accepted by every subcommand and ignored by all but one — which is how
+/// `momotaro index --mode expand --allow-write --max-context-tokens 4096`
+/// used to exit 0 with no effect at all. clap's refusal is the contract, so
+/// that is what is asserted: re-globalizing any of the three turns these
+/// commands green and this test red.
+#[test]
+fn a_flag_only_the_subcommand_that_reads_it_declares_is_refused_elsewhere() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    stage_vault(tempdir.path());
+    write_config(tempdir.path());
+    let (_, stderr, ok) = run_cli(tempdir.path(), &["init"]);
+    assert!(ok, "init should succeed: {stderr}");
+
+    for args in [
+        vec!["index", "--mode", "expand"],
+        vec!["index", "--allow-write"],
+        vec!["index", "--max-context-tokens", "4096"],
+        vec!["search", "why is the sky blue?", "--allow-write"],
+        vec![
+            "search",
+            "why is the sky blue?",
+            "--max-context-tokens",
+            "4096",
+        ],
+    ] {
+        let (_stdout, stderr, ok) = run_cli(tempdir.path(), &args);
+        assert!(
+            !ok,
+            "`{}` must not parse — it exited 0, which is the old silent \
+             acceptance",
+            args.join(" ")
+        );
+        assert!(
+            stderr.contains("unexpected argument"),
+            "the refusal names the argument it would not take: {stderr}"
+        );
+    }
+
+    // The other half: the flags are still **accepted where they live**. Help
+    // text cannot show this — a subcommand's description mentions `--mode`
+    // while the top level takes it away — so the parse itself is what is
+    // asked. `ask --no-llm` is refused by policy after parsing, which is a
+    // different refusal from "unexpected argument"; that difference is the
+    // assertion. Deleting the flags entirely would fail here.
+    let (_stdout, stderr, _ok) = run_cli(
+        tempdir.path(),
+        &[
+            "ask",
+            "why is the sky blue?",
+            "--mode",
+            "lexical",
+            "--allow-write",
+            "--max-context-tokens",
+            "4096",
+            "--no-llm",
+        ],
+    );
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "`ask` takes all three — the refusal that comes back is policy, not \
+         parsing: {stderr}"
+    );
+    // …and it *is* that policy refusal, in `validate_ask_policy`'s one
+    // spelling: asserting only the absence of a parse error would let any
+    // other clap message through and still call it a pass.
+    assert!(
+        stderr.contains("--no-llm forbids"),
+        "the parse succeeded and the policy refused it: {stderr}"
+    );
+    let (_stdout, stderr, _ok) = run_cli(
+        tempdir.path(),
+        &["search", "why is the sky blue?", "--mode", "lexical"],
+    );
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "`search` takes `--mode`: {stderr}"
     );
 }
 
@@ -419,6 +454,37 @@ fn control_characters_in_names_never_reach_stderr_raw() {
 }
 
 #[test]
+fn control_characters_in_json_errors_are_stripped_like_the_human_outlet() {
+    // The `--json` error is the same string as the human one (`format_error`
+    // is the sanitizer on both sides): a bidi override in a path must not
+    // ride the machine-readable channel. U+202E is an ordinary character in a
+    // Windows file name, so the fixture is portable.
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir(workspace.path().join("vault")).expect("create vault");
+    std::fs::write(
+        workspace.path().join("momotaro.toml"),
+        "[vault]\npath = 'vault\u{202e}evil'\n",
+    )
+    .expect("write momotaro.toml");
+
+    let (stdout, stderr, ok) = run_cli(workspace.path(), &["index", "--json"]);
+    assert!(!ok, "a missing vault is an error");
+    let payload: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout is one JSON error document");
+    let message = payload["error"]
+        .as_str()
+        .expect("the error carries a message");
+    assert!(
+        message.contains("vault"),
+        "the error must still say what is wrong: {message:?}"
+    );
+    assert!(
+        !stdout.contains('\u{202e}') && !stderr.contains('\u{202e}'),
+        "a bidi override survived an outlet: {stdout:?} {stderr:?}"
+    );
+}
+
+#[test]
 fn doctor_coverage_renders_sync_drive_warnings() {
     // D42: an eviction stub and a Windows-illegal name are facts
     // `doctor --coverage` must show — and they are warnings, not failures, in
@@ -467,5 +533,46 @@ fn doctor_coverage_renders_sync_drive_warnings() {
         value["failures"].as_array().map(Vec::len),
         Some(0),
         "{value}"
+    );
+}
+
+#[test]
+fn a_top_above_the_cap_is_refused_by_the_parser() {
+    // The pre-allocation tantivy does is driven by this number alone (probe
+    // S1-2: 20M -> 460 MB peak commit), so the parser refuses absurd values
+    // instead of letting a typo become a memory spike; 0 stays legal.
+    let workspace = tempfile::tempdir().expect("workspace");
+    stage_vault(workspace.path());
+    write_config(workspace.path());
+    let (_, stderr, ok) = run_cli(workspace.path(), &["init"]);
+    assert!(ok, "init: {stderr}");
+    let (_, stderr, ok) = run_cli(workspace.path(), &["index"]);
+    assert!(ok, "index: {stderr}");
+
+    let (_, stderr, ok) = run_cli(workspace.path(), &["search", "傅里叶", "--top", "1001"]);
+    assert!(!ok, "1001 is above the cap: {stderr}");
+    assert!(
+        stderr.contains("1001"),
+        "the refusal names the value: {stderr}"
+    );
+
+    let (_, stderr, ok) = run_cli(workspace.path(), &["search", "傅里叶", "--top", "0"]);
+    assert!(
+        ok,
+        "0 stays legal — an empty result, not an error: {stderr}"
+    );
+
+    let (stdout, _, ok) = run_cli(
+        workspace.path(),
+        &["search", "傅里叶", "--top", "1001", "--json"],
+    );
+    assert!(!ok, "still refused under --json");
+    let payload: serde_json::Value =
+        serde_json::from_str(&stdout).expect("the --json outlet carries the refusal");
+    assert!(
+        payload["error"]
+            .as_str()
+            .is_some_and(|sentence| sentence.contains("1001")),
+        "{payload}"
     );
 }

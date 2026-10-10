@@ -308,6 +308,51 @@ CREATE INDEX idx_answers_run ON answers(run_id);
 DROP INDEX IF EXISTS idx_verifications_run;
 CREATE INDEX idx_verifications_run ON verifications(run_id);",
     ),
+    // 7 -> 8: an index on `session_id` for the two tables a continued `ask`
+    // reads in full on every turn.
+    //
+    // `optoverview` §2: "The general rule is that indexes are only useful if
+    // there are WHERE-clause constraints on the left-most columns of the
+    // index." `history_for_session` constrains `session_id` and nothing else;
+    // `turn_runs_for_session` constrains it first and adds `EXISTS(...)`
+    // after, so the left-most-column rule is satisfied by both. Without one,
+    // `ask --session` reads every `body` blob in a session's history through
+    // a full scan, and `runs` is scanned the same way to number the rounds;
+    // `history_items` grows by two rows per ask forever, so this is not a
+    // small-table case.
+    //
+    // Same DROP-then-CREATE discipline as step 7 (see there): `IF NOT EXISTS`
+    // matches the *name* across the whole schema, not the table, so a stale
+    // name elsewhere would skip creation, stamp v8, and leave the column
+    // uncovered while `doctor` reported ready.
+    (
+        8,
+        "DROP INDEX IF EXISTS idx_runs_session;
+CREATE INDEX idx_runs_session ON runs(session_id);
+DROP INDEX IF EXISTS idx_history_items_session;
+CREATE INDEX idx_history_items_session ON history_items(session_id);",
+    ),
+    // 8 -> 9: turn ordering integrity for `run_trace`.
+    //
+    // `run_trace` replays a run's turns by `ORDER BY seq` (runs.rs), and
+    // `commit_run_llm_turn` stores the caller-declared `seq` verbatim, so two
+    // turns of one run carrying the same number would leave the replay order
+    // to SQLite's unspecified scan order. The unique key mirrors the defense
+    // the sibling projection table already has — `run_context_items`'
+    // `PRIMARY KEY (run_id, ordinal)` — while `llm_turns` keeps `turn_id` as
+    // its primary key and the caller's handle. It replaces
+    // `idx_llm_turns_run`: the new key's leftmost column serves every
+    // `WHERE run_id = ?` lookup the dropped index did. Same DROP-then-CREATE
+    // discipline as steps 7 and 8 (see step 7): `IF NOT EXISTS` matches the
+    // *name*, so a stale index of this name on another table would skip
+    // creation, stamp v9, and leave the pair unprotected while `doctor`
+    // reported ready.
+    (
+        9,
+        "DROP INDEX IF EXISTS idx_llm_turns_run;
+DROP INDEX IF EXISTS idx_llm_turns_run_seq;
+CREATE UNIQUE INDEX idx_llm_turns_run_seq ON llm_turns(run_id, seq);",
+    ),
 ];
 
 /// Applies every migration newer than `version`.
@@ -337,6 +382,46 @@ fn apply_step(connection: &mut Connection, target: u32, sql: &str) -> Result<(),
 mod tests {
     use super::*;
     use rusqlite::OptionalExtension;
+
+    /// `apply_pending` must skip the step the store already carries.
+    ///
+    /// The guard is `target > version`, and turning it into `>=` re-runs one
+    /// step. That is harmless for `CREATE … IF NOT EXISTS`, but step 3 is
+    /// `ALTER TABLE source_revisions ADD COLUMN raw_name` — not idempotent —
+    /// so a store reporting v3 with the column already present would refuse to
+    /// open at all. No fixture could tell either way: the intermediate-version
+    /// ones (`seed_v2_store`, `seed_v4_store`, the v6 and v7 rewinds) re-run
+    /// steps that are all `CREATE … IF NOT EXISTS` shaped, so re-running them
+    /// is a no-op. Step 3 is the only migration that notices — the rest of the
+    /// table is idempotent under a repeat.
+    #[test]
+    fn a_store_already_at_a_step_is_not_asked_to_take_it_again() {
+        let mut connection = Connection::open_in_memory().expect("open");
+        // The schema exactly as step 3 left it: steps 1–3, nothing later, so
+        // that step 3 is the one a `>=` would try to repeat.
+        let mut applied = 0;
+        for &(target, sql) in MIGRATIONS {
+            if target > 3 {
+                break;
+            }
+            connection
+                .execute_batch(sql)
+                .expect("apply the early steps");
+            applied = target;
+        }
+        assert_eq!(applied, 3, "the fixture really stops at step 3");
+        connection
+            .execute_batch("PRAGMA user_version = 3;")
+            .expect("stamp the version");
+
+        apply_pending(&mut connection, 3).expect("steps 4..8 apply cleanly");
+
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read the version back");
+        let newest = MIGRATIONS.last().expect("the table is not empty").0;
+        assert_eq!(version, newest, "…and the store reaches the newest step");
+    }
 
     #[test]
     fn every_step_is_ordered_and_unique() {
@@ -448,6 +533,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v9_makes_the_turn_order_key_unique() {
+        let mut connection = Connection::open_in_memory().expect("open in-memory store");
+        apply_pending(&mut connection, 0).expect("every step applies");
+
+        let unique_key = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_llm_turns_run_seq'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .expect("query sqlite_master");
+        assert!(
+            unique_key.is_some(),
+            "the unique turn-order key exists once migrations settle"
+        );
+        assert!(
+            connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master
+                     WHERE type = 'index' AND name = 'idx_llm_turns_run'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()
+                .expect("query sqlite_master")
+                .is_none(),
+            "the superseded single-column index is gone"
+        );
+
+        let insert = |turn_id: &str| {
+            connection.execute(
+                "INSERT INTO llm_turns (turn_id, run_id, seq, provider, model, request_hash, status, created_at)
+                 VALUES (?1, 'run-1', 1, 'p', 'm', 'h', 'finished', 1)",
+                [turn_id],
+            )
+        };
+        insert("turn-1").expect("the first turn of the run");
+        assert!(
+            insert("turn-2").is_err(),
+            "a second turn with the same (run_id, seq) is refused"
+        );
+    }
     fn version(connection: &Connection) -> u32 {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))

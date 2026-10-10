@@ -83,7 +83,11 @@ pub fn walk_entries(vault_root: &Path) -> Result<Vec<VaultEntry>, IngestError> {
         return Err(IngestError::VaultMissing(vault_root.display().to_string()));
     }
 
-    let mut entries: Vec<VaultEntry> = WalkDir::new(vault_root)
+    // A traversal error means the walk is incomplete. Returning the partial
+    // list would let reconcile treat unreadable branches as deleted, so the
+    // whole walk fails closed.
+    let mut entries: Vec<VaultEntry> = Vec::new();
+    for entry in WalkDir::new(vault_root)
         .into_iter()
         // Prune dot-prefixed directories (and their subtrees) by their own
         // file name; dot-prefixed files reach `classify`, which drops every
@@ -92,15 +96,21 @@ pub fn walk_entries(vault_root: &Path) -> Result<Vec<VaultEntry>, IngestError> {
         .filter_entry(|entry| {
             entry.depth() == 0 || !entry.file_type().is_dir() || !is_hidden(entry.file_name())
         })
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let kind = classify(&entry)?;
-            Some(VaultEntry {
+    {
+        let entry = entry.map_err(|error| {
+            IngestError::Io(
+                error
+                    .into_io_error()
+                    .unwrap_or_else(|| std::io::Error::other("vault traversal failed")),
+            )
+        })?;
+        if let Some(kind) = classify(&entry) {
+            entries.push(VaultEntry {
                 path: entry.into_path(),
                 kind,
-            })
-        })
-        .collect();
+            });
+        }
+    }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(entries)
 }

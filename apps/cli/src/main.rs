@@ -24,10 +24,6 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
-    /// Reserved for future timing output.
-    #[arg(long, global = true)]
-    profile: bool,
-
     /// Forbid every LLM call (`ask` and `--mode expand` refuse; lexical
     /// `search` is unaffected).
     #[arg(long, global = true)]
@@ -37,19 +33,6 @@ struct Cli {
     /// `--mode expand` are refused without it.
     #[arg(long, global = true)]
     allow_network: bool,
-
-    /// Allow tools to write files (Beta 保守默认: off).
-    #[arg(long, global = true)]
-    allow_write: bool,
-
-    /// Override the context budget (tokens).
-    #[arg(long, global = true)]
-    max_context_tokens: Option<u32>,
-
-    /// Retrieval mode: `lexical` (default, zero LLM) or `expand` (one short
-    /// LLM rewrite before retrieval).
-    #[arg(long, global = true, default_value = "lexical")]
-    mode: SearchMode,
 
     #[command(subcommand)]
     command: Command,
@@ -69,9 +52,8 @@ enum Command {
     /// Initialize the local SQLite store.
     Init,
 
-    /// Check workspace health without mutating it.
-    /// Check the workspace, or read the last ingest batch back
-    /// (`--coverage`, ADR 0026).
+    /// Check workspace health without mutating it, or read the last ingest
+    /// batch back (`--coverage`, ADR 0026).
     Doctor {
         /// Report what the most recent ingest run (`index` or `watch`) did to
         /// each file, read from
@@ -96,15 +78,46 @@ enum Command {
         /// Search terms (joined with spaces, so quotes are not required).
         query: Vec<String>,
 
-        /// Maximum number of hits.
+        /// Maximum number of hits (0 is legal and returns nothing).
         #[arg(long, short = 'n', default_value_t = 10)]
         top: usize,
+
+        /// Retrieval mode: `lexical` (default, zero LLM) or `expand` (one
+        /// short LLM rewrite before retrieval).
+        #[arg(long, default_value = "lexical")]
+        mode: SearchMode,
     },
 
     /// Answer a question from the indexed notes, with citations.
     Ask {
         /// The question (joined with spaces, so quotes are not required).
         query: Vec<String>,
+
+        /// Continue an existing session instead of opening a new one.
+        ///
+        /// The value is required and must name a session that exists; a typo
+        /// is an error rather than a silently new conversation. Without the
+        /// flag `ask` opens a fresh session every time.
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Make one logical request replay-safe across CLI retries.
+        #[arg(long)]
+        client_request_id: Option<String>,
+
+        /// Retrieval mode. `ask` answers with one LLM call regardless — the
+        /// flag exists to say so when it is given `expand` (usage.md), not to
+        /// change what ask does.
+        #[arg(long, default_value = "lexical")]
+        mode: SearchMode,
+
+        /// Allow tools to write files (Beta 保守默认: off).
+        #[arg(long)]
+        allow_write: bool,
+
+        /// Override the context budget (tokens).
+        #[arg(long)]
+        max_context_tokens: Option<u32>,
     },
 
     /// Replay one run: what was retrieved, what the model saw, and how every
@@ -136,7 +149,10 @@ fn print_success(json: bool, payload: String, human: &str) -> ExitCode {
 
 fn print_error(json: bool, error: RunError) -> ExitCode {
     if json {
-        println!("{}", serde_json::json!({ "error": error.to_string() }));
+        // The same safe string as the human outlet — `format_error` is the
+        // sanitizer on both sides: a bidi override in a path must not ride
+        // the machine-readable channel either.
+        println!("{}", serde_json::json!({ "error": format_error(&error) }));
     } else {
         // The serializer escapes the JSON form; a terminal needs the same care.
         eprintln!("error: {}", format_error(&error));
@@ -145,13 +161,21 @@ fn print_error(json: bool, error: RunError) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// The cap on `--top` (search): the pre-allocation tantivy does is driven by
+/// this number alone (probe S1-2: 20M -> 460 MB peak commit), so a typo must
+/// not become a memory spike. `--top 0` stays legal — it returns nothing.
+const SEARCH_TOP_CAP: usize = 1000;
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let root = match std::env::current_dir() {
         Ok(root) => root,
         Err(error) => {
             // The shell's cwd can disappear (e.g. removed while the terminal
-            // sat in it); that is a user-facing error, not a panic.
+            // sat in it); that is a user-facing error, not a panic. (The one
+            // error outlet that sanitizes nothing: the text is the OS's about
+            // a directory the process cannot name and carries no
+            // attacker-authored bytes — registered, S5/A4 + adversarial #3.)
             if cli.json {
                 println!("{}", serde_json::json!({ "error": error.to_string() }));
             } else {
@@ -165,7 +189,7 @@ fn main() -> ExitCode {
         Command::Init => match init_workspace(&root) {
             Ok(report) => print_success(
                 cli.json,
-                serde_json::to_string_pretty(&report).expect("stats report serializes"),
+                serde_json::to_string_pretty(&report).expect("init report serializes"),
                 "workspace initialized",
             ),
             Err(error) => print_error(cli.json, error),
@@ -263,9 +287,24 @@ fn main() -> ExitCode {
                 Err(error) => print_error(cli.json, error),
             }
         }
-        Command::Search { query, top } => {
+        Command::Search { query, top, mode } => {
+            if top > SEARCH_TOP_CAP {
+                // Both outlets, like every other refusal: `--json` gets the
+                // error object, the terminal the sentence (adversarial lane
+                // #2: the first cut wrote stderr only and left stdout empty
+                // under `--json`).
+                let message = format!(
+                    "--top {top} is above the cap of {SEARCH_TOP_CAP} \
+                     (the pre-allocation is driven by this number alone)"
+                );
+                if cli.json {
+                    println!("{}", serde_json::json!({ "error": message }));
+                }
+                eprintln!("error: {message}");
+                return ExitCode::FAILURE;
+            }
             let query = query.join(" ");
-            let output = match cli.mode {
+            let output = match mode {
                 SearchMode::Lexical => search_workspace(&root, &query, top),
                 SearchMode::Expand => {
                     // Policy before endpoint: `--no-llm` and the network gate
@@ -309,23 +348,32 @@ fn main() -> ExitCode {
                 Err(error) => print_error(cli.json, error),
             }
         }
-        Command::Ask { query } => {
+        Command::Ask {
+            query,
+            session,
+            client_request_id,
+            mode,
+            allow_write,
+            max_context_tokens,
+        } => {
             let query = query.join(" ");
             let options = AskOptions {
-                client_request_id: None,
+                client_request_id,
                 no_llm: cli.no_llm,
                 allow_network: cli.allow_network,
-                allow_write: cli.allow_write,
-                max_context_tokens: cli.max_context_tokens,
+                allow_write,
+                max_context_tokens,
+                session_id: session,
             };
-            if cli.mode == SearchMode::Expand {
+            if mode == SearchMode::Expand {
                 // `--mode` is search's retrieval mode (usage.md): an ask
                 // that silently ignored it would be an ask that lied about
                 // what it did.
                 return print_error(
                     cli.json,
                     RunError::PolicyRefused(
-                        "--mode is search's retrieval mode; ask answers with one LLM call regardless",
+                        "--mode is search's retrieval mode; ask answers with one LLM call regardless"
+                            .to_owned(),
                     ),
                 );
             }
@@ -350,7 +398,7 @@ fn main() -> ExitCode {
                     // failure marks (architecture §14.1.5) — and still exits
                     // non-zero: nothing is dressed as success (usage.md,
                     // "Exit codes").
-                    let exit = if report.status == "finished" {
+                    let exit = if ask_succeeded(&report.status) {
                         ExitCode::SUCCESS
                     } else {
                         ExitCode::FAILURE
@@ -456,10 +504,59 @@ fn search_output_lines(output: &SearchOutput) -> Vec<String> {
     lines
 }
 
+/// Whether one completed `ask` succeeded (`usage.md`, "Exit codes"): a run
+/// that reached `finished` does, everything else does not. The caller turns
+/// it into `ExitCode`.
+///
+/// Named rather than left inline because driving the binary to a *completed*
+/// run needs a live endpoint, which the zero-network rule keeps out of CI —
+/// so every `ask` test in `apps/cli/tests` stops at a policy refusal and this
+/// branch has no end-to-end witness. It returns `bool` rather than `ExitCode`
+/// because `ExitCode` is opaque and has nothing to assert against.
+fn ask_succeeded(status: &str) -> bool {
+    status == "finished"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Both directions, because both promises are load-bearing: a `finished`
+    /// run that exited non-zero would fail every script, and a `failed` run
+    /// that exited zero would dress a failure as success — the exact claim
+    /// `usage.md` "Exit codes" makes.
+    #[test]
+    fn the_ask_exit_verdict_follows_the_run_status() {
+        assert!(ask_succeeded("finished"), "a run that finished is success");
+        for status in ["failed", "cancelled", "accepted", "running"] {
+            assert!(
+                !ask_succeeded(status),
+                "`{status}` must not exit 0 — nothing is dressed as success"
+            );
+        }
+    }
+
+    #[test]
+    fn ask_parses_an_idempotency_key() {
+        let parsed = Cli::try_parse_from([
+            "momotaro",
+            "ask",
+            "--client-request-id",
+            "request-1",
+            "谱定理",
+        ])
+        .expect("the idempotency key parses");
+        let Command::Ask {
+            query,
+            client_request_id,
+            ..
+        } = parsed.command
+        else {
+            panic!("ask was parsed");
+        };
+        assert_eq!(client_request_id.as_deref(), Some("request-1"));
+        assert_eq!(query.join(" "), "谱定理");
+    }
     #[test]
     fn a_search_that_created_a_run_names_it_in_the_human_outlet() {
         let output = SearchOutput {
@@ -492,7 +589,13 @@ mod tests {
         // Needles are `concat!`-built so this test's own source cannot satisfy
         // them (the counting rule).
         let source = include_str!("main.rs");
-        let route = concat!("for line in search", "_output_lines(&output) {");
+        // Anchor at the start of the **human branch**, not at the `for`: a
+        // slice that began at the loop could never see a statement written
+        // above it, which is precisely the hole the previous anchor had.
+        let route = concat!(
+            "print_success(cli.json, payload, \"\")\n",
+            "                    } else {"
+        );
         let at = source
             .find(route)
             .expect("the human outlet routes through the renderer");
@@ -501,7 +604,7 @@ mod tests {
             .find(concat!("ExitCode::", "SUCCESS"))
             .expect("the arm ends there");
         let block = &tail[..stop];
-        // Past the header: whatever sits between `{` and the closing brace.
+        // Past the header: whatever sits between `} else {` and the exit code.
         // Dropping the header's text loses `route` above and never gets here;
         // changing what follows changes this slice.
         let after_header = &block[route.len()..];
@@ -513,9 +616,13 @@ mod tests {
 
         assert_eq!(
             lines,
-            vec![concat!("println!", "(\"{line}\");"), "}"],
-            "the loop's only statement is the print, so the outlet shows the \
-             renderer whole — no filter, no guard, no second path: {block}"
+            vec![
+                concat!("for line in search", "_output_lines(&output) {"),
+                concat!("println!", "(\"{line}\");"),
+                "}",
+            ],
+            "the human branch is the loop and its print and nothing else — no \
+             statement above the loop, no filter, no guard, no second path: {block}"
         );
     }
 

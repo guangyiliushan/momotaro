@@ -32,7 +32,7 @@ packages.
 
 ```text
 apps/cli          CLI (pnpm shim + Cargo binary)
-apps/desktop      product UI frontend (Vite/React; Tauri wraps it at v0.6)
+apps/desktop      product UI frontend (Vite/React; Tauri will wrap it later)
 packages/         JS libraries (ui; app-ui and ipc planned)
 crates/           Rust engine
 docs/             this documentation site

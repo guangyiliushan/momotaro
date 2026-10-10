@@ -8,7 +8,7 @@
 
 use std::ops::Range;
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
 use momotaro_contracts::{Chunk, IndexPolicy, estimate_tokens};
 
@@ -41,10 +41,7 @@ impl BlockKind {
 /// stack for subsequent blocks. A block that intersects an excluded span is
 /// dropped whole: the text itself is never rewritten, so no locator moves.
 fn collect_blocks(normalized: &str, excluded: &[Range<usize>]) -> Vec<Block> {
-    let parser = Parser::new_ext(
-        normalized,
-        Options::ENABLE_TABLES | Options::ENABLE_WIKILINKS,
-    );
+    let parser = Parser::new_ext(normalized, crate::PARSE_OPTIONS);
     let mut blocks: Vec<Block> = Vec::new();
     let mut stack: Vec<(u8, String)> = Vec::new();
     let mut heading_text = String::new();
@@ -62,6 +59,11 @@ fn collect_blocks(normalized: &str, excluded: &[Range<usize>]) -> Vec<Block> {
                 heading_text.clear();
             }
             Event::Text(t) if in_heading => heading_text.push_str(&t),
+            // Inline code inside a heading is heading text: the parser emits
+            // `Event::Code` beside `Event::Text`, and a heading read without
+            // it says `Foo  baz` for `Foo `bar` baz` — wrong for
+            // `heading_path`, the outline, and every anchor check on them.
+            Event::Code(t) if in_heading => heading_text.push_str(&t),
             Event::End(TagEnd::Heading(_)) => {
                 if let Some((_, slot)) = stack.last_mut() {
                     *slot = heading_text.trim().to_string();
@@ -96,6 +98,16 @@ fn push_block(
     if range.start >= range.end {
         return;
     }
+    // Markdown containers can report both a nested block and its parent (and
+    // offset iteration may visit either first). A contained span is the same
+    // source bytes twice; keep the outer container and drop the inner.
+    if blocks
+        .iter()
+        .any(|block| range.start >= block.range.start && range.end <= block.range.end)
+    {
+        return;
+    }
+    blocks.retain(|block| !(block.range.start >= range.start && block.range.end <= range.end));
     let heading: Vec<String> = stack
         .iter()
         .map(|(_, text)| text.clone())
@@ -163,26 +175,9 @@ fn line_number_for(starts: &[u32], byte_offset: u32) -> u32 {
 /// are text-kind (never into or out of Code/Table). The locator's
 /// `start_byte` points at the chunk's first real block; an overlap prefix
 /// is part of the chunk text but is not counted in the locator bytes.
-pub fn chunk_markdown(
-    source_key: &str,
-    revision_hash: &str,
-    normalized: &str,
-    policy: &IndexPolicy,
-) -> Vec<Chunk> {
-    chunk_markdown_with(
-        source_key,
-        revision_hash,
-        normalized,
-        policy,
-        SourceOffset::default(),
-        &[],
-        None,
-    )
-}
-
 /// Where a slice of text starts in the note it was cut from.
 ///
-/// `chunk_markdown` reads byte ranges and line numbers off the text it is handed.
+/// The chunker reads byte ranges and line numbers off the text it is handed.
 /// When that text is the *body* of a note — the note minus its frontmatter block —
 /// those ranges are relative to the slice, while the locator must address the
 /// original bytes so citation verification can slice the document directly. Pass
@@ -210,7 +205,7 @@ impl SourceOffset {
     }
 }
 
-/// [`chunk_markdown`] for a slice of a larger note: locators are shifted by `offset`,
+/// a slice of a larger note: locators are shifted by `offset`,
 /// and the byte spans in `excluded` never become chunk text.
 ///
 /// `excluded` is how a span the caller knows is noise — the Excalidraw scene
@@ -412,6 +407,28 @@ mod tests {
     use super::*;
     use momotaro_contracts::IndexPolicy;
 
+    /// The plain call the tests mean: no offset, no exclusions, no render.
+    ///
+    /// Production always passes those three, so the shorthand lived here and
+    /// not on the crate's public surface — the chunker's one entry is
+    /// [`chunk_markdown_with`].
+    fn chunk_markdown(
+        source_key: &str,
+        revision_hash: &str,
+        normalized: &str,
+        policy: &IndexPolicy,
+    ) -> Vec<Chunk> {
+        chunk_markdown_with(
+            source_key,
+            revision_hash,
+            normalized,
+            policy,
+            SourceOffset::default(),
+            &[],
+            None,
+        )
+    }
+
     fn policy_with(max: u32, overlap: u32) -> IndexPolicy {
         IndexPolicy {
             max_chunk_tokens: max,
@@ -471,9 +488,35 @@ mod tests {
     }
 
     #[test]
+    fn inline_code_in_a_heading_is_heading_text() {
+        // The parser emits `Event::Code` beside `Event::Text`; a heading read
+        // without it says `Foo  baz` for `Foo `bar` baz` — wrong for
+        // `heading_path`, the outline, and every anchor check built on them.
+        let chunks = chunk_markdown(
+            "a.md",
+            "rh",
+            "# Foo `bar` baz\n\nbody\n",
+            &IndexPolicy::default(),
+        );
+        assert_eq!(
+            chunks[0].heading_path.as_deref(),
+            Some("Foo bar baz"),
+            "{chunks:?}"
+        );
+    }
+
+    #[test]
     fn zh_headings_carry_heading_path() {
         let doc = "# 标题\n\n引言段落。\n\n## 章节\n\n正文第一段。\n\n正文第二段。\n";
-        let chunks = chunk_markdown("zh.md", "rh", doc, &IndexPolicy::default());
+        let chunks = chunk_markdown_with(
+            "zh.md",
+            "rh",
+            doc,
+            &IndexPolicy::default(),
+            SourceOffset::default(),
+            &[],
+            None,
+        );
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].heading_path.as_deref(), Some("标题"));
         assert_eq!(chunks[0].text, "引言段落。\n");
@@ -481,6 +524,16 @@ mod tests {
         // Block slices are verbatim (each paragraph carries its trailing
         // newline); packing joins them with the literal "\n\n" separator.
         assert_eq!(chunks[1].text, "正文第一段。\n\n\n正文第二段。\n");
+        // A packed chunk's locator starts at its **first** block, not the
+        // last one it happened to pack.
+        let first_at = doc.find("正文第一段").expect("first paragraph in doc");
+        let locator: serde_json::Value =
+            serde_json::from_str(&chunks[1].locator_json).expect("locator is valid JSON");
+        assert_eq!(
+            locator["start_byte"].as_u64(),
+            Some(first_at as u64),
+            "a packed chunk starts at its first block"
+        );
     }
 
     #[test]
@@ -574,6 +627,26 @@ mod tests {
         assert!(chunks[0].locator_json.contains("\"truncated\":false"));
     }
 
+    /// A nested list is reported both as the inner item and as the outer
+    /// container. The container is the durable citation locator; the nested
+    /// span must not also become a block.
+    #[test]
+    fn nested_list_blocks_deduplicate_by_containment() {
+        let doc = "1. outer\n   - inner\n";
+        let chunks = chunk_markdown("nested.md", "rh", doc, &IndexPolicy::default());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, doc);
+        // The container is the durable citation locator: the whole locator —
+        // start and end, hand-derived literals not the helper's own output — points
+        // at the container's own span. The nested item shares the end byte
+        // (both stop at the note's last newline) but never the start: a
+        // locator that drifted to the nested item would start at byte 9.
+        assert_eq!(
+            chunks[0].locator_json,
+            "{\"start_byte\":0,\"end_byte\":20,\"start_line\":1,\"end_line\":3,\"truncated\":false}"
+        );
+    }
+
     #[test]
     fn identical_content_different_keys_differ_in_chunk_id() {
         let doc = "same text\n\nmore text\n";
@@ -633,6 +706,159 @@ mod tests {
     /// An excluded span is dropped whole and nothing around it moves: the note's
     /// bytes are never rewritten, so a chunk's locator still addresses the note
     /// (§5 第 9 条 — the Excalidraw scene fence).
+    /// The parser options are load-bearing, not decoration: `ENABLE_TABLES`
+    /// is what makes pulldown return `Tag::Table` at all. Turn it off and the
+    /// same three lines come back as one paragraph — same bytes, different
+    /// `BlockKind`, so the whole text-kind / overlap machinery downstream
+    /// silently reclassifies it. No fixture fed the chunker a table until now.
+    #[test]
+    fn a_pipe_table_is_a_table_block_not_a_paragraph() {
+        let doc = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let blocks = collect_blocks(doc, &[]);
+        assert_eq!(blocks.len(), 1, "one table is one block: {blocks:?}");
+        assert_eq!(blocks[0].kind, BlockKind::Table, "{blocks:?}");
+        assert_eq!(blocks[0].range, 0..doc.len(), "{blocks:?}");
+    }
+
+    /// Half-open intersection: `block.start < span.end && span.start < block.end`.
+    /// A span that *begins* on a block's end byte, or *stops* on its start byte,
+    /// is adjacent — and an adjacent span drops nothing. `<=` on either operand
+    /// turns adjacency into intersection and deletes a block nobody excluded.
+    #[test]
+    fn a_span_adjacent_to_a_block_is_not_inside_it() {
+        let doc = "beforetoken\n\naftertoken\n";
+        let blocks = collect_blocks(doc, &[]);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+
+        let run = |span: Range<usize>| -> String {
+            chunk_markdown_with(
+                "scene.md",
+                "rh",
+                doc,
+                &IndexPolicy::default(),
+                SourceOffset::default(),
+                &[span],
+                None,
+            )
+            .iter()
+            .map(|chunk| chunk.text.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+        };
+
+        // Opens on the first block's end byte: covers only what follows it.
+        let text = run(blocks[0].range.end..doc.len());
+        assert!(
+            text.contains("beforetoken"),
+            "a span starting at a block's end leaves that block alone: {text:?}"
+        );
+        // Stops on the second block's start byte: covers only what precedes it.
+        let text = run(0..blocks[1].range.start);
+        assert!(
+            text.contains("aftertoken"),
+            "a span ending at a block's start leaves that block alone: {text:?}"
+        );
+    }
+
+    /// A fenced block's range stops *on* the newline that closes the fence, not
+    /// after it — the one byte where a line-start table built with `idx` rather
+    /// than `idx + 1` answers differently. Every locator line number in the crate
+    /// is `line_number_for(line_starts(..), byte)`, and nothing read one back.
+    #[test]
+    fn a_chunk_ending_on_a_newline_still_quotes_its_own_line() {
+        let doc = "```rust\nfn a() {}\n```\n";
+        let blocks = collect_blocks(doc, &[]);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        let end = blocks[0].range.end as u32;
+        assert_eq!(
+            doc.as_bytes()[blocks[0].range.end],
+            b'\n',
+            "the range stops on the fence's newline"
+        );
+
+        let starts = line_starts(doc);
+        assert_eq!(
+            starts.last().copied(),
+            Some(doc.len() as u32),
+            "the line after the final newline starts at the end of the text"
+        );
+        // Three lines of source, so the fence sits on line 3 and nowhere else.
+        let fence_line = doc[..blocks[0].range.end].matches('\n').count() as u32 + 1;
+        assert_eq!(line_number_for(&starts, end), fence_line);
+
+        let chunks = chunk_markdown("code-edge.md", "rh", doc, &IndexPolicy::default());
+        assert_eq!(chunks.len(), 1, "{chunks:?}");
+        let locator: serde_json::Value =
+            serde_json::from_str(&chunks[0].locator_json).expect("locator is valid JSON");
+        assert_eq!(
+            locator["start_line"].as_u64(),
+            Some(1),
+            "{}",
+            chunks[0].locator_json
+        );
+        assert_eq!(
+            locator["end_line"].as_u64(),
+            Some(u64::from(fence_line)),
+            "{}",
+            chunks[0].locator_json
+        );
+    }
+
+    /// The budget is *exclusive*: a block whose estimate equals `max_chunk_tokens`
+    /// fits, and a join that lands exactly on it still packs. Both comparisons
+    /// are `>`; `>=` reports a fitting block as truncated and splits a chunk
+    /// that was never over.
+    #[test]
+    fn the_budget_is_exclusive_at_both_ends() {
+        // 8 latin characters is exactly 2 tokens.
+        let at_line = "aaaaaaaa";
+        assert_eq!(estimate_tokens(at_line), 2, "the fixture sits on the line");
+        let chunks = chunk_markdown("edge.md", "rh", at_line, &policy_with(2, 0));
+        assert_eq!(chunks.len(), 1, "{chunks:?}");
+        assert!(
+            !chunks[0].locator_json.contains("\"truncated\":true"),
+            "a block that equals the budget is not over it: {}",
+            chunks[0].locator_json
+        );
+
+        // Two blocks joined by the separator come out at exactly 3 tokens.
+        let doc = "aaaa\n\nbbbb\n";
+        let blocks = collect_blocks(doc, &[]);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        let packed = format!(
+            "{}\n\n{}",
+            &doc[blocks[0].range.clone()],
+            &doc[blocks[1].range.clone()]
+        );
+        assert_eq!(
+            estimate_tokens(&packed),
+            3,
+            "the packed text sits exactly on the budget this fixture uses"
+        );
+        let chunks = chunk_markdown("edge2.md", "rh", doc, &policy_with(3, 0));
+        assert_eq!(
+            chunks.len(),
+            1,
+            "a join that equals the budget keeps packing: {chunks:?}"
+        );
+    }
+
+    /// "Closing a chunk on overflow seeds the next chunk … when both sides are
+    /// text-kind (never into or out of Code/Table)." A code block must open its
+    /// own chunk verbatim; the paragraph before it is not its head.
+    #[test]
+    fn overlap_never_seeds_into_a_code_block() {
+        let doc = "aaaaaaaaaaaa\n\n```\ncccc\n```\n";
+        let chunks = chunk_markdown("seed.md", "rh", doc, &policy_with(6, 4));
+        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        assert!(
+            chunks[1].text.starts_with("```"),
+            "a code block starts with its own fence, not someone else's tail: {:?}",
+            chunks[1].text
+        );
+        assert!(chunks[1].text.contains("cccc"), "{:?}", chunks[1].text);
+    }
+
     #[test]
     fn an_excluded_span_leaves_the_locators_around_it_alone() {
         let doc = "beforetoken\n\n```compressed-json\nDRAWINGNOISE\n```\n\naftertoken\n";
@@ -674,6 +900,15 @@ mod tests {
             // parser's own end offset — so the window closes just past that byte.
             Some((after_at + "aftertoken\n".len()) as u64),
             "the locator addresses the note: {}",
+            survivor.locator_json
+        );
+        // The survivor packs the paragraphs around the excluded span; its
+        // locator starts at the **first** of them, not the last.
+        let before_at = doc.find("beforetoken").expect("the text before the fence");
+        assert_eq!(
+            locator["start_byte"].as_u64(),
+            Some(before_at as u64),
+            "a packed chunk starts at its first block: {}",
             survivor.locator_json
         );
     }

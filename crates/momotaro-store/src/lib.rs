@@ -20,10 +20,15 @@ pub mod revisions;
 pub mod runs;
 mod unit;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use chunks::SourceCounts;
-pub use events::{NewStoreEvent, StoreEvent};
+pub use events::{NewStoreEvent, StoreEvent, now_epoch_secs};
 pub use revisions::NewSourceRevision;
-pub use runs::{CreateRunOutcome, NewRun, NewRunEvent};
+pub use runs::{
+    CreateRunOutcome, NewRun, NewRunEvent, NewSession, SessionContextItem, SessionRecord,
+};
 
 /// Table holding multi-value store metadata. Never the schema version: that
 /// lives in `PRAGMA user_version` (D46).
@@ -134,6 +139,19 @@ pub enum StoreError {
         found: String,
     },
 
+    /// An idempotency key already names a request whose frozen RunSpec hash
+    /// differs. The key is not a shortcut for "whatever I sent last"; a
+    /// different request must choose a new key.
+    #[error("client_request_id {key} already names request hash {expected}; got {actual}")]
+    IdempotencyConflict {
+        /// The rejected key.
+        key: String,
+        /// Hash stored under the key.
+        expected: String,
+        /// Hash on this request.
+        actual: String,
+    },
+
     /// A pre-migration backup failed, so the migration never started (D46).
     #[error("pre-migration backup failed: {0}")]
     BackupFailed(String),
@@ -199,6 +217,20 @@ pub fn sqlite_facts() -> Result<SqliteFacts, StoreError> {
 pub struct Store {
     connection: Connection,
     path: PathBuf,
+}
+
+impl StoreError {
+    /// Whether a failed write is resource contention the next retry can cure.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    }
 }
 
 impl Store {
@@ -275,7 +307,11 @@ impl Store {
                 return Err(StoreError::NoIdentity { found: version });
             }
             let objects = self.foreign_objects()?;
-            if !objects.is_empty() {
+            // A crash between CREATE TABLE schema_meta and the identity stamp
+            // leaves exactly one object of ours and no header identity. That is
+            // resumable: finish the stamp rather than strand the workspace.
+            let half_initialized = objects.len() == 1 && objects[0] == SCHEMA_TABLE;
+            if !objects.is_empty() && !half_initialized {
                 return Err(StoreError::ForeignObjects {
                     objects: objects.join(", "),
                 });
@@ -505,13 +541,8 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::raw_temp_store;
     use momotaro_contracts::{Chunk, OriginClass, SourceKind};
-
-    fn open_temp_store() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let store = Store::open(dir.path().join("momotaro.db")).expect("open store");
-        (dir, store)
-    }
 
     #[test]
     fn the_linked_engine_is_out_of_the_wal_reset_window() {
@@ -693,7 +724,7 @@ mod tests {
 
     #[test]
     fn future_schema_is_rejected() {
-        let (_dir, mut store) = open_temp_store();
+        let (_dir, mut store) = raw_temp_store();
         store
             .connection
             .execute_batch(
@@ -708,7 +739,7 @@ mod tests {
 
     #[test]
     fn fresh_db_records_user_version_and_application_id() {
-        let (_dir, mut store) = open_temp_store();
+        let (_dir, mut store) = raw_temp_store();
         store.init_schema().expect("init");
 
         assert_eq!(
@@ -716,6 +747,10 @@ mod tests {
             CURRENT_SCHEMA_VERSION
         );
         assert_eq!(store.application_id().expect("read app id"), APPLICATION_ID);
+        // The value itself, not just the read-back: this is an identity
+        // other builds must match, and the comparison above cannot see a
+        // changed constant.
+        assert_eq!(APPLICATION_ID, 0x4D4D_4F54, "ASCII `MMOT`");
         // schema_meta is left for multi-value metadata (D46 / Q2).
         assert_eq!(
             store
@@ -838,6 +873,87 @@ mod tests {
                  PRAGMA user_version = 2;"
             ))
             .expect("seed a v2 store");
+    }
+
+    /// The identity stamp before the migrations is a contract **no fixture
+    /// can violate**: the `if found_id == 0` branch only runs on a file with
+    /// zero objects (`refuse_write` treats every object as foreign when the id
+    /// is absent), and no migration step can fail on an empty one — the
+    /// failure that would show the order (a mid-migration I/O error) is not
+    /// constructible here. Moving the stamp below `apply_pending` leaves every
+    /// test green while a failed migration would then hand the file
+    /// `user_version > 0` with `application_id = 0`, which `refuse_write`
+    /// reads as "not ours" forever.
+    ///
+    /// So the clause is what gets pinned, on the same precedent as
+    /// `runs.rs`'s ORDER BY tie-break needle: the search runs over the source
+    /// **above** the `#[cfg(test)]` marker, so the copies inside this test
+    /// module cannot satisfy it.
+    #[test]
+    fn init_schema_stamps_the_identity_before_it_runs_a_migration() {
+        let source = include_str!("lib.rs");
+        let production_end = source
+            .rfind("#[cfg(test)]")
+            .expect("the test module follows the production code");
+        let production = &source[..production_end];
+
+        let init = production
+            .find("pub fn init_schema(&mut self)")
+            .expect("`init_schema` exists");
+        let stamp = production
+            .find("PRAGMA application_id = {APPLICATION_ID}")
+            .expect("`init_schema` stamps the identity");
+        let migrate = production
+            .find("migration::apply_pending(")
+            .expect("`init_schema` applies the pending migrations");
+
+        assert!(
+            init < stamp && stamp < migrate,
+            "identity first, then the migrations — stamp at {stamp}, migrate at \
+             {migrate}, both inside `init_schema` at {init}"
+        );
+    }
+
+    /// The file-modifying PRAGMAs `Store::open` applies, read back.
+    ///
+    /// `every_refusal_shape_leaves_the_file_byte_identical` pins the *other*
+    /// direction — a refused file is untouched. Nothing pinned that an
+    /// accepted one actually became a WAL database, and the two settings
+    /// depend on each other: `synchronous = NORMAL` skips the fsync because
+    /// WAL replays it from the log, so it is unsafe in rollback-journal mode.
+    /// `NETWORK_VOLUME_NOTE` also presumes this database is in WAL.
+    #[test]
+    fn an_accepted_store_is_opened_in_wal_with_the_settings_the_notes_depend_on() {
+        let (_dir, store) = raw_temp_store();
+
+        let journal: String = store
+            .connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("read journal_mode");
+        assert_eq!(
+            journal.to_lowercase(),
+            "wal",
+            "the engine note and the network-volume warning both assume WAL"
+        );
+
+        // 0 = OFF, 1 = NORMAL, 2 = FULL, 3 = EXTRA.
+        let synchronous: i64 = store
+            .connection
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .expect("read synchronous");
+        assert_eq!(
+            synchronous, 1,
+            "NORMAL is only safe *because* the mode above is WAL"
+        );
+
+        let size_limit: i64 = store
+            .connection
+            .query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
+            .expect("read journal_size_limit");
+        assert!(
+            size_limit > 0,
+            "an unbounded WAL grows until vacuumed: {size_limit}"
+        );
     }
 
     #[test]
@@ -1302,7 +1418,7 @@ mod tests {
 
     #[test]
     fn the_v5_tables_have_their_contract_columns() {
-        let (_dir, mut store) = open_temp_store();
+        let (_dir, mut store) = raw_temp_store();
         store.init_schema().expect("initialize schema");
 
         for (table, expected) in V5_SHAPES {
@@ -1500,10 +1616,11 @@ mod tests {
 
     #[test]
     fn a_store_stamped_v6_migrates_to_exactly_the_fresh_shape() {
-        // The two supported paths into schema 7: migrating a v6 store and
+        // The two supported paths into schema 8: migrating a v6 store and
         // initializing a brand-new file. v6 is what every build before step 7
-        // left behind — the run tables with no `run_id` index — so the v6
-        // shape is the fresh shape minus exactly those four indexes.
+        // left behind — the run tables with no `run_id` index — and step 8
+        // added the two `session_id` indexes, so the v6 shape is the fresh
+        // shape minus exactly those six indexes.
         let fresh_dir = tempfile::tempdir().expect("create temp dir");
         let fresh_path = fresh_dir.path().join("momotaro.db");
         let mut fresh = Store::open(&fresh_path).expect("open fresh store");
@@ -1517,9 +1634,11 @@ mod tests {
             v6.connection
                 .execute_batch(
                     "DROP INDEX idx_retrievals_run;
-                     DROP INDEX idx_llm_turns_run;
+                     DROP INDEX IF EXISTS idx_llm_turns_run_seq;
                      DROP INDEX idx_answers_run;
                      DROP INDEX idx_verifications_run;
+                     DROP INDEX idx_runs_session;
+                     DROP INDEX idx_history_items_session;
                      PRAGMA user_version = 6;",
                 )
                 .expect("rewind to the v6 shape");
@@ -1533,7 +1652,7 @@ mod tests {
                 "idx_store_events_external",
                 "idx_store_events_source",
             ],
-            "the v6 fixture really is v6: no run_id index yet"
+            "the v6 fixture really is v6: neither a run_id index nor a session index exists yet"
         );
 
         let mut v6 = Store::open(&v6_path).expect("reopen v6 store");
@@ -1560,11 +1679,79 @@ mod tests {
         );
     }
 
+    /// The one-step upgrade a pre-v8 machine actually takes: a store already
+    /// at v7 (step 7's four `run_id` indexes, no session indexes) running
+    /// **step 8 alone**.
+    ///
+    /// The v6 fixture crosses two steps at once, so nothing exercised 7→8 on
+    /// its own — and that is the path every real W3.10 install takes. (The
+    /// collision test below also starts from v7, but it is about a stale index
+    /// *name*, not about the migration landing.)
+    #[test]
+    fn a_store_stamped_v7_migrates_through_step_eight_alone() {
+        let fresh_dir = tempfile::tempdir().expect("create temp dir");
+        let fresh_path = fresh_dir.path().join("momotaro.db");
+        let mut fresh = Store::open(&fresh_path).expect("open fresh store");
+        fresh.init_schema().expect("initialize fresh");
+
+        let v7_dir = tempfile::tempdir().expect("create temp dir");
+        let v7_path = v7_dir.path().join("momotaro.db");
+        {
+            let mut v7 = Store::open(&v7_path).expect("open v7 store");
+            v7.init_schema().expect("initialize");
+            v7.connection
+                .execute_batch(
+                    "DROP INDEX idx_runs_session;
+                     DROP INDEX idx_history_items_session;
+                     PRAGMA user_version = 7;",
+                )
+                .expect("rewind to the v7 shape");
+        }
+        assert_eq!(
+            declared_indexes(&Store::open(&v7_path).expect("read v7")),
+            [
+                "idx_answers_run",
+                "idx_chunks_rev",
+                "idx_graph_links_from",
+                "idx_llm_turns_run_seq",
+                "idx_retrievals_run",
+                "idx_revisions_current",
+                "idx_store_events_external",
+                "idx_store_events_source",
+                "idx_verifications_run",
+            ],
+            "the v7 fixture really is v7: the four run_id indexes are there, \
+             neither session index is"
+        );
+
+        let mut v7 = Store::open(&v7_path).expect("reopen v7");
+        v7.init_schema().expect("migrate through step 8");
+
+        assert_eq!(
+            v7.user_version().expect("read user_version"),
+            CURRENT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            schema_shape(&fresh),
+            schema_shape(&v7),
+            "one step lands the same schema a fresh store builds"
+        );
+        assert!(
+            !backup_files(
+                v7_dir.path(),
+                &format!("backup-v7-to-v{CURRENT_SCHEMA_VERSION}-")
+            )
+            .is_empty(),
+            "the migration is preceded by a verified backup, named from the \
+             version constants (D46)"
+        );
+    }
+
     #[test]
     fn a_colliding_index_name_does_not_leave_a_table_uncovered() {
         // `CREATE INDEX IF NOT EXISTS` keys on the name across the whole
         // schema, not on the table: a store where `idx_answers_run` already sat
-        // on another table would skip the creation, stamp v7, and leave
+        // on another table would skip the creation, stamp the current version, and leave
         // `answers` uncovered while `doctor` reported ready. Step 7 drops first,
         // so the state converges.
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -1576,7 +1763,7 @@ mod tests {
                 .connection
                 .execute_batch(
                     "DROP INDEX idx_retrievals_run;
-                     DROP INDEX idx_llm_turns_run;
+                     DROP INDEX IF EXISTS idx_llm_turns_run_seq;
                      DROP INDEX idx_answers_run;
                      DROP INDEX idx_verifications_run;
                      CREATE INDEX idx_answers_run ON chunks(source_key);
@@ -1605,7 +1792,7 @@ mod tests {
         // The inventory is read from the live schema rather than from a
         // hand-written list: a table that grows a `run_id` column without a
         // covering index fails here, not at query time.
-        let (_dir, mut store) = open_temp_store();
+        let (_dir, mut store) = raw_temp_store();
         store.init_schema().expect("initialize schema");
 
         let tables: Vec<String> = store
@@ -1656,12 +1843,12 @@ mod tests {
         // sqlite_master only: the name, the table it belongs to and the column
         // list it covers. Query plans (`EXPLAIN QUERY PLAN`) are deliberately
         // not pinned — the plan is the engine's, the declaration is ours.
-        let (_dir, mut store) = open_temp_store();
+        let (_dir, mut store) = raw_temp_store();
         store.init_schema().expect("initialize schema");
 
         for (index, table) in [
             ("idx_answers_run", "answers"),
-            ("idx_llm_turns_run", "llm_turns"),
+            ("idx_llm_turns_run_seq", "llm_turns"),
             ("idx_retrievals_run", "retrievals"),
             ("idx_verifications_run", "verifications"),
         ] {
@@ -1675,8 +1862,90 @@ mod tests {
                 .unwrap_or_else(|error| panic!("index {index} is declared: {error}"));
             assert_eq!(owner, table, "{index} belongs to {owner}");
             assert!(
-                sql.to_uppercase().contains("(RUN_ID)"),
+                sql.to_uppercase().contains("RUN_ID"),
                 "{index} covers run_id: {sql}"
+            );
+        }
+    }
+
+    /// Step 8's two indexes: name, owning table and covered column.
+    ///
+    /// `schema_shape` compares only the *names* per table, so three mutants
+    /// walk straight through it: the wrong column (`ON runs(run_id)`), the
+    /// two indexes swapped, and `IF NOT EXISTS` in place of the DROP. The
+    /// first two are pinned here — the name is what a reader of
+    /// `sqlite_master` has to be able to trust; the third needs a colliding
+    /// name and is pinned separately.
+    #[test]
+    fn the_two_session_indexes_are_declared_on_their_own_table() {
+        let (_dir, mut store) = raw_temp_store();
+        store.init_schema().expect("initialize schema");
+
+        for (index, table) in [
+            ("idx_runs_session", "runs"),
+            ("idx_history_items_session", "history_items"),
+        ] {
+            let (owner, sql): (String, String) = store
+                .connection
+                .query_row(
+                    "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [index],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap_or_else(|error| panic!("index {index} is declared: {error}"));
+            assert_eq!(owner, table, "{index} belongs to {owner}");
+            assert!(
+                sql.to_uppercase().contains("(SESSION_ID)"),
+                "{index} covers session_id: {sql}"
+            );
+        }
+    }
+
+    /// `CREATE INDEX IF NOT EXISTS` keys on the name across the whole schema,
+    /// not on the table — the same trap step 7 already documents. A
+    /// `idx_runs_session` left sitting on `chunks` would skip the creation,
+    /// stamp v8, and leave `runs.session_id` uncovered while `doctor` reported
+    /// ready; step 8 drops first, so the state converges.
+    #[test]
+    fn a_colliding_session_index_name_does_not_leave_a_table_uncovered() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("momotaro.db");
+        {
+            let mut store = Store::open(&path).expect("open fresh store");
+            store.init_schema().expect("initialize");
+            store
+                .connection
+                .execute_batch(
+                    "DROP INDEX idx_runs_session;
+                     DROP INDEX idx_history_items_session;
+                     CREATE INDEX idx_runs_session ON chunks(source_key);
+                     PRAGMA user_version = 7;",
+                )
+                .expect("rewind to a colliding v7");
+        }
+
+        let mut store = Store::open(&path).expect("reopen");
+        store.init_schema().expect("migrate to current");
+
+        for (index, table) in [
+            ("idx_runs_session", "runs"),
+            ("idx_history_items_session", "history_items"),
+        ] {
+            let (owner, sql): (String, String) = store
+                .connection
+                .query_row(
+                    "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [index],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap_or_else(|error| panic!("index {index} is declared: {error}"));
+            assert_eq!(
+                owner, table,
+                "{index} was re-declared on its own table despite the collision"
+            );
+            assert!(
+                sql.to_uppercase().contains("(SESSION_ID)"),
+                "{index} covers session_id after the migration: {sql}"
             );
         }
     }
@@ -1801,7 +2070,7 @@ mod tests {
 
     #[test]
     fn init_creates_current_schema() {
-        let (_dir, mut store) = open_temp_store();
+        let (_dir, mut store) = raw_temp_store();
         store.init_schema().expect("initialize schema");
         assert_eq!(
             store.schema_version().expect("read schema"),
@@ -1809,9 +2078,35 @@ mod tests {
         );
     }
 
+    /// Crash after schema_meta but before application_id leaves one recoverable
+    /// object. init_schema finishes the stamp instead of stranding the file.
+    #[test]
+    fn half_initialized_schema_meta_is_recovered_not_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("momotaro.db");
+        let connection = rusqlite::Connection::open(&path).expect("open raw sqlite");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_meta (
+                     key TEXT PRIMARY KEY,
+                     value TEXT NOT NULL
+                 );",
+            )
+            .expect("simulate crash after table creation");
+        drop(connection);
+
+        let mut store = Store::open(&path).expect("open recoverable store");
+        store.init_schema().expect("finish initialization");
+        assert_eq!(store.application_id().expect("identity"), APPLICATION_ID);
+        assert_eq!(
+            store.schema_version().expect("version"),
+            Some(SchemaVersion::CURRENT)
+        );
+    }
+
     #[test]
     fn fresh_db_creates_the_revision_and_chunk_tables_and_indexes() {
-        let (_dir, mut store) = open_temp_store();
+        let (_dir, mut store) = raw_temp_store();
         store.init_schema().expect("initialize schema");
 
         let tables: Vec<String> = store
@@ -1833,7 +2128,7 @@ mod tests {
 
     #[test]
     fn v1_database_migrates_forward_and_keeps_rows() {
-        let (_dir, mut store) = open_temp_store();
+        let (_dir, mut store) = raw_temp_store();
         // A v1 store of ours: the identity stamp comes with the version carrier
         // (same change), so this is what our own older builds actually left.
         store
@@ -1873,7 +2168,7 @@ mod tests {
         // this, a file with a version carrier and no identity was reported
         // `ready` (exit 0) while `init`, `index` and `rebuild-index` all refused
         // it, which breaks the documented `doctor && index` gate.
-        let (_dir, store) = open_temp_store();
+        let (_dir, store) = raw_temp_store();
         store
             .connection
             .execute_batch(
@@ -1898,15 +2193,43 @@ mod tests {
 
     #[test]
     fn health_reports_uninitialized_store() {
-        let (_dir, store) = open_temp_store();
+        let (_dir, store) = raw_temp_store();
         let report = store.health().expect("health report");
         assert_eq!(report.status, WorkspaceStatus::Uninitialized);
         assert_eq!(report.schema_version, None);
     }
 
+    /// The older half of `health`'s version match — the only half that is
+    /// reachable. A *newer* database never gets here: `refuse_write` answers
+    /// `SchemaTooNew` first, so `found > CURRENT` is dead code and `doctor`
+    /// prints the refusal instead. An older one with our identity is exactly
+    /// what the writers accept (migrations apply), so it is this arm that has
+    /// to speak — and a body that called it "newer than supported" would send
+    /// every pre-migration workspace down the wrong road.
+    #[test]
+    fn health_calls_an_older_store_of_ours_needs_migrations_not_newer() {
+        let (_dir, store) = raw_temp_store();
+        store
+            .connection
+            .execute_batch(&format!(
+                "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 PRAGMA application_id = {APPLICATION_ID};
+                 PRAGMA user_version = 1;"
+            ))
+            .expect("write an older store that is still ours");
+
+        let health = store.health().expect("health");
+        assert_eq!(health.status, WorkspaceStatus::Invalid);
+        assert_eq!(
+            health.message.as_deref(),
+            Some("database schema version 1 requires migrations"),
+            "an older store needs migrations; it is not newer than anything"
+        );
+    }
+
     #[test]
     fn init_is_idempotent() {
-        let (_dir, mut store) = open_temp_store();
+        let (_dir, mut store) = raw_temp_store();
         store.init_schema().expect("initialize schema");
         store.init_schema().expect("initialize schema again");
         assert_eq!(
@@ -1917,7 +2240,7 @@ mod tests {
 
     #[test]
     fn stats_reports_zeroes_when_initialized_empty() {
-        let (_dir, mut store) = open_temp_store();
+        let (_dir, mut store) = raw_temp_store();
         store.init_schema().expect("initialize schema");
 
         let report = store.stats().expect("stats");
@@ -1930,7 +2253,7 @@ mod tests {
     /// `Uninitialized` — it exists and must not be silently re-initialized.
     #[test]
     fn stats_reports_future_schema_as_invalid() {
-        let (_dir, store) = open_temp_store();
+        let (_dir, store) = raw_temp_store();
         store
             .connection
             .execute_batch(
@@ -1954,7 +2277,7 @@ mod tests {
     /// migrations"), aligned with `health()`.
     #[test]
     fn stats_reports_old_schema_as_invalid_not_uninitialized() {
-        let (_dir, store) = open_temp_store();
+        let (_dir, store) = raw_temp_store();
         store
             .connection
             .execute_batch(
@@ -1974,7 +2297,7 @@ mod tests {
         // The rebuild path looks up one class per source key, and a wrong or
         // missing entry silently changes what a source *is* (T1.8 weights read
         // this), so the query is pinned here as well as through the index.
-        let (_dir, mut store) = open_temp_store();
+        let (_dir, mut store) = raw_temp_store();
         store.init_schema().expect("schema");
         for (key, hash, class) in [
             ("note:paper.md", "p1", OriginClass::Paper),
@@ -2012,7 +2335,7 @@ mod tests {
 
     #[test]
     fn stats_fills_counts_after_ingest() {
-        let (_dir, mut store) = open_temp_store();
+        let (_dir, mut store) = raw_temp_store();
         store.init_schema().expect("initialize schema");
 
         store
@@ -2085,7 +2408,7 @@ mod tests {
         // this asserts what the schema *declares* — a new or dropped explicit
         // index is a schema change this test must see (the step-5 assertion the
         // v5 batch deferred to W2.4, extended by step 7's four `run_id`
-        // indexes).
+        // indexes and step 8's two `session_id` indexes).
         let dir = tempfile::tempdir().expect("temp dir");
         let mut store = Store::open(dir.path().join("momotaro.db")).expect("open");
         store.init_schema().expect("init");
@@ -2095,9 +2418,11 @@ mod tests {
                 "idx_answers_run",
                 "idx_chunks_rev",
                 "idx_graph_links_from",
-                "idx_llm_turns_run",
+                "idx_history_items_session",
+                "idx_llm_turns_run_seq",
                 "idx_retrievals_run",
                 "idx_revisions_current",
+                "idx_runs_session",
                 "idx_store_events_external",
                 "idx_store_events_source",
                 "idx_verifications_run",

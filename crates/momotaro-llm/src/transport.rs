@@ -22,6 +22,8 @@
 //!   carry credentials, headers, or URLs with secrets — the client's sanitize
 //!   pass strips control characters, not secrets.
 
+use std::time::Duration;
+
 /// One complete provider reply: an HTTP status plus the raw body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportReply {
@@ -30,6 +32,10 @@ pub struct TransportReply {
     /// Raw response body. Size limits are the transport's responsibility —
     /// the client decodes whatever it is handed.
     pub body: String,
+    /// The provider's `Retry-After` delay, when it sent one and it was
+    /// decodable. This belongs to the reply, not [`crate::LlmError`], because
+    /// only a permitted retry can act on it.
+    pub retry_after: Option<Duration>,
 }
 
 /// A transport-level failure: no complete reply came back.
@@ -54,4 +60,19 @@ pub struct TransportError {
 pub trait ProviderTransport {
     /// Perform one provider exchange.
     fn send(&self, body: &str) -> Result<TransportReply, TransportError>;
+
+    /// Perform one exchange carrying the request's idempotency key.
+    ///
+    /// The default drops the key so existing transports keep compiling; the
+    /// production transport and the test rig override this. `complete` always
+    /// calls it with [`crate::LlmRequest::request_hash`], and every retry
+    /// passes the same value.
+    fn send_with_idempotency_key(
+        &self,
+        idempotency_key: &str,
+        body: &str,
+    ) -> Result<TransportReply, TransportError> {
+        let _ = idempotency_key;
+        self.send(body)
+    }
 }

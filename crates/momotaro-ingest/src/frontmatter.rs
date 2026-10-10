@@ -195,7 +195,7 @@ fn first_line(source: &str) -> (&str, &str) {
 /// Whether a full line is a bare delimiter, tolerating trailing spaces and tabs.
 fn is_delimiter(line: &str, expected: &str) -> bool {
     let (line, _) = split_ending(line);
-    line == expected || line.trim_end_matches([' ', '\t']) == expected
+    line.trim_end_matches([' ', '\t']) == expected
 }
 
 /// Splits one line into its content and its ending (`\r\n`, `\n`, or nothing).
@@ -251,7 +251,7 @@ fn simple_flow_sequence(inline: &str) -> Option<Vec<String>> {
 /// Whether a value even looks like a flow collection: `[ … ]`.
 fn looks_like_flow(inline: &str) -> bool {
     let trimmed = inline.trim();
-    trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2
+    trimmed.starts_with('[') && trimmed.ends_with(']')
 }
 
 /// What has been read of the field currently open, if any.
@@ -272,6 +272,13 @@ struct Pending {
 impl Pending {
     fn settle(self) -> Field {
         let value = if self.unmodelled {
+            Value::Raw(self.source.join("\n"))
+        } else if !self.list.is_empty() && self.inline.is_some() {
+            // A value *and* list items on one field: a shape this parser does
+            // not model — nothing is guessed, the whole field keeps its source
+            // lines (the rule the `unmodelled` arm above applies). Reading it
+            // as a list used to drop the inline value silently (probe A2-02:
+            // `tags: draft` + `- archived` lost `draft`).
             Value::Raw(self.source.join("\n"))
         } else if !self.list.is_empty() {
             Value::List(self.list)
@@ -761,8 +768,12 @@ mod tests {
         let source = "---\n# a note to self\n{ \"publish\": false }\n---\nbody\n";
         let (frontmatter, _) = split(source);
         let field = field(&frontmatter, "{ \"publish\"");
-        assert!(
-            matches!(field.value, Value::Raw(_)),
+        // The whole line, not just the variant: D41 writes this string into
+        // `source_revisions.metadata_json.frontmatter`, so a `Raw` that lost its
+        // bytes is data loss with the right type on it.
+        assert_eq!(
+            field.value,
+            Value::Raw("{ \"publish\": false }".to_owned()),
             "kept as source: {:?}",
             field.value
         );
@@ -776,8 +787,10 @@ mod tests {
         let source = "---\n\"a: b\": value\n---\nbody\n";
         let (frontmatter, _) = split(source);
         let field = field(&frontmatter, "\"a");
-        assert!(
-            matches!(field.value, Value::Raw(_)),
+        // The bytes, not just the variant — see the note in the test above.
+        assert_eq!(
+            field.value,
+            Value::Raw("\"a: b\": value".to_owned()),
             "kept as source, not split: {:?}",
             field.value
         );
@@ -790,6 +803,36 @@ mod tests {
         assert_eq!(
             field(&frontmatter, "tags").value,
             Value::List(vec!["project".to_owned(), "active".to_owned()])
+        );
+    }
+
+    /// `looks_like_flow` needs the brackets *and* the length: an unclosed
+    /// `[draft` is a scalar somebody wrote badly, not a sequence this parser
+    /// can read. Read it as one and it slices off the last character and
+    /// hands downstream `["draf"]` — invented data with the right type.
+    #[test]
+    fn an_unclosed_flow_sequence_stays_the_scalar_it_was_written_as() {
+        let source = "---\ntags: [draft\n---\nbody\n";
+        let (frontmatter, _) = split(source);
+        assert_eq!(
+            field(&frontmatter, "tags").value,
+            Value::Scalar("[draft".to_owned())
+        );
+    }
+
+    /// YAML 1.2.2 §8.1.1 again, the other way round: only a `|` or `>` header
+    /// makes the lines under a key scalar content. Without one, `- item` is a
+    /// list item — but a value *and* list items on one field is a shape this
+    /// parser does not model, so nothing is guessed: the field keeps its
+    /// source lines. (It used to read as a list with the inline value
+    /// silently dropped — probe A2-02.)
+    #[test]
+    fn an_inline_value_beside_list_items_is_raw_not_a_half_read_list() {
+        let source = "---\ntags: draft\n- archived\n---\nbody\n";
+        let (frontmatter, _) = split(source);
+        assert_eq!(
+            field(&frontmatter, "tags").value,
+            Value::Raw("tags: draft\n- archived".to_owned())
         );
     }
 

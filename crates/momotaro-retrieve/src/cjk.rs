@@ -10,7 +10,7 @@
 use momotaro_contracts::is_cjk;
 use tantivy::tokenizer::{TextAnalyzer, Token, TokenStream, Tokenizer};
 
-/// Name under which [`cjk_analyzer`] is registered on an index.
+/// Name under which `cjk_analyzer` is registered on an index.
 pub const CJK_TOKENIZER_NAME: &str = "cjk";
 
 /// Longest accepted non-CJK token, in characters; longer tokens are dropped.
@@ -57,7 +57,7 @@ impl TokenStream for CjkTokenStream {
 }
 
 /// Builds the analyzer registered as `"cjk"`. Lowercasing is built in.
-pub fn cjk_analyzer() -> TextAnalyzer {
+pub(crate) fn cjk_analyzer() -> TextAnalyzer {
     TextAnalyzer::builder(CjkTokenizer).build()
 }
 
@@ -211,9 +211,19 @@ mod tests {
     fn overlong_latin_token_is_dropped() {
         let dropped = tokens_of(&format!("{} tail", "a".repeat(50)));
         assert_eq!(texts(&dropped), ["tail"]);
-        // 40 chars is exactly at the limit and is kept.
+        // Dropping the text is only half of it: the token still consumes its
+        // position slot, so `tail` is the *second* token of the input. Without
+        // that gap a phrase query would stitch across the drop and match text
+        // that was never adjacent. Nothing here looked at `position`, so a
+        // drop that forgot to advance it passed.
+        assert_eq!(
+            dropped[0].position, 1,
+            "the dropped token still took a slot"
+        );
+        // 40 chars is exactly at the limit and is kept, at slot 0.
         let kept = tokens_of(&"a".repeat(40));
         assert_eq!(texts(&kept).len(), 1);
+        assert_eq!(kept[0].position, 0, "a token that is kept starts the run");
     }
 
     #[test]

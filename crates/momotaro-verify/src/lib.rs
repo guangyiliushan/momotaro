@@ -43,7 +43,7 @@ pub use error::VerifyError;
 pub use source::{BytesState, CitationSource, StoreSource};
 pub use status::{VerificationKind, VerificationStatus, VerifyDetail};
 pub use verdict::{AnswerVerdict, Verification};
-pub use verify::{VerifyPolicy, check_source_integrity, verify_answer, verify_citation};
+pub use verify::{VerifyPolicy, verify_answer};
 
 #[cfg(test)]
 mod tests {
@@ -54,11 +54,13 @@ mod tests {
     /// crate name would let any other client through, and "zero tokens, zero
     /// LLM" is a property of *what this crate may link against*, not of one
     /// spelling.
-    const DEPENDENCIES: [&str; 6] = [
+    const DEPENDENCIES: [&str; 8] = [
         "momotaro-contracts",
         "momotaro-store",
         "serde",
         "serde_json",
+        "sha2",
+        "hex",
         "tempfile",
         "thiserror",
     ];

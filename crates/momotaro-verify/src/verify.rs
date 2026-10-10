@@ -6,6 +6,7 @@
 //! when more than one is broken.
 
 use crate::citation::Citation;
+use crate::error::VerifyError;
 use crate::source::{BytesState, CitationSource};
 use crate::status::{VerificationKind, VerifyDetail};
 use crate::verdict::{AnswerVerdict, Verification};
@@ -87,7 +88,11 @@ pub fn verify_citation<S: CitationSource>(
     }
 
     let chunk = match source.chunk(&citation.chunk_id) {
-        Err(_) => {
+        Err(error) => {
+            // The verdict vocabulary deliberately has no free-text slot; keep
+            // the typed error's path/cause on the diagnostic channel instead
+            // of throwing it away at the seam boundary.
+            eprintln!("{}", unreadable_context("citation chunk", &error));
             return Verification::unsupported(
                 VerificationKind::Citation,
                 VerifyDetail::ChunkUnreadable,
@@ -134,13 +139,10 @@ pub fn verify_citation<S: CitationSource>(
 /// A read that fails for any reason other than absence is `unsupported`, not
 /// `failed`: "I could not open it" is not "it is not there".
 ///
-/// **No seam in this crate can recompute `revision_hash`** (it would need a
-/// hashing dependency this crate deliberately does not have), so through the
-/// production seam this check can reach only `failed` (`source_missing`) or
-/// `unsupported` — never `passed`. (`skipped` is reachable too when the policy
-/// is off; it never reaches the seam.) `passed` and `revision_hash_mismatch`
-/// exist for a seam that can hash; a caller must not expect an integrity pass
-/// until one lands.
+/// The production seam recomputes the ingest-domain hash from the canonical
+/// bytes; a generic seam that cannot do so reports `ByteHashUnchecked`, which
+/// stays `unsupported` rather than being promoted to a pass. `skipped` is
+/// reachable when the policy is off; it never reaches the seam.
 pub fn check_source_integrity<S: CitationSource>(
     source: &S,
     policy: VerifyPolicy,
@@ -155,10 +157,13 @@ pub fn check_source_integrity<S: CitationSource>(
     }
 
     match source.source_bytes(source_key, revision_hash) {
-        Err(_) => Verification::unsupported(
-            VerificationKind::SourceIntegrity,
-            VerifyDetail::SourceBytesUnavailable,
-        ),
+        Err(error) => {
+            eprintln!("{}", unreadable_context("source bytes", &error));
+            Verification::unsupported(
+                VerificationKind::SourceIntegrity,
+                VerifyDetail::SourceBytesUnavailable,
+            )
+        }
         Ok(BytesState::Missing) => Verification::failed(
             VerificationKind::SourceIntegrity,
             VerifyDetail::SourceMissing,
@@ -221,10 +226,19 @@ pub fn verify_answer<S: CitationSource>(
     }
 }
 
+/// Builds the diagnostic line for a seam failure without changing its verdict.
+///
+/// `VerifyError` already owns the useful context — the store failure, or the
+/// path and I/O source — and `Verification` is intentionally a stable,
+/// copyable verdict, so this is the one place the two meet.
+fn unreadable_context(what: &str, error: &VerifyError) -> String {
+    format!("momotaro-verify: {what} read failed: {error}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::VerifyError;
+    use crate::error::VerifyError;
     use crate::source::{BytesState, sealed};
     use crate::status::VerificationStatus;
     use momotaro_contracts::Chunk;
@@ -949,5 +963,28 @@ mod tests {
             VerifyDetail::HashMismatch,
             "hash and locator both broken",
         );
+    }
+
+    #[test]
+    fn unreadable_chunk_context_keeps_the_store_failure() {
+        let error = VerifyError::Store(momotaro_store::StoreError::InvalidSchemaVersion(
+            "boom".to_owned(),
+        ));
+        let detail = unreadable_context("citation chunk", &error);
+        assert!(detail.contains("citation chunk read failed"));
+        assert!(detail.contains("store read failed"));
+        assert!(detail.contains("boom"));
+    }
+
+    #[test]
+    fn unreadable_source_context_keeps_the_path_and_io_cause() {
+        let error = VerifyError::Io {
+            path: "workspace/notes/a.md".into(),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        let detail = unreadable_context("source bytes", &error);
+        assert!(detail.contains("source bytes read failed"));
+        assert!(detail.contains("workspace/notes/a.md"));
+        assert!(detail.contains("permission denied"));
     }
 }

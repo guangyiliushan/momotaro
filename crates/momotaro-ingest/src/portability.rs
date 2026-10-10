@@ -195,6 +195,29 @@ mod tests {
         assert!(!is_cloud_placeholder(attrs), "attrs={attrs:#x}");
     }
 
+    /// The production reader, not an injected one.
+    ///
+    /// Every other test here either hands `is_cloud_placeholder` a literal or
+    /// injects `attributes_of`, so the real Windows arm can be replaced by
+    /// either constant and stay green: `Ok(0)` and `Ok(1)` are both
+    /// non-placeholders, and the only positive verdict is the `#[ignore]`d one.
+    /// A file this machine just wrote carries `FILE_ATTRIBUTE_ARCHIVE`, which
+    /// neither constant has — so this is the only assertion that can tell the
+    /// reader reads.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_reader_returns_the_files_own_attributes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("fresh.md");
+        fs::write(&file, "x").expect("write");
+        let attrs = attributes_of(&file).expect("attributes");
+        assert_eq!(
+            attrs & 0x0000_0020,
+            0x0000_0020,
+            "FILE_ATTRIBUTE_ARCHIVE is set when NTFS creates a file: {attrs:#x}"
+        );
+    }
+
     /// The one thing no test on this machine can build: a real cloud
     /// placeholder. Run it by hand once — point the variable at a file inside a
     /// OneDrive (or any Cloud Files engine's) folder you freed space for
@@ -205,9 +228,12 @@ mod tests {
     /// ```
     ///
     /// It stops with the steps when the variable is unset, so "did not run"
-    /// cannot read as "passed". The index-run half of the story is proven with
-    /// injected attributes (`index_workspace_with`); what only a real sample
-    /// can show is that the attribute word the reader sees carries the bit.
+    /// cannot read as "passed". The index-run half of the story is proven on
+    /// the other side of the boundary — `momotaro-run` injects its own
+    /// attributes through a seam that is `pub(crate)` over there, which is why
+    /// this crate's readers were never able to reach it; what only a real
+    /// sample can show is that the attribute word the reader sees carries the
+    /// bit.
     #[cfg(windows)]
     #[test]
     #[ignore = "needs a real OneDrive placeholder"]

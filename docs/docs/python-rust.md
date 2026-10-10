@@ -22,10 +22,10 @@ agent 技能。两者都不进 `Cargo.toml`、不进发布二进制、不常驻�
 |---|---|---|
 | CLI `--json` | 评测、统计、批量分析 | 只消费输出；不写 canonical |
 | 只读 SQLite | golden set 标注、回归取数 | 只读连接；schema 以 Rust contracts 为准 |
-| 类型投影 | contracts → TS（`packages/ipc`）/ Python（评测） | 单一事实源在 Rust，生成而非手写 |
+| 类型投影 | contracts → TS（`packages/ipc`，**后置**）/ Python（评测） | 单一事实源在 Rust，生成而非手写 |
 | 版本化子进程 | 默认 PDF 解析与高配 PDF 解析（GROBID/Marker）；后置 math/CAS 验证 | JSON stdin/stdout；高配默认关；不在 ask 热路径 |
 
-前三条现在就可以用；第四条是版本化子进程协议，默认 PDF 解析从第一版启用，高配后端可换。
+第 1、2 条现在就可以用；**第 3 条要等 `packages/ipc` 落地**（`README` 记为 planned，本树的 `packages/` 只有 `ui`）；第四条是版本化子进程协议，默认 PDF 解析从第一版启用，高配后端可换。
 
 ## 高配解析器子进程（v0.4 接缝，D18）
 
@@ -47,7 +47,7 @@ PDF 双层解析走同一子进程通道（决策见 [Architecture D18](architec
 momotaro/
   tools/
     evals/          # golden set + 检索回归（可 Python）
-    migrate/        # 一次性迁移脚本
+    migrate/        # 一次性迁移脚本（后置，本树没有 tools/migrate/）
 ```
 
 规则：
@@ -62,7 +62,7 @@ momotaro/
 ## contracts 的语言投影
 
 `momotaro-contracts` 是唯一事实源。类型预留 schema 导出接缝（实现期选型），
-生成 `packages/ipc` 的 TS 类型与评测用 Python 类型。方向永远
+`packages/ipc` 落地后由它生成 TS 类型、评测侧生成 Python 类型。方向永远
 Rust → 其它语言；禁止在 TS / Python 里维护第二份契约再「保持同步」。
 
 ## math/CAS 接缝（后置，不是承诺）

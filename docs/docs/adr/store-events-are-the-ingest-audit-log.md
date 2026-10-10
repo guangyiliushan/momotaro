@@ -72,10 +72,11 @@ and each **domain** owns its set:
 
 The column cannot catch a third spelling; the writers keep the vocabularies
 closed instead — `FileOutcome` renders the outcome, `IndexFileErrorKind` renders
-the error kinds, and a **degradation code is not an error kind**: it rides on an
-`indexed` row, and it is `momotaro_contracts::Degradation`, whose `as_str` is the
-one writer. A file can lose more than one thing at once, and the shape of that
-lives in `ingest-interop.md` §5.5.
+the error kinds, and a **degradation code is not an error kind**: it rides on
+whichever row it happened to (an `indexed` one usually — but `symlink_encountered`
+only ever rides a `skipped` link), and it is
+`momotaro_contracts::Degradation`, whose `as_str` is the one writer. A file can lose more than one thing at once, and the shape of that
+lives in `ingest-interop.md` §5 第 8 条.
 
 The `ingest.finished` payload carries the report's counters, and they do **not**
 map one-to-one onto the rows: `files_indexed` counts both `indexed` and
@@ -89,13 +90,16 @@ D41's ten codes say what a file **lost** on the way into the index. D42's three
 warnings say what will not survive **another platform**: a cloud placeholder
 whose bytes are not on this device (`onedrive_placeholder`), an iCloud eviction
 stub standing in for a note that is not here (`icloud_placeholder`), and a name
-Windows' naming rules reserve (`windows_incompatible_name`). They
+Windows' naming rules reserve (`windows_incompatible_name`). The vocabulary
+table above names a fourth — `source_removed` — and it is **not** a D42 warning:
+it comes from D40 §4.2's delete half, and rides the same `Warning` enum only
+because both are "not a loss the file took". They
 are `momotaro_contracts::Warning`, not more `Degradation` variants: nothing was
 lost by the file, the ten stay ten, and a reader counting degradations is not
 silently taught a fourth kind of loss.
 
 A warning rides the same `reason_code` column and the same rows, with the two
-homes `ingest-interop.md` §5.5 第 8 条 gives a degradation list: `reason_code`
+homes `ingest-interop.md` §5 第 8 条 gives a degradation list: `reason_code`
 carries the first degradation when the row has one, and the first warning when
 it does not (each list in its enum's declaration order — the order the payload
 and the counts carry); `data_json` carries `{"degradations": […], "warnings": […]}` and,
@@ -156,7 +160,7 @@ decision; making that decision is not part of this contract.
   `indexed | skipped | metadata_refreshed | error` per source, beside the batch's
   own counters. The row is small. Since W2.4 the coverage rows are appended in
   one **event sweep** after the batch's data is settled (the `stale_anchor` code
-  is decided against the settled state, `§5 第 4 条`), each row its own
+  is decided against the settled state, §4 第 7 条), each row its own
   transaction: the loss window is the batch tail — a crash before or during the
   sweep loses the unwritten coverage rows while every data write survives, never
   the reverse.
@@ -176,7 +180,7 @@ decision; making that decision is not part of this contract.
   debounce batch then decided `stale_anchor` mid-walk — the same walk-order
   dependence the index batch avoids by design. Rows settle at the tail sweep in
   both shapes now, so every `stale_anchor` verdict is decided against the
-  settled state (`§5 第 4 条`) and both shapes keep exactly the tail window the
+  settled state (§4 第 7 条) and both shapes keep exactly the tail window the
   first bullet states. The *never invent* half holds in both shapes, because
   every data write precedes its event.
 - A batch that aborts mid-way leaves `ingest.started` with no terminal event, so a

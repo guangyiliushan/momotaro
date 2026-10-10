@@ -12,6 +12,7 @@ on:
   pull_request:
     branches:
       - main
+      - dev
     paths:
       - ".github/workflows/docs-test.yml"
       - "docs/**"

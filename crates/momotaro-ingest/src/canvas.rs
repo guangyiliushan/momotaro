@@ -21,7 +21,7 @@ use std::path::Path;
 /// path's branch share this one predicate, so a file cannot be walked in as a
 /// canvas and then read as Markdown somewhere else.
 #[must_use]
-pub fn is_canvas_path(path: &Path) -> bool {
+pub(crate) fn is_canvas_path(path: &Path) -> bool {
     path.extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("canvas"))
 }

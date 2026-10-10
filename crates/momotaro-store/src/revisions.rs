@@ -115,7 +115,10 @@ pub(crate) fn append_revision_tx(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)
          ON CONFLICT(source_key, revision_hash) DO UPDATE SET
              is_current = 1,
+             kind = excluded.kind,
              title = excluded.title,
+             uri = excluded.uri,
+             origin_class = excluded.origin_class,
              local_path = excluded.local_path,
              raw_name = excluded.raw_name,
              metadata_json = excluded.metadata_json",
@@ -169,26 +172,50 @@ impl crate::Store {
     ///
     /// Mirrors [`Self::current_titles`]; a source missing from the map means
     /// the store has no current revision for it (the column itself is NOT NULL).
-    pub fn current_origins(
+    /// One column off the current revision of each requested key.
+    ///
+    /// The two readers below differ only in *which* column and in what a NULL
+    /// means there — a class is NOT NULL (a NULL is a store violating its own
+    /// DDL), a title may be missing (the row simply carries none). `column` is
+    /// one of the two literal names at the call sites, never input.
+    fn current_column(
         &self,
         source_keys: &HashSet<&str>,
-    ) -> Result<HashMap<String, OriginClass>, StoreError> {
+        column: &str,
+    ) -> Result<HashMap<String, Option<String>>, StoreError> {
         if source_keys.is_empty() {
             return Ok(HashMap::new());
         }
         let placeholders = numbered_placeholders(source_keys);
         let sql = format!(
-            "SELECT source_key, origin_class FROM source_revisions
+            "SELECT source_key, {column} FROM source_revisions
              WHERE is_current = 1 AND source_key IN ({placeholders})"
         );
         let mut statement = self.connection.prepare(&sql)?;
         let params: Vec<&str> = source_keys.iter().copied().collect();
         let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })?;
-        let mut origins = HashMap::new();
+        let mut column_of = HashMap::new();
         for row in rows {
-            let (key, origin) = row?;
+            let (key, value) = row?;
+            column_of.insert(key, value);
+        }
+        Ok(column_of)
+    }
+
+    /// One trust class per source key, fetched in a single query.
+    ///
+    /// Mirrors [`Self::current_titles`]; a source missing from the map means
+    /// the store has no current revision for it (the column itself is NOT NULL).
+    pub fn current_origins(
+        &self,
+        source_keys: &HashSet<&str>,
+    ) -> Result<HashMap<String, OriginClass>, StoreError> {
+        let column = self.current_column(source_keys, "origin_class")?;
+        let mut origins = HashMap::new();
+        for (key, origin) in column {
+            let origin = origin.ok_or_else(|| invalid_value("origin_class", "NULL"))?;
             origins.insert(key, origin_from_string(&origin)?);
         }
         Ok(origins)
@@ -201,27 +228,11 @@ impl crate::Store {
         &self,
         source_keys: &HashSet<&str>,
     ) -> Result<HashMap<String, String>, StoreError> {
-        if source_keys.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let placeholders = numbered_placeholders(source_keys);
-        let sql = format!(
-            "SELECT source_key, title FROM source_revisions
-             WHERE is_current = 1 AND source_key IN ({placeholders})"
-        );
-        let mut statement = self.connection.prepare(&sql)?;
-        let params: Vec<&str> = source_keys.iter().copied().collect();
-        let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })?;
-        let mut titles = HashMap::new();
-        for row in rows {
-            let (key, title) = row?;
-            if let Some(title) = title {
-                titles.insert(key, title);
-            }
-        }
-        Ok(titles)
+        Ok(self
+            .current_column(source_keys, "title")?
+            .into_iter()
+            .filter_map(|(key, title)| title.map(|title| (key, title)))
+            .collect())
     }
 
     /// Every source that still has a current revision: its key, the spelling
@@ -259,15 +270,12 @@ impl crate::Store {
     /// next walk does not report the same absence twice — while a file that
     /// comes back becomes current again and earns a *fresh* absence if it
     /// disappears a second time.
-    ///
-    /// Returns whether anything was demoted, so a caller can skip a row it
-    /// would otherwise repeat.
-    pub fn demote_current(&mut self, source_key: &str) -> Result<bool, StoreError> {
-        let changed = self.connection.execute(
+    pub fn demote_current(&mut self, source_key: &str) -> Result<(), StoreError> {
+        self.connection.execute(
             "UPDATE source_revisions SET is_current = 0 WHERE source_key = ?1 AND is_current = 1",
             params![source_key],
         )?;
-        Ok(changed > 0)
+        Ok(())
     }
 
     /// Refreshes the mutable columns of one revision in place.
@@ -335,13 +343,7 @@ pub(crate) fn update_revision_fingerprint_tx(
 mod tests {
     use super::*;
     use crate::Store;
-
-    fn open_temp_store() -> Store {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let mut store = Store::open(dir.path().join("momotaro.db")).expect("open store");
-        store.init_schema().expect("initialize schema");
-        store
-    }
+    use crate::test_support::temp_store;
 
     fn revision<'a>(source_key: &'a str, revision_hash: &'a str) -> NewSourceRevision<'a> {
         NewSourceRevision {
@@ -376,7 +378,7 @@ mod tests {
 
     #[test]
     fn first_append_is_current() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         store
             .append_revision(&revision("a.md", "hash1"))
             .expect("append");
@@ -396,7 +398,7 @@ mod tests {
 
     #[test]
     fn second_revision_demotes_first_but_keeps_it() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         store
             .append_revision(&revision("a.md", "hash1"))
             .expect("append hash1");
@@ -413,9 +415,32 @@ mod tests {
         assert!(flags.contains(&("hash2".to_owned(), true)));
     }
 
+    /// A same-hash re-append can carry corrected classification/URI metadata;
+    /// the immutable pair is identity, not a reason to keep stale columns.
+    #[test]
+    fn reappending_updates_kind_uri_and_origin() {
+        let (_dir, mut store) = temp_store();
+        let mut first = revision("a.md", "hash1");
+        first.kind = SourceKind::Note;
+        first.uri = None;
+        first.origin_class = OriginClass::Owner;
+        store.append_revision(&first).expect("append");
+
+        let mut corrected = revision("a.md", "hash1");
+        corrected.kind = SourceKind::Paper;
+        corrected.uri = Some("https://example.test/paper");
+        corrected.origin_class = OriginClass::Paper;
+        store.append_revision(&corrected).expect("re-append");
+
+        let row = store.current_revision("a.md").expect("read").expect("row");
+        assert_eq!(row.kind, SourceKind::Paper);
+        assert_eq!(row.uri.as_deref(), Some("https://example.test/paper"));
+        assert_eq!(row.origin_class, OriginClass::Paper);
+    }
+
     #[test]
     fn reappending_same_revision_is_idempotent() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         store
             .append_revision(&revision("a.md", "hash1"))
             .expect("append hash1");
@@ -444,7 +469,7 @@ mod tests {
 
     #[test]
     fn missing_source_returns_none() {
-        let store = open_temp_store();
+        let (_dir, store) = temp_store();
         assert!(store.current_revision("nope").expect("read").is_none());
         assert!(
             store
@@ -456,7 +481,7 @@ mod tests {
 
     #[test]
     fn current_revision_title_extracts_title() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         store
             .append_revision(&revision("a.md", "hash1"))
             .expect("append");
@@ -471,7 +496,7 @@ mod tests {
 
     #[test]
     fn refreshing_a_missing_revision_is_an_error() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         store
             .append_revision(&revision("a.md", "hash1"))
             .expect("append");
@@ -487,7 +512,7 @@ mod tests {
 
     #[test]
     fn refresh_updates_exactly_one_row() {
-        let mut store = open_temp_store();
+        let (_dir, mut store) = temp_store();
         store
             .append_revision(&revision("a.md", "hash1"))
             .expect("append hash1");
@@ -547,7 +572,7 @@ mod tests {
 
     #[test]
     fn unknown_kind_string_is_rejected() {
-        let store = open_temp_store();
+        let (_dir, store) = temp_store();
         store
             .connection
             .execute(

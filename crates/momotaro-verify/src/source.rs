@@ -3,9 +3,14 @@
 
 use momotaro_contracts::Chunk;
 use momotaro_store::Store;
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
-use crate::VerifyError;
+use crate::error::VerifyError;
+
+/// Same identity domain as ingest's revision hashes.
+const REVISION_DOMAIN: &[u8] = b"momotaro-revision-v1\0";
 
 /// Marks a trait as implementable only where its author can see it.
 ///
@@ -20,11 +25,12 @@ pub(crate) mod sealed {
 /// What a source's on-disk bytes look like for one revision.
 ///
 /// `reference.md` defines source integrity as "the bytes named by the row are
-/// present **and match the hash**". This crate has no hashing dependency, so
-/// it can answer the first half and must say honestly that it cannot answer
-/// the second: [`Self::Present`] carries `hash_matches: None` whenever the
-/// check could not be performed, and the caller reports that as
-/// `unsupported`, never as `passed`.
+/// present **and match the hash**". The production seam therefore reads the
+/// canonical local bytes and streams their ingest-domain SHA-256. ADR 0023
+/// excludes paper bytes from snapshots; that is about backup copies, not a
+/// licence to call an unchecked file verified. A read that cannot hash keeps
+/// `hash_matches: None`, which the caller reports as `unsupported`, never as
+/// `passed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BytesState {
     /// The bytes are readable.
@@ -170,11 +176,21 @@ impl CitationSource for StoreSource<'_> {
         // is the residue — the window between those two syscalls, where the
         // entry is replaced or unpermissioned in between. It is a defensive
         // arm with no fixture (mutating it away is a registered survivor,
-        // O05). The *judgement* it carries — a read failure is `unsupported`,
+        // O05). O05 covers all three sites of this shape — this one and the
+        // two `ErrorKind::NotFound` guards below. Not for want of
+        // reachability: every missing leaf walks `canonicalize` → NotFound →
+        // `symlink_metadata` → NotFound, so both guards fire on the ordinary
+        // absence path. What no fixture can produce is a `symlink_metadata`
+        // that answers with some *other* error while `canonicalize` has just
+        // answered NotFound — that disagreement lives in the window between
+        // the two syscalls — so `== NotFound` → `true` cannot be told apart
+        // from the correct guard. What is held by the tests is the
+        // *judgement* these arms carry: a read that never ran is
+        // `unsupported`, never `source_missing`. The *judgement* it carries — a read failure is `unsupported`,
         // never `source_missing` — is pinned through the walk-up arm by
         // `a_read_failure_is_reported_as_unavailable_not_as_missing` and at
         // the mapping by
-        // `a_source_that_cannot_be_read_is_unavailable_rather_than_missing`.
+        // `a_source_that_cannot_be_read_is_unsupported_rather_than_missing`.
         //
         // Swapping this `fs::metadata` for `fs::symlink_metadata` would report
         // a *resolvable* link as missing; the fixture that kills that
@@ -184,7 +200,21 @@ impl CitationSource for StoreSource<'_> {
         // and dies on the ubuntu leg: registered survivor Q03, a platform
         // survivor rather than an uncovered arm.
         match std::fs::metadata(&joined) {
-            Ok(meta) if meta.is_file() => Ok(BytesState::Present { hash_matches: None }),
+            Ok(meta) if meta.is_file() => {
+                // Metadata and open are two syscalls, so a file removed in
+                // between is still a confirmed absence, not an I/O outage.
+                match revision_hash_matches(&joined, revision_hash) {
+                    Ok(hash_matches) => Ok(BytesState::Present {
+                        hash_matches: Some(hash_matches),
+                    }),
+                    Err(VerifyError::Io { source, .. })
+                        if source.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        Ok(BytesState::Missing)
+                    }
+                    Err(source) => Err(source),
+                }
+            }
             Ok(_) => Ok(BytesState::Missing),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BytesState::Missing),
             Err(source) => Err(VerifyError::Io {
@@ -193,6 +223,36 @@ impl CitationSource for StoreSource<'_> {
             }),
         }
     }
+}
+
+/// Streams the canonical local bytes and compares their ingest-domain hash.
+///
+/// A 16 KiB window matches ingest's attachment reader: a paper or video can be
+/// large, but integrity is a one-pass read rather than a snapshot copy. Any
+/// read error propagates with the path so the caller can keep it
+/// `unsupported` rather than confuse an outage with absence.
+fn revision_hash_matches(path: &Path, expected: &str) -> Result<bool, VerifyError> {
+    let file = std::fs::File::open(path).map_err(|source| VerifyError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = Sha256::new();
+    hasher.update(REVISION_DOMAIN);
+
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(|source| VerifyError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(hex::encode(hasher.finalize()) == expected)
 }
 
 /// Resolves `path`, tolerating a missing leaf: the deepest ancestor that
@@ -307,7 +367,8 @@ fn canonicalize_existing_ancestor(path: &Path) -> Result<Option<PathBuf>, Verify
 mod tests {
     use super::*;
     use crate::status::{VerificationKind, VerificationStatus, VerifyDetail};
-    use crate::{Citation, VerifyPolicy, check_source_integrity, verify_citation};
+    use crate::verify::{check_source_integrity, verify_citation};
+    use crate::{Citation, VerifyPolicy};
     use momotaro_contracts::{OriginClass, SourceKind};
     use momotaro_store::NewSourceRevision;
 
@@ -368,6 +429,13 @@ mod tests {
             metadata_json: "{}",
             ingested_at: 1,
         }
+    }
+
+    fn revision_hash(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(super::REVISION_DOMAIN);
+        hasher.update(bytes);
+        hex::encode(hasher.finalize())
     }
 
     /// Builds a store with one revision, its chunk row, and — when
@@ -440,14 +508,62 @@ mod tests {
         assert_eq!(v.detail, Some(VerifyDetail::ChunkMissing));
     }
 
+    /// The production seam does not stop at "the path exists": it hashes the
+    /// canonical bytes with ingest's domain and can therefore award an
+    /// integrity pass.
     #[test]
-    fn present_bytes_cannot_claim_passed_because_the_hash_cannot_be_recomputed() {
-        let f = fixture(Some("notes/a.md"));
+    fn matching_local_bytes_are_read_and_hashed_to_passed() {
+        let mut f = fixture(Some("notes/a.md"));
+        let expected = revision_hash(b"hello world");
+        f.store
+            .append_revision(&NewSourceRevision {
+                ingested_at: 2,
+                ..revision(&expected, Some("notes/a.md"))
+            })
+            .expect("append the real revision");
         let source = StoreSource::new(&f.store, f.root());
-        let v = integrity(&source, SOURCE_KEY, REVISION);
+        let v = integrity(&source, SOURCE_KEY, &expected);
         assert_eq!(v.kind, VerificationKind::SourceIntegrity);
-        assert_eq!(v.status, VerificationStatus::Unsupported);
-        assert_eq!(v.detail, Some(VerifyDetail::ByteHashUnchecked));
+        assert_eq!(
+            v.status,
+            VerificationStatus::Passed,
+            "detail: {:?}",
+            v.detail
+        );
+        assert_eq!(v.detail, None);
+    }
+
+    /// Mutation twins of the pass case: same path, same read, one changed
+    /// byte must fail and veto the answer rather than remain unchecked.
+    #[test]
+    fn tampered_local_bytes_fail_the_streamed_revision_hash() {
+        let mut f = fixture(Some("notes/a.md"));
+        let expected = revision_hash(b"hello world");
+        f.store
+            .append_revision(&NewSourceRevision {
+                ingested_at: 2,
+                ..revision(&expected, Some("notes/a.md"))
+            })
+            .expect("append the real revision");
+        std::fs::write(f.root().join("notes/a.md"), "hello wormd").expect("tamper");
+
+        let source = StoreSource::new(&f.store, f.root());
+        assert_eq!(
+            source.source_bytes(SOURCE_KEY, &expected).expect("read"),
+            BytesState::Present {
+                hash_matches: Some(false)
+            }
+        );
+        let v = integrity(&source, SOURCE_KEY, &expected);
+        assert_eq!(v.status, VerificationStatus::Failed);
+        assert_eq!(v.detail, Some(VerifyDetail::RevisionHashMismatch));
+
+        let answer =
+            crate::verify_answer(&source, VerifyPolicy::enabled(), &["f0001"], &[citation()]);
+        assert!(
+            !answer.fully_verified(),
+            "an integrity hash mismatch must veto the answer"
+        );
     }
 
     #[test]
@@ -799,18 +915,24 @@ mod tests {
         f.store
             .update_revision_fingerprint(SOURCE_KEY, REVISION, "{}", "link.md", "link.md")
             .expect("point the revision at the symlink");
+        let expected = revision_hash(b"hello world");
+        f.store
+            .append_revision(&NewSourceRevision {
+                ingested_at: 2,
+                ..revision(&expected, Some("link.md"))
+            })
+            .expect("append the real revision");
         let source = StoreSource::new(&f.store, f.root());
-        let v = integrity(&source, SOURCE_KEY, REVISION);
+        let v = integrity(&source, SOURCE_KEY, &expected);
         assert_eq!(
             v.status,
-            VerificationStatus::Unsupported,
+            VerificationStatus::Passed,
             "detail: {:?}",
             v.detail
         );
         assert_eq!(
-            v.detail,
-            Some(VerifyDetail::ByteHashUnchecked),
-            "a readable link is readable bytes — following it is the point"
+            v.detail, None,
+            "a readable link is read through and hashed like any other leaf"
         );
     }
 
@@ -1107,6 +1229,27 @@ mod tests {
                 .expect("walk")
                 .is_some(),
             "an absent file must still resolve through an existing ancestor"
+        );
+    }
+
+    /// The missing tail comes back in **path order** — the property
+    /// `momotaro-ingest`'s copy of this walk pins on its side. The two are
+    /// deliberately different in shape (this one answers `Option` and refuses
+    /// a broken link) and must not differ in order: a reversed tail makes a
+    /// citation's `local_path` point somewhere else, silently.
+    #[test]
+    fn a_missing_tail_is_re_appended_in_path_order() {
+        let ws = tempfile::tempdir().expect("temp workspace");
+        std::fs::create_dir_all(ws.path().join("a")).expect("dir a");
+        let missing = ws.path().join("a").join("b").join("c.md");
+        let expected = std::fs::canonicalize(ws.path().join("a"))
+            .expect("canonical a")
+            .join("b")
+            .join("c.md");
+        assert_eq!(
+            canonicalize_existing_ancestor(&missing).expect("walk"),
+            Some(expected),
+            "the missing tail keeps its order"
         );
     }
 

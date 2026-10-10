@@ -29,15 +29,15 @@ use crate::types::{ContextInput, Omission, OmittedReason, QueryIntent};
 use crate::budget::EVIDENCE_FLOOR;
 
 /// Global upper bound of the evidence count (§2.1 上界 10).
-pub const EVIDENCE_CEILING: usize = 10;
+const EVIDENCE_CEILING: usize = 10;
 
 /// The evidence section may use at most this share of the total budget
 /// (§2.1 不超过总预算 50%).
-pub const EVIDENCE_BUDGET_SHARE: f64 = 0.5;
+const EVIDENCE_BUDGET_SHARE: f64 = 0.5;
 
 /// Intent-tier count bounds (§2.1). The comparison range is the per-side
 /// range used as the plain count range until sides are modeled.
-pub fn tier_bounds(intent: QueryIntent) -> (usize, usize) {
+fn tier_bounds(intent: QueryIntent) -> (usize, usize) {
     match intent {
         QueryIntent::Fact => (3, 5),
         QueryIntent::Comparison => (4, 6),

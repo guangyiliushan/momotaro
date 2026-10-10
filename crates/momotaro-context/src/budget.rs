@@ -62,6 +62,14 @@ pub struct BudgetOutcome {
     pub kept: Vec<usize>,
     /// Explicit drops, all [`OmittedReason::BudgetExhausted`].
     pub dropped: Vec<Omission>,
+    /// The same drops by candidate slot (index into the candidate list), in
+    /// the same order as `dropped`.
+    ///
+    /// Keys repeat across kinds — a `chunk_hash` can spell a `history_id` —
+    /// so consumers that need the *object* (its tokens, its class) match by
+    /// slot; first-match-by-key takes the wrong one when they collide
+    /// (probe P4: a wrong `budget_delta`, and a kept turn's hashes released).
+    pub dropped_slots: Vec<usize>,
 }
 
 /// Run the five-level allocation (§2, 先到先得不回填).
@@ -76,7 +84,8 @@ pub(crate) fn enforce_token_budget(
 ) -> BudgetOutcome {
     let mut kept = vec![false; candidates.len()];
     let mut dropped = Vec::new();
-    let mut deferred_drops: Vec<Omission> = Vec::new();
+    let mut dropped_slots: Vec<usize> = Vec::new();
+    let mut deferred_drops: Vec<(usize, Omission)> = Vec::new();
     let mut running_raw: u64 = 0;
 
     // One claim against the running budget. `force` is for the fixed
@@ -93,6 +102,7 @@ pub(crate) fn enforce_token_budget(
                 item: candidate.key.clone(),
                 reason: OmittedReason::BudgetExhausted,
             });
+            dropped_slots.push(index);
             false
         }
     };
@@ -116,10 +126,13 @@ pub(crate) fn enforce_token_budget(
             continue;
         }
         if history_out {
-            deferred_drops.push(Omission {
-                item: candidates[index].key.clone(),
-                reason: OmittedReason::BudgetExhausted,
-            });
+            deferred_drops.push((
+                index,
+                Omission {
+                    item: candidates[index].key.clone(),
+                    reason: OmittedReason::BudgetExhausted,
+                },
+            ));
             continue;
         }
         history_out = !claim(index, &mut running_raw, false);
@@ -140,10 +153,13 @@ pub(crate) fn enforce_token_budget(
             continue;
         }
         if evidence_out {
-            deferred_drops.push(Omission {
-                item: candidate.key.clone(),
-                reason: OmittedReason::BudgetExhausted,
-            });
+            deferred_drops.push((
+                index,
+                Omission {
+                    item: candidate.key.clone(),
+                    reason: OmittedReason::BudgetExhausted,
+                },
+            ));
             continue;
         }
         evidence_out = !claim(index, &mut running_raw, false);
@@ -155,10 +171,19 @@ pub(crate) fn enforce_token_budget(
             claim(index, &mut running_raw, true);
         }
     }
-    dropped.append(&mut deferred_drops);
+    // Deferred drops append in encounter order, exactly as before — now with
+    // their slots travelling beside them.
+    for (index, omission) in deferred_drops {
+        dropped_slots.push(index);
+        dropped.push(omission);
+    }
 
     let kept = (0..candidates.len()).filter(|i| kept[*i]).collect();
-    BudgetOutcome { kept, dropped }
+    BudgetOutcome {
+        kept,
+        dropped,
+        dropped_slots,
+    }
 }
 
 #[cfg(test)]
@@ -196,6 +221,82 @@ mod tests {
         assert_eq!(outcome.dropped.len(), 1);
         assert_eq!(outcome.dropped[0].item, "hist-old");
         assert_eq!(outcome.dropped[0].reason, OmittedReason::BudgetExhausted);
+    }
+
+    /// The boundary is `<=`, and it is on the keeping side: an estimate that
+    /// lands **exactly** on the ceiling fits. §2.1's coefficient makes that a
+    /// real point and not a rounding curiosity — `ceil(raw × 1.25) == 8192`
+    /// first holds at raw 6553 (6553 × 1.25 = 8191.25), the one raw value
+    /// that sits on the line. Flip the comparison to `<` and this item drops
+    /// for being exactly the size the budget allows.
+    #[test]
+    fn an_estimate_that_lands_exactly_on_the_ceiling_still_fits() {
+        let budget = BudgetPolicy {
+            max_context_tokens: 8192,
+            ..BudgetPolicy::default()
+        };
+        // History is not force-claimed, so the `<=` comparison is what
+        // decides here. (Evidence past `EVIDENCE_FLOOR` claims the same way;
+        // this level is simply the one with a walk order to drive.)
+        let candidates = vec![candidate("hist", BudgetLevel::History, 6553)];
+        let outcome = enforce_token_budget(&candidates, &[0], &budget);
+        assert_eq!(outcome.kept, vec![0], "{:?}", outcome.dropped);
+    }
+
+    #[test]
+    fn drops_report_their_slots_alongside_their_keys() {
+        // The keys in `dropped` are what the stage record prints; the slots
+        // are what accounting matches by — keys repeat across kinds, slots
+        // do not (probe P4).
+        let budget = BudgetPolicy {
+            max_context_tokens: 100,
+            ..BudgetPolicy::default()
+        };
+        let candidates = vec![
+            candidate("policy", BudgetLevel::Resident, 10),
+            candidate("question", BudgetLevel::Question, 10),
+            candidate("hist-old", BudgetLevel::History, 40),
+            candidate("hist-new", BudgetLevel::History, 40),
+            candidate("instr", BudgetLevel::Instructions, 5),
+        ];
+        let outcome = enforce_token_budget(&candidates, &[3, 2], &budget);
+        assert_eq!(outcome.dropped[0].item, "hist-old");
+        assert_eq!(outcome.dropped_slots, vec![2]);
+    }
+
+    #[test]
+    fn deferred_drops_report_their_slots_in_encounter_order() {
+        // The doc promises `dropped_slots` in `dropped`'s order; the single
+        // drop above could not see an order change (adversarial lane #7).
+        // The walk stops at the first failed claim, so the tail turns are
+        // deferred — their slots must follow in encounter order.
+        let budget = BudgetPolicy {
+            max_context_tokens: 100,
+            ..BudgetPolicy::default()
+        };
+        let candidates = vec![
+            candidate("policy", BudgetLevel::Resident, 10),
+            candidate("question", BudgetLevel::Question, 10),
+            candidate("hist-c", BudgetLevel::History, 40),
+            candidate("hist-b", BudgetLevel::History, 40),
+            candidate("hist-a", BudgetLevel::History, 5),
+            candidate("hist-z", BudgetLevel::History, 5),
+            candidate("instr", BudgetLevel::Instructions, 5),
+        ];
+        let outcome = enforce_token_budget(&candidates, &[2, 3, 4, 5], &budget);
+        assert_eq!(
+            outcome.dropped_slots,
+            vec![3, 4, 5],
+            "claim drop first, then deferred drops in encounter order"
+        );
+        assert_eq!(
+            outcome
+                .dropped
+                .iter()
+                .map(|omission| omission.item.as_str())
+                .collect::<Vec<_>>(),
+            vec!["hist-b", "hist-a", "hist-z"]
+        );
     }
 
     #[test]

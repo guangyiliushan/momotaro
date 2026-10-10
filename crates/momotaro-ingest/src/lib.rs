@@ -8,6 +8,12 @@
 
 use momotaro_contracts::IndexFileErrorKind;
 
+/// The shared parsing base for this crate's three passes (`collect_blocks`,
+/// `analyze`, `first_h1`): one const, so a parser option cannot land in two
+/// of the three places (probe P1-F4). `union` is a `const fn` (bitflags 2.x).
+pub(crate) const PARSE_OPTIONS: pulldown_cmark::Options =
+    pulldown_cmark::Options::ENABLE_TABLES.union(pulldown_cmark::Options::ENABLE_WIKILINKS);
+
 mod canvas;
 mod chunker;
 pub mod excalidraw;
@@ -20,9 +26,9 @@ mod portability;
 mod title;
 mod walk;
 
-pub use chunker::{SourceOffset, chunk_markdown, chunk_markdown_with};
+pub use chunker::{SourceOffset, chunk_markdown_with};
 pub use excalidraw::scene_spans;
-pub use hash::{chunk_hash, chunk_id, revision_hash, revision_hash_reader};
+pub use hash::{chunk_hash, chunk_id, revision_hash, revision_hash_reader, sha256_of};
 pub use links::{
     Extracted, Namespace, Outline, RawLink, Resolution, analyze, anchor_still_exists,
     extract_frontmatter_links, parent_dir, percent_decode, resolve,

@@ -5,59 +5,17 @@
 //! the fake provider rig; the tests then spawn the binary against the same
 //! workspace, so the black-box assertions cover exactly what a script sees.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+mod common;
 
+use common::{run_cli, stage_vault, write_config};
 use momotaro_llm::fake::FakeLlm;
 use momotaro_run::{AskOptions, ask_workspace, index_workspace, init_workspace};
-
-fn stage_vault(workspace: &Path) {
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../crates/momotaro-run/tests/fixtures/vault")
-        .canonicalize()
-        .expect("fixture vault exists");
-    copy_tree(&source, &workspace.join("vault"));
-}
-
-fn copy_tree(source: &Path, target: &Path) {
-    std::fs::create_dir_all(target).expect("create vault dir");
-    for entry in std::fs::read_dir(source).expect("read fixture vault") {
-        let entry = entry.expect("dir entry");
-        let to = target.join(entry.file_name());
-        if entry.file_type().expect("file type").is_dir() {
-            copy_tree(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).expect("copy fixture file");
-        }
-    }
-}
-
-fn write_config(workspace: &Path) {
-    let config = concat!(
-        "[vault]\npath = 'vault'\n\n",
-        "[model]\nprovider = 'fake'\nmodel_id = 'fake-model'\n",
-    );
-    std::fs::write(workspace.join("momotaro.toml"), config).expect("write momotaro.toml");
-}
 
 fn ready_workspace(tempdir: &tempfile::TempDir) {
     stage_vault(tempdir.path());
     write_config(tempdir.path());
     init_workspace(tempdir.path()).expect("init");
     index_workspace(tempdir.path(), None).expect("index");
-}
-
-fn run_cli(cwd: &Path, args: &[&str]) -> (String, String, bool) {
-    let output = Command::new(env!("CARGO_BIN_EXE_momotaro-cli"))
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("cli binary runs");
-    (
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-        output.status.success(),
-    )
 }
 
 /// A contiguous quote span the citation protocol can carry.
@@ -126,6 +84,18 @@ fn stats_human_and_json_carry_the_same_fields() {
     assert!(ok, "stats should succeed: {stderr}");
     // 两出口字段一致: every field the JSON carries is named in the human
     // rendering, with its value.
+    //
+    // `schema_version` and `database_path` were the two this loop only ever
+    // checked for a KEY on the JSON side, while `format_stats` hand-writes
+    // both into one `format!` template — so a wrong value, or a missed
+    // `sanitize` on the path, had nothing anywhere to go red.
+    let schema_version = match value["schema_version"].as_u64() {
+        Some(version) => version.to_string(),
+        None => "unknown".to_owned(),
+    };
+    // The cell below asserts the **line**, not the bare number: a needle of
+    // `"9"` would be satisfied by any digit anywhere in the output.
+    let schema_version_line = format!("schema version: {schema_version}");
     for (field, needle) in [
         ("status", value["status"].as_str().expect("status")),
         (
@@ -135,6 +105,11 @@ fn stats_human_and_json_carry_the_same_fields() {
             } else {
                 "false"
             },
+        ),
+        ("schema_version", schema_version_line.as_str()),
+        (
+            "database_path",
+            value["database_path"].as_str().expect("database_path"),
         ),
     ] {
         assert!(
@@ -168,8 +143,13 @@ fn stats_human_and_json_carry_the_same_fields() {
             ),
         }
     }
-    assert!(human.contains("schema version:"), "{human}");
-    assert!(human.contains("database:"), "{human}");
+    assert!(
+        human.contains(&format!(
+            "database: {}",
+            value["database_path"].as_str().expect("database_path")
+        )),
+        "the database path renders its value, not just its label: {human}"
+    );
 
     // And the unknown half of the rule (a missing count is never 0,
     // architecture 5.2 rule 12) where counts are unavailable: an

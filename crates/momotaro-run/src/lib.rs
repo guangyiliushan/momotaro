@@ -15,10 +15,10 @@ pub use ask::{
 };
 pub use index_service::{
     RebuildReport, SearchHit, SearchOutput, coverage_report, expand_search_workspace,
-    index_workspace, index_workspace_with, rebuild_index, search_workspace,
+    index_workspace, rebuild_index, search_workspace,
 };
 pub use reconcile::{ReconcileReport, format_reconcile, reconcile};
-pub use watch::{WatchLine, format_watch_line, watch};
+pub use watch::{Trigger, WatchLine, format_watch_line, watch};
 
 use std::fs;
 use std::io;
@@ -33,7 +33,6 @@ use momotaro_llm::HttpTransport;
 use momotaro_retrieve::RetrieveError;
 use momotaro_store::{Store, StoreError};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::index_service::index_unusable_message;
@@ -139,6 +138,13 @@ pub enum RunError {
     #[error("workspace is not ready: {0}")]
     StoreUnhealthy(String),
 
+    /// An idempotency key was reused for a different request.
+    #[error("client_request_id {key} already names a different request")]
+    IdempotencyConflict {
+        /// The rejected key.
+        key: String,
+    },
+
     /// The local store failed.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -157,9 +163,10 @@ pub enum RunError {
     SpecInvalid(#[from] momotaro_contracts::RunSpecError),
 
     /// The active policy forbids the requested work (e.g. `ask` under
-    /// `--no-llm`).
+    /// `--no-llm`, or a `--session` that names no conversation). Carries a
+    /// `String` because the reason names the session or run it is about.
     #[error("policy refused the request: {0}")]
-    PolicyRefused(&'static str),
+    PolicyRefused(String),
 
     /// The run a read named does not exist.
     #[error("no run {run_id}")]
@@ -246,17 +253,37 @@ struct ModelConfig {
 
 /// The `[policy]` section (architecture §7): Beta 保守默认 — network and
 /// file writes are off unless explicitly allowed.
+///
+/// `#[serde(default)]` on the **container** means a missing key takes its
+/// value from [`Self::default`], which is the one place a default is written
+/// — there is no second spelling of it for a bare literal to drift from.
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 struct PolicySection {
     /// Whether tools may touch the network.
-    #[serde(default)]
     allow_network: bool,
     /// Whether tools may write files.
-    #[serde(default)]
     allow_write: bool,
     /// The context budget.
-    #[serde(default = "default_max_context_tokens")]
     max_context_tokens: u32,
+    /// Compaction trigger ratio (§4). `context-retrieval.md` §4 has shown
+    /// this key under `[policy]` since before this build had it — reading it
+    /// here is what makes that TOML true.
+    compact_trigger_ratio: f64,
+    /// Absolute compaction reserve; the effective reserve is
+    /// `min(this, 25% × max_context_tokens)` (§4).
+    compact_reserve_abs: u32,
+    /// End-to-end deadline for one provider turn (`harness.md` §4).
+    ///
+    /// A hung-peer escape hatch, not a model-quality knob — raise it for a
+    /// model whose good answers are slow. Wired to the transport's
+    /// `timeout_global`.
+    provider_turn_timeout_s: u64,
+    /// Deadline for one tool execution (`harness.md` §4). This build has no
+    /// tools that run, so the key is read and not yet enforced — the value is
+    /// here so the day tool execution lands it is configuration and not a
+    /// migration.
+    tool_timeout_s: u64,
 }
 
 impl Default for PolicySection {
@@ -264,10 +291,30 @@ impl Default for PolicySection {
         Self {
             allow_network: false,
             allow_write: false,
-            max_context_tokens: default_max_context_tokens(),
+            // §4's numbers, taken from the one place that owns them
+            // (`momotaro-context`) so the TOML default and the built-in
+            // default cannot drift into two numbers.
+            max_context_tokens: momotaro_context::DEFAULT_MAX_CONTEXT_TOKENS,
+            compact_trigger_ratio: momotaro_context::DEFAULT_COMPACT_TRIGGER_RATIO,
+            compact_reserve_abs: momotaro_context::DEFAULT_COMPACT_RESERVE_ABS,
+            // `harness.md` §4's numbers: the provider turn deadline and the
+            // tool-execution deadline it promises.
+            provider_turn_timeout_s: DEFAULT_PROVIDER_TURN_TIMEOUT_S,
+            tool_timeout_s: DEFAULT_TOOL_TIMEOUT_S,
         }
     }
 }
+
+/// `harness.md` §4's default provider-turn deadline, in seconds.
+///
+/// Crate-private on purpose: it is a default for a key this crate reads, not
+/// a spelling anything outside has to agree with (`architecture.md` §20's
+/// deliberate `pub const` list is closed at the nine contract spellings).
+pub(crate) const DEFAULT_PROVIDER_TURN_TIMEOUT_S: u64 = 120;
+
+/// `harness.md` §4's default tool-execution deadline, in seconds.
+/// Same visibility as [`DEFAULT_PROVIDER_TURN_TIMEOUT_S`], for the same reason.
+pub(crate) const DEFAULT_TOOL_TIMEOUT_S: u64 = 30;
 
 fn default_max_output_tokens() -> u32 {
     4096
@@ -275,10 +322,6 @@ fn default_max_output_tokens() -> u32 {
 
 fn default_thinking() -> String {
     "auto".to_owned()
-}
-
-fn default_max_context_tokens() -> u32 {
-    8192
 }
 
 impl WorkspaceConfig {
@@ -400,20 +443,6 @@ fn vault_scope(root: &Path, config: &WorkspaceConfig) -> Result<VaultScope, RunE
     })
 }
 
-/// Wall-clock seconds on the caller's clock — the `created_at` stamp the run
-/// layer hands the store (like `ingested_at`, the caller owns its clock).
-pub(crate) fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs() as i64)
-        .unwrap_or_default()
-}
-
-/// `sha256`, hex — the house digest (the same one `revision_hash` uses).
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
 pub(crate) fn to_i64(value: u64) -> Option<i64> {
     i64::try_from(value).ok()
 }
@@ -424,11 +453,46 @@ pub(crate) fn to_i64(value: u64) -> Option<i64> {
 /// Unique without a new dependency. One implementation for every id the run
 /// layer mints (batches, runs, retrievals) — the batch-id stamp used to be
 /// spelled twice (watch and index), which is the drift this closes.
+/// `<prefix>-<unix ms>-<nanos in zero-padded lower hex>`.
+///
+/// The hex field is padded to eight digits so **lexicographic order equals
+/// numeric order**, and both halves are monotonic under a clock rollback:
+/// the store clamps `created_at`, so an id generated after a backward step
+/// must not sort before the run that clamped over it.
 pub(crate) fn stamp_id(prefix: &str) -> String {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    format!("{prefix}-{}-{:x}", stamp.as_millis(), stamp.subsec_nanos())
+    let (millis, nanos) = next_stamp(stamp.as_millis() as u64, stamp.subsec_nanos());
+    format!("{prefix}-{millis}-{}", stamp_field(nanos))
+}
+
+/// Process-local last stamp: high 96 bits millis, low 32 bits nanos.
+static LAST_STAMP: std::sync::Mutex<u128> = std::sync::Mutex::new(0);
+
+/// Returns the next monotonic `(millis, nanos)` stamp.
+fn next_stamp(millis: u64, subsec_nanos: u32) -> (u64, u32) {
+    let mut last = LAST_STAMP.lock().expect("stamp mutex");
+    let last_millis = (*last >> 32) as u64;
+    let last_nanos = *last as u32;
+    let millis = millis.max(last_millis);
+    let nanos = if millis == last_millis && subsec_nanos <= last_nanos {
+        last_nanos.saturating_add(1)
+    } else {
+        subsec_nanos
+    };
+    *last = ((millis as u128) << 32) | u128::from(nanos);
+    (millis, nanos)
+}
+
+/// One stamp's nanosecond field, zero-padded to eight hex digits.
+///
+/// Split out so the padding can be tested deterministically: `stamp_id` reads
+/// the real clock, and a bare hex format lands on eight digits most of the
+/// time anyway — a test over live ids would let an unpadded mutant pass by
+/// luck. `subsec_nanos` is always below `2^32`, so eight is always enough.
+fn stamp_field(nanos: u32) -> String {
+    format!("{nanos:08x}")
 }
 
 /// Opens the store the run engine writes to, asking the same health question
@@ -483,7 +547,10 @@ pub fn doctor(root: impl AsRef<Path>) -> Result<HealthReport, RunError> {
 ///
 /// Split out so the refusal paths can be exercised for engines that this build
 /// does not link — an untestable hard failure is a hard failure nobody checks.
-pub fn doctor_with_facts(root: &Path, sqlite: &SqliteFacts) -> Result<HealthReport, RunError> {
+pub(crate) fn doctor_with_facts(
+    root: &Path,
+    sqlite: &SqliteFacts,
+) -> Result<HealthReport, RunError> {
     // Every branch reports the engine facts: the version of the engine that
     // writes the database is part of the workspace's health, not a detail.
     let network_volume = network_volume_of(root);
@@ -544,15 +611,31 @@ pub fn doctor_with_facts(root: &Path, sqlite: &SqliteFacts) -> Result<HealthRepo
     }
 
     let database_path = database_path(root);
-    if !database_path.exists() {
-        return Ok(report(
-            WorkspaceStatus::Uninitialized,
-            None,
-            Some(format!(
-                "database is not initialized: {}",
-                database_path.display()
-            )),
-        ));
+    // The guard every other read path takes (`store_fault`, `store_chunk_count`,
+    // `coverage_report`, `open_run_store`). `exists()` alone is not one: a
+    // 0-byte file passes it, `Store::open` finds nothing in such a file to
+    // refuse, and it then applies the file-modifying PRAGMAs — turning a
+    // workspace that was never written into a 4 KB database, from the one
+    // command whose contract says it touches nothing.
+    match index_service::store_file(root) {
+        index_service::StoreFile::Absent => {
+            return Ok(report(
+                WorkspaceStatus::Uninitialized,
+                None,
+                Some(format!(
+                    "database is not initialized: {}",
+                    database_path.display()
+                )),
+            ));
+        }
+        index_service::StoreFile::Empty => {
+            return Ok(report(
+                WorkspaceStatus::Uninitialized,
+                None,
+                Some("database has not been initialized".to_owned()),
+            ));
+        }
+        index_service::StoreFile::Present => {}
     }
 
     let health = Store::open(database_path)?.health()?;
@@ -567,6 +650,21 @@ pub fn doctor_with_facts(root: &Path, sqlite: &SqliteFacts) -> Result<HealthRepo
             WorkspaceStatus::Invalid,
             health.schema_version,
             Some(reason),
+        ));
+    }
+
+    // The two stores must agree on how much there is to serve: the writer
+    // commits a batch's documents in one step, after the per-file store
+    // commits (ADR 0026's order), and a crash in that window leaves committed
+    // work the index never got — visible to nothing else (a re-run skips
+    // those files; `reconcile` reads only state that agrees).
+    if let Some((chunks, documents)) = index_service::chunk_doc_drift(root) {
+        return Ok(report(
+            WorkspaceStatus::Invalid,
+            health.schema_version,
+            Some(format!(
+                "the index serves {documents} documents for {chunks} current chunks — the last ingest run has not finished its index work, or stopped early; `rebuild-index` restores agreement"
+            )),
         ));
     }
 
@@ -604,10 +702,20 @@ fn engine_refusal_message(facts: &SqliteFacts) -> Option<String> {
 }
 
 /// Returns current local store stats.
+///
+/// The same guard every other read path takes (`store_fault`,
+/// `store_chunk_count`, `coverage_report`, `open_run_store`, `doctor`): an
+/// `exists()` check lets a 0-byte file through to `Store::open`, which applies
+/// the file-modifying PRAGMAs — a read path must never be the reason a file
+/// changes.
 pub fn stats(root: impl AsRef<Path>) -> Result<StatsReport, RunError> {
-    let database_path = database_path(root.as_ref());
+    let root = root.as_ref();
+    let database_path = database_path(root);
 
-    if !database_path.exists() {
+    if !matches!(
+        index_service::store_file(root),
+        index_service::StoreFile::Present
+    ) {
         return Ok(StatsReport {
             status: WorkspaceStatus::Uninitialized,
             schema_version: None,
@@ -627,7 +735,16 @@ pub fn stats(root: impl AsRef<Path>) -> Result<StatsReport, RunError> {
 pub fn validate_ask_policy(options: &AskOptions) -> Result<(), RunError> {
     if options.no_llm {
         return Err(RunError::PolicyRefused(
-            "ask answers with an LLM, which --no-llm forbids",
+            "ask answers with an LLM, which --no-llm forbids".to_owned(),
+        ));
+    }
+    if options
+        .client_request_id
+        .as_deref()
+        .is_some_and(|key| key.trim().is_empty())
+    {
+        return Err(RunError::PolicyRefused(
+            "client_request_id must not be empty or whitespace".to_owned(),
         ));
     }
     Ok(())
@@ -675,7 +792,7 @@ pub(crate) fn ensure_network_allowed(
     if network_permitted(config, allow_network) {
         return Ok(());
     }
-    Err(RunError::PolicyRefused(NETWORK_REFUSAL))
+    Err(RunError::PolicyRefused(NETWORK_REFUSAL.to_owned()))
 }
 
 /// The policy half of `--mode expand` (§10.2): expanding spends one LLM call
@@ -684,7 +801,7 @@ pub(crate) fn ensure_network_allowed(
 pub fn validate_expand_policy(no_llm: bool) -> Result<(), RunError> {
     if no_llm {
         return Err(RunError::PolicyRefused(
-            "--mode expand rewrites the query with an LLM, which --no-llm forbids",
+            "--mode expand rewrites the query with an LLM, which --no-llm forbids".to_owned(),
         ));
     }
     Ok(())
@@ -754,6 +871,10 @@ fn http_transport_with(
              [model].api_key_env to the name of a variable instead"
         )));
     }
+    // `harness.md` §4's turn deadline, from the policy that owns it — the
+    // transport's own generous constant is only what a bare
+    // `HttpTransport::new` falls back to.
+    let turn_timeout = std::time::Duration::from_secs(config.policy.provider_turn_timeout_s);
     let api_key = match config.model.api_key_env.as_deref() {
         None => None,
         Some(name) => Some(lookup(name).map_err(|why| {
@@ -763,7 +884,7 @@ fn http_transport_with(
         })?),
     };
 
-    HttpTransport::new(&base_url, api_key.as_deref())
+    HttpTransport::with_turn_timeout(&base_url, api_key.as_deref(), turn_timeout)
         .map_err(|error| RunError::ProviderUnavailable(error.to_string()))
 }
 
@@ -803,30 +924,13 @@ const EXCERPT_LINE_CHARS: usize = 100;
 /// unprintable characters are dropped — C0/C1 controls can drive the terminal,
 /// and the bidi / zero-width format characters can hide or reorder the rest of
 /// the line.
-pub(crate) fn sanitize(text: &str) -> String {
-    text.chars()
-        .map(|c| if c.is_whitespace() { ' ' } else { c })
-        .filter(|c| !is_unprintable(*c))
-        .collect()
-}
-
-/// Whether `c` must never reach a terminal: C0/C1 controls plus the format
-/// characters that reorder or hide text (`U+202E` right-to-left override,
-/// `U+200B` zero width space, and their neighbours).
-fn is_unprintable(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{00ad}'                  // SOFT HYPHEN
-                | '\u{061c}'            // ARABIC LETTER MARK
-                | '\u{180e}'            // MONGOLIAN VOWEL SEPARATOR
-                | '\u{200b}'..='\u{200f}' // ZWSP, ZWNJ, ZWJ, LRM, RLM
-                | '\u{202a}'..='\u{202e}' // bidi embedding / override
-                | '\u{2060}'..='\u{206f}' // word joiner .. invisible operators
-                | '\u{feff}'            // BOM / zero width no-break space
-                | '\u{e0000}'..='\u{e007f}' // tag characters
-        )
-}
+/// Re-exported so every `crate::sanitize` call site here reads the one
+/// definition. Terminal safety is not an LLM concern, but `momotaro-llm`
+/// already needed it (its redacted `Debug`, its error strings) and `run`
+/// already depends on it — one spelling, no new crate edge. The two copies
+/// had already drifted to the point of differing only in comment alignment,
+/// which is exactly how they start.
+pub(crate) use momotaro_llm::sanitize;
 
 /// Renders the excerpt line under one search hit.
 ///
@@ -922,8 +1026,11 @@ fn network_volume_of(root: &Path) -> Option<bool> {
 pub fn format_health(report: &HealthReport) -> String {
     let line = match (&report.status, &report.message) {
         (WorkspaceStatus::Ready, _) => "workspace is ready".to_owned(),
-        (status, Some(message)) => format!("workspace {status:?}: {}", sanitize(message)),
-        (status, None) => format!("workspace {status:?}"),
+        // The wire spelling, not Debug's: `WorkspaceStatus::as_str`'s
+        // contract says the human line and `--json` share it, and the `stats`
+        // renderer already asks through it.
+        (status, Some(message)) => format!("workspace {}: {}", status.as_str(), sanitize(message)),
+        (status, None) => format!("workspace {}", status.as_str()),
     };
 
     // The engine that writes the database is part of the answer, not a detail
@@ -1049,8 +1156,9 @@ pub fn format_index_error(error: &IndexFileError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use momotaro_llm::is_unprintable;
 
-    use crate::index_service::{discard, index_dir, staging_dir};
+    use crate::index_service::{discard, index_dir, index_workspace_with, staging_dir};
 
     #[test]
     fn error_lines_escape_the_terminal() {
@@ -1062,6 +1170,28 @@ mod tests {
             "a\u{1b}[31m\u{202e}b.md".to_owned(),
         ));
         let line = format_error(&error);
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        assert!(!line.contains('\u{202e}'), "{line:?}");
+        assert!(line.contains("a[31mb.md"), "still readable: {line:?}");
+    }
+
+    /// The human stats line prints a path the program did not author, and
+    /// `format_stats` is the last thing between that path and the terminal.
+    /// The assertions are on the characters themselves, not on the predicate
+    /// the implementation happens to filter with — the same shape as
+    /// `error_lines_escape_the_terminal`, which every other human outlet here
+    /// already has.
+    #[test]
+    fn the_stats_line_escapes_the_terminal() {
+        let report = StatsReport {
+            status: WorkspaceStatus::Ready,
+            schema_version: None,
+            database_path: std::path::PathBuf::from("/ws/a\u{1b}[31m\u{202e}b.md"),
+            initialized: true,
+            sources: Some(3),
+            chunks: Some(5),
+        };
+        let line = format_stats(&report);
         assert!(!line.contains('\u{1b}'), "{line:?}");
         assert!(!line.contains('\u{202e}'), "{line:?}");
         assert!(line.contains("a[31mb.md"), "still readable: {line:?}");
@@ -1255,6 +1385,28 @@ mod tests {
         assert!(line.contains(r"\u{1b}"), "escaped form expected: {line}");
     }
 
+    /// Age fixture files past the store's write moment: the skip is the
+    /// answer for a stat that can vouch (D40 §4.3), and a same-second
+    /// fixture sits in the racy window where the content path answers for
+    /// it (`metadata_refreshed`).
+    fn age_past_the_store_write(paths: &[&Path]) {
+        for path in paths {
+            if path.is_dir() {
+                for entry in fs::read_dir(path).expect("read dir") {
+                    let entry = entry.expect("dir entry");
+                    age_past_the_store_write(&[&entry.path()]);
+                }
+                continue;
+            }
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .expect("open for attributes")
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+                .expect("age the mtime");
+        }
+    }
+
     fn write_config(root: &Path, vault: &Path) {
         fs::create_dir_all(root.join(".momotaro")).expect("create data dir");
         fs::write(
@@ -1367,6 +1519,70 @@ mod tests {
         assert!(text.contains("[model].api_key_env"), "{text}");
     }
 
+    /// `harness.md` §4 promises both deadlines under `[policy]`, with these
+    /// defaults. The keys are read here; the transport that honours the first
+    /// one is pinned by its own crate's test and by the needle below.
+    #[test]
+    fn the_policy_carries_harness_s_two_deadlines() {
+        assert_eq!(DEFAULT_PROVIDER_TURN_TIMEOUT_S, 120, "harness.md §4");
+        assert_eq!(DEFAULT_TOOL_TIMEOUT_S, 30, "harness.md §4");
+        let policy = PolicySection::default();
+        assert_eq!(policy.provider_turn_timeout_s, 120);
+        assert_eq!(policy.tool_timeout_s, 30);
+
+        // …and the TOML can move them.
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_model_config(
+            dir.path(),
+            &dir.path().join("vault"),
+            "[policy]\nprovider_turn_timeout_s = 7\ntool_timeout_s = 3\n",
+        );
+        let config = load_config(dir.path()).expect("config");
+        assert_eq!(config.policy.provider_turn_timeout_s, 7);
+        assert_eq!(config.policy.tool_timeout_s, 3);
+    }
+
+    /// The whole chain, end to end: the number in `[policy]` is the number
+    /// the transport will enforce. A needle on the constructor alone proved
+    /// only that a call was made — swapping the policy key for a constant
+    /// left the workspace green (R16, behaviour lens, mutant 6) — so this
+    /// reads the deadline back out of the transport it just built, and only
+    /// then counts the construction site.
+    #[test]
+    fn the_policy_s_deadline_is_the_one_the_transport_enforces() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_model_config(
+            dir.path(),
+            &dir.path().join("vault"),
+            "[model]\nbase_url_env = \"MM_BASE\"\n[policy]\nprovider_turn_timeout_s = 7\n",
+        );
+        let transport = http_transport_with(dir.path(), |name| match name {
+            "MM_BASE" => Ok("https://api.example.com/v1".to_owned()),
+            other => Err(format!("{other} is not set")),
+        })
+        .expect("transport");
+        assert_eq!(
+            transport.turn_timeout(),
+            Some(std::time::Duration::from_secs(7)),
+            "the configured number, not a constant: 7 appears only in the TOML above"
+        );
+
+        // …and there is still exactly one construction site. The count is
+        // site uniqueness, not value — the read-back above is what says the
+        // policy's number is the one in force. The anchor's leading newline
+        // and indentation are what keep this assertion's own literal from
+        // satisfying it; a rustfmt reflow of that line drops the count to 0
+        // and fails here on formatting, which is the intended brittleness.
+        let source = include_str!("lib.rs");
+        assert_eq!(
+            source
+                .matches("\n    HttpTransport::with_turn_timeout(&base_url")
+                .count(),
+            1,
+            "the one construction site"
+        );
+    }
+
     #[test]
     fn a_workspace_that_names_no_key_variable_gets_a_keyless_transport() {
         // A local endpoint needs no credential; only a variable the config
@@ -1461,6 +1677,26 @@ mod tests {
         assert!(body.contains("\"model\":\"test-model\""), "{body}");
         assert!(body.contains("zzqqvvsstt"), "{body}");
         assert!(body.contains("exactly 4 strings"), "{body}");
+
+        // Both write points that carry `provider_of` land in this run: the run
+        // row and the turn the rewrite became. Nothing asserted either column —
+        // the store's own tests hand-write `provider: "fake"` on rows they build
+        // themselves, so a function body that answered `""` published a blank
+        // provider into `runs` and `llm_turns` with every test green.
+        let trace = store_of(dir.path())
+            .run_trace(output.run_id.as_deref().expect("expand builds a run"))
+            .expect("read the run")
+            .expect("the run is there");
+        assert_eq!(
+            trace.run.provider.as_deref(),
+            Some("openai-compatible"),
+            "the run row names the provider that answered"
+        );
+        assert_eq!(trace.llm_turns.len(), 1, "the one rewrite turn");
+        assert_eq!(
+            trace.llm_turns[0].provider, "openai-compatible",
+            "and so does the turn"
+        );
     }
 
     #[test]
@@ -1884,10 +2120,12 @@ mod tests {
     }
 
     #[test]
-    fn a_search_refused_for_a_missing_database_records_no_run() {
-        // The store half of that same gate. "Zero rows" is literal here: the
-        // command may not create the database it just refused to read, so the
-        // witness is the file's absence rather than a count inside it.
+    fn a_search_refused_for_a_missing_database_does_not_recreate_it() {
+        // The store half of that same gate. The name claims what the body
+        // asserts: there is no database to count runs in, so the witness is
+        // the file's continued absence — `run_count` cannot be read here, and
+        // a name promising a count it never takes is the defect this rename
+        // closes.
         let dir = indexed_fixture();
         add_model_config(dir.path(), "test-model");
         let fake = momotaro_llm::fake::FakeLlm::new();
@@ -2100,11 +2338,202 @@ mod tests {
         assert!(database_path(dir.path()).exists());
     }
 
+    /// `EXCERPT_LINE_CHARS` is a *width* contract for `momotaro search`'s
+    /// human outlet: at the limit the text stands whole, past it it is cut.
+    /// Nothing drove either side — flipping `<=` to `>` returned every
+    /// at-limit excerpt truncated and every over-long one whole, and the
+    /// workspace stayed green.
     #[test]
-    fn config_without_index_section_uses_defaults() {
+    fn an_excerpt_is_whole_at_the_width_limit_and_cut_past_it() {
+        let at_limit: String = "x".repeat(EXCERPT_LINE_CHARS);
+        assert_eq!(
+            format_search_excerpt(&at_limit),
+            at_limit,
+            "exactly the limit is still the whole line"
+        );
+
+        let over: String = "y".repeat(EXCERPT_LINE_CHARS + 1);
+        let rendered = format_search_excerpt(&over);
+        let head: String = rendered.chars().take(EXCERPT_LINE_CHARS).collect();
+        assert_eq!(
+            head,
+            "y".repeat(EXCERPT_LINE_CHARS),
+            "…past it the first width chars are the line: {rendered:?}"
+        );
+        assert_ne!(
+            rendered, over,
+            "…and it is not the whole line: {rendered:?}"
+        );
+        assert!(
+            rendered.ends_with("..."),
+            "the cut is marked rather than silent: {rendered:?}"
+        );
+    }
+
+    /// The index summary's collision count is the only way a caller learns
+    /// about collisions, so it has to count *that* kind and no other:
+    /// `==` → `!=` reported every other error as a collision and nothing
+    /// noticed.
+    #[test]
+    fn the_index_summary_counts_only_key_collisions() {
+        use momotaro_contracts::IndexFileErrorKind as Kind;
+        let error = |kind| momotaro_contracts::IndexFileError {
+            source_key: None,
+            kind,
+            message: "m".to_owned(),
+        };
+        let report = momotaro_contracts::IndexReport {
+            batch_id: "b".to_owned(),
+            files_scanned: 3,
+            files_skipped: 0,
+            files_indexed: 3,
+            revisions_created: 1,
+            chunks_written: 4,
+            errors: vec![
+                error(Kind::KeyCollision),
+                error(Kind::InvalidUtf8),
+                error(Kind::InvalidUtf8),
+            ],
+            duration_ms: 7,
+        };
+        let line = format_index_summary(&report);
+        assert!(
+            line.contains("1 key collisions"),
+            "one of the three errors is a collision: {line}"
+        );
+        assert!(
+            line.contains("3 errors"),
+            "…and all three are still errors: {line}"
+        );
+    }
+
+    /// A missing `[index]` section fills in the documented defaults — pinned
+    /// as **literals**, for the reason the `[policy]` sibling below states: a
+    /// comparison against the same `Default` the parser calls moves with it.
+    ///
+    /// The previous version asserted `policy == IndexPolicy::default()`,
+    /// which is true by construction when the whole section is absent (the
+    /// container default *is* that expression) and pinned nothing — while the
+    /// serde factories it looks like it covers, `default_max_chunk_tokens` and
+    /// `default_chunk_overlap_tokens`, went unobserved. Zeroing either one
+    /// left the workspace green, and both are read on every `index`.
+    #[test]
+    fn config_without_index_section_uses_the_documented_defaults() {
         let policy = parse_index_policy("");
-        assert_eq!(policy, IndexPolicy::default());
+        assert_eq!(policy.max_chunk_tokens, 512, "the chunk ceiling default");
+        assert_eq!(
+            policy.chunk_overlap_tokens, 64,
+            "the overlap default — half of which the validator leans on"
+        );
         validate_policy(&policy).expect("defaults validate");
+    }
+
+    /// The same factories when the section *is* present but the key is not:
+    /// the key that was set wins, the other one comes from `default_*`.
+    #[test]
+    fn a_partial_index_section_keeps_the_untouched_documented_defaults() {
+        let overlap_set = parse_index_policy("[index]\nchunk_overlap_tokens = 32\n");
+        assert_eq!(
+            overlap_set.chunk_overlap_tokens, 32,
+            "the key that was set is set"
+        );
+        assert_eq!(
+            overlap_set.max_chunk_tokens, 512,
+            "…and the key that was not comes from `default_max_chunk_tokens`"
+        );
+        validate_policy(&overlap_set).expect("512 >= 2 * 32");
+
+        let ceiling_set = parse_index_policy("[index]\nmax_chunk_tokens = 1024\n");
+        assert_eq!(
+            ceiling_set.max_chunk_tokens, 1024,
+            "the key that was set is set"
+        );
+        assert_eq!(
+            ceiling_set.chunk_overlap_tokens, 64,
+            "…and the key that was not comes from `default_chunk_overlap_tokens`"
+        );
+        validate_policy(&ceiling_set).expect("1024 >= 2 * 64");
+    }
+
+    /// The three factories on `[model]` and `[vault]` nobody reaches: a
+    /// config with both sections present but these keys absent is the normal
+    /// shape, and `default_max_output_tokens` feeds every `ask` request's
+    /// `max_tokens` while `default_thinking` and `default_vault_name` are
+    /// frozen into the run spec and the workspace's own row.
+    #[test]
+    fn a_partial_model_and_vault_section_keep_their_documented_defaults() {
+        let config: WorkspaceConfig =
+            toml::from_str("vault.path = \"v\"\n[model]\nmodel_id = \"m\"\n")
+                .expect("parse config");
+        assert_eq!(
+            config.model.max_output_tokens, 4096,
+            "the ceiling every `ask` hands the provider"
+        );
+        assert_eq!(config.model.thinking, "auto", "the default thinking tier");
+        assert_eq!(config.vault.name, "default", "the default workspace name");
+    }
+
+    /// D26: the config spelling maps to exactly one semantic tier — `auto`
+    /// is the answer slot's default (`medium`), not a wildcard. This binds
+    /// the third spelling set (config) to the enum: a mapping that drifts
+    /// from `as_str` (or a `Default` that drifts from the literals) turns
+    /// this red.
+    #[test]
+    fn the_config_thinking_spellings_map_to_their_semantic_tiers() {
+        use momotaro_contracts::ThinkingTier;
+        for (spelling, tier) in [
+            ("auto", ThinkingTier::Medium),
+            ("off", ThinkingTier::Off),
+            ("low", ThinkingTier::Low),
+            ("medium", ThinkingTier::Medium),
+            ("high", ThinkingTier::High),
+        ] {
+            let config: WorkspaceConfig = toml::from_str(&format!(
+                "vault.path = \"v\"\n[model]\nmodel_id = \"m\"\nthinking = \"{spelling}\"\n"
+            ))
+            .expect("parse config");
+            assert_eq!(
+                config.model_thinking().expect("a legal spelling"),
+                tier,
+                "{spelling}"
+            );
+            if spelling != "auto" {
+                assert_eq!(tier.as_str(), spelling, "the config spelling is as_str");
+            }
+        }
+        let config: WorkspaceConfig =
+            toml::from_str("vault.path = \"v\"\n[model]\nmodel_id = \"m\"\nthinking = \"warm\"\n")
+                .expect("parse config");
+        assert!(
+            matches!(config.model_thinking(), Err(RunError::ConfigInvalid(_))),
+            "an unknown spelling is refused"
+        );
+        // The serde default is part of this mapping's claim: an omitted key
+        // takes `default_thinking()` and freezes as the answer slot's
+        // default, so a default that drifts from the literals is red here.
+        let config: WorkspaceConfig =
+            toml::from_str("vault.path = \"v\"\n[model]\nmodel_id = \"m\"\n")
+                .expect("parse config");
+        assert_eq!(
+            config.model_thinking().expect("the default is legal"),
+            ThinkingTier::Medium,
+            "an omitted thinking freezes as the answer slot's default"
+        );
+    }
+
+    /// A partial `[policy]` section fills the rest from the documented
+    /// defaults — pinned as **literals**, not against `PolicySection::default()`,
+    /// because a comparison to the same `Default` the parser calls would move
+    /// with it.
+    #[test]
+    fn config_with_a_partial_policy_section_uses_the_documented_defaults() {
+        let full = "vault.path = \"v\"\n[policy]\nallow_network = true\n";
+        let config: WorkspaceConfig = toml::from_str(full).expect("parse config");
+        assert!(config.policy.allow_network, "the key that was set is set");
+        assert!(!config.policy.allow_write, "untouched stays off");
+        assert_eq!(config.policy.max_context_tokens, 8192, "§2.1 default");
+        assert_eq!(config.policy.compact_trigger_ratio, 0.85, "§4 default");
+        assert_eq!(config.policy.compact_reserve_abs, 12_000, "§4 default");
     }
 
     #[test]
@@ -2418,6 +2847,7 @@ mod tests {
         let vault = dir.path().join("vault");
         fs::create_dir_all(&vault).expect("create vault");
         fs::write(vault.join("a.md"), "# A\n\nbody\n").expect("write");
+        age_past_the_store_write(&[&vault.join("a.md")]);
         write_config(dir.path(), &vault);
         init_workspace(dir.path()).expect("init");
         let first = index_workspace(dir.path(), None).expect("first index");
@@ -2525,6 +2955,7 @@ mod tests {
         let vault = dir.path().join("vault");
         fs::create_dir_all(&vault).expect("create vault");
         fs::write(vault.join("a.md"), "# A\n\nbody\n").expect("write");
+        age_past_the_store_write(&[&vault.join("a.md")]);
         write_config(dir.path(), &vault);
         init_workspace(dir.path()).expect("init");
 
@@ -2772,6 +3203,65 @@ mod tests {
     }
 
     #[test]
+    fn stats_never_writes_the_database_it_reports_on() {
+        // The same guard `doctor` takes: a 0-byte database is `Uninitialized`
+        // and stays 0 bytes — `Store::open` would apply the file-modifying
+        // PRAGMAs and turn it into a 4 KB database.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store_dir = dir.path().join(".momotaro");
+        fs::create_dir_all(&store_dir).expect("create store dir");
+        let database = store_dir.join("momotaro.db");
+        fs::write(&database, b"").expect("create an empty database file");
+
+        let report = stats(dir.path()).expect("stats on an empty store");
+        assert_eq!(report.status, WorkspaceStatus::Uninitialized);
+        assert_eq!(
+            fs::metadata(&database).expect("stat").len(),
+            0,
+            "a read path must never be the reason a file changes"
+        );
+    }
+
+    #[test]
+    fn a_batch_that_died_before_its_index_commit_is_a_doctor_finding() {
+        // The writer commits a batch's documents in one step, after the
+        // per-file store commits: a kill in that window leaves current chunks
+        // whose documents never landed, and nothing else sees it — a re-run
+        // skips the files (fingerprints match) and `reconcile` reads only
+        // state that agrees. The count is what stays true; `rebuild-index` is
+        // the repair.
+        let (dir, _vault, root) = settled_workspace();
+        // Emulate the window from the index side (a count cannot tell which
+        // side lost sync): drop one source's documents, store untouched.
+        let index =
+            momotaro_retrieve::SearchIndex::open_or_create(&crate::index_service::index_dir(&root))
+                .expect("index");
+        let mut writer = index
+            .writer(crate::index_service::WRITER_HEAP_BYTES)
+            .expect("writer");
+        momotaro_retrieve::SearchIndex::remove_source(&mut writer, index.fields(), "note:b.md")
+            .expect("remove");
+        writer.commit().expect("commit");
+        drop(writer);
+        drop(index);
+
+        let report = doctor(&root).expect("doctor");
+        assert!(!is_healthy(&report), "{report:?}");
+        assert!(
+            report
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("rebuild-index")),
+            "the finding names the repair: {report:?}"
+        );
+
+        rebuild_index(&root).expect("rebuild");
+        let healed = doctor(&root).expect("doctor after the repair");
+        assert!(is_healthy(&healed), "{healed:?}");
+        let _ = dir;
+    }
+
+    #[test]
     fn a_store_this_build_cannot_use_is_named_as_such() {
         // Someone else's database (F7): the reader must say what `doctor` says,
         // not fall through to `no such table: store_events`.
@@ -2816,6 +3306,13 @@ mod tests {
         let store_dir = dir.path().join(".momotaro");
         fs::write(store_dir.join("momotaro.db"), b"").expect("empty store");
         let empty = doctor(dir.path()).expect("doctor on an empty store");
+        assert_eq!(
+            fs::metadata(store_dir.join("momotaro.db"))
+                .expect("stat")
+                .len(),
+            0,
+            "the command that promises not to mutate did not: {empty:?}"
+        );
         assert!(!is_healthy(&empty), "{empty:?}");
         assert!(is_uninitialized(&empty), "{empty:?}");
 
@@ -3212,6 +3709,10 @@ mod tests {
     #[test]
     fn reindex_unchanged_files_skips_and_never_duplicates() {
         let (dir, vault) = fixture_workspace();
+        // Age the copies out of the store's racy window (D40 §4.3): the
+        // skip is the answer for a stat that can vouch, and same-second
+        // fixtures are wall-clock flaky against that window.
+        age_past_the_store_write(&[&vault]);
 
         let first = index_workspace(dir.path(), None).expect("first index");
         assert_eq!(first.revisions_created, 5);
@@ -3221,10 +3722,16 @@ mod tests {
         // Same content, new mtime: must refresh metadata, not create revisions.
         let fourier = vault.join("fourier.md");
         let body = fs::read(&fourier).expect("read fourier");
-        // Ensure the new mtime differs from the stored fingerprint at ms
-        // granularity even on coarse filesystem clocks.
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        // A new mtime, distinct from the stored fingerprint's stamp even on
+        // coarse filesystem clocks -- and past-dated so the rewrite is out of
+        // the racy window too (the third run must skip it like the rest).
         fs::write(&fourier, &body).expect("rewrite fourier");
+        fs::File::options()
+            .write(true)
+            .open(&fourier)
+            .expect("open for attributes")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+            .expect("move the mtime");
 
         let second = index_workspace(dir.path(), None).expect("second index");
         assert_eq!(second.revisions_created, 0, "hash unchanged");
@@ -3771,7 +4278,7 @@ mod tests {
             network_volume: None,
         };
         let line = format_health(&report);
-        assert!(line.contains("Invalid"), "{line}");
+        assert!(line.contains("invalid"), "the wire spelling: {line}");
         assert!(line.contains("outside workspace"), "{line}");
         assert!(!line.contains("is ready"), "{line}");
 
@@ -3822,6 +4329,57 @@ mod tests {
             "the engine version matters most when the database is missing"
         );
         assert!(!is_healthy(&report));
+    }
+
+    /// `HealthReport.network_volume` is the assembly half of the
+    /// network-volume probe (D31 / D40 §4.8): `format_health`'s rendering
+    /// branch has fixtures for `Some(true)` and `Some(false)`, but nothing
+    /// checked that the *probe* reaches the report. `network_volume_of`
+    /// returning `None` forever (the warning never fires) or `Some(true)`
+    /// forever (it always does) left the workspace green.
+    ///
+    /// Cross-checked against a direct probe of the same workspace root rather
+    /// than against a literal: a local temp directory is local on every
+    /// platform this runs on, but the invariant the report owes is "it says
+    /// what the probe said", and that holds wherever the test runs.
+    #[test]
+    fn the_health_report_carries_what_the_network_volume_probe_says() {
+        let (dir, _vault) = fixture_workspace();
+
+        let expected = momotaro_platform::volume_info(dir.path()).remote;
+        let report = doctor(dir.path()).expect("doctor runs");
+        assert_eq!(
+            report.network_volume, expected,
+            "the report has to carry what the probe answered, not a constant: \
+             {report:?}"
+        );
+        assert!(
+            report.network_volume.is_some(),
+            "this workspace's volume is answerable, so the field is too: {report:?}"
+        );
+
+        // …and the answer has to come from the probe. The assertion above is
+        // satisfied by a body that answered `Some(false)` for ever on every
+        // machine this test runs on — which is every machine, since they are
+        // local. The third constant is the one that would silently swallow the
+        // D31 warning on a workspace that really is on a share, so what is
+        // pinned is the source: both paths get asked.
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("fn network_volume_of(root: &Path) -> Option<bool> {")
+            .expect("the function exists");
+        let body = &source[start..];
+        let brace = body
+            .find("\n}\n")
+            .or_else(|| body.find("\r\n}\r\n"))
+            .expect("its closing brace");
+        let body = &body[..brace];
+        assert_eq!(
+            body.matches("momotaro_platform::volume_info(").count(),
+            3,
+            "the store's directory, its parent before `init`, and the vault are \
+             all asked, and their answers are folded"
+        );
     }
 
     #[test]
@@ -3907,6 +4465,7 @@ mod tests {
         fs::create_dir_all(&vault).unwrap();
         fs::write(vault.join("caf\u{00e9}.md"), "# A\n\nnfc marker\n").unwrap();
         fs::write(vault.join("cafe\u{0301}.md"), "# B\n\nnfd marker\n").unwrap();
+        age_past_the_store_write(&[&vault]);
         write_config(dir.path(), &vault);
         init_workspace(dir.path()).expect("init");
 
@@ -4427,6 +4986,7 @@ mod tests {
         )
         .expect("write the attachment");
         fs::write(vault.join("note.md"), "# Note\n\nbody\n").expect("write the note");
+        age_past_the_store_write(&[&vault.join("attach/pic.png"), &vault.join("note.md")]);
         write_config(dir.path(), &vault);
         init_workspace(dir.path()).expect("init");
         let report = index_workspace(dir.path(), None).expect("index");
@@ -4999,6 +5559,7 @@ mod tests {
         ] {
             fs::write(vault.join(name), format!("# {name}\n\nCLEANTOKEN\n")).expect("write");
         }
+        age_past_the_store_write(&[&vault]);
         write_config(dir.path(), &vault);
         init_workspace(dir.path()).expect("init");
         let report = index_workspace(dir.path(), None).expect("index");
@@ -5389,6 +5950,20 @@ mod tests {
         )
     }
 
+    /// The `ingest.finished` payload of one batch: the run's own tally of what
+    /// it did (§5 第 7 条 「覆盖了多少」), as opposed to the per-row codes
+    /// `coverage_row_of` reads.
+    fn finished_payload(store: &Store, batch_id: &str) -> serde_json::Value {
+        let events = store
+            .store_events_for_batch(batch_id)
+            .expect("read the batch");
+        let finished = events
+            .iter()
+            .find(|event| event.event_type == "ingest.finished")
+            .expect("the closing event");
+        serde_json::from_str(&finished.data_json).expect("payload is JSON")
+    }
+
     #[test]
     fn a_narrowed_walk_leaves_out_of_tree_graph_rows_alone() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -5530,6 +6105,11 @@ mod tests {
         fs::write(vault.join("aaa-good.md"), "[[zzz-target#Head]]\n").expect("write good");
         fs::write(vault.join("aaa-bad.md"), "[[zzz-target#NoSuch]]\n").expect("write bad");
         fs::write(vault.join("zzz-target.md"), "# Head\n\nbody\n").expect("write target");
+        age_past_the_store_write(&[
+            &vault.join("aaa-good.md"),
+            &vault.join("aaa-bad.md"),
+            &vault.join("zzz-target.md"),
+        ]);
         write_config(dir.path(), &vault);
         init_workspace(dir.path()).expect("init");
         let report = index_workspace(dir.path(), None).expect("index");
@@ -5550,6 +6130,19 @@ mod tests {
             payload["stale_anchors"],
             serde_json::json!([{ "target": "note:zzz-target.md", "anchor": "NoSuch" }]),
             "which anchor went stale is on the record: {bad_data}"
+        );
+
+        // The run's own tally: one bad anchor, one good one — so the counter
+        // has something to count, and only the first run's batch counts it
+        // (the re-index below skips the file).
+        let finished = finished_payload(&store, &report.batch_id);
+        assert_eq!(
+            finished["graph_stale_anchors"], 1,
+            "one stale anchor, not zero and not two: {finished}"
+        );
+        assert_eq!(
+            finished["graph_ambiguous_links"], 0,
+            "and nothing ambiguous here: {finished}"
         );
 
         // Re-projection keeps saying so: a skipped file's row carries the code
@@ -5597,6 +6190,15 @@ mod tests {
             serde_json::json!(["note:d1/dup.md", "note:d2/dup.md", "note:d3/dup.md"]),
             "every candidate is on the record, sorted: {data}"
         );
+
+        // The run's own tally of the same fact (§5 第 7 条 「覆盖了多少」).
+        // Asserting it as 0 somewhere else says nothing: an accumulator pinned
+        // at 0 by a mutant still reads back as 0.
+        let payload = finished_payload(&store, &report.batch_id);
+        assert_eq!(
+            payload["graph_ambiguous_links"], 1,
+            "one ambiguous name in this vault: {payload}"
+        );
     }
 
     #[test]
@@ -5610,6 +6212,7 @@ mod tests {
             "good [t](target.md#Head) bad [u](bad%ZZname.md) gone [v](gone.md)\n",
         )
         .expect("write a");
+        age_past_the_store_write(&[&vault.join("target.md"), &vault.join("a.md")]);
         write_config(dir.path(), &vault);
         init_workspace(dir.path()).expect("init");
         let report = index_workspace(dir.path(), None).expect("index");
@@ -5855,6 +6458,7 @@ mod tests {
         fs::create_dir_all(&vault).expect("create vault");
         fs::write(vault.join("target.md"), "# Head\n\nbody\n").expect("write target");
         fs::write(vault.join("a.md"), "[[target#NoSuch]]\n").expect("write a");
+        age_past_the_store_write(&[&vault.join("target.md"), &vault.join("a.md")]);
         write_config(dir.path(), &vault);
         init_workspace(dir.path()).expect("init");
         index_workspace(dir.path(), None).expect("run 1");
@@ -5958,6 +6562,48 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         index_workspace(&root, None).expect("index");
         (dir, vault, root)
+    }
+
+    #[test]
+    fn a_workspace_that_was_never_initialized_asks_for_init_first() {
+        // `index`, `reconcile` and the watcher's startup pass all funnel
+        // through `run_batch`; before the shared guard they answered with
+        // SQLite's raw "unable to open database file". The read-side entries
+        // (`trace`, `doctor`) answer with the advice sentence, and now so do
+        // these. (`stats` prints an uninitialized *report* with exit 0 — a
+        // report is not an error outlet, and its shape is the contract.)
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("vault");
+        let root = dir.path().to_path_buf();
+        write_config(&root, &vault);
+
+        let error = index_workspace(&root, None).expect_err("uninitialized index is an error");
+        assert!(matches!(error, RunError::StoreUnhealthy(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("run `momotaro init` first"),
+            "{error}"
+        );
+
+        let error = reconcile(&root).expect_err("uninitialized reconcile is an error");
+        assert!(matches!(error, RunError::StoreUnhealthy(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("run `momotaro init` first"),
+            "{error}"
+        );
+
+        // The 0-byte shape (a file left behind by a crash) answers the same
+        // sentence on the write path too — the guard's `Empty` arm had no
+        // witness (adversarial lane #5; a mutant rerouting Empty to
+        // `store_fault`'s "database is not initialized: <path>" survived).
+        fs::write(root.join(".momotaro").join("momotaro.db"), b"")
+            .expect("leave a 0-byte database");
+        let error = index_workspace(&root, None).expect_err("a 0-byte store is not usable");
+        assert!(matches!(error, RunError::StoreUnhealthy(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("run `momotaro init` first"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -6080,6 +6726,47 @@ mod tests {
         );
     }
 
+    /// A removal is a row like any other, so the two readings of a batch count
+    /// it the same way (ADR 0026: "the rows are the breakdown"). It was the one
+    /// row they disagreed about: `doctor --coverage` counted the `skipped` row a
+    /// deleted note writes, the `ingest.finished` payload did not, and
+    /// `momotaro index` printed no mention of the deletion either — three
+    /// surfaces, one batch, three answers.
+    #[test]
+    fn a_removed_source_is_counted_where_the_rows_are_counted() {
+        let (dir, vault, root) = settled_workspace();
+        fs::remove_file(vault.join("b.md")).expect("remove");
+        let report = index_workspace(&root, None).expect("index");
+
+        let events = store_of(&root)
+            .store_events_for_batch(&report.batch_id)
+            .expect("this batch's rows");
+        let skipped_rows = events
+            .iter()
+            .filter(|event| {
+                event.event_type.ends_with(".coverage")
+                    && event.outcome.as_deref() == Some("skipped")
+            })
+            .count();
+        assert_eq!(
+            report.files_skipped, skipped_rows as u64,
+            "the payload and the rows count the same batch the same way: {report:?}"
+        );
+        assert_eq!(
+            report.files_skipped,
+            coverage_report(&root)
+                .expect("read")
+                .expect("a batch")
+                .skipped,
+            "and doctor --coverage, which reads this same ingest batch, agrees"
+        );
+        // Both files the batch accounted for: the one still in the vault and
+        // the one that went.
+        assert_eq!(report.files_scanned, 2, "{report:?}");
+        assert_eq!(report.files_skipped, 2, "{report:?}");
+        let _ = dir;
+    }
+
     #[test]
     fn a_vault_that_lost_a_file_reports_the_removal_it_found() {
         // Both existing assertions on `removed` are `== 0`, so a batch that
@@ -6099,7 +6786,11 @@ mod tests {
             outcome.removed, 1,
             "the key the walk no longer names is counted once"
         );
-        assert_eq!(outcome.report.files_scanned, 1, "one file is left");
+        // Both files the batch accounted for: the one still in the vault and
+        // the one that went (a removal is a row, so `files_scanned` names it —
+        // ADR 0026's counters are a partition of it).
+        assert_eq!(outcome.report.files_scanned, 2, "one file left, one gone");
+        assert_eq!(outcome.report.files_skipped, 2, "and both are skipped rows");
         let _ = dir;
     }
 
@@ -6280,6 +6971,33 @@ mod tests {
                 .any(|hit| hit.hit.source_key.contains("outside")),
             "and the search index still has it"
         );
+    }
+
+    #[test]
+    fn an_override_that_names_the_vault_root_is_a_whole_vault_walk() {
+        // `usage.md` shows `momotaro index <path>` with the vault itself: the
+        // walk covers every key, so the absence half runs. The old gate
+        // (`path_override.is_none()`) skipped it, and a deleted file kept its
+        // row and its search hits.
+        let (dir, vault, root) = settled_workspace();
+        fs::remove_file(vault.join("b.md")).expect("remove");
+
+        index_workspace(&root, Some(&vault)).expect("a walk bounded to the vault root");
+
+        assert_eq!(
+            removals_for(&root, "note:b.md"),
+            1,
+            "the absence is a fact the walk covered"
+        );
+        assert!(
+            !search_workspace(&root, "second body", 5)
+                .expect("search")
+                .hits
+                .iter()
+                .any(|hit| hit.hit.source_key.contains("b.md")),
+            "and the phantom hit is gone"
+        );
+        let _ = dir;
     }
 
     #[test]
@@ -6533,5 +7251,150 @@ mod tests {
             "the stat moved, so there is work"
         );
         let _ = dir;
+    }
+
+    /// `[policy]`'s two compaction knobs fall back to §4's numbers when the
+    /// TOML says nothing about them. `context-retrieval.md` §4 shows those
+    /// exact keys with those exact values, so a default that drifted would
+    /// make that document a lie — and nobody's config is the witness, because
+    /// nobody writes these keys.
+    #[test]
+    fn the_policy_section_defaults_to_the_documented_compaction_numbers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join("vault")).expect("vault");
+        // `write_config`'s shape: a vault, no `[policy]` section at all.
+        write_config(dir.path(), &dir.path().join("vault"));
+
+        let config = load_config(dir.path()).expect("load config");
+        assert_eq!(
+            config.policy.compact_trigger_ratio, 0.85,
+            "§4's trigger ratio when the key is absent"
+        );
+        assert_eq!(
+            config.policy.compact_reserve_abs, 12_000,
+            "§4's reserve when the key is absent"
+        );
+        assert_eq!(
+            config.policy.max_context_tokens, 8192,
+            "§2.1's budget when the key is absent"
+        );
+
+        // And the values that are present are read, not defaulted over.
+        fs::write(
+            config_path(dir.path()),
+            "vault.path = \"vault\"\n\n[policy]\ncompact_trigger_ratio = 0.4\ncompact_reserve_abs = 0\nmax_context_tokens = 4096\n",
+        )
+        .expect("write config");
+        let config = load_config(dir.path()).expect("reload config");
+        assert_eq!(config.policy.compact_trigger_ratio, 0.4);
+        assert_eq!(config.policy.compact_reserve_abs, 0);
+        assert_eq!(config.policy.max_context_tokens, 4096);
+    }
+
+    /// The stamp's nanosecond field is padded because `run_id` is the round
+    /// axis's tiebreak (`context-retrieval.md` §3). The field is **hex**: left
+    /// unpadded, 9 renders `9` while 16 renders `10`, so `...-9` sorts *after*
+    /// `...-10` and two turns landing in the same second come out in the wrong
+    /// order. Asserted on the field, not on live ids — the clock would hand an
+    /// unpadded format eight digits most of the time and let the mutant
+    /// through by luck. Comparing 9 with 16 rather than with 10 is the whole
+    /// point: unpadded, `9 < a` still holds, so that pair proves nothing.
+    #[test]
+    fn an_empty_client_request_id_is_refused_before_a_run() {
+        for key in [Some(String::new()), Some("   ".to_owned())] {
+            let options = AskOptions {
+                client_request_id: key,
+                ..AskOptions::default()
+            };
+            let error = validate_ask_policy(&options)
+                .expect_err("a key that cannot identify a request is refused");
+            assert!(matches!(error, RunError::PolicyRefused(_)), "{error:?}");
+        }
+        assert!(
+            validate_ask_policy(&AskOptions::default()).is_ok(),
+            "no key remains legal"
+        );
+    }
+
+    #[test]
+    fn stamp_state_is_monotonic_after_a_clock_rollback() {
+        let first = next_stamp(200, 100);
+        let rolled = next_stamp(100, 900);
+        assert!(
+            (rolled.0, rolled.1) > first,
+            "the generator never steps backwards: {first:?} then {rolled:?}"
+        );
+    }
+
+    #[test]
+    fn stamp_ids_field_pads_so_it_sorts_the_way_the_round_axis_needs() {
+        assert_eq!(
+            stamp_field(16),
+            "00000010",
+            "the value that sorts between 9 and 17 once padded"
+        );
+        assert!(
+            stamp_field(9) < stamp_field(16),
+            "padded: lexicographic order equals numeric order ({:?} vs {:?})",
+            stamp_field(9),
+            stamp_field(16)
+        );
+        assert_eq!(stamp_field(9).len(), 8, "always eight digits");
+        assert_eq!(stamp_field(0), "00000000", "padded from nothing");
+
+        let id = stamp_id("run");
+        let field = id.rsplit('-').next().expect("a nanosecond field");
+        assert_eq!(field.len(), 8, "the live generator pads too: {id}");
+        assert!(field.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+    }
+
+    /// The same-millisecond half of `next_stamp` — the reason the nanosecond
+    /// field exists: two ids inside one millisecond stay distinct and ordered.
+    /// A duplicate or a step backwards would collide with
+    /// `UNIQUE (batch_id, seq)` and take the watcher down with it.
+    #[test]
+    fn two_stamps_in_one_millisecond_stay_distinct_and_ordered() {
+        let a = next_stamp(200, 100);
+        let b = next_stamp(200, 100);
+        assert!(
+            b > a,
+            "the same inputs inside one millisecond must bump: {a:?} then {b:?}"
+        );
+        let c = next_stamp(200, 50);
+        assert!(
+            c > b,
+            "an older nanosecond inside the millisecond must bump, not rewind: {b:?} then {c:?}"
+        );
+    }
+
+    /// The id reads as what it is: `<prefix>-<unix ms>-<nanos…>` — the
+    /// millisecond is for a human, so the middle field must be the epoch
+    /// millisecond, not garbage from the state word's halves.
+    #[test]
+    fn the_stamp_id_middle_field_reads_as_the_epoch_millisecond() {
+        // Prime the state word with a large nanosecond half: a broken
+        // `>>`/`<<` extraction then overshoots the clock and cannot stay
+        // invisible behind the `max` clamp on a fresh `0`.
+        next_stamp(5, 500_000_000);
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis() as u64;
+        let id = stamp_id("run");
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis() as u64;
+        assert_eq!(id.split('-').count(), 3, "three segments: {id}");
+        let middle: u64 = id
+            .split('-')
+            .nth(1)
+            .expect("prefix-millis-nanos shape")
+            .parse()
+            .expect("the middle field is numeric");
+        assert!(
+            middle + 2000 >= before && middle <= after + 2000,
+            "the middle field is the epoch millisecond: {id}"
+        );
     }
 }

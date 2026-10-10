@@ -91,10 +91,26 @@ impl BudgetPolicy {
     /// Compaction fires when the session's estimated size crosses this
     /// line; the formula is a pure helper so the ask loop and this crate
     /// share one definition.
+    ///
+    /// A non-finite ratio, zero, or one past 1.0 (a typo'd `8.5`, a `NaN`
+    /// from a hand-edited TOML) fails **closed** to
+    /// [`DEFAULT_COMPACT_TRIGGER_RATIO`] — the same rule
+    /// [`Self::adjusted_total`] applies to the coefficient, and for the same
+    /// reason: `(NaN * budget) as u64` is `0`, which would put the trigger on
+    /// the floor and report a compaction on every single turn. Config garbage
+    /// must never open the trigger.
     pub fn compact_trigger(&self) -> u64 {
+        let ratio = if self.compact_trigger_ratio.is_finite()
+            && self.compact_trigger_ratio > 0.0
+            && self.compact_trigger_ratio <= 1.0
+        {
+            self.compact_trigger_ratio
+        } else {
+            DEFAULT_COMPACT_TRIGGER_RATIO
+        };
         let reserve = self.compact_reserve() as u64;
         let budget = u64::from(self.max_context_tokens);
-        let by_ratio = (self.compact_trigger_ratio * self.max_context_tokens as f64).floor() as u64;
+        let by_ratio = (ratio * self.max_context_tokens as f64).floor() as u64;
         (budget.saturating_sub(reserve)).min(by_ratio)
     }
 }
@@ -151,6 +167,34 @@ mod tests {
         assert_eq!(big.compact_trigger(), 85_000);
     }
 
+    /// Config garbage fails closed to the documented default — the same rule
+    /// [`BudgetPolicy::adjusted_total`] applies to the coefficient.
+    ///
+    /// Worth its own test because the failure is silent in the other
+    /// direction: `(NaN * budget) as u64` is `0`, so a `NaN` ratio would put
+    /// the trigger on the floor and report a compaction on **every** turn,
+    /// while a `1.5` typo would suppress it entirely on a large budget.
+    #[test]
+    fn an_out_of_range_ratio_falls_back_to_the_documented_default() {
+        let expected = BudgetPolicy {
+            max_context_tokens: 100_000,
+            ..BudgetPolicy::default()
+        }
+        .compact_trigger();
+        for ratio in [f64::NAN, f64::INFINITY, -0.5, 0.0, 1.5] {
+            let policy = BudgetPolicy {
+                max_context_tokens: 100_000,
+                compact_trigger_ratio: ratio,
+                ..BudgetPolicy::default()
+            };
+            assert_eq!(
+                policy.compact_trigger(),
+                expected,
+                "a ratio of {ratio:?} must not decide the trigger"
+            );
+        }
+    }
+
     #[test]
     fn the_three_calibrated_knobs_come_from_config_not_code() {
         // Changing config values must flow through the math unchanged —
@@ -179,4 +223,13 @@ fn a_corrupted_coefficient_fails_closed_to_the_default() {
         ..BudgetPolicy::default()
     };
     assert_eq!(negative.adjusted_total(100), 125);
+    // The doc says "non-finite **or non-positive**" and its twin test lists
+    // `0.0` for the ratio — this one skipped it. A zero coefficient makes every
+    // estimate round to 0, so the budget is never exceeded and compaction
+    // never fires.
+    let zero = BudgetPolicy {
+        token_estimate_coefficient: 0.0,
+        ..BudgetPolicy::default()
+    };
+    assert_eq!(zero.adjusted_total(100), 125);
 }

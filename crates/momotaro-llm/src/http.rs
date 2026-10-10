@@ -48,16 +48,22 @@ use crate::transport::{ProviderTransport, TransportError, TransportReply};
 /// chat-completions protocol (`docs/docs/architecture.md` §7, `[model]`).
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 
+/// The optional throttling hint the retry policy reads before replaying.
+const RETRY_AFTER_HEADER: &str = "retry-after";
+
 /// How long establishing the connection (including the TLS handshake) may take.
 ///
 /// A transport constant, not a user knob: a TCP+TLS session cannot legitimately
-/// take longer than this, whereas a *generation* can — so only the connect phase
-/// is bounded here. Leaving the reply unbounded is deliberate: an arbitrary
-/// global deadline would cut off a slow but perfectly valid long answer, and
-/// picking a number for that belongs to the model/timeout contract, not to the
-/// transport. Known remaining face: a peer that accepts the connection and then
-/// stalls mid-reply hangs the call until the user cancels it.
+/// take longer than this. A *generation* can take longer than a socket phase,
+/// so the global bound is deliberately generous — it is a hung-peer escape
+/// hatch, not a model-quality knob.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// End-to-end deadline for DNS through reading the response body.
+///
+/// This covers every other timeout (including `CONNECT_TIMEOUT`) and bounds a
+/// peer that accepts the connection and then stalls before or mid-reply.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Why an endpoint could not be turned into a transport.
 ///
@@ -75,11 +81,23 @@ pub enum TransportConfigError {
     /// request line (and in anything that echoes a URL).
     #[error("the provider endpoint must not embed a credential; use the api key parameter")]
     EndpointWithUserInfo,
+    /// The endpoint carries a fragment, which never reaches a request line
+    /// (ureq writes it from `path_and_query()`), so the appended path suffix
+    /// would be silently lost.
+    #[error("the provider endpoint must not carry a fragment")]
+    EndpointWithFragment,
     /// The API key is not printable ASCII without spaces, so it cannot go into
     /// an HTTP header here — the refusal belongs at the configuration seam,
     /// before any request is attempted, not at the socket.
     #[error("the API key must be printable ASCII without spaces, so it can go into an HTTP header")]
     UnusableApiKey,
+    /// A credential was configured for a non-loopback plain-HTTP endpoint.
+    /// The key would leave the process in cleartext; loopback is allowed for
+    /// local proxies and development servers.
+    #[error(
+        "an API key over non-loopback HTTP would leave the process in cleartext; use HTTPS or loopback"
+    )]
+    PlainHttpWithApiKey,
 }
 
 /// A blocking, OpenAI-compatible HTTP transport.
@@ -117,6 +135,23 @@ impl HttpTransport {
     /// Performs no I/O. The key is optional — a local endpoint may need none —
     /// and an empty key is treated as no key rather than as `Bearer `.
     pub fn new(base_url: &str, api_key: Option<&str>) -> Result<Self, TransportConfigError> {
+        Self::with_turn_timeout(base_url, api_key, RESPONSE_TIMEOUT)
+    }
+
+    /// [`Self::new`] with the end-to-end deadline taken from configuration
+    /// rather than `RESPONSE_TIMEOUT`.
+    ///
+    /// The deadline is a **hung-peer escape hatch, not a model-quality knob**:
+    /// it exists so an endpoint that accepts and then stalls cannot hold a run
+    /// open for ever. How generous it needs to be depends on the model — a
+    /// slow-but-valid long answer must not be cut — so the number belongs to
+    /// `[policy].provider_turn_timeout_s` (`harness.md` §4) and not to a
+    /// constant here.
+    pub fn with_turn_timeout(
+        base_url: &str,
+        api_key: Option<&str>,
+        turn_timeout: Duration,
+    ) -> Result<Self, TransportConfigError> {
         let origin = endpoint_origin(base_url)?;
         let api_key = api_key
             .map(str::trim)
@@ -136,12 +171,44 @@ impl HttpTransport {
             })
             .transpose()?;
 
-        let endpoint = format!("{}{CHAT_COMPLETIONS_PATH}", base_url.trim_end_matches('/'));
+        // A credential over the open Internet must not travel as plaintext.
+        // The loopback names are explicit because this is an authorization
+        // decision, not generic host matching. This runs after key validation
+        // so the caller fixes key shape and transport in one typed pass.
+        if api_key.is_some() && origin.starts_with("http://") && !is_loopback_origin(&origin) {
+            return Err(TransportConfigError::PlainHttpWithApiKey);
+        }
+
+        // A fragment never reaches a request line, so a base carrying one
+        // would silently lose the suffix: refused, typed, at this seam.
+        if base_url.contains('#') {
+            return Err(TransportConfigError::EndpointWithFragment);
+        }
+        // The suffix goes *before* a query, not after it. By-string appending
+        // put `/chat/completions` inside the query and the request landed on a
+        // path that never exists (probe: `http::Uri` parses it the way ureq
+        // does, and `ureq-proto`'s `prelude()` writes the request line from
+        // `path_and_query()`). Azure-style bases carry `?api-version=…`, and
+        // that shape must keep working — with the suffix in front.
+        let (path, query) = base_url.split_once('?').map_or(
+            (base_url.trim_end_matches('/'), None),
+            |(path, query)| {
+                (
+                    path.trim_end_matches('/'),
+                    (!query.is_empty()).then_some(query),
+                )
+            },
+        );
+        let endpoint = match query {
+            Some(query) => format!("{path}{CHAT_COMPLETIONS_PATH}?{query}"),
+            None => format!("{path}{CHAT_COMPLETIONS_PATH}"),
+        };
         let agent = Agent::config_builder()
             // The seam answers with a raw status + body (TransportReply), so a
             // 4xx/5xx must stay a reply for `error::classify` to read.
             .http_status_as_error(false)
             .timeout_connect(Some(CONNECT_TIMEOUT))
+            .timeout_global(Some(turn_timeout))
             .tls_config(
                 TlsConfig::builder()
                     .root_certs(RootCerts::PlatformVerifier)
@@ -174,18 +241,36 @@ impl HttpTransport {
         self.api_key.is_some()
     }
 
-    /// The headers every exchange carries.
+    /// The end-to-end deadline this transport was built with — what
+    /// `[policy].provider_turn_timeout_s` resolved to at the seam.
+    ///
+    /// Honest about why it exists: it is the read side of a **witness**, not
+    /// a consumer requirement. Nothing in production asks a transport for its
+    /// deadline; [`Self::endpoint`], [`Self::has_api_key`] and `origin()` are
+    /// in the same position. The alternative to exposing it is leaving
+    /// `momotaro-run` unable to tell its own configured number from a hard
+    /// coded one, which is exactly the wiring change that goes unobserved.
+    pub fn turn_timeout(&self) -> Option<Duration> {
+        self.agent.config().timeouts().global
+    }
+
+    /// The headers every exchange carries: the base pair, the credential as
+    /// a bearer header when there is one, and the optional idempotency key
+    /// `complete` derives from the exact canonical request bytes.
     ///
     /// Split out of [`ProviderTransport::send`] because `send`'s I/O body
     /// cannot run in a test while this can — and this is the only place that
     /// knows the credential travels as a header at all.
-    fn headers(&self) -> Vec<(&'static str, String)> {
+    fn headers_for(&self, idempotency_key: Option<&str>) -> Vec<(&'static str, String)> {
         let mut headers = vec![
             ("content-type", "application/json".to_owned()),
             ("accept", "application/json".to_owned()),
         ];
         if let Some(key) = &self.api_key {
             headers.push(("authorization", format!("Bearer {key}")));
+        }
+        if let Some(key) = idempotency_key {
+            headers.push(("idempotency-key", key.to_owned()));
         }
         headers
     }
@@ -209,8 +294,11 @@ impl std::fmt::Debug for HttpTransport {
     /// The credential never reaches a formatter: `{:?}` on a transport must not
     /// be a way to print it. Hand-written rather than derived for exactly that.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The endpoint may carry a provider-specific path and query; only the
+        // origin is safe diagnostic material. Keep both fields so readers can
+        // tell "origin allowed" from "endpoint redacted".
         f.debug_struct("HttpTransport")
-            .field("endpoint", &self.endpoint)
+            .field("endpoint", &"<redacted>")
             .field("origin", &self.origin)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .finish()
@@ -224,8 +312,18 @@ impl ProviderTransport for HttpTransport {
     /// The structural test pins that composition; changing any one of them in
     /// here takes it red.
     fn send(&self, body: &str) -> Result<TransportReply, TransportError> {
+        // The legacy seam has no key; `complete` uses the keyed method below.
+        self.send_with_idempotency_key("", body)
+    }
+
+    fn send_with_idempotency_key(
+        &self,
+        idempotency_key: &str,
+        body: &str,
+    ) -> Result<TransportReply, TransportError> {
+        let idempotency_key = (!idempotency_key.is_empty()).then_some(idempotency_key);
         let mut request = self.agent.post(&self.endpoint);
-        for (name, value) in self.headers() {
+        for (name, value) in self.headers_for(idempotency_key) {
             request = request.header(name, value);
         }
 
@@ -235,6 +333,14 @@ impl ProviderTransport for HttpTransport {
             .send(body)
             .map_err(|error| self.failure(error, false))?;
         let status = response.status().as_u16();
+        let now = std::time::SystemTime::now();
+        let retry_after = crate::error::retry_after(
+            response
+                .headers()
+                .get(RETRY_AFTER_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            now,
+        );
 
         // From here the provider has answered: whatever goes wrong while the
         // body is being read is output that has already been spent, so the
@@ -244,7 +350,11 @@ impl ProviderTransport for HttpTransport {
             .read_to_string()
             .map_err(|error| self.failure(error, true))?;
 
-        Ok(TransportReply { status, body: text })
+        Ok(TransportReply {
+            status,
+            body: text,
+            retry_after,
+        })
     }
 }
 
@@ -279,6 +389,32 @@ fn describe(error: &ureq::Error) -> String {
         Error::Io(source) => source.to_string(),
         _ => "the exchange ended without a complete reply".to_owned(),
     }
+}
+
+/// The loopback endpoints allowed to receive an API key over plain HTTP.
+fn is_loopback_origin(origin: &str) -> bool {
+    let Some(authority) = origin.strip_prefix("http://") else {
+        return false;
+    };
+
+    // IPv6 keeps its brackets in an authority; split at the final colon only
+    // for host-like authorities so a bracketed address's port is not mistaken
+    // for address bytes.
+    let host = if let Some(address) = authority.strip_prefix('[') {
+        address
+            .split_once(']')
+            .map_or(authority, |(address, _)| address)
+    } else {
+        authority
+            .split_once(':')
+            .map_or(authority, |(host, _)| host)
+    };
+
+    // `::1` only ever reaches here with its brackets already stripped (the
+    // bracketed branch above), and it carries no letters to fold — so one
+    // spelling is the whole IPv6 arm, and a host that still has brackets is
+    // not a host this function can see.
+    host == "127.0.0.1" || host == "localhost" || host == "::1"
 }
 
 /// Splits an endpoint into its scheme and its `host[:port]`, refusing the
@@ -333,6 +469,26 @@ mod tests {
     }
 
     #[test]
+    fn a_query_on_the_base_keeps_the_suffix_before_it_and_a_fragment_is_refused() {
+        // The probe shape: by-string appending made the request line
+        // `/v1?api-version=…/chat/completions` — suffix inside the query, path
+        // that never exists. Structural join puts the suffix first, and a
+        // trailing separator before the `?` must not double up.
+        assert_eq!(
+            endpoint("https://api.example.com:8443/v1?api-version=2024-01-01"),
+            "https://api.example.com:8443/v1/chat/completions?api-version=2024-01-01"
+        );
+        assert_eq!(
+            endpoint("https://api.example.com:8443/v1/?api-version=2024-01-01"),
+            "https://api.example.com:8443/v1/chat/completions?api-version=2024-01-01"
+        );
+        // A fragment is not a request-line fact: refused, not dropped.
+        let error = HttpTransport::new("https://api.example.com/v1#frag", None)
+            .expect_err("a fragment is refused");
+        assert_eq!(error, TransportConfigError::EndpointWithFragment);
+    }
+
+    #[test]
     fn the_agent_reads_a_4xx_or_5xx_as_a_reply_not_an_error() {
         // Without this, a provider's 401 body never reaches `classify` and the
         // failure loses the structured code that decides its category.
@@ -354,6 +510,25 @@ mod tests {
             tls.root_certs()
         );
         assert!(!tls.disable_verification(), "verification stays on");
+    }
+
+    /// `with_turn_timeout` is what the run layer's `[policy]` deadline reaches.
+    /// The number is not this crate's business — `RESPONSE_TIMEOUT` is only
+    /// what a bare `new` falls back to — so what is pinned is that the
+    /// parameter is what lands in `timeout_global`.
+    #[test]
+    fn the_turn_deadline_is_the_one_it_was_built_with() {
+        let transport = HttpTransport::with_turn_timeout(
+            "https://api.example.com/v1",
+            None,
+            Duration::from_secs(7),
+        )
+        .expect("transport");
+        assert_eq!(
+            transport.agent.config().timeouts().global,
+            Some(Duration::from_secs(7)),
+            "the deadline is a parameter, not a constant"
+        );
     }
 
     #[test]
@@ -523,7 +698,7 @@ mod tests {
         // inline, or hard-coding a status, takes it red.
         let source = include_str!("http.rs");
         let body = source
-            .split("fn send")
+            .split("fn send_with_idempotency_key")
             .nth(1)
             .expect("send exists")
             .split("\n}")
@@ -537,7 +712,9 @@ mod tests {
             !body.contains(".post(&self.origin)"),
             "and never at the origin, which carries no path: {body}"
         );
-        let headers = body.find("self.headers()").expect("the headers are built");
+        let headers = body
+            .find("self.headers_for(")
+            .expect("the headers are built");
         let call = body.find(".send(body)").expect("the call is made");
         assert!(
             target < headers,
@@ -582,7 +759,7 @@ mod tests {
         let with_key =
             HttpTransport::new("https://api.example.com/v1", Some("sk-abc")).expect("transport");
         assert_eq!(
-            with_key.headers(),
+            with_key.headers_for(None),
             vec![
                 ("content-type", "application/json".to_owned()),
                 ("accept", "application/json".to_owned()),
@@ -596,7 +773,7 @@ mod tests {
                 HttpTransport::new("https://api.example.com/v1", key).expect("transport");
             assert!(
                 transport
-                    .headers()
+                    .headers_for(None)
                     .iter()
                     .all(|(name, _)| *name != "authorization"),
                 "{label} must not send an Authorization header"
@@ -613,9 +790,11 @@ mod tests {
             .expect("transport");
         let rendered = format!("{transport:?}");
 
+        assert!(rendered.contains("endpoint: \"<redacted>\""), "{rendered}");
+        assert!(rendered.contains("https://api.example.com"), "{rendered}");
         assert!(
-            rendered.contains("https://api.example.com/v1"),
-            "{rendered}"
+            !rendered.contains("/v1/chat/completions"),
+            "the formatter leaked the endpoint path: {rendered}"
         );
         assert!(rendered.contains("<redacted>"), "{rendered}");
         assert!(
@@ -805,6 +984,59 @@ mod tests {
         assert!(
             text.contains(concat!("name = ", "\"rustls-platform-verifier\"")),
             "and it must be carrying the platform verifier"
+        );
+    }
+
+    #[test]
+    fn the_reply_deadline_bounds_the_whole_exchange() {
+        let transport = HttpTransport::new("https://api.example.com/v1", None).expect("transport");
+        // The literal, not `RESPONSE_TIMEOUT`, for the same reason as the
+        // connect check: comparing to the constant cannot catch an accidental
+        // zero. A slow fake body cannot run here without a socket, so the
+        // agent config is the test seam for the deadline.
+        assert_eq!(
+            transport.agent.config().timeouts().global,
+            Some(Duration::from_secs(300)),
+            "a peer that accepts and stalls must not hang the call"
+        );
+    }
+
+    #[test]
+    fn a_key_over_non_loopback_http_is_refused_without_sending() {
+        let error = HttpTransport::new("http://api.example.com/v1", Some("sk-abc"))
+            .expect_err("plaintext credential off-loopback must be refused");
+        assert_eq!(error, TransportConfigError::PlainHttpWithApiKey);
+        assert!(
+            !error.to_string().contains("api.example.com"),
+            "the refusal leaked the endpoint: {error}"
+        );
+
+        // Plain HTTP stays useful for local tools, and HTTPS keeps its key.
+        for url in [
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:8080/v1",
+            "http://[::1]:8080/v1",
+        ] {
+            HttpTransport::new(url, Some("sk-abc"))
+                .unwrap_or_else(|error| panic!("{url} must be allowed: {error}"));
+        }
+        HttpTransport::new("https://api.example.com/v1", Some("sk-abc"))
+            .expect("HTTPS carries the key");
+        HttpTransport::new("http://api.example.com/v1", None)
+            .expect("no key is no plaintext credential");
+    }
+
+    #[test]
+    fn the_idempotency_key_travels_as_a_header_only_when_keyed() {
+        let transport =
+            HttpTransport::new("https://api.example.com/v1", Some("sk-abc")).expect("transport");
+        let keyed = transport.headers_for(Some("request-hash"));
+        assert!(keyed.contains(&("idempotency-key", "request-hash".to_owned())));
+
+        let headers = transport.headers_for(None);
+        assert!(
+            headers.iter().all(|(name, _)| *name != "idempotency-key"),
+            "the legacy seam must not invent a key"
         );
     }
 }

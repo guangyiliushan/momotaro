@@ -5,19 +5,22 @@
 //! the canonical home of chunk text.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 pub(crate) mod boost;
-pub mod cjk;
-pub mod fusion;
-pub mod index;
-pub mod query;
-pub mod schema;
+// The modules are crate-private: what is API is the root re-export list below,
+// so a name can move between files without becoming a public path.
+mod cjk;
+mod fusion;
+mod index;
+mod query;
+mod schema;
 
-pub use cjk::{CJK_TOKENIZER_NAME, CjkTokenizer, cjk_analyzer};
+pub use cjk::{CJK_TOKENIZER_NAME, CjkTokenizer};
 pub use fusion::{RRF_K, fuse_rrf};
 pub use index::{IndexWriterHandle, SearchIndex};
-pub use query::{escape_query, is_searchable, normalize_query};
-pub use schema::{Fields, build_schema, doc_from_chunk, fields};
+pub use query::{is_searchable, normalize_query};
+pub use schema::{Fields, fields};
 
 use tantivy::TantivyError;
 use thiserror::Error;
@@ -28,12 +31,6 @@ pub enum RetrieveError {
     /// Underlying tantivy failure.
     #[error(transparent)]
     Tantivy(#[from] TantivyError),
-    /// User query could not be parsed even after escaping.
-    #[error("query parse failed: {0}")]
-    QueryParse(String),
-    /// Expected an existing index directory but found none.
-    #[error("index directory not found: {0}")]
-    IndexMissing(String),
     /// The on-disk index schema was not produced by this build (stale,
     /// truncated, or foreign index). Rebuild the index to recover.
     #[error("index schema mismatch: missing field `{0}`; rebuild the index")]
@@ -99,11 +96,11 @@ mod tests {
         }
     }
 
-    fn ram_index() -> SearchIndex {
+    pub(crate) fn ram_index() -> SearchIndex {
         let index = tantivy::Index::create_in_ram(schema::build_schema());
         index
             .tokenizers()
-            .register(CJK_TOKENIZER_NAME, cjk_analyzer());
+            .register(CJK_TOKENIZER_NAME, cjk::cjk_analyzer());
         let fields = schema::fields(&index.schema()).expect("own schema resolves");
         let reader = index.reader().expect("reader");
         SearchIndex::from_parts(index, fields, reader)
@@ -454,14 +451,94 @@ mod tests {
         assert_eq!(hits[0].chunk_id, "d-1");
     }
 
+    /// Collector-order truncation cannot decide a score tie at the boundary.
+    /// Sorting all matches by the documented total order, then cutting, is
+    /// what makes `top_k` deterministic.
+    /// Escaping the apostrophe keeps the query on the literal path; the false
+    /// fallback marker proves it did not survive only through the quoted retry.
+    #[test]
+    fn an_apostrophized_query_hits_as_a_literal_not_phrase_fallback() {
+        let si = ram_index();
+        let mut writer = si.writer(20_000_000).expect("writer");
+        upsert_owner(
+            &mut writer,
+            si.fields(),
+            "a.md",
+            "A",
+            &[chunk("apos-1", "a.md", 0, None, "don't stop believing")],
+        )
+        .expect("upsert");
+        writer.commit().expect("commit");
+
+        let hits = si.search("don't stop", 10).expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].chunk_id, "apos-1");
+        assert!(!si.parse_fell_back());
+    }
+
+    #[test]
+    fn a_tie_across_the_top_k_boundary_keeps_its_lexical_sources() {
+        let si = ram_index();
+        let mut writer = si.writer(20_000_000).expect("writer");
+        for key in ["z.md", "a.md", "b.md"] {
+            upsert_owner(
+                &mut writer,
+                si.fields(),
+                key,
+                "T",
+                &[chunk("t", key, 0, None, "identical boundary text")],
+            )
+            .expect("upsert");
+        }
+        writer.commit().expect("commit");
+
+        let hits = si.search("identical boundary", 2).expect("boundary hits");
+        let keys: Vec<&str> = hits.iter().map(|hit| hit.source_key.as_str()).collect();
+        assert_eq!(keys, ["a.md", "b.md"]);
+    }
+
+    /// Repeated searches share one parser construction and must produce the
+    /// same hit order; the cache is a cost fix, not a ranking change.
+    #[test]
+    fn repeated_searches_keep_the_same_lexical_result() {
+        let si = ram_index();
+        let mut writer = si.writer(20_000_000).expect("writer");
+        upsert_owner(
+            &mut writer,
+            si.fields(),
+            "a.md",
+            "A",
+            &[chunk("a-1", "a.md", 0, None, "repeated parser content")],
+        )
+        .expect("upsert");
+        writer.commit().expect("commit");
+
+        let first = si.search("repeated parser", 10).expect("first search");
+        let second = si.search("repeated parser", 10).expect("second search");
+        assert_eq!(first, second);
+        assert!(!si.parse_fell_back());
+    }
+
     #[test]
     fn tie_break_sorts_equal_scores_by_source_then_ordinal() {
         let si = ram_index();
         let mut writer = si.writer(20_000_000).expect("writer");
         // Identical single-term docs across sources get identical BM25 scores
-        // (same term, same length, same field stats).
-        let sources = ["z.md", "a.md", "m.md"];
-        for (i, key) in sources.iter().enumerate() {
+        // (same term, same length, same field stats), so ordering falls to the
+        // two tie-break keys — and the third one was doing no work at all: every
+        // fixture above carried ordinal 0, so `a.ordinal.cmp(&b.ordinal)` compared
+        // zeros. Two chunks now share a source *and* a body, so the score ties,
+        // `source_key` ties, and only ordinal ascending can order that pair. It
+        // doubles as the read-path witness for the stored ordinal: a decoder that
+        // answered 0 for every value would hand the pair back with a 0 on it.
+        // (`upsert_source` deletes the source key first, so both chunks have to
+        // go in through one call or the second wipes the first.)
+        let a = [
+            chunk("t-a-0", "a.md", 0, None, "identical body text"),
+            chunk("t-a-2", "a.md", 2, None, "identical body text"),
+        ];
+        upsert_owner(&mut writer, si.fields(), "a.md", "T", &a).expect("upsert");
+        for (i, key) in ["m.md", "z.md"].iter().enumerate() {
             upsert_owner(
                 &mut writer,
                 si.fields(),
@@ -479,9 +556,18 @@ mod tests {
         }
         writer.commit().expect("commit");
         let hits = si.search("identical body", 10).expect("hits");
-        assert_eq!(hits.len(), 3);
+        assert_eq!(hits.len(), 4);
         let keys: Vec<&str> = hits.iter().map(|h| h.source_key.as_str()).collect();
-        assert_eq!(keys, ["a.md", "m.md", "z.md"]);
+        assert_eq!(keys, ["a.md", "a.md", "m.md", "z.md"]);
+        let in_a: Vec<(&str, u32)> = hits[..2]
+            .iter()
+            .map(|h| (h.chunk_id.as_str(), h.ordinal))
+            .collect();
+        assert_eq!(
+            in_a,
+            [("t-a-0", 0), ("t-a-2", 2)],
+            "the third key orders the tied pair, and 2 reads back as 2"
+        );
         for (i, hit) in hits.iter().enumerate() {
             assert_eq!(hit.rank, i as u32 + 1);
         }

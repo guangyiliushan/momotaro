@@ -95,34 +95,17 @@ const SELECT: &str = "SELECT
         outcome, reason_code, message, data_json, external_id
     FROM store_events";
 
-pub(crate) fn now_epoch_secs() -> i64 {
+/// Seconds since the Unix epoch — the one clock the store and the run layer
+/// share, so a row's timestamp cannot disagree with the event beside it
+/// because two copies read `SystemTime` differently.
+pub fn now_epoch_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or_default()
 }
 
-impl Store {
-    /// Transaction time for the batch about to be written.
-    ///
-    /// Store-assigned, once per batch, and **never below the newest row's**:
-    /// wall-clock steps (NTP) must not move transaction time backwards
-    /// (`docs/docs/storage-events.md`, "缺失不得代偿"; Jensen & Snodgrass on
-    /// transaction time). Read by `id`, which is the same order the log is read
-    /// in, so this is one row lookup rather than an aggregate over the table.
-    pub(crate) fn next_recorded_at(&self) -> Result<i64, StoreError> {
-        let now = now_epoch_secs();
-        let last: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT recorded_at FROM store_events ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(last.map_or(now, |last| now.max(last)))
-    }
-}
+impl Store {}
 
 fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreEvent> {
     Ok(StoreEvent {
@@ -192,8 +175,21 @@ impl Store {
         batch_id: &str,
         events: &[NewStoreEvent<'_>],
     ) -> Result<(), StoreError> {
-        let recorded_at = self.next_recorded_at()?;
-        let transaction = self.connection.transaction()?;
+        // BEGIN IMMEDIATE serializes the newest-row read with the append, so
+        // a concurrent writer cannot land between the two and break the
+        // never-below-newest invariant.
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = now_epoch_secs();
+        let last: Option<i64> = transaction
+            .query_row(
+                "SELECT recorded_at FROM store_events ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let recorded_at = last.map_or(now, |last| now.max(last));
         insert_events_tx(&transaction, batch_id, events, recorded_at)?;
         transaction.commit()?;
         Ok(())
@@ -290,37 +286,28 @@ impl Store {
     }
 }
 
-/// Opens a store in a fresh temp dir with the schema applied.
-#[cfg(test)]
-fn temp_store() -> (tempfile::TempDir, Store) {
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let mut store = Store::open(dir.path().join("momotaro.db")).expect("open store");
-    store.init_schema().expect("init schema");
-    (dir, store)
-}
-
-#[cfg(test)]
-fn event<'a>(batch_id: &'a str, seq: i64, event_type: &'a str) -> NewStoreEvent<'a> {
-    NewStoreEvent {
-        occurred_at: 1_000,
-        batch_id,
-        seq,
-        domain: "ingest",
-        event_type,
-        source_key: None,
-        outcome: None,
-        reason_code: None,
-        message: None,
-        data_json: "{}",
-        external_id: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::temp_store;
 
     use momotaro_contracts::SchemaVersion;
+
+    fn event<'a>(batch_id: &'a str, seq: i64, event_type: &'a str) -> NewStoreEvent<'a> {
+        NewStoreEvent {
+            occurred_at: 1_000,
+            batch_id,
+            seq,
+            domain: "ingest",
+            event_type,
+            source_key: None,
+            outcome: None,
+            reason_code: None,
+            message: None,
+            data_json: "{}",
+            external_id: None,
+        }
+    }
 
     #[test]
     fn the_migration_lands_the_table_its_indexes_and_the_version() {
@@ -610,6 +597,45 @@ mod tests {
             external_id: Some("provider-7".to_owned()),
         };
         assert_eq!(stored, expected, "every column survives the round trip");
+    }
+
+    /// Two connections serialize on BEGIN IMMEDIATE, so the second append's
+    /// transaction-time read cannot race ahead of the first append's insert.
+    #[test]
+    fn concurrent_appends_keep_recorded_at_monotonic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("momotaro.db");
+        let mut writer = Store::open(&path).expect("open");
+        writer.init_schema().expect("init");
+        let event = |batch: &'static str| NewStoreEvent {
+            occurred_at: 10,
+            batch_id: batch,
+            seq: 1,
+            domain: "ingest",
+            event_type: "ingest.started",
+            source_key: None,
+            outcome: None,
+            reason_code: None,
+            message: None,
+            data_json: "{}",
+            external_id: None,
+        };
+        writer.append_store_event(&event("one")).expect("one");
+        let mut second = Store::open(&path).expect("second");
+        second
+            .append_store_event(&event("two"))
+            .expect("serialized writer");
+        let times: Vec<i64> = writer
+            .latest_store_events(2)
+            .expect("read")
+            .into_iter()
+            .map(|row| row.recorded_at)
+            .collect();
+        assert_eq!(times.len(), 2);
+        assert!(
+            times[0] >= times[1],
+            "newest first stays monotonic: {times:?}"
+        );
     }
 
     #[test]

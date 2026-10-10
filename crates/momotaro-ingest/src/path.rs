@@ -12,8 +12,6 @@ use std::path::{Component, Path, PathBuf};
 
 use super::IngestError;
 
-/// Renders `path` relative to `workspace_root` for the `local_path` column.
-///
 /// Canonicalizes a workspace root for path facts.
 ///
 /// Resolving many files under one root should canonicalize once and then use
@@ -162,6 +160,28 @@ mod tests {
     /// The canonical root — what a caller obtains once per run.
     fn canonical(dir: &tempfile::TempDir) -> PathBuf {
         canonical_workspace_root(dir.path()).expect("canonical root")
+    }
+
+    /// The missing tail a canonicalize-through-ancestor leaves behind comes
+    /// back in **path order**. `momotaro-verify` carries its own copy of this
+    /// walk (it answers `Option` and refuses a broken link); the two are
+    /// deliberately different in shape and must not differ in order — a
+    /// reversed tail makes a citation's `local_path` point somewhere else,
+    /// silently, and nothing else in either crate would notice.
+    #[test]
+    fn a_missing_tail_is_re_appended_in_path_order() {
+        let root = ws();
+        fs::create_dir_all(root.path().join("a")).expect("dir a");
+        let missing = root.path().join("a").join("b").join("c.md");
+        let expected = fs::canonicalize(root.path().join("a"))
+            .expect("canonical a")
+            .join("b")
+            .join("c.md");
+        assert_eq!(
+            canonicalize_existing_ancestor(&missing).expect("walk"),
+            expected,
+            "the missing tail keeps its order"
+        );
     }
 
     #[test]

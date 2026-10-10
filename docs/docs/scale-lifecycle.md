@@ -13,7 +13,7 @@ sidebar_position: 11
 
 ## 1. SQLite 引擎纪律（D29）
 
-### 缺省 PRAGMA（八条定稿）
+### 缺省 PRAGMA（七条定稿）
 
 ```sql
 -- 既有三条：journal_mode=WAL; foreign_keys=ON; busy_timeout=5000;
@@ -37,8 +37,9 @@ trusted_schema=OFF;
 
 ### 连接层单写
 
-写连接唯一（连接池 max=1 的写通道），读连接不限——crush `SQLITE_NOTADB(26)`
-事故与五方单写先例的连接层教训，补强 [Harness](harness.md) §5。
+写是单写者，**没有连接池**：`Store` 持一条 rusqlite `Connection`，WAL 下并发读不受限，
+写锁由每条写路径自己取（`commit_*` 单元开 `BEGIN IMMEDIATE`，`busy_timeout` 5s）——
+crush `SQLITE_NOTADB(26)` 事故与五方单写先例的连接层教训，补强 [Harness](harness.md) §5。
 
 ### 容量红线 = 治理触发表（数字待 pilot）
 
@@ -54,7 +55,7 @@ trusted_schema=OFF;
 
 ## 2. run_events 生命周期（D30）
 
-`run_events` / `history_items` 是审计正史（§6.5 只追加）。治理只有两种合法
+`run_events` / `history_items` 是审计正史（[architecture](architecture.md) §6.5 只追加）。治理只有两种合法
 形态：**搬移**（归档文件仍属 canonical，`trace` 跨库透明读）与**派生重建**
 （`usage_projections` 类聚合表可随意重建）。先例的 prune-on-insert（openclaw）
 作用对象是可丢遥测，不可照搬到 canonical 表。
@@ -111,12 +112,21 @@ sqlite3_rsync 不采用（Windows SSHD 官方未跑通）。
 
 ### 检测四层
 
-1. **L-open**：每次打开 `quick_check` + `foreign_key_check`
-   （integrity_check 不查外键——官方原文）；
+1. **L-open**：**不跑全文件校验**——`quick_check` 读整个文件，而 `Store::open`
+   挂在每条读路径上（doctor / coverage / search / chunk 计数各开一次库），全文件
+   校验放在 L-backup 的产物上；`foreign_key_check` 同样不跑，因为 DDL 没有声明任何
+   `REFERENCES`（`migration.rs`、`runs.rs` 的注释各自写着），引用完整性由代码守
+   （`ensure_run` 的守卫），PRAGMA 无物可查。L-open 提供的是**预防**：连接级
+   `busy_timeout` / `trusted_schema = OFF`，加 `refuse_write` 闸后的四条文件级
+   PRAGMA（`foreign_keys = ON` 同组，防的是**尚不存在的外键**——留给 DDL 加上
+   `REFERENCES` 的那天，不是今天的一道闸）（2026-10-06 更正——此前这里写的是"每次打开
+   `quick_check` + `foreign_key_check`"，代码从未实现过，也没有登记）；
 2. **L-backup**：备份产物验证（四步法第 2 步）；
 3. **L-reconcile（审计对账）**：canonical 计数（runs 终态数）vs 事件流计数
    （terminal 事件数）不一致即抓「静默丢写」——SQLite 设计无腐化冗余，
    integrity_check 查不出从未落盘的提交；
+   （2026-10-08 更正——本条此前读起来像一条已存在的检查：**全树没有审计
+   对账实现，也没有登记**。同 L-open 先例，登记见 architecture §20。）
    边界（这些检查能检出什么）：它们能检出的是**内容完整性**与**存活性**；它们
    检不出「历史被改写」与「从未如此」的区别——只读当前字节的校验原理上分不出
    这两者，也不该被当成防篡改证据（`chunk_hash` 同理：它够身份与去重，不够

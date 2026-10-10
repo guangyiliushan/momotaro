@@ -146,27 +146,22 @@ momotaro/
     desktop/                   # @momotaro/desktop：产品 UI
       package.json
       src/                     # React
-      src-tauri/               # 仅 Cargo member
-        Cargo.toml
-        src/lib.rs
+      # src-tauri/：后置 —— 目录尚不存在，也不是 Cargo member
     mobile/                    # 后置，与 desktop 同构
     www/                       # 后置营销站，不跑引擎
   packages/
-    ui/
-    app-ui/
-    ipc/
-  crates/
+    ui/                        # app-ui / ipc 是计划（根 `README.md`：「ui; app-ui and ipc planned」，`packages/ui` 自己没有 README）
+  crates/                      # 9 个 crate；根 Cargo.toml 的 members 是这 9 条加 apps/cli
     momotaro-contracts/
     momotaro-store/
     momotaro-ingest/
     momotaro-retrieve/
-    momotaro-feeds/
-    momotaro-papers/
+    momotaro-platform/         # 卷标与占位文件属性；不依赖任何 momotaro crate
     momotaro-context/
     momotaro-llm/
-    momotaro-tools/
     momotaro-verify/
     momotaro-run/
+    # 后置，目录尚不存在（见 §20）：momotaro-feeds / momotaro-papers / momotaro-tools
   docs/                        # 本站；GitHub Pages
 ```
 
@@ -176,9 +171,16 @@ momotaro/
 [workspace]
 resolver = "2"
 members = [
-  "crates/*",
+  "crates/momotaro-contracts",
+  "crates/momotaro-store",
+  "crates/momotaro-run",
+  "crates/momotaro-ingest",
+  "crates/momotaro-retrieve",
+  "crates/momotaro-llm",
+  "crates/momotaro-context",
+  "crates/momotaro-verify",
+  "crates/momotaro-platform",
   "apps/cli",
-  "apps/desktop/src-tauri",
 ]
 ```
 
@@ -199,22 +201,24 @@ pnpm turbo run dev --filter=@momotaro/desktop
 cargo test --workspace
 ```
 
-现有脚手架里的 `apps/web` 并入 `apps/desktop` 的前端，不保留「能跑后端的产品 Web」。
+并入方向：`apps/web` 并入 `apps/desktop` 的前端，不保留「能跑后端的产品 Web」。（**本树没有 `apps/web`** —— `git log --all --name-only` 里它一次都没出现过，这句记的是并入前那个脚手架的名字，不是现状。）
 
 ### 5.2 Crate 依赖方向
 
 ```text
 momotaro-contracts          纯类型，无 IO
+momotaro-platform           卷标 / 占位文件属性；同样不依赖任何 momotaro crate
         ^
 momotaro-store              SQLite schema / migration / 事务
         ^
-momotaro-ingest / retrieve / feeds / papers
+momotaro-ingest / retrieve
         ^
-momotaro-context / llm / tools / verify
+momotaro-context / llm / verify
+# 后置，目录尚不存在（§20）：feeds / papers / tools
         ^
 momotaro-run                search / ask / ingest / trace / spark
         ^
-apps/cli  |  apps/desktop/src-tauri  |  后置 apps/mobile
+apps/cli  |  后置 apps/desktop/src-tauri  |  后置 apps/mobile
 ```
 
 硬性规则：
@@ -329,42 +333,45 @@ chunk_overlap_tokens = 64
 provider = "openai-compatible"
 model_id = "qwen3"
 base_url_env = "MOMOTARO_BASE_URL"
-api_key_env = "MOMOTARO_API_KEY"    # 或 api_key_keychain = "momotaro.answer"（D28 分层读取链）
+api_key_env = "MOMOTARO_API_KEY"    # 或 api_key_keychain = "momotaro.answer"（D28 分层读取链）——
+                                    # 本构建**硬拒绝**后者（直接 ProviderUnavailable 拒绝，测试钉在 run 侧）
 context_window = 32768
 max_output_tokens = 4096
 thinking = "medium"                  # 语义四档 off|low|medium|high（D26）；"auto" = preset 默认
-supports_tools = false
+supports_tools = false         # 未实现：本构建不读（§13 Tool Contract / ADR 0005）
 
-[model.pricing]                      # 四元组，缺项 unknown（不写 0）
+[model.pricing]                      # 四元组，缺项 unknown（不写 0）—— 整段未实现：本构建不读，契约先行
 input_per_million = "unknown"
 output_per_million = "unknown"
 cache_read_per_million = "unknown"
 currency = "unknown"
 
-# 可选第二槽（D25 三态：未配置=回退 answer；空串=显式禁用）
+# 可选第二槽（D25 三态：未配置=回退 answer；空串=显式禁用）—— 未实现：本构建不读（`WorkspaceConfig` 无此段，见 §20 的 D25 条目）
 # [model_slots.utility]
 # model_id = "qwen3-flash"           # 命中内置 preset 时其余字段可省略
 # thinking = "low"
 
-# 压缩例外槽位（默认 answer+low，两向可翻转；D25）
+# 压缩例外槽位（默认 answer+low，两向可翻转；D25）—— 未实现：本构建不读（见 §20 排期 v0.7）
 # [slots.compact]
 # slot = "answer"
 # thinking = "low"
 
-[privacy]
-prefer_local_endpoint = false        # true 时两槽都要求指向 localhost 端点（local 是配置形态，不是第三槽）
+[privacy]                            # 未实现：本构建没有这个段
+prefer_local_endpoint = false        # 未实现：本构建不读（true 时两槽都要求指向 localhost 端点，随 §20 的 1.x 落地）
 
 [policy]
 allow_network = false
 allow_write = false
 max_context_tokens = 8192
-max_tool_result_tokens = 1200
+max_tool_result_tokens = 1200         # 未实现：本构建不读
+compact_trigger_ratio = 0.85   # 假设 + 观测闭环；0.40 为质量实验档
+compact_reserve_abs = 12000    # 实际 reserve = min(值, 25% × 预算)
 
-[papers]
+[papers]                           # 未实现：本构建没有这一段（v0.4，§20 排期）
 allow_network = false
 providers = ["arxiv"]
 
-[feeds]
+[feeds]                            # 未实现：本构建没有这一段（v0.4，§20 排期）
 poll_interval_s = 3600
 ```
 
@@ -639,6 +646,9 @@ CREATE TABLE run_context_items (
   source_ref_json TEXT,
   token_estimate INTEGER NOT NULL,
   body_hash TEXT NOT NULL,
+  decision_rationale TEXT,          -- multi-agent §5.1 埋点（≤50 token 决策摘要）
+  assumptions TEXT,                 -- multi-agent §5.1 埋点
+  supersedes TEXT,                  -- multi-agent §5.1 埋点：指向被取代工件
   PRIMARY KEY (run_id, ordinal)
 );
 ```
@@ -647,7 +657,9 @@ CREATE TABLE run_context_items (
 
 #### tool_calls / llm_turns / answers / answer_citations / verifications
 
-这些表是 `momotaro-store` 的 canonical 表，和 `runs`、`run_events` 一样不可由索引重建删除。字段是 MVP 的最小闭合集：
+这些表是 `momotaro-store` 的 canonical 表，和 `runs`、`run_events` 一样不可由索引重建删除
+（`tool_calls` 等见 §8.1 的先声明后实现说明——本文写的是契约形状，`migration.rs` 今天的 15
+张表里还没有它）。字段是 MVP 的最小闭合集：
 
 ```sql
 CREATE TABLE tool_calls (
@@ -689,7 +701,10 @@ CREATE TABLE answers (
   run_id TEXT NOT NULL,
   text TEXT NOT NULL,
   prompt_hash TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  decision_rationale TEXT,          -- multi-agent §5.1 埋点（≤50 token 决策摘要）
+  assumptions TEXT,                 -- multi-agent §5.1 埋点
+  supersedes TEXT                   -- multi-agent §5.1 埋点：指向被取代工件
 );
 
 CREATE TABLE answer_citations (
@@ -720,7 +735,7 @@ CREATE TABLE verifications (
 
 **`run_id` 子表的索引（schema v7）**：`retrievals` / `llm_turns` / `answers` /
 `verifications` 四张表各带一个 `run_id` 索引
-（`idx_retrievals_run` / `idx_llm_turns_run` / `idx_answers_run` /
+（`idx_retrievals_run` / `idx_llm_turns_run_seq`（schema v9：UNIQUE (run_id, seq)，兼作 `run_id` 前缀） / `idx_answers_run` /
 `idx_verifications_run`）。DDL 不声明 `REFERENCES`，所以 SQLite 并不强制这些外键——
 它们按构造是子表，读它们的是 `run_trace`（四张表各一次 `WHERE run_id = ?1`）。索引按
 [sqlite.org/foreignkeys.html](https://www.sqlite.org/foreignkeys.html) §3 的口径建：「Indices are not required for child key
@@ -730,6 +745,14 @@ should be created on the child key columns of each foreign key constraint.」—
 本 schema 其余的 `run_id` 表已由自己的键覆盖：`runs` 是主键，`run_events` /
 `run_context_items` / `history_items` 的键最左列就是 `run_id`（§8.1 另有本库尚未
 实现的 `tool_calls` / `sparks`，不在本清点内）。
+
+**`session_id` 的索引（schema v8）**：`runs` / `history_items` 各带一个 `session_id`
+索引（`idx_runs_session` / `idx_history_items_session`）。`ask --session` 每一轮都要把该
+会话的**全部** `history_items` 正文读出来重放，并按 `runs` 给轮次编号；两张表都会随使用
+无限增长（`history_items` 每次 `ask` 加两行），没有索引就是每轮一次全表扫大 blob。口径同
+[sqlite.org/optoverview.html](https://www.sqlite.org/optoverview.html)：「The general rule is
+that indexes are only useful if there are WHERE-clause constraints on the left-most columns
+of the index.」——两条查询都只约束 `session_id`，单列索引正是它说的形状。
 
 #### feeds
 
@@ -839,7 +862,11 @@ MVP 只实现 Tantivy BM25。中文用 CJK tokenizer，不要把 SQLite FTS5 当
 
 ## 9. 契约类型
 
-`momotaro-contracts` 只包含纯类型和纯校验。示意（Rust；语义与下列字段一致）：
+`momotaro-contracts` 只包含纯类型和纯校验。**下面 14 个不是今天的一张清单**：
+5 个在 `momotaro-contracts`（`SourceRevision` / `Chunk` / `RetrievalHit` / `RunSpec` /
+`VaultScope`），2 个在别的 crate（`Citation` 在 `momotaro-verify`、`ContextFragment` 在
+`momotaro-context`），7 个**尚未实现**（`ToolResult` / `Answer` / `Project` / `Annotation` /
+`Spark` / `FeedSource` / `FeedItem`，与 §20 的排期一致）。语义示意（Rust；字段与下列一致）：
 
 ```text
 SourceRevision
@@ -884,6 +911,12 @@ FeedItem
 15. finish run
 ```
 
+**表外的一次写：`sessions` 行。** 顺序是：先判调用方点名的会话存不存在（`session_exists`，
+在幂等检查**之前**）→ 过幂等检查 → **过了之后**才建 run，新会话就是在这中间 `create_session`
+开出来的。所以幂等在建会话之前，重放仍然一行不写（[Harness 工程](harness.md) §1）。它不落
+任何事件、也不属于上面十五步里的任何一步，这正是它当初从清单上漏掉的原因：`sessions` 是
+`trace` 唯一回放不出来的表。
+
 成功定义为：LLM 结束、正文非空、每条引用能解析、hash 匹配、`answer.finalized` 已写。任一项失败则 `run.status = failed`，不得把失败 retry 伪装成成功。
 
 终态必达、崩溃恢复、取消、超时与重试、并发模型等工程纪律见
@@ -910,8 +943,8 @@ expand 的落地口径（已实现，`momotaro-retrieve::fuse_rrf` / `momotaro-r
 | 平局 | `score` 降序 → `source_key` 升序 → `ordinal` 升序 → `chunk_id` 升序。**前三级与 lexical 路径的平局规则一致**，末级把序补成**全序**——比较器自己定得住序，不依赖累加容器的迭代顺序，也就不依赖 `sort_by` 的稳定性 |
 | 确定性 | 同一组输入列表 ⇒ 同一排序（§6.1）。各列表的贡献**先按值排序再求和**，浮点加法的结合性因此不进入结果：把 N 条查询换个先后，融合分数逐位相同 |
 | 重写不可用 | 2xx 回来但**没有一条可搜的查询** ⇒ 报错（`the query rewrite produced no usable query`）。不退回单条原查询：没扩就不许报告自己扩过 |
-| 写入 | **建一条 `mode = search` 的 run**：四道门（`--no-llm`、网络授权、索引与库、spec 校验）**全部先于 run 创建**，所以被拒时零行、一个 token 也不花。接受之后落 `runs` + `retrievals`（一次；`strategy_json` 记下 N 条重写查询与 `rrf_k`）+ `retrieval_hits` + `llm_turns`（重写那一个 turn，含 provider 报的 usage）+ 终态事件，因此 `trace <run_id>` 可以回放、token 有账可查；无法归类的存储错误按 `ask` 的同一规则留给下次 open 的 sweep 收尾。lexical 不建 run，`SearchOutput.run_id` 不出现；`stats` 仍只数 sources/chunks |
-| 门禁 | `--no-llm`、网络策略（`--allow-network` ∨ `[policy].allow_network`）、索引与库可用——**三道都过了才拨号**。任何一道不过，都是一次 token、一次连接都不花。三道之间的先后是实现细节，本文不承诺 |
+| 写入 | **建一条 `mode = search` 的 run**：四道门（`--no-llm`、网络授权、索引与库、spec 构造与校验——空 query、端点/模型未配）**全部先于 run 创建**，所以被拒时零行、一个 token 也不花。接受之后落 `runs` + `retrievals`（一次；`strategy_json` 记下 N 条重写查询与 `rrf_k`）+ `retrieval_hits` + `llm_turns`（重写那一个 turn，含 provider 报的 usage）+ 终态事件，因此 `trace <run_id>` 可以回放、token 有账可查；无法归类的存储错误**留给下一次 `ask` / `trace` 打开时的 sweep 收尾**（`expand` 自己不扫，见 [Harness](harness.md) §2）。lexical 不建 run，`SearchOutput.run_id` 不出现；`stats` 仍只数 sources/chunks |
+| 门禁 | `--no-llm`、网络策略（`--allow-network` ∨ `[policy].allow_network`）、索引与库可用、spec 构造与校验（空 query、端点/模型未配）——**四道，与上面「写入」行同一份清单；四道全部先于 run 创建，因此也先于拨号**。任何一道不过，都是一次 token、一次连接都不花。四道之间的先后是实现细节，本文不承诺 |
 | 端点 | 端点与密钥来自 `[model]`（§7）：配置只写变量名、值在环境里；缺配置在拨号前以 `provider unavailable` 拒绝（见 usage.md "Provider endpoint"） |
 
 ### 10.3 paper add
@@ -1015,7 +1048,7 @@ P1 = 当前 Project 的来源 + 用户显式选择进入本次工作的来源
 P2 = 当前 Vault 中其余可检索来源
 ```
 
-默认 `ask` / `spark` 只使用 P1；`search` 覆盖 P2。未绑定 Project 时 P1 = P2 = 整个 Vault，拆分退化为 no-op；v0.3 的 ask 不因缺 Project 报 `retrieval_empty`（[ADR 0007](adr/unbound-ask-uses-whole-vault.md)）。当 `ask` 指定 `--scope wide` 或 RunSpec 允许扩大范围时，P2 命中仍排在 P1 之后，并受 `max_context_tokens` 约束。这个优先级只影响 `run_context_items`，不改变 `retrieval_hits`。
+默认 `ask` / `spark` 只使用 P1；`search` 覆盖 P2。未绑定 Project 时 P1 = P2 = 整个 Vault，拆分退化为 no-op；v0.3 的 ask 不因缺 Project 报 `retrieval_empty`（[ADR 0007](adr/unbound-ask-uses-whole-vault.md)）。（**0.x 无 `--scope` 旗标，`RunSpec` 也没有 scope 字段** —— 下面这半是 scope seam 的契约，入口随 project 落地。）P2 命中排在 P1 之后，并受 `max_context_tokens` 约束。这个优先级只影响 `run_context_items`，不改变 `retrieval_hits`。
 
 ### 12.2 Token budget
 
@@ -1139,16 +1172,21 @@ momotaro ask "解释谱定理和 PCA 的关系"
 momotaro trace <run_id>
 momotaro stats
 momotaro doctor
-momotaro paper search "..."
-momotaro paper add arxiv:2401.12345
-momotaro feed add <url>
-momotaro feed import ./subscriptions.opml
-momotaro project new "..."
-momotaro annotate ...
-momotaro spark --project <id>
+momotaro rebuild-index
+momotaro watch
+momotaro reconcile
 ```
 
-全局参数：`--json --profile --no-llm --allow-network --allow-write --max-context-tokens --mode lexical|expand`。
+后置（§20 排期，尚无子命令，跑起来是 clap 的 unrecognized subcommand）：
+`paper search`、`paper add`、`feed add`、`feed import`、`feed poll`、
+`project new`、`project add`、`annotate`、`spark`。
+
+全局参数只有三个：`--json --no-llm --allow-network`（`global = true`，子命令一律认）。
+其余三个是**子命令自己的**（grill Q2 收成按子命令声明）：`--mode lexical|expand` 归
+`search` 与 `ask`，`--allow-write` 与 `--max-context-tokens` 只归 `ask`。把它们写在子命令
+之前、或给了不读它的子命令，是 clap 的 `unexpected argument`——这正是 §20 里那条裁决，
+见证是 `apps/cli/tests/cli.rs` 的
+`a_flag_only_the_subcommand_that_reads_it_declares_is_refused_elsewhere`。
 
 桌面 IPC：Tauri command / event，不把本机 HTTP 当核心总线。`momotaro serve` 仅在后置 Graph Console 需要时出现，且绑 `127.0.0.1`。
 
@@ -1161,6 +1199,7 @@ momotaro spark --project <id>
 | `config` | user | false |
 | `source_missing` | user | false |
 | `index_unavailable` | system | true |
+| `store_unavailable` | system | true |
 | `retrieval_empty` | harness | false |
 | `llm_auth` | user | false |
 | `llm_rate_limit` | provider | true |
@@ -1172,8 +1211,25 @@ momotaro spark --project <id>
 | `citation_invalid` | harness/model | false |
 | `model_probe` | system | true |
 | `user_cancelled` | user | false |
+| `interrupted` | system | true |
 
-可预期错误写入 run_events，带 `category / severity / attribution / retryable`。失败判定不落在错误行上：`count_as_failure` 的语义由终态事件承载（一个错误算不算数，看它后面是不是跟着 `run.finished` / `run.failed` / `run.cancelled`），该字段留待任务图波次（multi-agent §5.1 的共识语义）随真实读者定稿。
+`maybe` is this taxonomy's own word: the retry depends on what the provider
+answered next, so the table cannot decide alone. The wire has no third value —
+`failure_data.retryable` is a bool, and the two `maybe` rows are both priced
+`true` when the row is built (`failure_row` in `ask.rs`). A reader of the
+payload sees `true`; a reader of this table sees the reason it is one.
+
+**五个类别今天没有 `run_events.category` 生产者**：`config` / `network_disabled` /
+`model_probe` / `user_cancelled` 全仓零命中；第五个 `source_missing` 也不是 run 侧的 ——
+它今天只作为 `VerifyDetail` 的拼写落进 `verifications.details_json`（`momotaro-verify`）。
+`failure_row` 的十一个臂（`ask.rs`）之外，没有任何路径把这五个当作 category 写出
+——第十一个臂 `store_unavailable` 是**有**生产者的那一个（`AskFailure::StoreUnavailable`），
+所以它在上表里是一行事实而不是声明。前两个还有一半更要紧的事实：按 [usage](usage.md) 的四道门与
+`[model].base_url_env` 那段，**未授权网络与端点未配都在建 run 之前拒绝、不产生 run
+行**，所以它们今天连 `run_events.category` 都不可能成为。这与下一句
+「可预期错误写入 run_events」不冲突：那句话说的是**建完 run 之后**才失败的那些。
+五个类别留在表里是「先声明后实现」（`reference.md` 对 `RunMode::Spark` 用的同一口径），
+不是对当前行为的描述。失败判定不落在错误行上：一个错误算不算数，看它后面是不是跟着 `run.finished` / `run.failed` / `run.cancelled` —— 失败判定语义由终态事件承载，该**语义**留待任务图波次随真实读者定稿（multi-agent §5.1 并未定义此语义）。
 
 ## 19. Testing
 
@@ -1200,7 +1256,7 @@ cargo test --workspace
 2. `crates/momotaro-contracts` `store` `run`。
 3. `apps/cli` shim；`momotaro init / doctor / stats`。
 4. 文档与本文件一致（废 Python / PySide6）。
-5. `apps/web` 并入 `apps/desktop` 前端，不接引擎。
+5. `apps/web` 并入 `apps/desktop` 前端，不接引擎（本树没有该目录，见 §5.1 的并入方向）。
 
 验收：无 API key；`cargo test --workspace` 过。
 
@@ -1209,6 +1265,12 @@ cargo test --workspace
 `index` / lexical `search` / Tantivy。重建索引不丢 canonical 数据。1,000 个 Markdown 可完成。
 
 已做：`source_key` NFC 身份键、vault ⊆ workspace、origin 乘性权重、`store_events` 审计日志、`doctor --coverage`、wikilink 全形态建边入 derived `graph_links`（dangling/歧义/锚点校验齐，五类降级码生产者；行身份与重建见 [ADR 0027](adr/graph-links-rows-are-a-rebuilt-projection.md)）、**watcher + 对账四触发**（`notify` 8.2 + debouncer、事件一律归并为重扫、racy 强制内容校验、四触发写 `vault.reconcile.*`，细则见 [摄取安全与 Vault 互操作](ingest-interop.md) §4）。本波剩余：D42 的碰撞消歧后缀策略（两条目都保留 + 消歧后缀 + 事件，ADR 0002 与 ADR 0026 都指向它）、D24 的多链头暴露（平台测试矩阵已随 W2.6 落地，不在此列）。D40 的「单文件 = 恰好一个事务」已由 store 的 `commit_source_file` 交付（revision + chunks + 边同事务，事件由调用方选配；现行调用方都不选配——行一律落批尾扫尾，`stale_anchor` 因此在两种形态都对落定状态裁决，口径见 [ADR 0026](adr/store-events-are-the-ingest-audit-log.md)）。
+
+**2026-10-08 登记**：L-reconcile 的审计对账（`scale-lifecycle.md` L 阶梯第 3 条，
+`runs` 终态计数 vs terminal 事件计数）**尚无实现**，此前也未登记——实现随 L 阶梯其余部分排期。
+另：`momotaro-contracts` 39 处 `Deserialize` derive 中 36 个零反序列化读者（真读者：
+`IndexPolicy` 的生产入口 + `SchemaVersion`/`RetrievalHit` 的本 crate round-trip 测试）；
+删除会收窄库边界预留面，**维持现状、登记为 API 裁决**（2026-10-08，修复批验证环落点）。
 
 ### v0.3 可追溯问答
 
@@ -1281,56 +1343,167 @@ Windows / macOS / Linux 桌面安装包 + CLI。文档仍 GitHub Pages。营销�
 ### W3.10 接线波遗留（评审登记，待修）
 
 本波三轮钉点评审（分别钉 `c269ebf`、`b5569a1`、`66c625a`）与九维度评审合计登记
-23 项未修事项。它们此前只写在提交信息里——照文档办事的人看不到——故全部收档于此，
-**全部待后续修复**：每一项在「登记于」那列的提交体内有完整论证与读数，修掉一项就从
-表里删一行（或把「卡在哪」改成完成时的读数）。本表只登记**确实没做**的，本波还清的
-（expand 的 token 记账、零宽守卫、人类出口 lexical 半边见证等）不在此列。
+23 项。它们此前只写在提交信息里——照文档办事的人看不到——故立档于此：每一项在
+「登记于」那列的提交体内有完整论证与读数，**修掉一项就从表里删一行**（或把「卡在哪」
+改成完成时的读数），所以本表是**动态的**——当前表内 8 项，另外 14 项已修、1 项已撤回，
+分档见下。本表只登记**确实没做**的，本波还清的（expand 的 token 记账、零宽守卫、人类
+出口 lexical 半边见证等）不在此列。
 
-**A. 代码与契约（4）**
+**2026-10-03 分档，2026-10-05 回填**（W3.11 开工前裁决，收口时按实况回填）：23 项里
+**14 项已随各自提交从表里删行**（其中 `--mode expand` 人类出口那条是 W3.11 修复轮关的，
+理由本身不成立），**1 项撤回**（原表记作「四道门先后」那条：现读确认非缺陷 —— 闸门就在
+需要 transport 的那个函数里、构造零 I/O、§10.2 也已不承诺先后），**8 项本轮不修或尚未
+完成**，理由逐条如下，防止下一轮重提 ——
+① `lru 0.16.4` 的 RUSTSEC-2026-0253（已裁另开任务升 tantivy，`^0.16.3` 钉死）；
+② D25 `expand → utility(low)` 槽映射（等 `[model_slots.utility]` 落地）；
+③ `(no_llm, allow_network)` 裸 bool 对（纯重构，给不出能杀死它的突变）；
+④ 不可命名错误弃给 sweep（改动面在 `index_service` 写点）；
+⑤ ~~`--mode expand` 人类出口的端到端见证~~ —— **已修**（W3.11 修复轮）：理由本身不成立，`expand_search_workspace` 收 `ProviderTransport`，`FakeLlm` 就能驱动，既不要端点也不碰网络；见 `ask_e2e` 的 `expand_renders_every_hit_as_not_included_because_no_context_stage_ran`；
+⑥ 写点计数两半 `cfg` 不一致（修它只会更脆）；
+⑦ 两条等价变异体（按定义杀不掉）；
+⑧ ~~ADR 0017 与 §10.2~~ —— **已修**（2026-10-05）：ADR 0017 现在点名「explicit 模式才建
+   `mode = search` 的 run、默认 lexical 一条都不建」，与 §10.2 逐字对齐（决策本身未改：
+   run 模式仍是闭合集）；
+⑨ ~~`deny.toml` 的 `syn 3 (serde_derive)` 举例~~ —— **已修**（2026-10-05）：那行现在写
+   成 `11 dependents, serde_derive one of them`（`cargo tree -i syn@3.0.5` 实数 11），不再
+   是举例冒充枚举；同轮 `cargo deny --locked check` 复跑 exit 0；
+⑩ `66c625a` 提交信息里的 `db.rs` 行数（那是 **cargo-deny 自己的** `db.rs`，不在本仓；
+   提交信息不可改写，本表已记实为 218）。
+⑪ **B5 · expand 失败的终态种类** —— 详见 B 表（访问器加了又撤）。
+
+**A. 代码与契约（3）**
 
 | 项 | 卡在哪 | 登记于 |
 |---|---|---|
-| `lru 0.16.4` 的 RUSTSEC-2026-0253（修复版 ≥0.18.2） | tantivy 0.26.2 钉 `^0.16.3`，`cargo update --precise 0.18.2` 被拒；默认 `unsound = "Workspace"` 把它盖住，打开 `unsound = "all"` 立刻红（已在 `deny.toml` 头部写明该豁免） | `c269ebf`，裁决「另开任务升 tantivy」 |
+| `lru 0.16.4` 的 RUSTSEC-2026-0253（**INFO · Unsound**，条目无 CVSS；修复版 ≥0.18.2） | 触发是**panic 路径的 UB**：key 的 `Drop` 在 `LruCache::pop()` 里 panic → 跳过 `detach()` → 悬垂节点 → 后续 eviction 写已释放内存（UAF / 可能 double-free）；需 unwinding + `catch_unwind` + 会 panic 的 key，本仓皆无。**已发布 tantivy 最高 0.26.2、全部钉 `lru ^0.16.3`**，只有未发布的 0.27.0 改成了 0.18.2 —— 原裁决「另开任务升 tantivy」的前提（有可升的版本）不成立。现按**显式豁免**处置：`deny.toml` 开 `unsound = "all"`（默认 `workspace` 档对传递依赖**根本不报**，是结构性失明不是豁免）+ `ignore` 条目写明理由与**2027-01-07 复审**；0.27.0 落地即升并移除该条 | `deny.toml` 的 `ignore` 条目（2026-10-09 实施；原登记 `c269ebf`） |
 | D25 的 `expand → utility(low)` 槽映射 | `[model_slots.utility]` 尚无配置；重写现跑 answer 槽，`RunSpec` 记的是实际跑的而非映射将选的 | `c269ebf` |
-| `strategy_json` 的 `ask` 侧缺 `mode` | 契约写 `(engine, k, mode)`，expand 写全四键而 `ask` 只写 `{engine, k}`；改动会动 `ask` 的存储 JSON | `b5569a1` |
 | `expand_search_workspace` 的 `(no_llm, allow_network)` 裸 bool 对与 CLI 两步校验 | 纯重构，本波未排期 | `c269ebf` |
 
-**B. 测试见证（8）**
+**B. 测试见证（4）**
 
 | 项 | 卡在哪 | 登记于 |
 |---|---|---|
-| expand 失败的**终态种类**（`Failed` vs `Finished`） | `expand_search_workspace` 失败返回 `Err` 不交回 `run_id`，`Store` 只有 `run_count` / `sweep_interrupted_runs` / `run_id_for_client_request` / `run_trace`，**没有按 run 查 status 的口**；要么加 store 访问器，要么给 search run 一个 `client_request_id`——契约决定 | `b5569a1` |
+| expand 失败的**终态种类**（`Failed` vs `Finished`） | 访问器试过又撤了：`run_status` 加上去**没有任何调用方** —— `expand_search_workspace` 失败返回 `Err` 不交回 `run_id`，没有注入缝就问不到那条 run 的终态。与「不可命名错误弃给下一个 sweep」**卡在同一个缝上**，两条一起留着 | `b5569a1` + W3.11 复核 |
 | 「不可命名错误弃给下一个 sweep」 | 要在 run 行**之后**制造一个不可命名的存储错误，需要注入缝，本波没加 | `b5569a1` |
-| `--mode expand` 人类出口的**端到端**见证 | 需要二进制真的完成一次 expand，即需要 provider 端点；loopback 服务器会打破「一切测试走 fake transport、CI 不真打网络」的硬约束。**注意这条理由不覆盖 lexical 那半**，那半已由不带 `#[cfg]` 的测试补上 | `66c625a` |
-| `hit_inclusion` 无 `format_trace` 端到端 | 只有单元断言，没驱动整条 trace 渲染 | `66c625a` |
-| 缺库那条拒绝测试名里有 `records_no_run` 却从不读 `run_count` | 靠「文件不存在」传递，与名字声称的不完全一致 | `66c625a` |
 | 写点计数扫整个 `index_service.rs` | `ask.rs` 那半切在 `#[cfg(test)]`，本模块这半没有；只影响过度约束风险（它不数自己的针） | `66c625a` |
-| 结构针锚在 `for` 上 | 循环**之前**多插一行打印能活；claim 只覆盖循环体 | `9fd1d6b` |
 | 两条等价变异体 | `RRF_K` 硬编码（与常量位相同）、融合累加器 `BTreeMap→HashMap`（比较器全序时观察不可见）——杀不掉，登记而非补测试 | `b5569a1` |
 
-**C. 文档（10）**
+**C. 文档（1）**
 
 | 项 | 卡在哪 | 登记于 |
 |---|---|---|
-| `scale-lifecycle.md` 的「连接池 max=1 的写通道」 | **第三种**不存在的写机制（`harness.md` 的已修，这条是另一份文档的另一个说法） | `66c625a` |
-| `architecture.md` §10.2 自己跟自己打架的门数 | 写入行说四道、门禁行说三道、`usage.md` 又是第三种 | `66c625a` |
-| §5 未定义「session」是否进程内 | 正是条目 3 声明不做的跨进程协调那一轴，两读法都讲得通 | `66c625a` |
-| `harness.md` 说 sweep「打开库时跑」 | 实际只有 ask/trace 会 sweep，expand 打开库不 sweep；本波让这个缺口变得可达 | `b5569a1` |
-| §18 表缺 `interrupted` 行 | `ask.rs` 与 `harness.md` 都在用这个值 | `b5569a1` |
-| ADR 0017「submitting search is a Run」与 §10.2 lexical 不建 run | 读作模式词汇表则无冲突，读作行为声明则矛盾；本波收窄了但没改 ADR | `b5569a1` |
-| `deny.toml` 的 `syn 3 (serde_derive)` 是举例不是枚举 | `syn 3` 实有 ≥9 个依赖方，`serde_derive` 只是其一；版本号与 android 归因都是对的 | `b5569a1` |
-| 「一次改写调用」数的是 turn 还是 HTTP send | turn 级为真；429/5xx/408 重试时是 2 次 send，两份孪生句用了同一措辞 | `66c625a` |
-| 新增的 `§10.2` 裸引用 | `harness.md` 与 `development.md` 各自惯例都带限定，新句没跟 | `66c625a` |
-| `66c625a` 提交信息把 `db.rs` 写成 213 行 | 实为 **218**（213 是 `.flat_map`）；机制本身两轮复核均正确 | `9fd1d6b` |
+| `66c625a` 提交信息把 **cargo-deny 的** `db.rs` 写成 213 行 | 实为 **218**（213 是 `.flat_map`）；机制本身两轮复核均正确。那个 `db.rs` 是 cargo-deny 的源文件，不在本仓 | `9fd1d6b` |
 
-**D. 供应链与工程（1）**
+### W3.11 修复波遗留（评审登记，待修）
+
+第 9–12 轮钉点评审留下的**已登记未修**项（第 9 轮三镜、第 10 轮三镜、第 11 轮三镜、
+第 12 轮三镜）。与上表同一规矩：**「登记于」那列的提交体内有完整论证与
+读数，修掉一项就从表里删一行**，所以本表也是**动态的**——当前 7 项，且只剩测试见证。
+本表只登记**确实没做**的；第 1–8 轮的登记项写在它们各自的提交里（`7a49151` / `0fc2548` /
+`b060d30` / `cb62585` / `74f2d79` / `6b5fd44`，第 1 轮六镜的非阻塞尾巴另在 `78985b6`），
+不在本节。
+
+2026-10-09 grill 裁决波（Q1–Q12）把 A、C 两张表清空了，按同一规矩逐行删：
+
+- **三个 `global = true` 旗标** —— 裁决收成按子命令声明（`--mode` 归 `search`/`ask`，
+  `--allow-write` 与 `--max-context-tokens` 归 `ask`），`--json` / `--no-llm` /
+  `--allow-network` 保持全局；
+- **`VerifyPolicy::disabled()`** —— 裁决**留**：那是设计好的测试缝，与
+  `backup_before_migration_with`、`index_workspace_with` 同形，理由在各自 doc。
+  删掉的是登记行，不是函数；
+- **18 个零调用点根导出** —— 裁决是「常量留 `pub`（9 个契约拼写），函数删/降」。
+  复核时**零调用点的函数已经 0 个**，剩的正好 9 个常量
+  （context 8：`DEFAULT_TOKEN_ESTIMATE_COEFFICIENT` / `EMPTY_MARKER` / `EVIDENCE_FLOOR` /
+  `HISTORY_GUARD_ROUNDS` / `HISTORY_GUARD_TOKENS` / `SUMMARY_VERSION_V1` /
+  `UNTRUSTED_CLOSE` / `UNTRUSTED_OPEN_PREFIX`；retrieve 1：`CJK_TOKENIZER_NAME`）；
+- **`SummaryV1::parse_stored`** —— 接进生产，落点是 `select_history` 的 fail-closed 闸，
+  闸的形状是**恒等**（`parse_stored(&item.body).is_ok_and(|p| &p == record)`），不是
+  「两个较弱的检查都过」。R16 查出后者会动数据正确性：`validate_against_text` 只查三样
+  （version、空字段标记、chunk_hash 子串在文本里），`covered_turns` 等字段仍可分叉，而
+  `covered` 是从 record 建的、`item.body` 才是被重放的——多报一轮就挪动了重放窗口。
+  恒等一条同时含两份承诺（存储文本自身可解析 + §4 第 3 条逐字转写，转义拼写不算逐字；
+  递来的 record 就是文本说的那个）。两条具名见证：`a_body_that_is_not_a_self_validating_
+  summary_is_not_saved_by_a_matching_record`（文本那一维）与 `a_record_that_claims_
+  more_turns_than_the_body_is_not_the_body_s_summary`（分叉那一维）；把闸换回
+  `validate_against_text` 单独一支，两条同时红。注释不再引 `payload_json` 的
+  `summary.v1` 镜像当分叉机制——本树里它还没有写入方/读取方，真正的不变量是
+  `ask.rs` 的 `history_item` 把 record 建成 body 的解析，闸是把它查出来而不是假设它；
+- **`chunk_markdown`** —— 已从 `chunker.rs` 与根导出删除（`mod tests` 里的同名 helper 除外）；
+- **`momotaro-store` 的 `now_epoch_secs`** —— 一库一名收口：`momotaro-run` 全部走
+  `momotaro_store::now_epoch_secs()`，自己那份删了；
+- **提交信息引 `gates.sh` 而它不在树里**（原 C 表唯一一行）—— 脚本已 vendored 成
+  `tools/gates.sh`，提交信息里的 `bash tools/gates.sh` 现在谁都能重放；CI 各步就是它的
+  `--only`，两处不漂。
+
+**B. 测试见证（7）**
 
 | 项 | 卡在哪 | 登记于 |
 |---|---|---|
-| CLI 先建 transport 再过引擎的索引门 | 构造零 I/O；§10.2 已改成只承诺三道门都先于拨号、不承诺彼此先后 | W3.10 波次行 |
+| `anchor_still_exists` 的空层级守卫 `||` → `&&` 是**等价突变体** | 守卫本身冗余：outline 构造已经滤掉空层级，空层级永不命中，带空组件的锚点本来就走尾部比较返回 false（同 `context/lib.rs` 里那条不可达的 `-=` 死臂；行号会漂，按符号找）。已补上使它冗余的不变量见证 | `3bef2bf` |
+| `rebuild_index` 回滚的 `&&`→`||` 是**等价突变体** | 把两者分开的那个状态不可达，且 rename 的失败无论如何都被吞。（原行另一半 `strip_code_fence` 的 `+`→`*` **判错了**：它不是等价体，是**没人测** —— 310 条电池把它跑出来之后已补 `strip_code_fence_returns_the_body_exactly` 钉死，从本行摘出） | `01dc6c5`（`strip_code_fence` 半边第 15 轮闭） |
+| `ingest/hash.rs:41` 的 `16 * 1024` → `16 + 1024` 是**等价突变体** | 流式读缓冲区大小不是可观测行为：SHA-256 取整条字节流、与切块无关，`Read` 契约也不保证填满。手工施加 → 全绿、具名 `FAILED` = 0、rc 0、sha256 还原一致 | `64c12a2` |
+| `#[cfg(not(windows))]` 臂在本机不编译，突变体构建出的二进制与未突变时逐字相同 ⇒ 判 MISSED | `platform/lib.rs` 的 `VolumeInfo::UNKNOWN`（`#[cfg(not(windows))]` 那条臂；行号会漂，按符号找）；同族的 `portability.rs:75` 第 8 轮已登记，按同一口径不再计一条 | `64c12a2` |
+| `Store::health` 剩下的三条 miss | 三条都是等价突变体；那条死臂的「为什么留着」已写进 doc | `e0550b0`（行为镜） |
+| `validate_against_text` 的 `chunk_hash` 是**子串**判断（`stored_text.contains(...)`） | 哈希可以被文本里另一处的**超串**满足：`chunk_hash = "cafe"` 而正文只出现 "cafe1234" 时闸照样过。转义拼写那一维（`caf\u0065` 不算逐字）**已有见证**（`a_hash_spelled_with_json_escapes_is_not_verbatim_in_the_raw_text`，R18 补），超串这一维没有。实际风险极低——`chunk_hash` 是 64 位十六进制摘要，靠超串蒙对近乎不可能——而收紧它是**线格式/契约变更**，不是补一个测试能了的；按「确实没做」的口径登记 | R16 behaviour 镜（非阻塞）+ R18 A 镜（转义维见证已补） |
+| 每轮全量 `cargo test --workspace` 在 `%TEMP%` 留下 ~24 个删不掉的 `.tmp*/momotaro.db`（进程退出后可删） | 镜 2/3/4 各自复现、**与 TEMP 落点无关**（绿 run 也留，镜 3 实测 72 个）⇒ 疑似 `Store`/TempDir 的 drop 顺序让连接活过临时目录；只登记不改产码，留给评审轮查 | `8f54572` |
+
+
+### R18 全量扫描遗留（非阻塞，登记）
+
+> R18（2026-10-09/10，六镜 + 复核镜一次性全量扫描）的 **18 条 blocking 全部修复并逐条红证**；下列为同轮登记的非阻塞面。使用约定同上两表：**修掉一项删一行**；只登记确实没做的。
+
+**A 行为与契约（3）**
+
+| 项 | 卡在哪 | 登记于 |
+|---|---|---|
+| watch 形态的 racy 秒窗关上后，同毫秒改写会被当假事件丢弃、永不补索引（`gate` 答 Drop） | 根治要么给指纹存亚毫秒（线格式变更，需裁决），要么照 git 的 smudge 在店写时把 racy-clean 指纹降级；Batch 侧补偿与两捷径已修（R18 C-F1），此条是 `gate` 秒窗的残留面 | R18 C 镜 |
+| `DEBOUNCE` 未钉（`watch.rs:51`，500ms→2500ms 全绿） | 只有延迟差异、无数据/契约影响；钉它是墙钟夹具 | R17-beh |
+| `ReconcileReport::removed` 两支语义零见证（已记 gone 不再计 / 文件回来再离开再计） | 补双遍与回归两用例即可 | R18-H |
+
+**B 测试见证（6）**
+
+| 项 | 卡在哪 | 登记于 |
+|---|---|---|
+| `a_failed_second_backup_leaves_the_first_artifact_in_place` 只断言留存件存在且可验，未钉「留存的是**第一份原件**」（与被合法新快照替换不可分） | 断言 `fs::read(&first) == first_bytes` 钉身份（顺序突变已由姊妹测试杀，套件级无缺口） | R18-V1 |
+| e2e 弱断言 message 超称「五元组」（`ask_e2e.rs` 的 `"the citation carries the five-tuple"` 只查 chunk_hash 非空；行号会漂，按符号找） | 五元组契约另有单元层独立见证；升级全五字段非空或降 message | R18-D |
+| `every_column_round_trips` 的 `id`/`recorded_at` 两列自证残留（`events.rs`） | 兄弟测试当前杀对换突变（套件级无缺口）；注释改准或加独立锚 | R18-D |
+| `turn_timeout()` 访问器在 llm crate 内无见证（只被 run crate 测试杀） | 补一条 llm 内读回断言 | R17-beh |
+| `run/lib.rs` 针脚测试的源文本锚脆（纯格式重排即红） | 刻意的脆（它杀真接线突变体 m03/m04）；换结构针需另设计 | R17-beh |
+| `fat_body()` 其余 token 载体形状未逐一推演等价突变 | 推演批可补 | R18-G |
+
+**C 文档与状态注（4）**
+
+| 项 | 卡在哪 | 登记于 |
+|---|---|---|
+| `ask --mode expand` 拒绝句无记载无测试，help 的 `(usage.md)` 指针悬空（`main.rs:108-110`） | usage.md 补一句 + 一条 CLI 测试 | R18-B |
+| `ingest-interop.md` §5.7 十类降级码名录与 `Degradation::ALL` 声明序的**第 7/8 项对调**（`excalidraw_detected`/`canvas_parse_error`，其余 8 位一致；勿整体重排） | 对调这两项，或注明名录无序 | R18-B |
+| `architecture.md` §7「`auto` = preset 默认」未标未实现（`model_thinking` 硬编码 auto→medium） | 改实况句或加未实现标记 | R18-B |
+| `context-retrieval.md`「CI 每 PR 跑 golden」过称（`rust.yml` 有 paths 过滤） | 改「每个触发本 workflow 的 PR」 | R18-B |
+
+**D 过工程与 API 面（7）**
+
+| 项 | 卡在哪 | 登记于 |
+|---|---|---|
+| `verification_from_row` 手写三元闭集而非走 `VerificationKind::from_code`（后者生产零调用） | 换 `from_code` 删字面量三臂 | R18-E |
+| ingest 事件族读侧重打字面量（写侧走 `INGEST_PLAN`） | 读侧改用常量 | R18-E |
+| `data_json` 载荷键 `"degradations"`/`"warnings"` 写读两份字面量 | 照 `source_ref` 建键常量小节 | R18-E |
+| `Batch`/`BatchShape` 四个方法私有模块挂 `pub`（`unreachable_pub` 恰报 4 条） | 降 `pub(crate)` | R18-E |
+| `CjkTokenStream` 导出表漏名（trait 关联类型可投影命名，门静默） | 根 `pub use` 或注释补投影说明 | R18-E |
+| `item_tokens` 纯别名层且 doc「reused by every pipeline stage」不实 | 删 wrapper 或改两处调用方 | R18-E |
+| 恒等闸注释把弱检查说得比实际强（`history.rs`「may still differ」清单不全） | 注释改实况 | R18-A |
+
+**E 等价突变体（2，登记不补测）**
+
+| 项 | 卡在哪 | 登记于 |
+|---|---|---|
+| `next_stamp` `&&`→`||`（分支更易走 bump，可观测契约全保持） | 可证等价 | R18-C |
+| `next_stamp` `\|`→`^`（位域不相交，逐位恒等） | 可证等价 | R18-C |
+
+**F 计数/序数小项（4，注释级）**：rust.yml instruments 注释「three checks」实为四步（R18-A）；§18「第十一个臂 `store_unavailable`」序数错（实为 match 第 3 臂）（R18-F）；`index_service.rs` 针脚注释「tenth write site」已陈旧（现第 11）（R18-F）；`deny.toml` 头注「registered as its own task」指向旧处置（现为显式豁免）（R18-F）。
 
 
 ## 21. 明确拒绝的设计
+
 
 1. 不做通用多 Agent 框架，不移植 32 工具注册表和 LangGraph。
 2. 不在核心引入 Python 运行时。
@@ -1550,7 +1723,7 @@ keyring「不可用/被锁」与「无凭据」显式区分并提示；Windows �
 
 ### D29：SQLite 引擎纪律（PRAGMA 定稿 + 版本钉扎 + 红线=治理触发）
 
-缺省 PRAGMA 八条定稿与容量触发表见 [规模与生命周期](scale-lifecycle.md)。
+缺省 PRAGMA 七条定稿（3 条连接级 + 4 条文件级，`Store::open` 实发；块内另两行是「保持默认」与「显式不开」，不下发）与容量触发表见 [规模与生命周期](scale-lifecycle.md)。
 **引擎版本钉扎**：捆绑引擎必须落在 WAL-reset 窗口之外。上游口径（sqlite.org/wal.html
 §11）：缺陷存在于 **3.7.0（2010-07-21）至 3.51.2（2026-01-09）**，**自 3.51.3
 （2026-03-13）起修复**；窗口内另有 3.44.6 / 3.50.7 两个回补版本。3.52.0 已撤回
@@ -1562,10 +1735,12 @@ keyring「不可用/被锁」与「无凭据」显式区分并提示；Windows �
 
 ### D30：run_events 生命周期——归档 ≠ 删除
 
-`run_events` / `history_items` 是审计正史：治理只有搬移（月度 `VACUUM INTO`
-归档库，归档文件仍属 canonical，trace 跨库透明读）与派生重建
+`run_events` / `history_items` / `run_context_items` 是审计正史：治理只有搬移（月度
+`VACUUM INTO` 归档库，归档文件仍属 canonical，trace 跨库透明读）与派生重建
 （usage_projections）两种合法形态，**永不 DELETE**——先例的 prune-on-insert
-对象全是可丢遥测，不可照搬。默认单表 + `created_at` 时间索引 + 聚合走派生表，
+对象全是可丢遥测，不可照搬。`run_context_items` 入列是因为 session 内的证据位置守恒
+账本是它的纯函数（[上下文与检索工程](context-retrieval.md) §1.1）：行一旦可删，账本
+就随 canonical 漂移。默认单表 + `created_at` 时间索引 + 聚合走派生表，
 是否归档由 pilot 数字决定；分区表出局（存量 migration + 跨分区唯一约束两关，
 收益不抵摩擦）。快照滚动预算 日7/周4/月12。Tantivy：commit 去抖 5-10s
 （Windows #2847 正确性防御）、不主动 purge_deletes（#710 教训）。
@@ -1591,9 +1766,16 @@ keyring「不可用/被锁」与「无凭据」显式区分并提示；Windows �
 0.x 快照默认不含 papers 目录（[ADR 0023](adr/snapshot-excludes-paper-bytes.md)）。
 
 备份 = 临时名 `VACUUM INTO` → 产物 `quick_check` 验证 → 记快照清单 → 原子
-改名（中断只废产物不伤原库）。检测四层：打开时 `quick_check` +
-`foreign_key_check`（integrity_check 不查外键）；备份产物验证；**审计对账**
-（runs 终态计数 vs terminal 事件计数——抓 integrity_check 查不出的静默丢写）；
+改名（中断只废产物不伤原库）。检测四层：**打开时不跑全文件校验**（2026-10-06 更正——
+`quick_check` 读整个文件，而 `Store::open` 挂在每条读路径上：doctor / coverage /
+search / chunk 计数各开一次库；全文件校验是**备份产物**那一层的活。`foreign_key_check`
+同理不跑，因为 DDL 一条 `REFERENCES` 都没有，引用完整性由代码守（`ensure_run` 的
+守卫），PRAGMA 无物可查）。L-open 提供的是**预防**而非检测：连接级
+`busy_timeout` / `trusted_schema = OFF`，加 `refuse_write` 闸后的四条文件级 PRAGMA。
+（`foreign_keys = ON` 也在这一组里，但它防的同样是**尚不存在的外键** —— 没有
+`REFERENCES` 就没有违反可防；它留着是为了 DDL 真加上外键那天，而不是今天的一道闸。）备份产物验证；**审计对账**
+（runs 终态计数 vs terminal 事件计数——抓 integrity_check 查不出的静默丢写；
+**2026-10-08 更正：尚无实现，此前也无登记**——登记见 §20，细则更正见 scale-lifecycle.md 的 L 阶梯）；
 路径告警。恢复 L0 隔离 → L1 `.recover` → L2 快照重放 → L3 源 Markdown 全量
 重建兜底。修复阶梯上限：每进程每路径一次 + 持久台账 + 跨进程锁（hermes
 105 次/89GB 修复风暴的制度化防御）。验收含 kill -9 ×1000 故障注入。细则见
@@ -1682,8 +1864,9 @@ sha256 与库比对才重建 chunk。对账四触发（启动全 walk / 每日 /
 `commit_source_file`：revision + chunks + 边 + 事件同事务），chunk
 内容寻址 upsert，canonical 永不污染；批量 index 的 coverage 行仍在批尾
 sweep（丢窗 = 批尾、对账承接），
-watcher 路径事件入事务、零丢窗——口径见
-[ADR 0026](adr/store-events-are-the-ingest-audit-log.md)。网络盘维持探测告警（D31），不做轮询降级
+watcher 路径事件同样走批尾 sweep——**不入事务，两种形态都恰好保留批尾窗口**
+（2026-10-08 更正——此前这里写的是「入事务、零丢窗」，与代码及
+[ADR 0026](adr/store-events-are-the-ingest-audit-log.md) 的实况不符）。网络盘维持探测告警（D31），不做轮询降级
 实现。细则见 [摄取安全与 Vault 互操作](ingest-interop.md)。
 
 ### D41：vault 语法边界与建边矩阵
@@ -1742,7 +1925,7 @@ minidump**（栈内存夹带用户内容）。任何未来上报必须 opt-in �
 
 ```text
 1. momotaro index 可索引 fixture vault。
-2. momotaro search（lexical）无 API key，零 LLM；--mode expand 发一次改写调用。
+2. momotaro search（lexical）无 API key，零 LLM；--mode expand 发一次改写 LLM turn（可观察输出之前的重发仍算这一次）。
 3. momotaro ask 返回带引用答案。
 4. 每个引用可定位到 source revision 和 chunk。
 5. 每个回答有 run_id。

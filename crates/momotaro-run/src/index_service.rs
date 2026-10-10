@@ -7,11 +7,11 @@ use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use momotaro_contracts::{
-    AnchorKind, Chunk, CoverageCounts, CoverageFailure, CoverageReport, Degradation, GraphLink,
-    IndexFileError, IndexFileErrorKind, IndexPolicy, IndexReport, LlmTurnRecord, ModelSlot,
+    AnchorKind, CoverageCounts, CoverageFailure, CoverageReport, Degradation, GraphLink,
+    HealthReport, IndexFileError, IndexFileErrorKind, IndexPolicy, IndexReport, LlmTurnRecord,
     OriginClass, RetrievalHit, RetrievalHitRecord, RetrievalRecord, RunSpec, SourceKind,
     TerminalEvent, Warning, WorkspaceStatus, run_event,
 };
@@ -29,14 +29,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::{
-    RunError, WorkspaceConfig, database_path, load_config, sha256_hex, to_i64, validate_policy,
-    vault_scope,
+    RunError, WorkspaceConfig, database_path, load_config, to_i64, validate_policy, vault_scope,
 };
 
 /// Tool tag embedded in every revision fingerprint.
 const FINGERPRINT_TOOL: &str = "momotaro-index-v1";
 /// Memory budget handed to the tantivy writer.
-const WRITER_HEAP_BYTES: usize = 50_000_000;
+pub(crate) const WRITER_HEAP_BYTES: usize = 50_000_000;
 /// Longest excerpt, in characters, attached to a search hit.
 const EXCERPT_CHARS: usize = 200;
 
@@ -220,9 +219,20 @@ pub(crate) fn gate(
     if !metadata.is_file() {
         return Ok(Gate::Directory);
     }
-    let source_key = source_key_for(vault_root, file)?;
-    let raw_name = raw_name_for(vault_root, file)?;
-    let local_path = momotaro_ingest::local_path_in(workspace_root, file)?;
+    // The name half, the same rule the content half below states ("nothing
+    // in here may fail the batch"): a key this pass cannot derive — a
+    // non-UTF-8 name, an entry that resolves outside the workspace — is one
+    // path's fact, and `process_file` writes the row for it
+    // (`PassOne::Failed`, matched per file, never raised). `?` here used to
+    // end `run_batch`, and with it the whole watcher, on one bad name.
+    // `ForceRebuild` is the "could not run" answer: the pass decides.
+    let (Ok(source_key), Ok(raw_name), Ok(local_path)) = (
+        source_key_for(vault_root, file),
+        raw_name_for(vault_root, file),
+        momotaro_ingest::local_path_in(workspace_root, file),
+    ) else {
+        return Ok(Gate::ForceRebuild);
+    };
     let Some(current) = store.current_revision(&source_key)? else {
         return Ok(Gate::Proceed);
     };
@@ -238,22 +248,64 @@ pub(crate) fn gate(
     // which is exactly the clause's "最近 N 秒内有事件"; the label and the store
     // write moment are both answers about the *batch*, so the caller reads
     // them once instead of three Win32 calls and a query per path.
-    if !is_racy(mtime_secs(&metadata), last_written) && !coarse {
+    if (StatProbe {
+        last_written,
+        coarse,
+    })
+    .stat_can_vouch(&metadata)
+    {
         return Ok(verdict(true, false, None));
     }
-    // The stat proves nothing here, so compare the bytes (D40 §4.3).
-    let hash_matches = match read_stable(file).map_err(|source| RunError::Io { source })? {
-        // Let the real pass own the retry: it is the one that writes.
-        StableRead::Torn => None,
-        StableRead::Stable(bytes) => {
-            let normalized = normalize_markdown(&bytes)?;
-            Some(revision_hash(&normalized) == current.revision_hash)
-        }
+    // The stat proves nothing here, so compare the bytes (D40 §4.3). Which
+    // bytes, and which hash, are the stored revision's to say: an attachment's
+    // column is `revision_hash_reader` over its raw bytes while a note's is
+    // `revision_hash` over its normalized text, and hashing one with the other
+    // answers a question nobody asked (it also reads the whole file, which
+    // `register_attachment` exists to avoid — a vault may hold a video).
+    //
+    // Nothing in here may fail the batch. Every error here is a fact about one
+    // path, and the pass that writes the row owns it; `None` means "the
+    // comparison could not run" — a torn read, a lock, a normalization
+    // failure — and it must not read as agreement: `verdict` sends it to the
+    // rebuild path instead of the skip rule.
+    let hash_matches = match current.kind {
+        SourceKind::Attachment => stable_raw_hash(file).map(|hash| hash == current.revision_hash),
+        _ => match read_stable(file).ok() {
+            Some(StableRead::Stable(bytes)) => normalize_markdown(&bytes)
+                .ok()
+                .map(|normalized| revision_hash(&normalized) == current.revision_hash),
+            Some(StableRead::Torn) | None => None,
+        },
     };
-    // Same bytes: the event was false, but this file is racy, so it earns its
-    // `skipped` row — and that row is what advances `recorded_at` past the
-    // file's mtime and clears the raciness (D40 §4.3, git's `--refresh`).
+    // `Some(true)`: same bytes — the event was false, but this file is racy,
+    // so it earns its `skipped` row, and that row is what advances
+    // `recorded_at` past the file's mtime and clears the raciness (D40 §4.3,
+    // git's `--refresh`). A `None` never reaches that rule: see `verdict`.
     Ok(verdict(true, true, hash_matches))
+}
+
+/// `path`'s revision hash over its **raw** bytes, with a stat on each side.
+///
+/// The attachment half of [`gate`]'s content check, and the reason that check
+/// no longer asks a Markdown question of a `.png`: `register_attachment` writes
+/// `revision_hash_reader`'s answer into the column, so this is the same hash on
+/// the same bytes. The bracketing stats are the torn-read guarantee
+/// [`read_stable`] gives a note (D40 §4.2), and the bytes stream through the
+/// hasher rather than being held whole (D40 §4.3's content check has to run
+/// here too, and a vault may hold a video).
+///
+/// `None` is "the stat did not answer": an unreadable file and a torn one are
+/// the same answer to the cheap pass, and both mean the pass that writes rows
+/// decides instead.
+fn stable_raw_hash(path: &Path) -> Option<String> {
+    let before = fs::metadata(path).ok()?;
+    let hash = fs::File::open(path)
+        .ok()
+        .and_then(|mut file| revision_hash_reader(&mut file).ok())?;
+    let after = fs::metadata(path).ok()?;
+    // Same two halves as [`read_stable`], asked of the same function rather
+    // than re-typed here: a copy drifts the first time one of them changes.
+    (!is_torn(&before, &after)).then_some(hash)
 }
 
 /// How far a file's pass got, for the two callers that answer it differently.
@@ -263,6 +315,7 @@ pub(crate) fn gate(
 /// the batch records it as an I/O row while the watcher backs off and
 /// requeues (D40 §4.5). Typing it keeps the watcher from having to match on a
 /// message, which this repo forbids.
+#[derive(Debug)]
 enum PassError {
     /// The file changed while it was read; nothing was written.
     Torn,
@@ -302,6 +355,43 @@ impl From<StoreError> for PassError {
 /// "store error" would say the opposite of what happened: the unit rolled
 /// back and nothing was attempted. The classification stays identical for
 /// every other failure; only the refusal keeps its own variant.
+/// The store half of D40 §4.3's "same bytes under a fresh fingerprint" branch,
+/// shared by the note and the attachment pass.
+///
+/// Same `revision_hash`, so no new revision: only the mutable columns move,
+/// and they move in one transaction with the guard D40 §4.7 requires — the
+/// first step re-checks the stat the bytes were read under. The two passes
+/// differ in what they write (a note carries re-derived metadata and
+/// re-projected edges; an attachment carries its fingerprint and no rows),
+/// not in when this applies or how it commits.
+// The argument list mirrors `commit_source_refresh`'s own, plus the two the
+// guard needs — the same shape `record_coverage` and `run_expand` carry.
+#[allow(clippy::too_many_arguments)]
+fn commit_refresh(
+    store: &mut Store,
+    source_key: &str,
+    revision_hash: &str,
+    metadata_json: &str,
+    local_path: &str,
+    raw_name: &str,
+    edges: &[GraphLink],
+    file: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), PassError> {
+    commit_step(source_key, || {
+        store.commit_source_refresh(
+            source_key,
+            revision_hash,
+            metadata_json,
+            local_path,
+            raw_name,
+            edges,
+            None,
+            guard_against(file, metadata),
+        )
+    })
+}
+
 fn commit_step<T>(
     source_key: &str,
     step: impl FnOnce() -> Result<T, StoreError>,
@@ -333,12 +423,27 @@ fn forced(mode: &ProcessMode) -> bool {
 /// A refusal rolls the whole unit back and the caller requeues — the file
 /// moved between our read and our write, so what we hold describes nothing
 /// that is there. Deliberately no path in the message: it reaches a terminal.
-fn guard_against(file: &Path, expected: &fs::Metadata) -> impl FnOnce() -> Result<(), StoreError> {
-    let expected_mtime = mtime_ms(expected);
-    let expected_len = expected.len();
+///
+/// The comparison is [`is_torn`] — the same predicate the read half of this
+/// contract runs, negated. It used to be written out a third time here after
+/// round 12 had already collapsed the other two into one definition, which is
+/// exactly how three "did this file move" answers drift apart again.
+///
+/// What that predicate is: the stamp compared **exactly**, not through
+/// `mtime_ms`. Truncation is for the racy-clean *fingerprint* — two writes in
+/// one tick are what that rule exists for — and answering "did the file move"
+/// with a millisecond-wide comparison hands this guard the blind spot the read
+/// half lost a round over: a same-length rewrite inside one millisecond reads
+/// as "nothing happened", and the buffer in hand commits bytes that are not on
+/// disk. A filesystem that only stamps seconds answers the same either way;
+/// one with finer resolution is exactly where the truncation costs.
+fn guard_against<'a>(
+    file: &Path,
+    expected: &'a fs::Metadata,
+) -> impl FnOnce() -> Result<(), StoreError> + 'a {
     let file = file.to_owned();
     move || match fs::metadata(&file) {
-        Ok(stat) if mtime_ms(&stat) == expected_mtime && stat.len() == expected_len => Ok(()),
+        Ok(stat) if !is_torn(expected, &stat) => Ok(()),
         _ => Err(StoreError::GuardRejected(GUARD_REFUSED.to_owned())),
     }
 }
@@ -363,11 +468,32 @@ fn read_stable(path: &Path) -> io::Result<StableRead> {
     let before = fs::metadata(path)?;
     let bytes = fs::read(path)?;
     let after = fs::metadata(path)?;
-    if mtime_ms(&before) != mtime_ms(&after) || before.len() != after.len() {
+    if is_torn(&before, &after) {
         return Ok(StableRead::Torn);
     }
-    let _ = after;
     Ok(StableRead::Stable(bytes))
+}
+
+/// Whether two stats describe two different moments of the same file.
+///
+/// Either half moving is enough: a same-size overwrite changes only the
+/// timestamp, an append or a truncation in the same tick changes only the
+/// length, and both describe bytes that were not one version. Split out so a
+/// test can hand it two real `fs::Metadata` values — the read that would
+/// produce them cannot be staged, but the predicate it runs can be fed.
+///
+/// Tornness *is* `watch::same_stat` negated — one predicate, one definition.
+/// It used to be a second copy of the comparison, written out again beside the
+/// first: the two agreed only for as long as nobody edited either, and they
+/// live in sibling modules that cannot see each other's private items. The
+/// comparison itself is exact, not through [`mtime_ms`]: a rewrite that lands
+/// inside one millisecond keeps its truncated value, so a millisecond-wide
+/// check calls the two moments equal and hands the second one's bytes to
+/// whoever commits them. Truncation is right for the *fingerprint* — two
+/// writes in one tick are the racy-clean case `is_racy` exists for — and wrong
+/// for *tornness*, which is a question about the bytes.
+fn is_torn(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    !crate::watch::same_stat(before, after)
 }
 
 /// Whether a matching stat can be trusted for this file (D40 §4.3).
@@ -405,6 +531,28 @@ fn mtime_secs(metadata: &fs::Metadata) -> i64 {
         .map_or(0, |since| since.as_secs() as i64)
 }
 
+/// Batch-level stat inputs (D40 §4.3): the store's last write moment and
+/// whether the volume is coarse. Read once per batch and carried to every
+/// cheap skip, so all three ask the same question.
+#[derive(Clone, Copy)]
+pub(crate) struct StatProbe {
+    pub last_written: i64,
+    pub coarse: bool,
+}
+
+impl StatProbe {
+    /// Can a **matched** stat vouch for the bytes? Not while the file sits in
+    /// the racy window (its mtime is at or after the store's last write — a
+    /// same-tick rewrite keeps a matching stat with different bytes) and not
+    /// on a coarse volume (two-second ticks swallow small edits). The gate
+    /// asked this before its cheap pass; the pass-side skips ask it too —
+    /// one predicate for all three, because this family has answered
+    /// differently per site before.
+    pub(crate) fn stat_can_vouch(&self, metadata: &fs::Metadata) -> bool {
+        !is_racy(mtime_secs(metadata), self.last_written) && !self.coarse
+    }
+}
+
 /// The verdict on one file, given what the cheap pass found (D40 §4.2 / §4.3).
 ///
 /// Split out from [`gate`] so every combination can be pinned without a
@@ -417,7 +565,10 @@ fn mtime_secs(metadata: &fs::Metadata) -> i64 {
 ///   earns the row that clears its raciness (D40 §4.3).
 /// * stat matches, is racy, and the bytes differ: the skip rule would swallow
 ///   a real change, so the rebuild path is forced.
-/// * the read tore: hand it to the pass that owns the retry (D40 §4.5).
+/// * stat matches, is racy, and the comparison could not run (a torn read, a
+///   lock, or a normalization failure): the skip rule would be clearing a
+///   raciness nobody disproved — the rebuild path is forced, and a read that
+///   tears *there* goes to the retry queue (D40 §4.5).
 fn verdict(stat_matches: bool, racy: bool, hash_matches: Option<bool>) -> Gate {
     if !stat_matches {
         return Gate::Proceed;
@@ -427,8 +578,7 @@ fn verdict(stat_matches: bool, racy: bool, hash_matches: Option<bool>) -> Gate {
     }
     match hash_matches {
         Some(true) => Gate::Proceed,
-        Some(false) => Gate::ForceRebuild,
-        None => Gate::Proceed,
+        Some(false) | None => Gate::ForceRebuild,
     }
 }
 
@@ -457,6 +607,35 @@ fn index_fault(root: &Path) -> Option<String> {
         .map(|error| error.to_string())
 }
 
+/// `Some((chunks, documents))` when the index and the store disagree on how
+/// much there is to serve.
+///
+/// The writer commits a batch's documents in one step, after the per-file
+/// store commits (ADR 0026's order), so a crash in that window leaves current
+/// chunks whose documents never landed — and nothing else says so: a re-run
+/// skips those files (their fingerprints match) and `reconcile` reads only
+/// state that agrees. `doctor` turns this into an `Invalid` naming the
+/// command that repairs it.
+///
+/// The store side counts only chunks of **current** revisions
+/// (`all_current_chunks`): rows retained for older revisions (ADR 0022) stay
+/// in the store on purpose and never had documents. `None` — nothing to
+/// report — covers a workspace whose index does not exist yet (owned by
+/// `index_fault`) or one whose store or index cannot be opened here.
+pub(crate) fn chunk_doc_drift(root: &Path) -> Option<(u64, u64)> {
+    let dir = index_dir(root);
+    if !SearchIndex::exists(&dir) {
+        return None;
+    }
+    let documents = SearchIndex::open_or_create(&dir).ok()?.doc_count();
+    let chunks = Store::open(database_path(root))
+        .ok()?
+        .all_current_chunks()
+        .ok()?
+        .len() as u64;
+    (chunks != documents).then_some((chunks, documents))
+}
+
 /// What the database file is, decided without opening it.
 ///
 /// `Store::open` creates the file it does not find and switches a 0-byte file to
@@ -483,6 +662,18 @@ pub(crate) fn store_file(root: &Path) -> StoreFile {
 ///
 /// `None` covers both "healthy" and "no database at all": an absent store is
 /// `Uninitialized`, which reads as "run `init`".
+/// The preamble every store read shares: `store_file` has already said the file
+/// is worth opening (an empty one must not be — opening is what writes), so
+/// open it and ask what it says about itself.
+///
+/// `None` when it will not open or will not answer. `store_fault` turns that
+/// silence into words for a human; the readers simply have no answer.
+fn open_healthy_store(root: &Path) -> Option<(Store, HealthReport)> {
+    let store = Store::open(database_path(root)).ok()?;
+    let health = store.health().ok()?;
+    Some((store, health))
+}
+
 pub(crate) fn store_fault(root: &Path) -> Option<String> {
     match store_file(root) {
         StoreFile::Absent => None,
@@ -490,7 +681,7 @@ pub(crate) fn store_fault(root: &Path) -> Option<String> {
         // open it, because opening is what writes.
         StoreFile::Empty => Some("database has not been initialized".to_owned()),
         StoreFile::Present => {
-            let health = Store::open(database_path(root)).ok()?.health().ok()?;
+            let (_, health) = open_healthy_store(root)?;
             (health.status != WorkspaceStatus::Ready).then(|| {
                 health
                     .message
@@ -508,8 +699,8 @@ fn store_chunk_count(root: &Path) -> Option<u64> {
     if !matches!(store_file(root), StoreFile::Present) {
         return None;
     }
-    let store = Store::open(database_path(root)).ok()?;
-    if store.health().ok()?.status != WorkspaceStatus::Ready {
+    let (store, health) = open_healthy_store(root)?;
+    if health.status != WorkspaceStatus::Ready {
         return None;
     }
     Some(store.counts().ok()?.chunks)
@@ -729,7 +920,6 @@ pub(crate) fn index_unusable_message(root: &Path) -> Option<String> {
     index_fault(root).map(|reason| format!("{reason}; run `momotaro rebuild-index` to rebuild it"))
 }
 
-/// Where a replacement index is built before it is swapped in.
 /// Where the previous index waits while a rebuild swaps the new one in.
 ///
 /// Only for the moment between the two renames: a successful swap discards it,
@@ -738,6 +928,7 @@ fn retired_dir(root: &Path) -> PathBuf {
     root.join(".momotaro").join("index.retired")
 }
 
+/// Where a replacement index is built before it is swapped in.
 pub(crate) fn staging_dir(root: &Path) -> PathBuf {
     root.join(".momotaro").join("index.rebuilding")
 }
@@ -753,6 +944,8 @@ pub(crate) fn index_dir(root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The millisecond fixtures need the clock type; production does not name it.
+    use std::time::SystemTime;
 
     /// The production text with the tests module cut out, so needles count
     /// call sites without counting the tests' own calls (the module sits
@@ -762,8 +955,10 @@ mod tests {
         let start = source
             .find(concat!("#[cfg(", "test)]"))
             .expect("the tests module");
-        let end = source[start..]
+        let tail = &source[start..];
+        let end = tail
             .find(concat!("\n", "}", "\n"))
+            .or_else(|| tail.find(concat!("\r\n", "}", "\r\n")))
             .expect("the tests module ends");
         let mut out = String::with_capacity(source.len());
         out.push_str(&source[..start]);
@@ -824,6 +1019,202 @@ mod tests {
         assert_eq!(EXPANDED_QUERY_COUNT, 4);
         // And the placeholder really is substituted, never left literal.
         assert!(!prompt.contains("{n}"), "{prompt}");
+    }
+
+    /// The expand half of the same fix has no end-to-end witness: the failure
+    /// returns `Err` and takes the `run_id` with it, so no test can read that
+    /// run's turn row back (the same seam §20 registers twice). What *can* be
+    /// pinned is that the branch calls the builder the ask half is witnessed
+    /// through — a call site deleted here would otherwise be silent, and
+    /// `cargo-mutants` deletes calls as a matter of course.
+    #[test]
+    fn the_failed_rewrite_branch_records_what_the_provider_reported() {
+        let half = production_half();
+        assert_eq!(
+            half.matches("record_failure_usage(&mut turn, &error)")
+                .count(),
+            1,
+            "exactly the one failure branch, and it is in the production half"
+        );
+        assert!(
+            !half.contains("fn record_failure_usage"),
+            "the builder itself lives in ask.rs, not duplicated here"
+        );
+    }
+
+    /// `strip_code_fence` cuts the fence lines off and keeps the body
+    /// **exactly**. The slice is `at + 1`, and an off-by-one there leaves a
+    /// leading newline that today's only caller eats (a JSON array tolerates
+    /// leading whitespace; the line-by-line fallback trims and skips blanks) —
+    /// so nothing went red while the contract was untested, which is exactly
+    /// the state that hands the next caller an off-by-one. (`+` → `*` on that
+    /// line survived the whole battery until it was pinned here.)
+    #[test]
+    fn strip_code_fence_returns_the_body_exactly() {
+        assert_eq!(
+            strip_code_fence(
+                "```json
+X
+```"
+            ),
+            "X
+"
+        );
+        assert_eq!(
+            strip_code_fence(
+                "```
+X
+```"
+            ),
+            "X
+"
+        );
+        // No fence: untouched. A fence with nothing after the opening line:
+        // no body at all.
+        assert_eq!(
+            strip_code_fence(
+                "X
+```"
+            ),
+            "X
+```"
+        );
+        assert_eq!(strip_code_fence("```"), "");
+    }
+
+    /// §5 第 4 条's carve-out has **two** fences: `non_note_keys`, and the
+    /// `kind == Note` guard on the revision. The first is built from *this
+    /// batch's* entries, so it is empty for a target that is not in the batch
+    /// — a note the watcher just touched, linking to an attachment indexed
+    /// earlier. The second fence is the one that stands there.
+    ///
+    /// Registered since round 8 as a structural equivalent ("the outline
+    /// builder filters empty levels" class); it is not. A full battery finally
+    /// drove it: `revision.kind == SourceKind::Note` → `true` survived the
+    /// whole suite, because every fixture reached the first fence instead.
+    #[test]
+    fn an_anchor_on_a_non_note_target_outside_the_batch_is_never_stale() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = Store::open(dir.path().join("momotaro.db")).expect("store");
+        store.init_schema().expect("schema");
+
+        // An attachment whose blob is *outline-shaped* — exactly what would
+        // make the anchor check answer "missing" if the kind guard did not
+        // stop it first. Real attachments carry a fingerprint blob, so this is
+        // the shape the guard exists for.
+        for (key, kind) in [
+            ("attachment:guide.pdf", SourceKind::Attachment),
+            ("web:example.com", SourceKind::Web),
+        ] {
+            store
+                .commit_source_file(
+                    &NewSourceRevision {
+                        source_key: key,
+                        revision_hash: "hash",
+                        kind,
+                        title: None,
+                        uri: None,
+                        local_path: None,
+                        raw_name: None,
+                        origin_class: OriginClass::Owner,
+                        metadata_json:
+                            r#"{"outline": {"headings": [["Present"]], "block_ids": []}}"#,
+                        ingested_at: 0,
+                    },
+                    &[],
+                    &[],
+                    None,
+                    || Ok(()),
+                )
+                .expect("plant the non-note revision");
+        }
+        store
+            .commit_source_file(
+                &NewSourceRevision {
+                    source_key: "note:real.md",
+                    revision_hash: "hash",
+                    kind: SourceKind::Note,
+                    title: None,
+                    uri: None,
+                    local_path: None,
+                    raw_name: None,
+                    origin_class: OriginClass::Owner,
+                    metadata_json: r#"{"outline": {"headings": [["Present"]], "block_ids": []}}"#,
+                    ingested_at: 0,
+                },
+                &[],
+                &[],
+                None,
+                || Ok(()),
+            )
+            .expect("plant the note revision");
+
+        // `non_note_keys` is empty: none of these targets is in this batch.
+        let checks = [
+            ("attachment:guide.pdf", "Missing"),
+            ("web:example.com", "Missing"),
+            ("note:real.md", "Missing"),
+        ];
+        let checks = checks
+            .iter()
+            .map(|(target, raw)| ((*target).to_owned(), AnchorKind::Heading, (*raw).to_owned()))
+            .collect::<Vec<_>>();
+        let missing = stale_anchors(&store, &checks, &HashSet::new()).expect("the sweep runs");
+
+        // The two non-Note targets are never anchor-checked; the note is, and
+        // its missing anchor is reported — so the emptiness above is the kind
+        // guard at work, not a sweep that found nothing anywhere.
+        assert_eq!(
+            missing,
+            vec![("note:real.md".to_owned(), "Missing".to_owned())],
+            "only the note's anchor is checked"
+        );
+    }
+
+    #[test]
+    fn the_failed_rewrite_event_carries_the_same_four_fields_as_the_terminal() {
+        // `a_failed_rewrite_is_reported_as_a_typed_llm_failure` walks this
+        // branch and asserts the error value it returns — not what the turn's
+        // event wrote. The terminal half of the same failure has been pinned
+        // byte for byte since it existed; this is the other half.
+        let error = momotaro_llm::LlmError {
+            kind: momotaro_llm::LlmErrorKind::Auth,
+            status: Some(401),
+            provider_code: None,
+            message: "the provider call for model m failed: HTTP 401".to_owned(),
+            output_observed: false,
+            attempts: 1,
+            usage: None,
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&crate::ask::llm_finished_failure_payload("turn-1", &error))
+                .expect("payload is JSON");
+        assert_eq!(payload["error"]["category"], "llm_auth", "{payload}");
+        assert_eq!(payload["error"]["attribution"], "user", "{payload}");
+        assert_eq!(payload["error"]["retryable"], false, "{payload}");
+        assert_eq!(
+            payload["error"]["severity"],
+            momotaro_contracts::Severity::Error.as_str(),
+            "{payload}"
+        );
+        assert_eq!(payload["slot"], "answer", "{payload}");
+        assert_eq!(payload["turn_id"], "turn-1", "{payload}");
+        // No usage object on this failure: the cache summary is present and
+        // *empty*, the same "absent means not reported" reading the turn row
+        // uses. A failure that did report is covered end to end in
+        // `a_failed_exchange_that_reported_usage_still_records_it_on_the_turn`.
+        // `.get` and not `payload[...]`: indexing a missing key also answers
+        // `Null`, so what is pinned here is the key's *presence*.
+        assert_eq!(
+            payload.get("billable_tokens"),
+            Some(&serde_json::Value::Null),
+            "{payload}"
+        );
+        assert_eq!(
+            payload.get("cached_tokens"),
+            Some(&serde_json::Value::Null),
+            "{payload}"
+        );
     }
 
     #[test]
@@ -1077,8 +1468,28 @@ mod tests {
                 Warning::WindowsIncompatibleName,
                 "the name is one Windows' naming rules reserve; tools and sync clients that follow them will refuse it (D42)",
             ),
+            (
+                Warning::SourceRemoved,
+                "the path no longer holds a file; its rows stay as history and the next reconcile converges the projections (D40 §4.2)",
+            ),
         ] {
             assert_eq!(warning_message(warning), sentence, "{warning:?}");
+        }
+        // A no-wildcard match over the closed set: a new Warning fails this
+        // file's compile until its match arm lands here; adding the table row
+        // is on the developer (no length pin yet).
+        for warning in [
+            Warning::OneDrivePlaceholder,
+            Warning::IcloudPlaceholder,
+            Warning::WindowsIncompatibleName,
+            Warning::SourceRemoved,
+        ] {
+            match warning {
+                Warning::OneDrivePlaceholder
+                | Warning::IcloudPlaceholder
+                | Warning::WindowsIncompatibleName
+                | Warning::SourceRemoved => {}
+            }
         }
     }
 
@@ -1132,6 +1543,510 @@ mod tests {
         );
     }
 
+    /// A refusal to stat is not an absence. `Gate::Absent` costs this path its
+    /// row *and* its requeue (`run_batch` drops it, the pass loop skips it), so
+    /// an unreadable file would vanish silently while the batch reported
+    /// success. Only `NotFound` may read as absent — and the other arm, the one
+    /// that turns a sharing violation or a permission denial into a batch
+    /// error, is the one nothing drove: a path with an interior NUL is
+    /// `InvalidInput` on every platform Rust supports, never `NotFound`.
+    #[test]
+    fn a_path_the_metadata_read_refuses_is_an_error_not_an_absence() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("vault");
+        let workspace = momotaro_ingest::canonical_workspace_root(dir.path()).expect("canonical");
+        let vault_root = momotaro_ingest::canonical_workspace_root(&vault).expect("canonical");
+        let mut store = Store::open(dir.path().join("momotaro.db")).expect("store");
+        store.init_schema().expect("schema");
+
+        let file = PathBuf::from(format!("{}/\0evil.md", vault_root.display()));
+        let refusal = gate(&store, &workspace, &vault_root, &file, false, 0)
+            .expect_err("a stat that refused is not a file that is gone");
+        assert!(
+            matches!(refusal, RunError::Io { .. }),
+            "it reports the failure instead of swallowing it: {refusal:?}"
+        );
+    }
+
+    /// The whole `force_content` chain in one place: `Gate::ForceRebuild` is
+    /// written into the map, the map becomes this flag, and this flag is what
+    /// `process_file` and `register_attachment` read to drop their skip rule.
+    /// The two ends had witnesses; the middle — the predicate itself — did not,
+    /// so a body that answered `false` unconditionally lost the verdict while
+    /// every test stayed green.
+    #[test]
+    fn forced_only_a_watch_that_asked_for_content_is() {
+        assert!(
+            forced(&ProcessMode::Watch {
+                force_content: true
+            }),
+            "the one mode the gate's ForceRebuild turns on"
+        );
+        assert!(
+            !forced(&ProcessMode::Watch {
+                force_content: false
+            }),
+            "a watch with nothing to re-check"
+        );
+        assert!(
+            !forced(&ProcessMode::Batch),
+            "the batch trusts its own walk"
+        );
+    }
+
+    /// D40 §4.7 checks the file *as a whole*: mtime **and** length. The
+    /// existing test moves both; this one moves only the timestamp — the shape
+    /// a same-size rewrite takes, and the commonest one (edit one word, keep the
+    /// byte count; or a coarse filesystem that rounds the stamp). `||` would let
+    /// it through, and through it goes a commit of bytes that are no longer on
+    /// disk.
+    #[test]
+    fn the_guard_refuses_when_only_the_timestamp_moved() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("a.md");
+        fs::write(&path, "same length").expect("write");
+        let before = fs::metadata(&path).expect("stat");
+
+        let stamp = before
+            .modified()
+            .expect("mtime")
+            .checked_add(Duration::from_secs(10))
+            .expect("a stamp ten seconds out");
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open for attributes")
+            .set_modified(stamp)
+            .expect("move the mtime");
+        let after = fs::metadata(&path).expect("stat");
+        assert_eq!(before.len(), after.len(), "the length never moved");
+        assert_ne!(mtime_ms(&before), mtime_ms(&after), "only the stamp did");
+
+        let guard = guard_against(&path, &before);
+        let refusal = guard().expect_err("a moved timestamp is a moved file");
+        assert!(
+            matches!(refusal, StoreError::GuardRejected(_)),
+            "{refusal:?}"
+        );
+    }
+
+    /// The case a millisecond-wide comparison cannot see, on the **write**
+    /// path: a same-length rewrite whose stamp lands inside one millisecond of
+    /// the one the bytes were read under. `mtime_ms` truncates, so both sides
+    /// collapse into one value and the guard answers "the file did not move"
+    /// while the buffer holds a version that is no longer on disk. The middle
+    /// assertions pin that the truncation really does collide here, so this
+    /// cannot pass by accident in either direction — and it is the same
+    /// fixture `a_rewrite_inside_one_millisecond_is_still_torn` uses for the
+    /// read half of the very same question.
+    #[test]
+    fn a_same_length_rewrite_inside_one_millisecond_is_still_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("a.md");
+        fs::write(&path, "12345").expect("write");
+        let set_stamp = |at: SystemTime| {
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open for attributes")
+                .set_modified(at)
+                .expect("set the mtime");
+        };
+
+        // Aligned to a whole millisecond first, or the pair could straddle a
+        // boundary and the test would not be about truncation at all.
+        let since = (SystemTime::now() - Duration::from_secs(60))
+            .duration_since(UNIX_EPOCH)
+            .expect("a stamp in the past");
+        let aligned = UNIX_EPOCH
+            + Duration::from_secs(since.as_secs())
+            + Duration::from_millis(u64::from(since.subsec_millis()));
+        set_stamp(aligned);
+        let before = fs::metadata(&path).expect("stat");
+
+        // Five bytes again, 400µs later: the commonest edit the guard's own
+        // doc describes ("edit one word, keep the byte count"), and the one a
+        // ten-second fixture cannot reach.
+        fs::write(&path, "54321").expect("rewrite");
+        set_stamp(aligned + Duration::from_micros(400));
+        let after = fs::metadata(&path).expect("stat");
+
+        assert_eq!(before.len(), after.len(), "same length");
+        assert_eq!(
+            mtime_ms(&before),
+            mtime_ms(&after),
+            "the two stamps really do collapse into one millisecond"
+        );
+        assert_ne!(
+            before.modified().expect("mtime"),
+            after.modified().expect("mtime"),
+            "…but they are not the same moment"
+        );
+
+        let refusal =
+            guard_against(&path, &before)().expect_err("GUARD SHOULD REFUSE: the file did move");
+        assert!(
+            matches!(refusal, StoreError::GuardRejected(_)),
+            "{refusal:?}"
+        );
+    }
+
+    /// `read_stable`'s contract is the absolute half of D40 §4.2: torn bytes
+    /// never reach a caller that would commit them. The read itself cannot be
+    /// staged, so the predicate it runs is fed two real stats that disagree on
+    /// **one** half each — the two cases an `&&` would let through.
+    #[test]
+    fn the_torn_predicate_watches_both_halves_of_the_stat() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let long = dir.path().join("long.md");
+        let short = dir.path().join("short.md");
+        fs::write(&long, "12345").expect("write");
+        fs::write(&short, "12").expect("write");
+
+        // Same stamp, different length: an append or truncation inside one tick.
+        let stamp = SystemTime::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("a stamp in the past");
+        for path in [&long, &short] {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .expect("open for attributes")
+                .set_modified(stamp)
+                .expect("pin the mtime");
+        }
+        let (long_stat, short_stat) = (
+            fs::metadata(&long).expect("stat"),
+            fs::metadata(&short).expect("stat"),
+        );
+        assert_eq!(
+            mtime_ms(&long_stat),
+            mtime_ms(&short_stat),
+            "the timestamps agree, so only the length disagrees"
+        );
+        assert!(
+            is_torn(&long_stat, &short_stat),
+            "a length that moved is a torn read"
+        );
+
+        // Same length, different stamp: a same-size rewrite.
+        fs::File::options()
+            .write(true)
+            .open(&long)
+            .expect("open for attributes")
+            .set_modified(stamp + Duration::from_secs(5))
+            .expect("move the mtime");
+        let moved = fs::metadata(&long).expect("stat");
+        assert_eq!(moved.len(), long_stat.len(), "the lengths agree");
+        assert_ne!(
+            mtime_ms(&moved),
+            mtime_ms(&long_stat),
+            "only the stamp moved"
+        );
+        assert!(
+            is_torn(&long_stat, &moved),
+            "a stamp that moved is a torn read"
+        );
+        assert!(
+            !is_torn(&long_stat, &long_stat),
+            "the same stat is not torn"
+        );
+    }
+
+    /// The case a millisecond-wide comparison cannot see: two same-length
+    /// stats whose timestamps differ by less than a millisecond. `mtime_ms`
+    /// truncates, so both land on the same value and the pair reads as "one
+    /// moment" — while `watch`'s `same_stat`, the answer to this same question
+    /// on the other side of the crate, uses the exact `SystemTime` and calls it
+    /// moved. The middle assertion pins that the truncation really does
+    /// collide here, so this test cannot pass by accident in either direction.
+    #[test]
+    fn a_rewrite_inside_one_millisecond_is_still_torn() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let first = dir.path().join("a.md");
+        let second = dir.path().join("b.md");
+        for path in [&first, &second] {
+            fs::write(path, "12345").expect("write");
+        }
+
+        // Aligned to a whole millisecond, then nudged inside it: otherwise the
+        // pair could straddle a boundary and the test would not be about
+        // truncation at all.
+        let since = (SystemTime::now() - Duration::from_secs(60))
+            .duration_since(UNIX_EPOCH)
+            .expect("a stamp in the past");
+        let aligned = UNIX_EPOCH
+            + Duration::from_secs(since.as_secs())
+            + Duration::from_millis(u64::from(since.subsec_millis()));
+        for (path, at) in [
+            (&first, aligned),
+            (&second, aligned + Duration::from_micros(400)),
+        ] {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .expect("open for attributes")
+                .set_modified(at)
+                .expect("set the mtime");
+        }
+
+        let (one, two) = (
+            fs::metadata(&first).expect("stat"),
+            fs::metadata(&second).expect("stat"),
+        );
+        assert_eq!(one.len(), two.len(), "same length");
+        assert_eq!(
+            mtime_ms(&one),
+            mtime_ms(&two),
+            "the two stamps really do collapse into one millisecond"
+        );
+        assert_ne!(
+            one.modified().expect("mtime"),
+            two.modified().expect("mtime"),
+            "…but they are not the same moment"
+        );
+        assert!(
+            is_torn(&one, &two),
+            "a stat that moved is a torn read, whatever the millisecond says"
+        );
+    }
+
+    /// `mtime_secs` is the whole of D40 §4.3's "recent is not trustworthy": it
+    /// feeds `is_racy(mtime, last_written)`, and git's rule is that entry. Feed
+    /// it a constant and that branch is dead in any workspace that has ever
+    /// written the store — the recent-rewrite case the content check exists for
+    /// would be dropped as a false event.
+    #[test]
+    fn the_racy_clock_reads_the_file_not_a_constant() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("a.md");
+        fs::write(&file, "x").expect("write");
+        let stamp = mtime_secs(&fs::metadata(&file).expect("stat"));
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs() as i64;
+        assert!((stamp - wall).abs() <= 5, "{stamp} is not the file's mtime");
+        assert!(stamp > 1_600_000_000, "and not a constant: {stamp}");
+    }
+
+    /// "Only a fault when there is something to serve — an empty directory in a
+    /// workspace that was never indexed is just an empty directory." The
+    /// *other* half of that sentence (`!dir.is_dir()`) was already pinned by a
+    /// zero-chunk input; this one drives the index directory existing with no
+    /// index inside it, which is the state `>= 0` would turn into a refusal to
+    /// serve.
+    #[test]
+    fn an_index_directory_with_no_index_in_it_is_not_a_fault_when_there_is_nothing_to_serve() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        fs::create_dir_all(root.join(".momotaro")).expect("data dir");
+        let mut store = Store::open(database_path(root)).expect("store");
+        store.init_schema().expect("schema");
+        assert_eq!(
+            store_chunk_count(root),
+            Some(0),
+            "the fixture: an initialized store that holds no chunks"
+        );
+        fs::create_dir_all(index_dir(root)).expect("an empty index directory");
+        assert!(
+            !SearchIndex::exists(&index_dir(root)),
+            "with no index in it"
+        );
+
+        assert_eq!(
+            index_fault(root),
+            None,
+            "an empty directory in a workspace that was never indexed is just \
+             an empty directory"
+        );
+    }
+
+    /// The refresh branch exists because the count and the truth parted ways:
+    /// an attachment whose bytes did not change but whose fingerprint moved
+    /// (a touch, a copy, a sync rewrite) is *indexed* — not skipped, not a new
+    /// revision. `files_indexed` feeds the summary line, the `ingest.finished`
+    /// payload, `reconcile`'s `changed` and the watch line, so a `+=` that
+    /// stopped adding was a lie in four places at once.
+    /// D40 §4.3 for attachments, the half the note path already had: a file
+    /// rewritten behind a stat that still matches has to reach the content
+    /// check, and the content check has to say the bytes moved. `stable_raw_hash`
+    /// answering "the stat did not answer" instead routes it to `Proceed`, the
+    /// skip rule takes it, and the store keeps a `revision_hash` that no longer
+    /// describes the file — a stale index on a two-second filesystem, which is
+    /// the exact case the check exists for.
+    #[test]
+    fn an_attachment_whose_bytes_changed_behind_a_matching_stat_is_forced_to_rebuild() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("vault");
+        let workspace = momotaro_ingest::canonical_workspace_root(dir.path()).expect("canonical");
+        let vault_root = momotaro_ingest::canonical_workspace_root(&vault).expect("canonical");
+        let file = vault_root.join("photo.png");
+        fs::write(&file, b"AAAA").expect("write");
+
+        let mut store = Store::open(dir.path().join("momotaro.db")).expect("store");
+        store.init_schema().expect("schema");
+        let source_key = source_key_for(&vault_root, &file).expect("source key");
+        let raw_name = raw_name_for(&vault_root, &file).expect("raw name");
+        let local_path = momotaro_ingest::local_path_in(&workspace, &file).expect("local path");
+        let stamp = fs::metadata(&file).expect("stat");
+        let planted =
+            revision_hash_reader(&mut fs::read(&file).expect("read").as_slice()).expect("hash");
+        store
+            .commit_source_file(
+                &NewSourceRevision {
+                    source_key: &source_key,
+                    revision_hash: &planted,
+                    kind: SourceKind::Attachment,
+                    title: None,
+                    uri: None,
+                    local_path: Some(&local_path),
+                    raw_name: Some(&raw_name),
+                    origin_class: OriginClass::Owner,
+                    metadata_json: &fingerprint_json(&stamp),
+                    ingested_at: 0,
+                },
+                &[],
+                &[],
+                None,
+                || Ok(()),
+            )
+            .expect("plant a revision");
+
+        // Same length, same stamp, different bytes — the state a two-second
+        // filesystem hands a rewrite inside one tick.
+        fs::write(&file, b"BBBB").expect("rewrite");
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open for attributes")
+            .set_modified(stamp.modified().expect("mtime"))
+            .expect("put the stamp back");
+        let after = fs::metadata(&file).expect("stat");
+        assert_eq!(
+            mtime_ms(&stamp),
+            mtime_ms(&after),
+            "the stat really did not move"
+        );
+        let now =
+            revision_hash_reader(&mut fs::read(&file).expect("read").as_slice()).expect("hash");
+        assert_ne!(now, planted, "but the bytes did");
+
+        let verdict = gate(&store, &workspace, &vault_root, &file, false, 0).expect("gate");
+        assert_eq!(
+            verdict,
+            Gate::ForceRebuild,
+            "the cheap pass must not call a real change a false event"
+        );
+    }
+
+    #[test]
+    fn an_attachment_whose_bytes_did_not_change_still_counts_as_indexed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("vault");
+        let workspace = momotaro_ingest::canonical_workspace_root(dir.path()).expect("canonical");
+        let vault_root = momotaro_ingest::canonical_workspace_root(&vault).expect("canonical");
+        let file = vault_root.join("photo.png");
+        fs::write(&file, b"the same bytes throughout").expect("write");
+
+        let mut store = Store::open(dir.path().join("momotaro.db")).expect("store");
+        store.init_schema().expect("schema");
+        let source_key = source_key_for(&vault_root, &file).expect("source key");
+        let raw_name = raw_name_for(&vault_root, &file).expect("raw name");
+        let local_path = momotaro_ingest::local_path_in(&workspace, &file).expect("local path");
+        let raw = fs::read(&file).expect("read back what we wrote");
+        let hash = revision_hash_reader(&mut raw.as_slice()).expect("hash");
+        store
+            .commit_source_file(
+                &NewSourceRevision {
+                    source_key: &source_key,
+                    revision_hash: &hash,
+                    kind: SourceKind::Attachment,
+                    title: None,
+                    uri: None,
+                    local_path: Some(&local_path),
+                    raw_name: Some(&raw_name),
+                    origin_class: OriginClass::Owner,
+                    // The fingerprint this revision holds is not the file's —
+                    // exactly the state the refresh branch exists for.
+                    metadata_json: "{}",
+                    ingested_at: 0,
+                },
+                &[],
+                &[],
+                None,
+                || Ok(()),
+            )
+            .expect("plant a revision");
+
+        let mut report = IndexReport {
+            batch_id: "b".to_owned(),
+            files_scanned: 0,
+            files_skipped: 0,
+            files_indexed: 0,
+            revisions_created: 0,
+            chunks_written: 0,
+            errors: Vec::new(),
+            duration_ms: 0,
+        };
+        let outcome = register_attachment(
+            &mut store,
+            &workspace,
+            &file,
+            &source_key,
+            &raw_name,
+            &mut report,
+            StatProbe {
+                last_written: i64::MAX,
+                coarse: false,
+            },
+            &ProcessMode::Batch,
+        )
+        .expect("register");
+
+        assert!(
+            outcome.as_str() == FileOutcome::METADATA_REFRESHED,
+            "same bytes, moved fingerprint: {outcome:?}"
+        );
+        assert_eq!(report.files_indexed, 1, "the refresh is an index hit");
+        assert_eq!(report.files_skipped, 0, "and not a skip");
+        assert_eq!(report.revisions_created, 0, "and no new revision");
+    }
+
+    /// `SearchHit.excerpt`'s contract is written on the field: the leading text
+    /// of the chunk, cut on a character boundary, ellipsized at 200. The only
+    /// assertion on it anywhere checked that it was *not empty* — which a
+    /// literal `"xyzzy"` passes, as does a hit with no cap at all.
+    #[test]
+    fn an_excerpt_is_the_leading_text_capped_at_two_hundred_characters() {
+        let short = "0123456789";
+        assert_eq!(
+            excerpt_of(short),
+            short,
+            "a short excerpt comes back whole, with nothing invented"
+        );
+
+        let long: String = "abcdefghij".repeat(40);
+        let cut = excerpt_of(&long);
+        assert!(
+            cut.starts_with(&long[..200]),
+            "the cap keeps the leading text, byte for byte"
+        );
+        assert!(cut.ends_with('\u{2026}'), "and marks the cut: {cut:?}");
+        assert_eq!(
+            cut.chars().count(),
+            201,
+            "200 characters and the ellipsis — not 199, not 200, not the lot"
+        );
+        assert!(
+            cut.chars().count() < long.chars().count(),
+            "a long chunk never rides whole into the payload"
+        );
+    }
+
     #[test]
     fn the_rebuild_joins_the_writer_and_retires_the_index_before_it_swaps() {
         // What this pins: dropping a writer is not joining it, so tantivy keeps
@@ -1156,6 +2071,17 @@ mod tests {
         assert!(
             source.contains(concat!("discard(&", "retired)?")),
             "a successful swap unlinks the retired index"
+        );
+        // And the half that runs when the swap *fails*: by this point `dir` has
+        // just been renamed away, so the rollback is `!dir.exists() &&
+        // retired.exists()`. Dropping the `!` reads `dir.exists()` — false by
+        // construction — and turns "put the live index back before reporting"
+        // into dead code, leaving the workspace with no live index at all.
+        // No fixture can fail that rename locally (the lens tried), so it is
+        // pinned the way `init_schema`'s order is.
+        assert!(
+            source.contains(concat!("if !dir.exists() && ", "retired.exists()")),
+            "a failed swap puts the live index back"
         );
     }
 
@@ -1201,8 +2127,10 @@ mod tests {
         // write sites are counted here too, with the same teeth — a call site
         // that drops a save, duplicates one, or hand-splices its own writes
         // moves these numbers. The counts are the current shape on purpose:
-        // `commit_run_llm_turn` is two because a failed exchange still lands
-        // its turn row.
+        // the two `commit_llm_finished` calls are the llm turn write sites (a
+        // failed exchange still lands its turn row), and the one
+        // `commit_run_llm_turn` is the helper the two sites share (P2-F5) —
+        // counted too, or a helper that dropped its save would be invisible.
         let source = include_str!("index_service.rs");
         let writes = concat!("store.commit_source", "_file(");
         let refresh = concat!("store.commit_source", "_refresh(");
@@ -1211,10 +2139,23 @@ mod tests {
             2,
             "both content write sites commit through the unit"
         );
+        // One now: the note's and the attachment's refresh are the same
+        // transaction shape and share `commit_refresh`, so the call is counted
+        // once. (`register_attachment` used to run `update_revision_fingerprint`
+        // as a bare autocommit UPDATE with no guard in the same transaction as
+        // its edges — D40 §4.7 promises the watcher one unit per file, kind or
+        // not — and the count of two was what caught that.)
         assert_eq!(
             source.matches(refresh).count(),
             1,
-            "the refresh write site commits through its unit too"
+            "the refresh write commits through its unit"
+        );
+        // Counted in the production half: the sibling needle below says the
+        // name in its own assertions, and this test reads the whole file.
+        assert_eq!(
+            production_half().matches("commit_refresh(").count(),
+            3,
+            "the shared helper, and the two passes that call it"
         );
 
         let ask_source = include_str!("ask.rs");
@@ -1227,11 +2168,18 @@ mod tests {
             (concat!("store.commit_run", "_start("), 1),
             (concat!("store.commit_run", "_retrieval("), 1),
             (concat!("store.commit_run", "_context("), 1),
-            (concat!("store.commit_run", "_llm_turn("), 2),
+            (concat!("commit_llm", "_finished(store"), 2),
+            (concat!(".commit_run_llm", "_turn("), 1),
             (concat!("store.commit_run", "_verifications("), 1),
             (concat!("store.commit_run", "_answer("), 1),
             (concat!("store.commit_run", "_terminal("), 1),
             (concat!("store.append_run", "_event("), 2),
+            // W3.11 added the session row as the ask module's tenth write
+            // site. It is a different family from the run units, so without
+            // this needle a hand-spliced `create_session` would move the
+            // count to zero and stay invisible — which is the exact hole the
+            // whole pin exists for.
+            (concat!("store.create", "_session("), 1),
         ] {
             assert_eq!(
                 ask.matches(needle).count(),
@@ -1245,14 +2193,14 @@ mod tests {
         // site added here is never seen — which is precisely how "the run
         // records a STARTED event" survived a mutation that deleted it.
         // The counts are the current shape on purpose: `commit_run_terminal`
-        // is two because a success and a named failure each land one, and
-        // `commit_run_llm_turn` is two because a failed exchange still lands
-        // its turn row.
+        // is two because a success and a named failure each land one, and the
+        // llm turn write sites run through the shared `commit_llm_finished`
+        // (two call sites here — see the ask module's note above).
         for (needle, expected) in [
             (concat!("store.commit_run", "_create("), 1),
             (concat!("store.commit_run", "_start("), 1),
             (concat!("store.commit_run", "_terminal("), 2),
-            (concat!("store.commit_run", "_llm_turn("), 2),
+            (concat!("crate::ask::commit_llm", "_finished("), 2),
             (concat!("store.commit_run", "_retrieval("), 1),
         ] {
             assert_eq!(
@@ -1337,7 +2285,7 @@ mod tests {
             Err(StoreError::InvalidSchemaVersion("x".to_owned()))
         })
         .expect_err("a refusal is an error");
-        let index = index_step("k", || Err(RetrieveError::IndexMissing("x".to_owned())))
+        let index = index_step("k", || Err(RetrieveError::SchemaMismatch("x".to_owned())))
             .expect_err("a refusal is an error");
         assert_ne!(store.kind, index.kind, "two resources, two kinds");
     }
@@ -1392,6 +2340,14 @@ mod tests {
             started.elapsed() >= Duration::from_millis(30),
             "each retry waits: a busy loop would return instantly"
         );
+        // …and it must *return*. The lower bound alone could not tell a backoff
+        // from a backoff that never ends: a schedule whose step shrinks to zero
+        // hangs here for minutes and the test is only "slow", not red.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the drain gives up instead of hanging: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -1439,6 +2395,14 @@ mod tests {
         .expect_err("a refusal that never clears is still a failure");
         assert_eq!(calls.get(), 50);
         assert!(started.elapsed() >= Duration::from_millis(900));
+        // Upper bound as well as lower: a `retry_delay` mutant that shrinks one
+        // step turns this into a 93–153 s hang that reads as "slow", not red.
+        // The budget is ~1 s; anything past ten is a loop that will not end.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the retry budget is a budget: {:?}",
+            started.elapsed()
+        );
     }
 
     fn store_with_one_event() -> (tempfile::TempDir, Store) {
@@ -1551,6 +2515,10 @@ mod tests {
             non_note_keys: &non_note,
             attributes_of: &|_| Ok(0),
             search_index: &index,
+            stat_probe: StatProbe {
+                last_written: i64::MAX,
+                coarse: false,
+            },
         };
         let mut claimed: HashMap<String, String> = HashMap::new();
         let mut report = IndexReport {
@@ -1670,17 +2638,652 @@ mod tests {
         );
         assert_eq!(
             verdict(true, true, None),
-            Gate::Proceed,
-            "a torn read belongs to the retry, not to this decision"
+            Gate::ForceRebuild,
+            "a comparison that could not run may not clear raciness: the pass re-reads"
         );
     }
-}
 
-pub(crate) fn now_epoch_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    /// The clock every audit column reads: `store_events.occurred_at` (ADR 0026
+    /// says that column *is* "when it happened") and
+    /// `source_revisions.ingested_at`, which `project_links` then copies into
+    /// `graph_links.created_at`. Nothing reads those back, so a reader that
+    /// answered a constant would date the whole log to 1970 unnoticed.
+    #[test]
+    fn the_audit_clock_reads_the_wall_clock() {
+        let now = momotaro_store::now_epoch_secs();
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs() as i64;
+        assert!(
+            (now - wall).abs() <= 5,
+            "{now} is not the wall clock {wall}"
+        );
+        assert!(
+            now > 1_600_000_000,
+            "nobody's audit log starts in 1970: {now}"
+        );
+    }
+
+    /// `FrontmatterParse::Json` is the second syntax ingest accepts (Obsidian's
+    /// JSON properties, `frontmatter.rs` says so) and both of its consumers live
+    /// here — the blob written to `metadata_json.frontmatter`, and the loss the
+    /// coverage row reports. Neither had a fixture, so the whole path could be
+    /// replaced by a constant or have its guard inverted with everything green.
+    #[test]
+    fn a_json_block_is_parsed_and_a_broken_one_is_a_loss() {
+        let ok = FrontmatterParse::Json(r#"{"tags": ["journal"], "publish": false}"#.to_owned());
+        let blob = frontmatter_json(&ok);
+        assert_eq!(blob["state"], "parsed", "{blob}");
+        assert_eq!(blob["source"], "json", "{blob}");
+        let fields = blob["fields"].as_array().expect("an object has fields");
+        assert_eq!(fields.len(), 2, "{blob}");
+        let field = |key: &str| {
+            fields
+                .iter()
+                .find(|entry| entry["key"] == key)
+                .unwrap_or_else(|| panic!("no {key} in {blob}"))
+        };
+        assert_eq!(field("tags")["value"]["list"][0], "journal", "{blob}");
+        assert_eq!(field("publish")["value"]["scalar"], "false", "{blob}");
+        assert!(
+            degradations_of(&ok).is_empty(),
+            "a block this build reads is not a loss: {:?}",
+            degradations_of(&ok)
+        );
+
+        // "A JSON block that does not read is the same loss as a YAML block
+        // that does not read" — the sentence the guard exists for.
+        let broken = FrontmatterParse::Json("{ not json".to_owned());
+        assert_eq!(
+            degradations_of(&broken),
+            vec![Degradation::FrontmatterParseError],
+            "an unreadable JSON block is reported like any other"
+        );
+    }
+
+    /// D40 §4.5 and §4.7 each name the batch shape that decides whether a row
+    /// gets written, and both say the same thing backwards: the watcher never
+    /// writes for a file it could not read, and `index` never writes for a file
+    /// a guard refused. Reproducing either needs a race — a file that moves
+    /// between two stats, or between the read and the commit — so the source is
+    /// what is pinned, counted in the production half so the tests' own copies
+    /// cannot answer for it.
+    #[test]
+    fn both_batch_gates_stay_inverted() {
+        let production = production_half();
+        assert_eq!(
+            production.matches("if !shape.gated").count(),
+            2,
+            "one per arm: Torn (§4.5) and Requeued (§4.7)"
+        );
+    }
+
+    /// D40 §4.7 is a promise about *files*, not about kinds: the guard is the
+    /// transaction's first step and a refusal rolls back into the retry queue.
+    /// The note path had it from the commit that introduced it;
+    /// `register_attachment` was written in that same commit with `|| Ok(())`
+    /// and `store_step`, so a refusal there became a `store` failure row — the
+    /// one shape `commit_step` exists to rule out.
+    ///
+    /// Neither half is drivable from a portable test: the file has to move
+    /// between the read and the commit, which no harness here can arrange. So
+    /// the source is what is pinned, and in the production half so this
+    /// module's own fixtures cannot answer for it.
+    #[test]
+    fn the_attachment_writes_carry_the_same_guard_as_a_note() {
+        let production = production_half();
+        // Three call sites, not four: the refresh commit is shared now, so
+        // both passes route one of their two units through `commit_refresh`
+        // and carry the guard there once.
+        assert_eq!(
+            production.matches("guard_against(file").count(),
+            3,
+            "the shared refresh commit, plus one write per pass"
+        );
+        assert_eq!(
+            production.matches("commit_refresh(").count(),
+            3,
+            "the definition, and the note and attachment passes"
+        );
+        assert!(
+            !production.contains("|| Ok(())"),
+            "no write site skips the transaction's first step any more"
+        );
+        assert_eq!(
+            production.matches("commit_step(").count(),
+            3,
+            "every write classifies a refusal as a refusal: the shared              refresh commit, plus one write per pass"
+        );
+        // D40 §4.3 is the same rule twice: a stat that matches on a racy or
+        // coarse filesystem is not evidence, so both passes drop the shortcut
+        // when the cheap pass told them to re-check the bytes.
+        assert_eq!(
+            production.matches("&& !forced(mode)").count(),
+            2,
+            "the note skip rule and the attachment skip rule"
+        );
+        assert!(
+            production.contains("Result<FileOutcome, PassError>"),
+            "the attachment pass can say 'requeue' instead of 'store error'"
+        );
+        assert!(
+            production.contains("PassOne::Requeued"),
+            "and pass_one turns that refusal into a requeue"
+        );
+    }
+
+    /// Puts a revision on the store exactly as `gate` will look for one — the
+    /// same `source_key_for` / `raw_name_for` / `local_path_in` answers and the
+    /// same fingerprint the stat carries — so the cheap pass reaches its content
+    /// branch instead of answering "no row" on the way past.
+    fn plant(
+        store: &mut Store,
+        workspace_root: &Path,
+        vault_root: &Path,
+        file: &Path,
+        kind: SourceKind,
+        revision_hash: &str,
+    ) {
+        let metadata = fs::metadata(file).expect("stat the file");
+        let source_key = source_key_for(vault_root, file).expect("source key");
+        let raw_name = raw_name_for(vault_root, file).expect("raw name");
+        let local_path = momotaro_ingest::local_path_in(workspace_root, file).expect("local path");
+        store
+            .commit_source_file(
+                &NewSourceRevision {
+                    source_key: &source_key,
+                    revision_hash,
+                    kind,
+                    title: None,
+                    uri: None,
+                    local_path: Some(&local_path),
+                    raw_name: Some(&raw_name),
+                    origin_class: OriginClass::Owner,
+                    metadata_json: &fingerprint_json(&metadata),
+                    ingested_at: 0,
+                },
+                &[],
+                &[],
+                None,
+                || Ok(()),
+            )
+            .expect("plant the revision");
+    }
+
+    /// `last_written = 0` makes every mtime racily clean (git's rule, and the
+    /// reason `is_racy` takes the boundary as an argument): it is the only way
+    /// a portable test reaches the content branch, which is otherwise behind a
+    /// coarse filesystem or a file rewritten in the store's own tick.
+    fn racy_gate(store: &Store, workspace_root: &Path, vault_root: &Path, file: &Path) -> Gate {
+        gate(store, workspace_root, vault_root, file, false, 0).expect("gate")
+    }
+
+    /// A file the Markdown pass refuses must reach the pass that writes its row,
+    /// not fail the batch the watcher is running. `normalize_markdown` answered
+    /// `InvalidUtf8` and `gate` used to hand it to `?`, which left `run_batch`
+    /// and took the whole watcher down with it — one bad `.md` and no file is
+    /// watched again.
+    /// `mark_index_pending` clears the fingerprint: after it runs, the next
+    /// stat match cannot skip the repair. (The wiring half — that a **failed
+    /// index write** is what owes this call — is counted in
+    /// `every_committed_but_unindexed_branch_owes_mark_index_pending_its_call`; this test
+    /// drives the helper itself, not a failing write.)
+    #[test]
+    fn mark_index_pending_clears_the_fingerprint() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("vault");
+        let workspace = momotaro_ingest::canonical_workspace_root(dir.path()).expect("canonical");
+        let canonical_vault = momotaro_ingest::canonical_workspace_root(&vault).expect("canonical");
+        let file = canonical_vault.join("note.md");
+        fs::write(&file, "# note\n").expect("write");
+        let mut store = Store::open(dir.path().join("momotaro.db")).expect("store");
+        store.init_schema().expect("schema");
+        let source_key = source_key_for(&canonical_vault, &file).expect("key");
+        plant(
+            &mut store,
+            &workspace,
+            &canonical_vault,
+            &file,
+            SourceKind::Note,
+            "hash",
+        );
+
+        mark_index_pending(&mut store, &source_key, "hash", "note.md", "note.md")
+            .expect("mark pending");
+        let metadata = store
+            .current_revision(&source_key)
+            .expect("read")
+            .expect("revision")
+            .metadata_json;
+        assert_eq!(metadata, "{}", "the next stat match cannot skip the repair");
+    }
+
+    /// The wiring half of `mark_index_pending_clears_the_fingerprint`: the
+    /// helper is only the effect — the calls that owe it are the failed
+    /// `upsert_source` arms, **one per branch** that commits store rows first
+    /// and the index second (D40's two-step file transaction). Two such
+    /// branches exist: the content path, and the same-bytes refresh path
+    /// (which is also the repair path for a prior run that failed here). A
+    /// per-branch obligation is what this pins — not "exactly one call site",
+    /// which would have made the second call a red and the missing one a
+    /// green. Counted on the same precedent as the store-write needles above;
+    /// the needle is a split concat out of habit — production_half() already cuts the tests module, so the split is not what keeps this test from being its own hit.
+    #[test]
+    fn every_committed_but_unindexed_branch_owes_mark_index_pending_its_call() {
+        let source = production_half();
+        // The needle stops at the open paren on purpose: rustfmt wraps a long
+        // argument list, so `…(store` would stop matching the moment the call
+        // is split across lines — a formatting change would then be a red.
+        let needle = concat!("mark_index", "_pending(");
+        let arm = "if let Err(error) = index_step(";
+        assert_eq!(
+            source.matches(arm).count(),
+            2,
+            "the content path and the same-bytes refresh path — a third \
+             branch that commits store rows without indexing must join the count"
+        );
+        let calls =
+            source.matches(needle).count() - source.matches("fn mark_index_pending(").count();
+        assert_eq!(
+            calls, 2,
+            "one call per branch, and no more: an extra one on a success path \
+             is a second false invariant, not a backstop"
+        );
+        // …and each call sits in a failure arm. Deleting one is not the only
+        // regression — moving it into the happy path (a refactor that 'cleans
+        // up' the error arm) owes a red too.
+        //
+        // The **argument** is pinned as well as the call: passing the wrong
+        // revision hash makes `update_revision_fingerprint` answer
+        // `RevisionMissing` and leave the stale fingerprint in place, which
+        // is the very omission this backstop exists to prevent. Both arms
+        // pass a hash, and each known spelling appears exactly once — the
+        // refresh arm the revision it just committed, the content arm the
+        // hash it just chunked. (Order-independent on purpose.)
+        let mut rest = source.as_str();
+        let mut hashes = Vec::new();
+        for _ in 0..2 {
+            let (_, tail) = rest
+                .split_once(arm)
+                .expect("the index write's failure branch exists");
+            let branch = &tail[..tail
+                .find("return Err(PassError::File")
+                .expect("the branch ends by returning the file error")];
+            assert_eq!(
+                branch.matches(needle).count(),
+                1,
+                "the one call belongs to the failure branch, not the success path"
+            );
+            hashes.push(branch);
+            rest = tail;
+        }
+        let arm_text = hashes.concat();
+        for expected in ["&revision.revision_hash", "&hash"] {
+            assert_eq!(
+                arm_text.matches(expected).count(),
+                1,
+                "{expected} is passed exactly once across the two failure arms: {arm_text}"
+            );
+        }
+    }
+
+    /// D40 §4.3's predicate matrix: a matched stat can vouch only outside
+    /// the racy window and off a coarse volume. The window's `>=` is git's
+    /// whole test — a file whose mtime lands **on** the store's write moment
+    /// is exactly the one a same-tick rewrite can hide behind.
+    #[test]
+    fn a_matched_stat_can_vouch_only_outside_the_window_and_off_coarse_volumes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("note.md");
+        fs::write(&path, "# note\n").expect("write");
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100))
+            .expect("pin the mtime");
+        let metadata = fs::metadata(&path).expect("stat");
+
+        // mtime == last_written: on the boundary, racy (git's `>=`).
+        assert!(
+            !StatProbe {
+                last_written: 100,
+                coarse: false,
+            }
+            .stat_can_vouch(&metadata)
+        );
+        // Window open below the boundary: the store wrote after the file.
+        assert!(
+            StatProbe {
+                last_written: 101,
+                coarse: false,
+            }
+            .stat_can_vouch(&metadata)
+        );
+        // A coarse volume erases the stat either way.
+        assert!(
+            !StatProbe {
+                last_written: 101,
+                coarse: true,
+            }
+            .stat_can_vouch(&metadata)
+        );
+    }
+
+    /// The `process_file` skip owes the same question as `gate`: Batch used
+    /// to skip on a matched fingerprint alone, and a same-tick rewrite kept
+    /// its stat while its bytes changed. Driven through `pass_one` in Batch
+    /// shape (the shape that had no compensation at all).
+    #[test]
+    fn a_matched_fingerprint_inside_the_racy_window_reaches_the_content_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("vault");
+        let file = vault.join("note.md");
+        fs::write(&file, "# note\n").expect("write");
+        let mut store = Store::open(dir.path().join("momotaro.db")).expect("store");
+        store.init_schema().expect("schema");
+        let workspace = momotaro_ingest::canonical_workspace_root(dir.path()).expect("canonical");
+        let canonical_vault = momotaro_ingest::canonical_workspace_root(&vault).expect("canonical");
+        let file = canonical_vault.join("note.md");
+        plant(
+            &mut store,
+            &workspace,
+            &canonical_vault,
+            &file,
+            SourceKind::Note,
+            "hash",
+        );
+        let index = SearchIndex::open_or_create(&dir.path().join("index")).expect("index");
+        let mut writer = index.writer(WRITER_HEAP_BYTES).expect("writer");
+        let policy = IndexPolicy::default();
+        let ns = Namespace::new(std::iter::empty());
+        let non_note: HashSet<String> = HashSet::new();
+
+        // Racy: the planted fingerprint matches, but the window is open
+        // (`last_written = 0` vouches for nothing) — the content path runs
+        // and the fake revision hash is rebuilt. The skip is what must not
+        // happen.
+        let ctx = PassContext {
+            vault_root: &canonical_vault,
+            workspace_root: &workspace,
+            policy: &policy,
+            ns: &ns,
+            non_note_keys: &non_note,
+            attributes_of: &|_| Ok(0),
+            search_index: &index,
+            stat_probe: StatProbe {
+                last_written: 0,
+                coarse: false,
+            },
+        };
+        let mut claimed = HashMap::new();
+        let mut report = IndexReport {
+            batch_id: String::new(),
+            files_scanned: 1,
+            files_skipped: 0,
+            files_indexed: 0,
+            revisions_created: 0,
+            chunks_written: 0,
+            errors: Vec::new(),
+            duration_ms: 0,
+        };
+        let passed = pass_one(
+            VaultFileKind::Note,
+            &file,
+            &ctx,
+            &mut claimed,
+            &mut store,
+            &mut writer,
+            &mut report,
+            ProcessMode::Batch,
+        );
+        assert!(
+            matches!(passed, Ok(PassOne::Done { outcome: Ok(_), .. })),
+            "the content path answers, not the skip"
+        );
+        assert_eq!(report.files_skipped, 0, "racy: no cheap skip");
+        drop(writer);
+
+        // Control: the same file with a probe that can vouch skips.
+        let mut writer = index.writer(WRITER_HEAP_BYTES).expect("writer");
+        let mut claimed = HashMap::new();
+        let ctx = PassContext {
+            vault_root: &canonical_vault,
+            workspace_root: &workspace,
+            policy: &policy,
+            ns: &ns,
+            non_note_keys: &non_note,
+            attributes_of: &|_| Ok(0),
+            search_index: &index,
+            stat_probe: StatProbe {
+                last_written: i64::MAX,
+                coarse: false,
+            },
+        };
+        let mut report = IndexReport {
+            batch_id: String::new(),
+            files_scanned: 1,
+            files_skipped: 0,
+            files_indexed: 0,
+            revisions_created: 0,
+            chunks_written: 0,
+            errors: Vec::new(),
+            duration_ms: 0,
+        };
+        let passed = pass_one(
+            VaultFileKind::Note,
+            &file,
+            &ctx,
+            &mut claimed,
+            &mut store,
+            &mut writer,
+            &mut report,
+            ProcessMode::Batch,
+        );
+        let _ = passed;
+        assert_eq!(report.files_skipped, 1, "a stat that can vouch skips");
+    }
+
+    /// The attachment skip owes the same question (its comment always claimed
+    /// it): a matched fingerprint inside the racy window goes to the content
+    /// path, where the raw-bytes hash decides.
+    #[test]
+    fn a_racy_matched_stat_never_reaches_the_attachment_skip() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("vault");
+        fs::write(vault.join("pic.png"), [0x89, b'P', b'N', b'G']).expect("write");
+        let mut store = Store::open(dir.path().join("momotaro.db")).expect("store");
+        store.init_schema().expect("schema");
+        let workspace = momotaro_ingest::canonical_workspace_root(dir.path()).expect("canonical");
+        let canonical_vault = momotaro_ingest::canonical_workspace_root(&vault).expect("canonical");
+        let file = canonical_vault.join("pic.png");
+        let source_key = source_key_for(&canonical_vault, &file).expect("key");
+        let raw_name = raw_name_for(&canonical_vault, &file).expect("name");
+        plant(
+            &mut store,
+            &workspace,
+            &canonical_vault,
+            &file,
+            SourceKind::Attachment,
+            "hash",
+        );
+        let mut report = IndexReport {
+            batch_id: String::new(),
+            files_scanned: 1,
+            files_skipped: 0,
+            files_indexed: 0,
+            revisions_created: 0,
+            chunks_written: 0,
+            errors: Vec::new(),
+            duration_ms: 0,
+        };
+        register_attachment(
+            &mut store,
+            &workspace,
+            &file,
+            &source_key,
+            &raw_name,
+            &mut report,
+            StatProbe {
+                last_written: 0,
+                coarse: false,
+            },
+            &ProcessMode::Batch,
+        )
+        .expect("register");
+        assert_eq!(report.files_skipped, 0, "racy: no cheap skip");
+
+        let mut report = IndexReport {
+            batch_id: String::new(),
+            files_scanned: 1,
+            files_skipped: 0,
+            files_indexed: 0,
+            revisions_created: 0,
+            chunks_written: 0,
+            errors: Vec::new(),
+            duration_ms: 0,
+        };
+        register_attachment(
+            &mut store,
+            &workspace,
+            &file,
+            &source_key,
+            &raw_name,
+            &mut report,
+            StatProbe {
+                last_written: i64::MAX,
+                coarse: false,
+            },
+            &ProcessMode::Batch,
+        )
+        .expect("register");
+        assert_eq!(report.files_skipped, 1, "a stat that can vouch skips");
+    }
+
+    #[test]
+    fn a_file_the_markdown_pass_refuses_does_not_take_the_batch_with_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("vault");
+        let workspace = momotaro_ingest::canonical_workspace_root(dir.path()).expect("canonical");
+        let vault_root = momotaro_ingest::canonical_workspace_root(&vault).expect("canonical");
+        let file = vault_root.join("binary.md");
+        fs::write(&file, [0xff, 0xfe, 0x00, 0x41]).expect("write bytes");
+
+        let mut store = Store::open(dir.path().join("momotaro.db")).expect("store");
+        store.init_schema().expect("schema");
+        plant(
+            &mut store,
+            &workspace,
+            &vault_root,
+            &file,
+            SourceKind::Note,
+            "planted",
+        );
+
+        assert_eq!(
+            racy_gate(&store, &workspace, &vault_root, &file),
+            Gate::ForceRebuild,
+            "the comparison could not run, so the file goes to the pass that reads it and writes its row"
+        );
+    }
+
+    /// The name half of the same rule: a path the gate cannot derive a key
+    /// for — here a stat-reachable file outside the vault, the portable
+    /// stand-in for the non-UTF-8 name and the resolving-out symlink — is
+    /// `ForceRebuild`, not an error. `?` here used to end `run_batch` and
+    /// take the watcher down; the pass writes the per-row failure instead.
+    #[test]
+    fn a_path_the_gate_cannot_name_is_forced_not_raised() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("vault");
+        let workspace = momotaro_ingest::canonical_workspace_root(dir.path()).expect("canonical");
+        let vault_root = momotaro_ingest::canonical_workspace_root(&vault).expect("canonical");
+        let outside = dir.path().join("outside.md");
+        fs::write(&outside, "# outside\n").expect("write");
+
+        let mut store = Store::open(dir.path().join("momotaro.db")).expect("store");
+        store.init_schema().expect("schema");
+
+        assert_eq!(
+            gate(&store, &workspace, &vault_root, &outside, false, 0).expect("no error"),
+            Gate::ForceRebuild,
+            "an unnameable path goes to the pass, which writes its row"
+        );
+    }
+
+    /// Which hash the cheap pass compares is the stored kind's to say. An
+    /// attachment's column is over its raw bytes, so a CRLF file reads back
+    /// equal there and *unequal* through Markdown's normalisation — and the
+    /// unequal answer would force a rebuild for a file that never changed.
+    #[test]
+    fn the_gate_compares_an_attachment_against_its_own_bytes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("vault");
+        let workspace = momotaro_ingest::canonical_workspace_root(dir.path()).expect("canonical");
+        let vault_root = momotaro_ingest::canonical_workspace_root(&vault).expect("canonical");
+        let file = vault_root.join("readme.txt");
+        fs::write(&file, b"line one\r\nline two\r\n").expect("write bytes");
+
+        let mut store = Store::open(dir.path().join("momotaro.db")).expect("store");
+        store.init_schema().expect("schema");
+        let raw = fs::read(&file).expect("read the bytes we wrote");
+        let hash = revision_hash_reader(&mut raw.as_slice()).expect("hash");
+        plant(
+            &mut store,
+            &workspace,
+            &vault_root,
+            &file,
+            SourceKind::Attachment,
+            &hash,
+        );
+
+        assert_eq!(
+            racy_gate(&store, &workspace, &vault_root, &file),
+            Gate::Proceed,
+            "the raw bytes are the ones the column holds, so the event was false"
+        );
+    }
+
+    /// The same fixture the other way round: a note's column is over its
+    /// normalized text, and comparing it as raw bytes would call a clean file
+    /// changed and force a rebuild on every racy event.
+    #[test]
+    fn the_gate_compares_a_note_against_its_normalized_text() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).expect("vault");
+        let workspace = momotaro_ingest::canonical_workspace_root(dir.path()).expect("canonical");
+        let vault_root = momotaro_ingest::canonical_workspace_root(&vault).expect("canonical");
+        let file = vault_root.join("crlf.md");
+        fs::write(&file, "# H\r\n\r\nbody\r\n").expect("write bytes");
+
+        let mut store = Store::open(dir.path().join("momotaro.db")).expect("store");
+        store.init_schema().expect("schema");
+        let raw = fs::read(&file).expect("read the bytes we wrote");
+        let normalized = normalize_markdown(&raw).expect("utf-8 and markdown");
+        let hash = revision_hash(&normalized);
+        plant(
+            &mut store,
+            &workspace,
+            &vault_root,
+            &file,
+            SourceKind::Note,
+            &hash,
+        );
+
+        assert_eq!(
+            racy_gate(&store, &workspace, &vault_root, &file),
+            Gate::Proceed,
+            "the normalized text is the one the column holds, so the event was false"
+        );
+    }
 }
 
 /// File mtime as epoch milliseconds; 0 when the clock cannot report it.
@@ -1761,13 +3364,6 @@ fn revision_metadata(
     blob.to_string()
 }
 
-/// The block's JSON form, built here rather than in `momotaro-ingest` so the
-/// parser crate stays free of a JSON dependency on its production path.
-///
-/// Tagged and self-describing on purpose: a reader of the blob must be able to
-/// tell "there was no block" from "the block could not be read" from "here are
-/// the fields" without guessing, and the failure keeps its raw text and line so
-/// a later pass can retry the parse (`frontmatter_parse_error`).
 /// Reads a JSON property block into the same field shape a YAML block produces.
 ///
 /// `None` is "this build could not read it", not "it was empty". Values mirror the
@@ -1808,6 +3404,13 @@ fn json_frontmatter(raw: &str) -> Option<Vec<serde_json::Value>> {
     )
 }
 
+/// The block's JSON form, built here rather than in `momotaro-ingest` so the
+/// parser crate stays free of a JSON dependency on its production path.
+///
+/// Tagged and self-describing on purpose: a reader of the blob must be able to
+/// tell "there was no block" from "the block could not be read" from "here are
+/// the fields" without guessing, and the failure keeps its raw text and line so
+/// a later pass can retry the parse (`frontmatter_parse_error`).
 fn frontmatter_json(parse: &FrontmatterParse) -> serde_json::Value {
     match parse {
         FrontmatterParse::Absent => serde_json::json!({ "state": "absent" }),
@@ -1965,7 +3568,7 @@ fn payload_json(payload: &RowPayload<'_>) -> String {
 /// its message is the very string the report carries. No call site re-types
 /// either, the row cannot disagree with the report, and no clone is needed to
 /// keep them equal.
-// Ten arguments, the same count as before the warnings landed: the three code
+// Nine arguments, the same count as before the warnings landed: the three code
 // lists ride the one `RowPayload` bundle (one more explicit list would have
 // made twelve). The wider context struct a review measured was +22 lines and
 // fixed nothing; the rule this function exists for is one home per rendering,
@@ -2096,6 +3699,21 @@ fn index_step(
     step().map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Index, error))
 }
 
+/// Marks a committed revision so its next stat comparison cannot skip the
+/// failed index write. This is the store-side backstop for D40's two-step file
+/// transaction: store rows commit first, the index commits second.
+fn mark_index_pending(
+    store: &mut Store,
+    source_key: &str,
+    revision_hash: &str,
+    local_path: &str,
+    raw_name: &str,
+) -> Result<(), IndexFileError> {
+    store_step(source_key, || {
+        store.update_revision_fingerprint(source_key, revision_hash, "{}", local_path, raw_name)
+    })
+}
+
 fn file_error(
     source_key: Option<&str>,
     kind: IndexFileErrorKind,
@@ -2131,7 +3749,7 @@ pub fn index_workspace(
 /// passes `momotaro_ingest::attributes_of` (the real attribute word on
 /// Windows, a constant zero elsewhere), and the tests inject facts to drive
 /// what no machine here can build.
-pub fn index_workspace_with(
+pub(crate) fn index_workspace_with(
     root: impl AsRef<Path>,
     path_override: Option<&Path>,
     attributes_of: impl Fn(&Path) -> io::Result<u32>,
@@ -2145,6 +3763,70 @@ pub fn index_workspace_with(
     .report)
 }
 
+/// The link-resolution namespace and the non-note key set from one walked
+/// batch (§5 第 3 条 / §5 第 4 条): keys ride the walk's own order here, and
+/// resolution never depends on that order because the namespace is complete
+/// before any file is processed.
+fn build_namespace(
+    vault_root: &Path,
+    entries: &[momotaro_ingest::VaultEntry],
+) -> (Vec<(String, String)>, HashSet<String>) {
+    let mut namespace_pairs: Vec<(String, String)> = Vec::new();
+    // Attachment and canvas keys ride the same pass, for the anchor carve-out
+    // (§5 第 4 条): a fragment on such a target is not an anchor — a PDF page
+    // number, a canvas subpath, neither is a heading.
+    let mut non_note_keys: HashSet<String> = HashSet::new();
+    for entry in entries {
+        let Ok(key) = source_key_for(vault_root, &entry.path) else {
+            continue;
+        };
+        let tail = key.strip_prefix("note:").unwrap_or(&key).to_owned();
+        namespace_pairs.push((tail, key.clone()));
+        if matches!(
+            entry.kind,
+            VaultFileKind::Attachment | VaultFileKind::Canvas
+        ) {
+            non_note_keys.insert(key);
+        }
+    }
+    (namespace_pairs, non_note_keys)
+}
+
+/// Deletions, at vault scale (D40 §4.2's delete half): a key the walk no
+/// longer names becomes a skipped row. A walk that did not cover the whole
+/// vault cannot say what is absent — `index --vault sub` names fewer files on
+/// purpose, and every source outside the override would look deleted.
+fn collect_removals(
+    store: &Store,
+    keep_keys: &HashSet<&str>,
+    whole_vault: bool,
+) -> Result<Vec<PendingRow>, RunError> {
+    let mut removals: Vec<PendingRow> = Vec::new();
+    if !whole_vault {
+        return Ok(removals);
+    }
+    for (key, raw_name, _ingested_at) in store.current_sources()? {
+        if keep_keys.contains(key.as_str()) {
+            continue;
+        }
+        // The row is attributed by name, and a row written before `raw_name`
+        // existed has none: fall back to the key's own spelling, which is the
+        // vault-relative path of the file that is no longer there.
+        let raw_name = raw_name.or_else(|| key.strip_prefix("note:").map(str::to_owned));
+        removals.push(PendingRow {
+            source_key: Some(key),
+            raw_name,
+            outcome: Ok(FileOutcome::skipped(
+                Vec::new(),
+                vec![Warning::SourceRemoved],
+            )),
+            replace_rows: None,
+            anchors: Vec::new(),
+            ambiguous: Vec::new(),
+        });
+    }
+    Ok(removals)
+}
 /// The batch loop, with the event family it writes injected (D40 §4.4).
 ///
 /// `index` hands it a full [`BatchShape`] over [`INGEST_PLAN`]; the four
@@ -2182,6 +3864,22 @@ pub(crate) fn run_batch(
     if !vault_root.is_dir() {
         return Err(RunError::VaultMissing { path: vault_root });
     }
+    // The delete half and the edge prune are whole-vault questions (D40 §4.2):
+    // a narrowed walk (`index --vault sub`) names fewer files on purpose and
+    // cannot speak for keys outside it. An override that names the vault root
+    // itself IS a whole-vault walk — `usage.md`'s `momotaro index <path>`
+    // example is exactly that call — so it takes the same route as the
+    // no-override run. Both directions of `is_within` are the equality the
+    // containment contract knows: the helper canonicalizes both sides, which
+    // a lexical compare would not (symlinks, `..`, spellings).
+    let whole_vault = match path_override {
+        None => true,
+        Some(_) => {
+            let configured = vault_scope(root, &config)?.root;
+            momotaro_ingest::is_within(&vault_root, &configured)?
+                && momotaro_ingest::is_within(&configured, &vault_root)?
+        }
+    };
     // This command only adds files the store has not seen, so it cannot repair a
     // missing or unreadable index: failing here, with the command that can, beats
     // reporting "0 of 5 files indexed" while the workspace still cannot be
@@ -2197,8 +3895,12 @@ pub(crate) fn run_batch(
     let policy = &config.index;
     validate_policy(policy)?;
 
-    let mut store = Store::open(database_path(root))?;
-    store.init_schema()?;
+    // The guard the run-side entries share (`open_run_store`): an
+    // uninitialized workspace gets the advice sentence, not SQLite's raw
+    // "unable to open database file" — `.momotaro` does not exist yet, so
+    // there is not even a file for SQLite to create. This is where `index`,
+    // `reconcile` and the watcher's startup pass all meet.
+    let mut store = crate::open_run_store(root)?;
 
     let entries = walk_entries(&vault_root)?;
 
@@ -2206,24 +3908,7 @@ pub(crate) fn run_batch(
     // path that has a key, keyed by its vault-relative tail. Built before any
     // processing so resolution never depends on walk order — a link to a file
     // processed later resolves exactly like one processed earlier.
-    let mut namespace_pairs: Vec<(String, String)> = Vec::new();
-    // Attachment and canvas keys ride the same pass, for the anchor carve-out
-    // (§5 第 4 条): a fragment on such a target is not an anchor — a PDF page
-    // number, a canvas subpath, neither is a heading.
-    let mut non_note_keys: HashSet<String> = HashSet::new();
-    for entry in &entries {
-        let Ok(key) = source_key_for(&vault_root, &entry.path) else {
-            continue;
-        };
-        let tail = key.strip_prefix("note:").unwrap_or(&key).to_owned();
-        namespace_pairs.push((tail, key.clone()));
-        if matches!(
-            entry.kind,
-            VaultFileKind::Attachment | VaultFileKind::Canvas
-        ) {
-            non_note_keys.insert(key);
-        }
-    }
+    let (namespace_pairs, non_note_keys) = build_namespace(&vault_root, &entries);
 
     let mut batch = Batch::new(shape.plan);
 
@@ -2241,20 +3926,25 @@ pub(crate) fn run_batch(
     // D40 §4.2: a watcher's path is a hint, not a fact. The cheap pass runs
     // *before* the batch opens, so a false event costs one stat and writes
     // nothing at all — not even `started`.
+    //
+    // D40 §4.3: both answers are about the volume and the batch, not about
+    // the file: read them once for the whole loop, for **both** shapes — the
+    // pass-side skips consult the same probe, and a Batch that never read it
+    // trusted a matched fingerprint no matter how racy.
+    let stat_probe = StatProbe {
+        last_written: last_written(&store),
+        coarse: momotaro_platform::volume_info(&vault_root).coarse == Some(true),
+    };
     let mut forced: HashMap<PathBuf, bool> = HashMap::new();
     if shape.gated {
-        // Both answers are about the volume and the batch, not about the file:
-        // read them once for the whole loop (D40 §4.3).
-        let coarse = momotaro_platform::volume_info(&vault_root).coarse == Some(true);
-        let last_written = last_written(&store);
         for path in shape.only.iter().flatten() {
             match gate(
                 &store,
                 &workspace_root,
                 &vault_root,
                 path,
-                coarse,
-                last_written,
+                stat_probe.coarse,
+                stat_probe.last_written,
             )? {
                 Gate::Drop | Gate::Absent => {}
                 Gate::ForceRebuild => {
@@ -2277,42 +3967,19 @@ pub(crate) fn run_batch(
         report.files_scanned = forced.len() as u64;
     }
 
-    // Deletions, at vault scale (D40 §4.2's delete half): a key the walk no
-    // longer names. The row cannot repeat, because the demotion that goes with
-    // it takes the key out of `current_sources` — and a file that comes back
-    // becomes current again, so its *next* disappearance is a new fact.
     let keep_keys: HashSet<&str> = namespace_pairs
         .iter()
         .map(|(_, key)| key.as_str())
         .collect();
-    // A walk that did not cover the whole vault cannot say what is absent:
-    // `index --vault sub` names fewer files on purpose, and every source
-    // outside the override would look deleted. Absence is a whole-vault
-    // question, so a narrowed walk leaves it alone.
-    let mut removals: Vec<PendingRow> = Vec::new();
-    if path_override.is_none() {
-        for (key, raw_name, _ingested_at) in store.current_sources()? {
-            if keep_keys.contains(key.as_str()) {
-                continue;
-            }
-            // The row is attributed by name, and a row written before
-            // `raw_name` existed has none: fall back to the key's own spelling,
-            // which is the vault-relative path of the file that is no longer
-            // there.
-            let raw_name = raw_name.or_else(|| key.strip_prefix("note:").map(str::to_owned));
-            removals.push(PendingRow {
-                source_key: Some(key),
-                raw_name,
-                outcome: Ok(FileOutcome::Skipped {
-                    degradations: Vec::new(),
-                    warnings: vec![Warning::SourceRemoved],
-                }),
-                replace_rows: None,
-                anchors: Vec::new(),
-                ambiguous: Vec::new(),
-            });
-        }
-    }
+    let removals = collect_removals(&store, &keep_keys, whole_vault)?;
+    // A removal is a row like any other, so it counts where rows are counted
+    // (ADR 0026: "the rows are the breakdown"). It is also a file this batch
+    // accounted for: without the pair below, `doctor --coverage` counted a
+    // `skipped` row that the `ingest.finished` payload did not — same batch,
+    // two answers — and the summary line read "N of M" with M one short of the
+    // rows it went on to list.
+    report.files_scanned += removals.len() as u64;
+    report.files_skipped += removals.len() as u64;
 
     if shape.gated && forced.is_empty() && removals.is_empty() {
         report.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -2335,7 +4002,7 @@ pub(crate) fn run_batch(
     // still unrecorded.
     let seq = batch.next_seq();
     store.append_store_event(&NewStoreEvent {
-        occurred_at: now_epoch_secs(),
+        occurred_at: momotaro_store::now_epoch_secs(),
         batch_id: &batch.id,
         seq,
         domain: batch.plan.domain,
@@ -2344,7 +4011,11 @@ pub(crate) fn run_batch(
         outcome: None,
         reason_code: None,
         message: None,
-        data_json: &serde_json::json!({ "files_scanned": report.files_scanned }).to_string(),
+        // No `files_scanned` here. This event's only promise is "a batch is
+        // running" (ADR 0026); the counts live on `ingest.finished`, where
+        // `summarize_coverage` reads them. An announced count on the *started*
+        // row was written by one side and read by none.
+        data_json: "{}",
         external_id: None,
     })?;
 
@@ -2358,7 +4029,7 @@ pub(crate) fn run_batch(
     let mut claimed: HashMap<String, String> = HashMap::new();
     // Coverage rows are written after the data batch (ADR 0026: data first,
     // events after): `stale_anchor` is decided against the state every file
-    // left behind, never against walk order (§5 第 4 条) — in both shapes.
+    // left behind, never against walk order (§4 第 7 条) — in both shapes.
     // The two halves of a removal land in one batch but in a safe order: the
     // index delete is queued here and made durable at the writer's commit, and
     // the demotion waits until after the coverage rows (the tail below) — a
@@ -2383,6 +4054,7 @@ pub(crate) fn run_batch(
         non_note_keys: &non_note_keys,
         attributes_of: &attributes_of,
         search_index: &search_index,
+        stat_probe,
     };
 
     for entry in entries {
@@ -2510,16 +4182,16 @@ pub(crate) fn run_batch(
     let keep_json = serde_json::to_string(&keep).expect("keys serialize");
     // A narrowed walk (`index --vault sub`) names only part of the vault, so
     // its namespace is not the vault's truth: like the absence detection
-    // above, the prune runs on a full walk only. A narrowed run leaves every
-    // out-of-tree row alone — a rebuild reproduces all of them.
-    if path_override.is_none() {
+    // above, the prune runs on a whole-vault walk only. A narrowed run leaves
+    // every out-of-tree row alone — a rebuild reproduces all of them.
+    if whole_vault {
         store.prune_graph_edges_outside(&keep_json)?;
     }
     let (graph_rows, graph_dangling) = store.graph_counts()?;
 
     // The event sweep: every file's data — chunks, blobs, rows — is settled, so
     // an anchor check sees the run's final state and the codes cannot depend on
-    // walk order (§5 第 4 条). Data first, events after (ADR 0026).
+    // walk order (§4 第 7 条). Data first, events after (ADR 0026).
     let mut graph_ambiguous = 0u64;
     let mut graph_stale = 0u64;
     for row in pending {
@@ -2539,7 +4211,7 @@ pub(crate) fn run_batch(
 
     let seq = batch.next_seq();
     store.append_store_event(&NewStoreEvent {
-        occurred_at: now_epoch_secs(),
+        occurred_at: momotaro_store::now_epoch_secs(),
         batch_id: &batch.id,
         seq,
         domain: batch.plan.domain,
@@ -2595,7 +4267,7 @@ fn coverage_event<'a>(
     data_json: &'a str,
 ) -> NewStoreEvent<'a> {
     NewStoreEvent {
-        occurred_at: now_epoch_secs(),
+        occurred_at: momotaro_store::now_epoch_secs(),
         batch_id: &batch.id,
         seq,
         domain: batch.plan.domain,
@@ -2614,97 +4286,116 @@ fn coverage_event<'a>(
 /// `Clone` because a watcher row is built from the outcome *and* returned to
 /// its caller, and building the same outcome twice would let the two disagree.
 #[derive(Debug, Clone)]
-pub(crate) enum FileOutcome {
-    /// Nothing was read: the fingerprint, stored path and raw name all match, or
-    /// the file is a link the index does not follow, an eviction stub it does not
-    /// read, or a placeholder whose bytes are not on this device. `degradations`
-    /// and `warnings` carry what that decision cost the file, so a link's row
-    /// says why it is not searchable.
-    Skipped {
-        degradations: Vec<Degradation>,
-        warnings: Vec<Warning>,
-    },
-    /// Same bytes under a new path or spelling: the mutable columns moved. The
-    /// list is re-derived on this path too, or a file whose block cannot be read
-    /// would read as clean here (§5 第 8 条).
-    MetadataRefreshed {
-        degradations: Vec<Degradation>,
-        warnings: Vec<Warning>,
-    },
-    /// A revision and its chunks were written. `degradations` carries whatever the
-    /// file lost on the way in, in the enum's declaration order — the file *was*
-    /// indexed, so the outcome stays `indexed` and the codes ride alongside it. A
-    /// file can lose several things at once (§5 第 8 条), so it is a list: the row's
-    /// `reason_code` is its first element and its `data_json` carries all of it.
-    Indexed {
-        degradations: Vec<Degradation>,
-        warnings: Vec<Warning>,
-    },
+pub(crate) struct FileOutcome {
+    kind: FileOutcomeKind,
+    degradations: Vec<Degradation>,
+    warnings: Vec<Warning>,
+}
+
+/// The outcome word `store_events.outcome` carries (ADR 0026) — the one axis
+/// production branches on. The payloads were identical across the three enum
+/// variants and nothing matched on them (probe P2-F2), so they are a kind
+/// field instead of three struct variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileOutcomeKind {
+    /// Nothing was read: the fingerprint, stored path and raw name all match,
+    /// or the file is a link the index does not follow, an eviction stub it
+    /// does not read, or a placeholder whose bytes are not on this device.
+    /// `degradations` and `warnings` carry what that decision cost the file,
+    /// so a link's row says why it is not searchable.
+    Skipped,
+    /// Same bytes under a new path or spelling: the mutable columns moved.
+    /// The lists are re-derived on this path too, or a file whose block cannot
+    /// be read would read as clean here (§5 第 8 条).
+    MetadataRefreshed,
+    /// A revision and its chunks were written. `degradations` carries whatever
+    /// the file lost on the way in, in the enum's declaration order — the file
+    /// *was* indexed, so the outcome stays `indexed` and the codes ride
+    /// alongside it.
+    Indexed,
+}
+
+impl FileOutcomeKind {
+    /// The wire spelling written to `store_events.outcome` (ADR 0026).
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => FileOutcome::SKIPPED,
+            Self::MetadataRefreshed => FileOutcome::METADATA_REFRESHED,
+            Self::Indexed => FileOutcome::INDEXED,
+        }
+    }
 }
 
 impl FileOutcome {
     /// The wire spelling of the `indexed` outcome. A reader that only needs the
-    /// word compares against this; the variant itself carries the degradation
-    /// code beside the outcome.
+    /// word compares against this; the kind carries the degradation code beside
+    /// the outcome.
     const INDEXED: &'static str = "indexed";
 
     /// The wire spelling of the `metadata_refreshed` outcome, for the same reason
-    /// the indexed one exists: a struct variant is not a value to compare against.
+    /// the indexed one exists: a kind is not a value to compare against.
     const METADATA_REFRESHED: &'static str = "metadata_refreshed";
 
     /// The wire spelling of `skipped`, for the same reason again.
     const SKIPPED: &'static str = "skipped";
 
+    fn skipped(degradations: Vec<Degradation>, warnings: Vec<Warning>) -> Self {
+        Self {
+            kind: FileOutcomeKind::Skipped,
+            degradations,
+            warnings,
+        }
+    }
+
+    fn metadata_refreshed(degradations: Vec<Degradation>, warnings: Vec<Warning>) -> Self {
+        Self {
+            kind: FileOutcomeKind::MetadataRefreshed,
+            degradations,
+            warnings,
+        }
+    }
+
+    fn indexed(degradations: Vec<Degradation>, warnings: Vec<Warning>) -> Self {
+        Self {
+            kind: FileOutcomeKind::Indexed,
+            degradations,
+            warnings,
+        }
+    }
+
     /// The wire spelling written to `store_events.outcome` (ADR 0026).
     fn as_str(&self) -> &'static str {
-        match self {
-            Self::Skipped { .. } => Self::SKIPPED,
-            Self::MetadataRefreshed { .. } => "metadata_refreshed",
-            Self::Indexed { .. } => Self::INDEXED,
-        }
+        self.kind.as_str()
     }
 
     /// The whole degradation list: the row's `data_json` and the per-code
     /// counts read it (§5 第 8 条 ③④).
     fn degradations(&self) -> &[Degradation] {
-        match self {
-            Self::Skipped { degradations, .. }
-            | Self::MetadataRefreshed { degradations, .. }
-            | Self::Indexed { degradations, .. } => degradations,
-        }
+        &self.degradations
     }
 
     /// The whole warning list (D42), in the enum's declaration order: the row's
     /// `data_json` and the per-code counts read it, the same way they read the
     /// degradations.
     fn warnings(&self) -> &[Warning] {
-        match self {
-            Self::Skipped { warnings, .. }
-            | Self::MetadataRefreshed { warnings, .. }
-            | Self::Indexed { warnings, .. } => warnings,
-        }
+        &self.warnings
     }
 
     /// The first degradation, for callers that need its sentence rather than its
     /// spelling — the row's primary code when the file lost something.
     fn degradation(&self) -> Option<Degradation> {
-        self.degradations().first().copied()
+        self.degradations.first().copied()
     }
 
     /// Adds one code and restores the declaration order (§5 第 8 条).
     ///
     /// The event sweep calls this: `stale_anchor` is decided against the run's
-    /// final state, after every file's data is written (§5 第 4 条), so it joins
+    /// final state, after every file's data is written (§4 第 7 条), so it joins
     /// the list last while the row still reads in enum order.
     fn push_degradation(&mut self, code: Degradation) {
-        let list = match self {
-            Self::Skipped { degradations, .. }
-            | Self::MetadataRefreshed { degradations, .. }
-            | Self::Indexed { degradations, .. } => degradations,
-        };
-        list.push(code);
-        list.sort_unstable();
-        list.dedup();
+        self.degradations.push(code);
+        self.degradations.sort_unstable();
+        self.degradations.dedup();
     }
 }
 
@@ -2743,6 +4434,8 @@ pub(crate) struct PassContext<'a> {
     pub attributes_of: &'a dyn Fn(&Path) -> io::Result<u32>,
     /// The open search index.
     pub search_index: &'a SearchIndex,
+    /// Batch-level stat inputs (D40 §4.3), read once per batch.
+    pub stat_probe: StatProbe,
 }
 
 /// What one file's pass produced, before anything is written for it.
@@ -2845,10 +4538,11 @@ pub(crate) fn pass_one(
     let source_key = match source_key_for(ctx.vault_root, file) {
         Ok(key) => key,
         // Reachable codes here: `invalid_utf8`, `outside_vault`,
-        // `invalid_source_key` (see `IngestError::kind`). A non-UTF-8 name
-        // cannot be created on Windows, so no portable test drives this arm;
-        // it stays correct by construction because the row's code is the
-        // typed kind's spelling, never a literal.
+        // `invalid_source_key` (see `IngestError::kind`). An unpaired
+        // surrogate is a *legal* WTF-16 file name, so the Windows leg drives
+        // this arm for real
+        // (`a_lone_surrogate_name_is_one_row_and_the_watcher_survives`);
+        // the row's code is the typed kind's spelling, never a literal.
         Err(error) => {
             let message = error.to_string();
             let error = file_error(None, error.kind(), message);
@@ -2901,10 +4595,7 @@ pub(crate) fn pass_one(
         match (ctx.attributes_of)(file) {
             Ok(attrs) if is_cloud_placeholder(attrs) => {
                 report.files_skipped += 1;
-                let outcome = FileOutcome::Skipped {
-                    degradations: Vec::new(),
-                    warnings: vec![Warning::OneDrivePlaceholder],
-                };
+                let outcome = FileOutcome::skipped(Vec::new(), vec![Warning::OneDrivePlaceholder]);
                 return Ok(PassOne::Done {
                     source_key,
                     raw_name,
@@ -2932,10 +4623,10 @@ pub(crate) fn pass_one(
         VaultFileKind::Symlink => {
             report.files_skipped += 1;
             (
-                Ok(FileOutcome::Skipped {
-                    degradations: vec![Degradation::SymlinkEncountered],
-                    warnings: Vec::new(),
-                }),
+                Ok(FileOutcome::skipped(
+                    vec![Degradation::SymlinkEncountered],
+                    Vec::new(),
+                )),
                 LinkFindings::default(),
             )
         }
@@ -2945,27 +4636,42 @@ pub(crate) fn pass_one(
         VaultFileKind::IcloudPlaceholder => {
             report.files_skipped += 1;
             (
-                Ok(FileOutcome::Skipped {
-                    degradations: Vec::new(),
-                    warnings: vec![Warning::IcloudPlaceholder],
-                }),
+                Ok(FileOutcome::skipped(
+                    Vec::new(),
+                    vec![Warning::IcloudPlaceholder],
+                )),
                 LinkFindings::default(),
             )
         }
         // Everything that is not a note is registered rather than read: the
         // vault's inventory is complete without pretending binary bytes are
         // searchable (§5 第 10 条).
-        VaultFileKind::Attachment => (
-            register_attachment(
+        VaultFileKind::Attachment => {
+            // Same three answers as the note arm: a refusal requeues rather
+            // than recording a `store` row, because nothing was written
+            // (D40 §4.7). The attachment pass cannot produce `Torn` — its
+            // guard is the check over that window — but `PassError` is one
+            // type for both arms, so the arm is here.
+            let passed = register_attachment(
                 store,
                 ctx.workspace_root,
                 file,
                 &source_key,
                 &raw_name,
                 report,
-            ),
-            LinkFindings::default(),
-        ),
+                ctx.stat_probe,
+                &mode,
+            );
+            return match passed {
+                Ok(outcome) => Ok(PassOne::Done {
+                    source_key,
+                    raw_name,
+                    outcome: Ok(outcome),
+                    findings: LinkFindings::default(),
+                }),
+                Err(error) => pass_error(source_key, raw_name, error),
+            };
+        }
         // The note path owns its own transaction, so it returns here; its row,
         // like every row, is written at the batch tail (ADR 0026).
         VaultFileKind::Note | VaultFileKind::Canvas => {
@@ -2982,6 +4688,7 @@ pub(crate) fn pass_one(
                 report,
                 ctx.ns,
                 ctx.non_note_keys,
+                ctx.stat_probe,
                 &mut mode,
             );
             return match passed {
@@ -2991,20 +4698,7 @@ pub(crate) fn pass_one(
                     outcome: Ok(outcome),
                     findings,
                 }),
-                Err(PassError::Torn) => Ok(PassOne::Torn {
-                    source_key,
-                    raw_name,
-                }),
-                Err(PassError::Guard) => Ok(PassOne::Requeued {
-                    source_key,
-                    raw_name,
-                }),
-                Err(PassError::File(error)) => Ok(PassOne::Failed {
-                    source_key: Some(source_key),
-                    raw_name: Some(raw_name),
-                    error,
-                }),
-                Err(PassError::Run(error)) => Err(error),
+                Err(error) => pass_error(source_key, raw_name, error),
             };
         }
     };
@@ -3019,8 +4713,38 @@ pub(crate) fn pass_one(
     })
 }
 
+/// The four error arms the attachment and note passes answered separately
+/// (probe P2-F1: the two blocks were byte-identical). One spelling, so
+/// `Torn` / `Guard` / `File` / `Run` cannot drift between them.
+fn pass_error(source_key: String, raw_name: String, error: PassError) -> Result<PassOne, RunError> {
+    match error {
+        PassError::Torn => Ok(PassOne::Torn {
+            source_key,
+            raw_name,
+        }),
+        PassError::Guard => Ok(PassOne::Requeued {
+            source_key,
+            raw_name,
+        }),
+        PassError::File(error) => Ok(PassOne::Failed {
+            source_key: Some(source_key),
+            raw_name: Some(raw_name),
+            error,
+        }),
+        PassError::Run(error) => Err(error),
+    }
+}
+
+/// One file, with the caller's row timing applied (D40 §4.7 / ADR 0026).
+///
+/// The body decides what the file *is*; the batch tail decides when its row
+/// lands. Rows settle at the tail sweep in both shapes — a `stale_anchor`
+/// verdict is a settled-state fact, so a row written while the batch is still
+/// walking can flip with walk order — and the data always precedes the row
+/// that describes it. A refusal returns its error here and the loop turns it
+/// into exactly one tail row.
 #[allow(clippy::too_many_arguments)]
-fn process_body(
+fn process_file(
     kind: VaultFileKind,
     store: &mut Store,
     search_index: &SearchIndex,
@@ -3033,6 +4757,7 @@ fn process_body(
     report: &mut IndexReport,
     ns: &Namespace,
     non_note_keys: &HashSet<String>,
+    stat_probe: StatProbe,
     mode: &mut ProcessMode,
 ) -> Result<(FileOutcome, LinkFindings), PassError> {
     let metadata = fs::metadata(file)
@@ -3051,8 +4776,11 @@ fn process_body(
         && fingerprint_matches(&revision.metadata_json, &metadata)
         && revision.local_path.as_deref() == Some(local_path.as_str())
         && revision.raw_name.as_deref() == Some(raw_name)
-        // A racy stat that matched is not evidence of anything: D40 §4.3
-        // sends it to the content path, where the hash decides.
+        // D40 §4.3: a matched stat only counts while it can vouch for the
+        // bytes — outside the racy window, off a coarse volume. Inside the
+        // window the content path decides, where the hash stands in for the
+        // stat (same predicate as `gate`'s cheap skip).
+        && stat_probe.stat_can_vouch(&metadata)
         && !forced(mode)
     {
         report.files_skipped += 1;
@@ -3072,10 +4800,7 @@ fn process_body(
             non_note_keys,
         );
         return Ok((
-            FileOutcome::Skipped {
-                degradations: projection.codes,
-                warnings: Vec::new(),
-            },
+            FileOutcome::skipped(projection.codes, Vec::new()),
             LinkFindings {
                 replace_rows: Some(projection.rows),
                 anchors: projection.anchors,
@@ -3115,32 +4840,70 @@ fn process_body(
         );
         // The codes were derived above for the blob; the same answer rides on
         // the row, or this path reports a broken block as a clean file.
-        let outcome = FileOutcome::MetadataRefreshed {
-            degradations: merge_codes(input.degradations, projection.codes),
-            warnings: Vec::new(),
-        };
+        let outcome = FileOutcome::metadata_refreshed(
+            merge_codes(input.degradations, projection.codes),
+            Vec::new(),
+        );
+        // Re-index on this path too: it is the repair path for a prior run
+        // whose store commit landed but whose index write did not. Without it,
+        // the refreshed fingerprint would let the next run skip a document the
+        // index still lacks.
+        let chunks = chunk_markdown_with(
+            source_key,
+            &revision.revision_hash,
+            &input.text,
+            policy,
+            input.offset,
+            &input.excluded,
+            input.rendered_from,
+        );
+        let title = derive_title(&input.text, source_key);
         // One transaction for the refresh as well (D40 §4.7): the mutable
         // columns and the re-projected edges land together, so a refresh never
         // leaves one half of the file behind. No coverage row rides it — every
         // row settles at the batch tail, where its `stale_anchor` verdict is
-        // decided against the settled state (§5 第 4 条) in both shapes.
-        commit_step(source_key, || {
-            store.commit_source_refresh(
+        // decided against the settled state (§4 第 7 条) in both shapes.
+        commit_refresh(
+            store,
+            source_key,
+            &revision.revision_hash,
+            &revision_metadata(
+                &fingerprint,
+                &input.frontmatter,
+                &input.extracted,
+                &input.outline,
+            ),
+            &local_path,
+            raw_name,
+            &projection.rows,
+            file,
+            &metadata,
+        )?;
+        if let Err(error) = index_step(source_key, || {
+            SearchIndex::upsert_source(
+                writer,
+                search_index.fields(),
+                source_key,
+                &title,
+                OriginClass::Owner,
+                &chunks,
+            )
+        }) {
+            // The same obligation as the content path below, and for a
+            // stronger reason: this branch just committed store rows
+            // **including a fresh fingerprint**, so a failed index write here
+            // would let every later run cheap-skip a document the index still
+            // lacks. That is the exact state this branch exists to repair, so
+            // the omission would close over itself and never heal.
+            mark_index_pending(
+                store,
                 source_key,
                 &revision.revision_hash,
-                &revision_metadata(
-                    &fingerprint,
-                    &input.frontmatter,
-                    &input.extracted,
-                    &input.outline,
-                ),
                 &local_path,
                 raw_name,
-                &projection.rows,
-                None,
-                guard_against(file, &metadata),
-            )
-        })?;
+            )?;
+            return Err(PassError::File(error));
+        }
         report.files_indexed += 1;
         return Ok((
             outcome,
@@ -3180,7 +4943,7 @@ fn process_body(
     let origin = OriginClass::Owner;
     // The rows' `created_at` is this revision's `ingested_at` (ADR 0027): the
     // same number the revision row records, so a rebuild reproduces the rows.
-    let ingested_at = now_epoch_secs();
+    let ingested_at = momotaro_store::now_epoch_secs();
     let projection = project_links(
         &input.extracted,
         source_key,
@@ -3194,13 +4957,13 @@ fn process_body(
     // chunks and edges land together — a crash cannot leave half a file. No
     // coverage row rides it: every row settles at the batch-tail sweep
     // (ADR 0026), where its `stale_anchor` verdict is decided against the
-    // settled state in both shapes (§5 第 4 条), and where every data write
+    // settled state in both shapes (§4 第 7 条), and where every data write
     // already precedes the event that describes it ("never invent").
-    let outcome = FileOutcome::Indexed {
-        degradations: merge_codes(input.degradations, projection.codes),
-        warnings: Vec::new(),
-    };
-    let created = commit_step(source_key, || {
+    let outcome = FileOutcome::indexed(
+        merge_codes(input.degradations, projection.codes),
+        Vec::new(),
+    );
+    let (created, replace_report) = commit_step(source_key, || {
         store.commit_source_file(
             &NewSourceRevision {
                 source_key,
@@ -3220,8 +4983,18 @@ fn process_body(
             guard_against(file, &metadata),
         )
     })?;
+    if !replace_report.drift.is_empty() {
+        report.errors.push(file_error(
+            Some(source_key),
+            IndexFileErrorKind::Store,
+            format!(
+                "referenced chunks were already absent: {}",
+                replace_report.drift.join(", ")
+            ),
+        ));
+    }
 
-    index_step(source_key, || {
+    if let Err(error) = index_step(source_key, || {
         SearchIndex::upsert_source(
             writer,
             search_index.fields(),
@@ -3230,7 +5003,13 @@ fn process_body(
             origin,
             &chunks,
         )
-    })?;
+    }) {
+        // The store already committed. Invalidate the fingerprint so the next
+        // run cannot skip this source; the same-bytes refresh path will redo
+        // the index write. fail-closed beats a silent permanent omission.
+        mark_index_pending(store, source_key, &hash, &local_path, raw_name)?;
+        return Err(PassError::File(error));
+    }
 
     report.files_indexed += 1;
     // A source demoted when its file disappeared and brought back re-adopts a
@@ -3252,47 +5031,6 @@ fn process_body(
             ambiguous: projection.ambiguous,
         },
     ))
-}
-
-/// One file, with the caller's row timing applied (D40 §4.7 / ADR 0026).
-///
-/// The body decides what the file *is*; the batch tail decides when its row
-/// lands. Rows settle at the tail sweep in both shapes — a `stale_anchor`
-/// verdict is a settled-state fact, so a row written while the batch is still
-/// walking can flip with walk order — and the data always precedes the row
-/// that describes it. A refusal returns its error here and the loop turns it
-/// into exactly one tail row.
-#[allow(clippy::too_many_arguments)]
-fn process_file(
-    kind: VaultFileKind,
-    store: &mut Store,
-    search_index: &SearchIndex,
-    writer: &mut IndexWriterHandle,
-    workspace_root: &Path,
-    file: &Path,
-    source_key: &str,
-    raw_name: &str,
-    policy: &IndexPolicy,
-    report: &mut IndexReport,
-    ns: &Namespace,
-    non_note_keys: &HashSet<String>,
-    mode: &mut ProcessMode,
-) -> Result<(FileOutcome, LinkFindings), PassError> {
-    process_body(
-        kind,
-        store,
-        search_index,
-        writer,
-        workspace_root,
-        file,
-        source_key,
-        raw_name,
-        policy,
-        report,
-        ns,
-        non_note_keys,
-        mode,
-    )
 }
 
 /// The part of one projection the event sweep still owes work for.
@@ -3360,8 +5098,10 @@ fn flush_row(
             Some((kind, message)),
         ),
         Ok(outcome) => {
-            // The primary code and its sentence come from one place, shared
-            // with the watcher's in-transaction row (§5 第 8 条 ②⑤).
+            // The primary code and its sentence come from one place, and
+            // every row writer shares it — the batch-tail sweep is the only
+            // production writer (ADR 0026: no caller writes in-transaction).
+            // (§5 第 8 条 ②⑤)
             let fields = row_fields(&outcome, &raw_name, &row.ambiguous, &stale);
             record_coverage(
                 store,
@@ -3394,19 +5134,20 @@ struct ChunkInput<'a> {
     /// The file a *rendered* text was built from, when it was not cut out of one (a
     /// readable `.canvas`): its chunk locators then name the file itself.
     rendered_from: Option<&'a str>,
-    /// The links this file writes (`§5 第 2 条`): the `links` / `link_losses`
+    /// The links this file writes (`§5 第 2/5 条`): the `links` / `link_losses`
     /// blob keys and the rows the projection builds.
     extracted: Extracted,
     /// Headings and `^id` definitions for later anchors pointing here
-    /// (`§5 第 4 条`): the `outline` blob key.
+    /// (`§5 第 5 条`): the `outline` blob key.
     outline: Outline,
 }
 
 /// One file's row, as the four fields every reader of it branches on.
 ///
-/// Shared by `flush_row` (the batch's tail) and by the watcher's
-/// in-transaction row: two spellings of "which code leads a row that carries
-/// several" is exactly how they drift apart (§5 第 8 条 ②⑤).
+/// Shared by every row writer — the batch-tail sweep is the only production
+/// writer (ADR 0026: no caller writes in-transaction): two spellings of
+/// "which code leads a row that carries several" is exactly how they drift
+/// apart (§5 第 8 条 ②⑤).
 struct RowFields {
     /// The outcome word.
     outcome: &'static str,
@@ -3470,7 +5211,7 @@ fn row_fields(
 ///
 /// The wikilink codes ride here too: `stale_anchor` is only decidable once
 /// every file's data — and so every target's outline — is in the store, and a
-/// code decided mid-run would depend on walk order (`§5 第 4 条`).
+/// code decided mid-run would depend on walk order (`§4 第 7 条`).
 struct PendingRow {
     source_key: Option<String>,
     raw_name: Option<String>,
@@ -3656,7 +5397,7 @@ fn parse_link_blob(metadata_json: &str) -> Extracted {
     out
 }
 
-/// The target-side outline stored in a revision blob (`§5 第 4 条`).
+/// The target-side outline stored in a revision blob (`§5 第 5 条`).
 ///
 /// `None` when the key is absent (a blob older than the key): an anchor
 /// pointing here is not verifiable, and "cannot verify" is not "missing" —
@@ -3828,60 +5569,56 @@ fn canvas_text(raw: &str) -> Option<String> {
         Some(value) => value.as_array()?.as_slice(),
         None => &[],
     };
-    {
-        for node in nodes {
-            let Some(node) = node.as_object() else {
-                continue;
-            };
-            let text = match node.get("type").and_then(serde_json::Value::as_str) {
-                Some("text") => string_field(node, "text"),
-                Some("file") => {
-                    string_field(node, "file").map(|file| match string_field(node, "subpath") {
-                        Some(subpath) => format!("{file}{subpath}"),
-                        None => file,
-                    })
-                }
-                Some("link") => string_field(node, "url"),
-                // A group without a label has no text of its own: an empty group is
-                // normal, and a placeholder would be a word we invented.
-                Some("group") => string_field(node, "label"),
-                _ => None,
-            };
-            let Some(text) = text else {
-                continue;
-            };
-            if let Some(id) = node.get("id").and_then(serde_json::Value::as_str) {
-                named.insert(id, blocks.len());
+    for node in nodes {
+        let Some(node) = node.as_object() else {
+            continue;
+        };
+        let text = match node.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") => string_field(node, "text"),
+            Some("file") => {
+                string_field(node, "file").map(|file| match string_field(node, "subpath") {
+                    Some(subpath) => format!("{file}{subpath}"),
+                    None => file,
+                })
             }
-            blocks.push(text);
+            Some("link") => string_field(node, "url"),
+            // A group without a label has no text of its own: an empty group is
+            // normal, and a placeholder would be a word we invented.
+            Some("group") => string_field(node, "label"),
+            _ => None,
+        };
+        let Some(text) = text else {
+            continue;
+        };
+        if let Some(id) = node.get("id").and_then(serde_json::Value::as_str) {
+            named.insert(id, blocks.len());
         }
+        blocks.push(text);
     }
     let edges: &[serde_json::Value] = match root.get("edges") {
         Some(value) => value.as_array()?.as_slice(),
         None => &[],
     };
-    {
-        for edge in edges {
-            let Some(edge) = edge.as_object() else {
-                continue;
-            };
-            let (Some(from), Some(to)) = (
-                edge.get("fromNode").and_then(serde_json::Value::as_str),
-                edge.get("toNode").and_then(serde_json::Value::as_str),
-            ) else {
-                continue;
-            };
-            let mut line = format!(
-                "{} -> {}",
-                endpoint(from, &named, &blocks),
-                endpoint(to, &named, &blocks)
-            );
-            if let Some(label) = string_field(edge, "label") {
-                line.push_str(": ");
-                line.push_str(&label);
-            }
-            blocks.push(line);
+    for edge in edges {
+        let Some(edge) = edge.as_object() else {
+            continue;
+        };
+        let (Some(from), Some(to)) = (
+            edge.get("fromNode").and_then(serde_json::Value::as_str),
+            edge.get("toNode").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        let mut line = format!(
+            "{} -> {}",
+            endpoint(from, &named, &blocks),
+            endpoint(to, &named, &blocks)
+        );
+        if let Some(label) = string_field(edge, "label") {
+            line.push_str(": ");
+            line.push_str(&label);
         }
+        blocks.push(line);
     }
     Some(blocks.join("\n\n"))
 }
@@ -3908,6 +5645,7 @@ fn endpoint<'a>(id: &'a str, named: &HashMap<&str, usize>, blocks: &'a [String])
 /// `normalize_markdown` over binary (that is Markdown's BOM/CRLF pass), and read
 /// the file into memory to hash it — a vault may hold a video, so the hash
 /// streams and the file's own bytes are never held whole.
+#[allow(clippy::too_many_arguments)]
 fn register_attachment(
     store: &mut Store,
     workspace_root: &Path,
@@ -3915,7 +5653,9 @@ fn register_attachment(
     source_key: &str,
     raw_name: &str,
     report: &mut IndexReport,
-) -> Result<FileOutcome, IndexFileError> {
+    stat_probe: StatProbe,
+    mode: &ProcessMode,
+) -> Result<FileOutcome, PassError> {
     let metadata = fs::metadata(file)
         .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Io, error))?;
     let fingerprint = fingerprint_json(&metadata);
@@ -3927,12 +5667,19 @@ fn register_attachment(
         && fingerprint_matches(&revision.metadata_json, &metadata)
         && revision.local_path.as_deref() == Some(local_path.as_str())
         && revision.raw_name.as_deref() == Some(raw_name)
+        // D40 §4.3: a matched stat only counts while it can vouch for the
+        // bytes (same predicate as `gate`'s cheap skip). `gate` answered that
+        // question for this file already — for an attachment against its raw
+        // bytes — and a skip that trusted the stat alone would throw the
+        // answer away on a racy or coarse stat.
+        && stat_probe.stat_can_vouch(&metadata)
+        && !forced(mode)
     {
         report.files_skipped += 1;
-        return Ok(FileOutcome::Skipped {
-            degradations: vec![Degradation::AttachmentUnindexed],
-            warnings: Vec::new(),
-        });
+        return Ok(FileOutcome::skipped(
+            vec![Degradation::AttachmentUnindexed],
+            Vec::new(),
+        ));
     }
 
     let hash = {
@@ -3950,20 +5697,22 @@ fn register_attachment(
     if let Some(revision) = &current
         && revision.revision_hash == hash
     {
-        store_step(source_key, || {
-            store.update_revision_fingerprint(
-                source_key,
-                &revision.revision_hash,
-                &fingerprint,
-                &local_path,
-                raw_name,
-            )
-        })?;
+        commit_refresh(
+            store,
+            source_key,
+            &revision.revision_hash,
+            &fingerprint,
+            &local_path,
+            raw_name,
+            &[],
+            file,
+            &metadata,
+        )?;
         report.files_indexed += 1;
-        return Ok(FileOutcome::MetadataRefreshed {
-            degradations: vec![Degradation::AttachmentUnindexed],
-            warnings: Vec::new(),
-        });
+        return Ok(FileOutcome::metadata_refreshed(
+            vec![Degradation::AttachmentUnindexed],
+            Vec::new(),
+        ));
     }
 
     // No H1 to find and no frontmatter to record: the fingerprint is the whole
@@ -3971,7 +5720,7 @@ fn register_attachment(
     // carries no chunks and no edges — the kind is decided by the extension, so
     // a key that is an attachment never had either.
     let title = derive_title("", source_key);
-    let created = store_step(source_key, || {
+    let (created, _replace_report) = commit_step(source_key, || {
         store.commit_source_file(
             &NewSourceRevision {
                 source_key,
@@ -3983,12 +5732,12 @@ fn register_attachment(
                 raw_name: Some(raw_name),
                 origin_class: OriginClass::Owner,
                 metadata_json: &fingerprint,
-                ingested_at: now_epoch_secs(),
+                ingested_at: momotaro_store::now_epoch_secs(),
             },
             &[],
             &[],
             None,
-            || Ok(()),
+            guard_against(file, &metadata),
         )
     })?;
 
@@ -3997,10 +5746,10 @@ fn register_attachment(
     if created {
         report.revisions_created += 1;
     }
-    Ok(FileOutcome::Indexed {
-        degradations: vec![Degradation::AttachmentUnindexed],
-        warnings: Vec::new(),
-    })
+    Ok(FileOutcome::indexed(
+        vec![Degradation::AttachmentUnindexed],
+        Vec::new(),
+    ))
 }
 
 /// Rebuilds the tantivy index from canonical store chunks.
@@ -4014,8 +5763,14 @@ pub fn rebuild_index(root: impl AsRef<Path>) -> Result<RebuildReport, RunError> 
     store.init_schema()?;
 
     let chunks = store.all_current_chunks()?;
-    let titles = collect_titles(&store, &chunks)?;
-    let origins = collect_origins(&store, &chunks)?;
+    // One key set for both lookups: the two wrappers each rebuilt the same
+    // `HashSet` from the same chunks (probe P2-F3).
+    let keys: HashSet<&str> = chunks
+        .iter()
+        .map(|chunk| chunk.source_key.as_str())
+        .collect();
+    let titles = store.current_titles(&keys)?;
+    let origins = store.current_origins(&keys)?;
 
     let dir = index_dir(root);
     // A rebuild is a from-scratch reconstruction from canonical storage, so the
@@ -4079,30 +5834,6 @@ pub fn rebuild_index(root: impl AsRef<Path>) -> Result<RebuildReport, RunError> 
     })
 }
 
-/// One display title per distinct source key, fetched in a single query.
-fn collect_titles(
-    store: &Store,
-    chunks: &[Chunk],
-) -> Result<HashMap<String, String>, crate::RunError> {
-    let keys: HashSet<&str> = chunks
-        .iter()
-        .map(|chunk| chunk.source_key.as_str())
-        .collect();
-    Ok(store.current_titles(&keys)?)
-}
-
-/// One trust class per distinct source key, fetched in a single query.
-fn collect_origins(
-    store: &Store,
-    chunks: &[Chunk],
-) -> Result<HashMap<String, OriginClass>, RunError> {
-    let keys: HashSet<&str> = chunks
-        .iter()
-        .map(|chunk| chunk.source_key.as_str())
-        .collect();
-    Ok(store.current_origins(&keys)?)
-}
-
 /// Outcome of one `momotaro rebuild-index` invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RebuildReport {
@@ -4116,7 +5847,12 @@ pub struct RebuildReport {
 }
 
 /// A search hit enriched with the source title and a text excerpt.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `Serialize` only: the CLI writes this out as JSON and a caller reads the
+/// payload back as `serde_json::Value` by key, so nothing in the workspace ever
+/// deserializes this type — deriving it would promise an entry point with no
+/// reader.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchHit {
     /// The raw retrieval hit fields, flattened into the same JSON object.
     #[serde(flatten)]
@@ -4128,7 +5864,9 @@ pub struct SearchHit {
 }
 
 /// The full result of one `momotaro search` invocation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `Serialize` only — see [`SearchHit`] for why the read side is not offered.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchOutput {
     /// The query as received.
     pub query: String,
@@ -4278,9 +6016,9 @@ pub fn expand_search_workspace<T: momotaro_llm::ProviderTransport + ?Sized>(
     // ---- acceptance: a search *is* a run (`runs.mode = search`) ------------
     let spec = search_spec(query, &config, &model, allow_network)?;
     let spec_json = serde_json::to_string(&spec).expect("run spec serializes");
-    let spec_hash = sha256_hex(spec_json.as_bytes());
+    let spec_hash = momotaro_ingest::sha256_of(spec_json.as_bytes());
     let run_id = crate::stamp_id("run");
-    let now = crate::now_secs();
+    let now = momotaro_store::now_epoch_secs();
 
     store.commit_run_create(
         &NewRun {
@@ -4375,7 +6113,7 @@ fn search_spec(
     let spec = RunSpec {
         mode: momotaro_contracts::RunMode::Search,
         query: query.to_owned(),
-        slot: ModelSlot::Answer,
+        slot: crate::ask::ANSWER_SLOT,
         thinking: config.model_thinking()?,
         model: model.to_owned(),
         max_output_tokens: REWRITE_MAX_TOKENS,
@@ -4407,7 +6145,7 @@ fn expand_failure_payload(error: &RunError) -> Option<(String, Option<String>)> 
     };
     let (attribution, retryable) = crate::ask::failure_row(category);
     Some((
-        crate::ask::failure_data(category, &attribution, retryable),
+        crate::ask::failure_data(category, attribution, retryable).to_string(),
         Some(error.to_string()),
     ))
 }
@@ -4440,6 +6178,11 @@ fn run_expand<T: momotaro_llm::ProviderTransport + ?Sized>(
         tools: Vec::new(),
         max_tokens: REWRITE_MAX_TOKENS,
     };
+    // §L6 (I4-F1): expand records the provider request's own hash
+    // (`LlmRequest::request_hash`, model included) — the ask path records
+    // the context stream hash instead (model-free, append-stable; see the
+    // note at ask.rs's write site). The two domains are adjudicated together
+    // wherever the cache key lands.
     let request_hash = request.request_hash();
 
     // The turn lands on failure too: its usage columns are what the attempt
@@ -4457,13 +6200,25 @@ fn run_expand<T: momotaro_llm::ProviderTransport + ?Sized>(
         output_tokens: None,
         cached_tokens: None,
         billable_tokens: None,
-        slot: Some(ModelSlot::Answer.as_str().to_owned()),
+        slot: Some(crate::ask::ANSWER_SLOT.as_str().to_owned()),
         reasoning_tokens: None,
         raw_ref: None,
         created_at: now,
         finished_at: Some(now),
     };
 
+    // `llm.started` precedes the send, as it does on the ask path: the two
+    // run-creating flows must not disagree about which half of the pair they
+    // write (reference.md lists both as stable; `append_run_event`'s doc says
+    // these exist for the moments that write no table rows).
+    store.append_run_event(
+        run_id,
+        &NewRunEvent {
+            event_type: run_event::LLM_STARTED.to_owned(),
+            data_json: serde_json::json!({ "turn_id": turn_id, "model": model }).to_string(),
+            created_at: now,
+        },
+    )?;
     let rewrite = match momotaro_llm::complete(transport, &request) {
         Ok(output) => {
             turn.status = "finished".to_owned();
@@ -4471,49 +6226,24 @@ fn run_expand<T: momotaro_llm::ProviderTransport + ?Sized>(
             turn.output_tokens = output.usage.output_tokens.and_then(to_i64);
             turn.cached_tokens = output.usage.cached_tokens.and_then(to_i64);
             turn.billable_tokens = output.usage.billable_tokens.and_then(to_i64);
+            turn.reasoning_tokens = output.usage.reasoning_tokens.and_then(to_i64);
             turn.raw_ref = output.raw_ref.clone();
             let data = serde_json::json!({
                 "billable_tokens": output.usage.billable_tokens,
                 "cached_tokens": output.usage.cached_tokens,
                 "finish_reason": output.finish_reason.as_str(),
-                "slot": ModelSlot::Answer.as_str(),
+                "slot": crate::ask::ANSWER_SLOT.as_str(),
                 "turn_id": turn_id,
             })
             .to_string();
-            store.commit_run_llm_turn(
-                run_id,
-                &turn,
-                &NewRunEvent {
-                    event_type: run_event::LLM_FINISHED.to_owned(),
-                    data_json: data,
-                    created_at: now,
-                },
-            )?;
+            crate::ask::commit_llm_finished(store, run_id, &turn, data, now)?;
             output
         }
         Err(error) => {
             turn.status = "failed".to_owned();
-            let (attribution, retryable) = crate::ask::failure_row(error.kind.category());
-            let data = serde_json::json!({
-                "error": {
-                    "attribution": attribution,
-                    "category": error.kind.category(),
-                    "retryable": retryable,
-                    "severity": momotaro_contracts::Severity::Error.as_str(),
-                },
-                "slot": ModelSlot::Answer.as_str(),
-                "turn_id": turn_id,
-            })
-            .to_string();
-            store.commit_run_llm_turn(
-                run_id,
-                &turn,
-                &NewRunEvent {
-                    event_type: run_event::LLM_FINISHED.to_owned(),
-                    data_json: data,
-                    created_at: now,
-                },
-            )?;
+            crate::ask::record_failure_usage(&mut turn, &error);
+            let data = crate::ask::llm_finished_failure_payload(&turn_id, &error);
+            crate::ask::commit_llm_finished(store, run_id, &turn, data, now)?;
             return Err(RunError::Llm(error));
         }
     };
@@ -4532,6 +6262,14 @@ fn run_expand<T: momotaro_llm::ProviderTransport + ?Sized>(
         return Err(RunError::RewriteUnusable);
     }
 
+    store.append_run_event(
+        run_id,
+        &NewRunEvent {
+            event_type: run_event::RETRIEVAL_STARTED.to_owned(),
+            data_json: serde_json::json!({ "query": query }).to_string(),
+            created_at: now,
+        },
+    )?;
     let mut lists = Vec::with_capacity(queries.len());
     for rewritten in &queries {
         lists.push(search_index.search(rewritten, top_k)?);

@@ -1,6 +1,6 @@
 //! Title derivation from normalized Markdown.
 
-use pulldown_cmark::{Event, Options, Parser};
+use pulldown_cmark::{Event, Parser};
 
 /// First H1 heading text, else the file stem from `source_key`.
 pub fn derive_title(normalized: &str, source_key: &str) -> String {
@@ -11,10 +11,7 @@ pub fn derive_title(normalized: &str, source_key: &str) -> String {
 }
 
 fn first_h1(normalized: &str) -> Option<String> {
-    let parser = Parser::new_ext(
-        normalized,
-        Options::ENABLE_TABLES | Options::ENABLE_WIKILINKS,
-    );
+    let parser = Parser::new_ext(normalized, crate::PARSE_OPTIONS);
     let mut in_h1 = false;
     let mut text = String::new();
     for event in parser {
@@ -35,6 +32,9 @@ fn first_h1(normalized: &str) -> Option<String> {
                 }
             }
             Event::Text(t) if in_h1 => text.push_str(&t),
+            // Inline code in an H1 is title text: `# Foo `bar` baz` reads
+            // `Foo  baz` without this arm.
+            Event::Code(t) if in_h1 => text.push_str(&t),
             _ => {}
         }
     }
@@ -104,6 +104,13 @@ mod tests {
     fn h1_with_inline_markup() {
         let doc = "# Ta *gore* 楽\n";
         assert_eq!(derive_title(doc, "x.md"), "Ta gore 楽");
+    }
+
+    #[test]
+    fn h1_with_inline_code() {
+        // `Event::Code` rides beside `Event::Text`; without the arm the code
+        // text vanishes from the title.
+        assert_eq!(derive_title("# Foo `bar` baz\n", "x.md"), "Foo bar baz");
     }
 
     #[test]

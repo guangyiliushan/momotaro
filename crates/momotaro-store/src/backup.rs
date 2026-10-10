@@ -276,4 +276,37 @@ mod tests {
         }
         assert!(path.exists(), "the live database is untouched");
     }
+
+    /// The name of `an_existing_target_is_replaced_only_after_a_new_artifact_exists`
+    /// promises a failure-safety order: a published artifact is replaced only
+    /// once a new one exists **and verifies**. A second backup that fails
+    /// mid-flight (here: the injected `verify` refuses) must leave the first
+    /// artifact in place and still verifying — deleting the old one before
+    /// the new one is safe would lose the only good backup on a half-run.
+    #[test]
+    fn a_failed_second_backup_leaves_the_first_artifact_in_place() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("momotaro.db");
+        let mut store = Store::open(&path).expect("open store");
+        store.init_schema().expect("init schema");
+
+        let first =
+            backup_before_migration(&store.connection, dir.path(), 1, 2).expect("first backup");
+        verify_artifact(&first).expect("the first artifact verifies");
+
+        let error = backup_before_migration_with(&store.connection, dir.path(), 1, 2, |_| {
+            Err(StoreError::BackupFailed(
+                "injected verify refusal".to_string(),
+            ))
+        })
+        .expect_err("the refused second backup must fail");
+        assert!(matches!(error, StoreError::BackupFailed(_)), "{error}");
+
+        assert!(
+            first.exists(),
+            "the first artifact survives a failed second backup"
+        );
+        verify_artifact(&first).expect("the surviving artifact still verifies");
+        assert!(path.exists(), "the live database is untouched");
+    }
 }

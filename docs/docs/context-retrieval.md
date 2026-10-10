@@ -50,6 +50,11 @@ chunk_hash` 的命中，context 与 citation 层就不用返工。
 第 3 层（效果）：跨源首次排序按重要性——最高分源置首、次高置尾、其余居中。
 ```
 
+**「出现」的口径**（第 1 层的定义）：该 chunk 的全文**真的进了 provider 请求**，即
+`run_context_items` 落下的那一条——不是「进了 rank 阶段」。被预算裁掉、从未发出的
+chunk 不入账：它不在任何请求前缀里，给它一个槽位既不影响字节稳定，还会让账本与
+canonical 行成为两份真相。
+
 三层叠加后首轮确定、后续轮次字节稳定——效果（首轮）、连贯（源内）、缓存
 （后续轮）各得其所。位置效应证据本身脆弱（2026 复现：幅度强依赖条件），
 故「首尾摆放」排第 3 优先级而非第 1。
@@ -66,7 +71,7 @@ chunk_hash` 的命中，context 与 citation 层就不用返工。
 | 1 | policy + tool definitions + **constraints 常驻层** | 固定小预算，内容稳定；压缩不可触达 |
 | 2 | question | 全量保留 |
 | 3 | history | 近轮全量（见 §3），旧轮见 §3 |
-| 4 | evidence | 按意图分档的 top-k（见 §2），三层排序（§1.1） |
+| 4 | evidence | 按意图分档的 top-k（见 §2.1），三层排序（§1.1） |
 | 5 | instructions | 固定尾部 |
 
 ### 2.1 两个可校准参数（2026-09-15 调查）
@@ -91,6 +96,16 @@ comparison 每侧 4-6 / survey 8-10；2026-09 调查：精排后 5-10 条是经�
 
 `ask --session` 的后续轮次：
 
+**轮次（`history_items` 行的归组轴）**：轮 = 该 session 内**写过 history 的 ask run**，
+按 `(runs.created_at, run_id)` 字典序编号，**从 1 起**。两个键缺一不可 —— `created_at` 是
+秒级，同秒并列行的返回序是 `undefined`（SQLite `lang_select` §4：*"The order in which
+two rows for which all ORDER BY expressions evaluate to equal values are returned is
+undefined."*），`run_id` 才是那把第二键。`session_id IS NULL` 的行不进任何轮次；只有**走到落答案那一步**的 ask 才写 history ⇒
+才占轮号，早于它中止的（检索不可用/为空、LLM 失败）不写 ⇒ 不占轮号。**但「失败」本身
+不等于「没走到」**：引用校验失败是在 `answer.finalized` **之后**判的，那一轮 history 已经
+落库，**照样占轮号**——轮号必须和 history 里实际存在的行一致，否则保护带会静默少护一轮。
+`runs.created_at` 是事务时间，取 `max(now, 最新行)` 单调钳，NTP 回拨不得让它倒退。
+
 1. **recency 保护带**：近 2 轮且 ≥8K token 保底，取宽者（一轮可能是 50
    token 也可能是 20K，固定轮数不安全；OpenCode 40K 保护带先例）；
 2. 保护带之外的更早轮次降级为摘要（`summary.v1`，见 §3.1），不重放原始
@@ -98,7 +113,11 @@ comparison 每侧 4-6 / survey 8-10；2026-09 调查：精排后 5-10 条是经�
 3. 旧轮被引用过的 chunk 以标题 + 指针出现，需要全文时由模型走 `kb_read`
    （ReadAgent gist+lookup 同构——指针化记忆有直接学术先例与理论豁免权：
    rate-distortion 下限证明任何有损压缩存在事实幻觉下限，原文永不压缩）；
-4. 已注入过的 evidence 按 `chunk_hash` 去重，不因多轮重复占预算。
+4. 已注入过的 evidence 按 `chunk_hash` 去重，不因多轮重复占预算。**去重基随摘要覆盖收窄**：
+   被某份有效摘要覆盖的轮次，其携带的 `chunk_hash` 从去重基中**释放** —— 原文已随降级离开
+   重放窗口，继续拉黑等于在 0.x（无 `kb_read`）里**永久关掉**它。释放只给 fresh retrieve
+   一个机会，**不保证捞回**（BM25 可能不再命中）；这一点没有任何厂商承诺，不得写成
+   「一定能取回」。
 
 ### 3.1 summary.v1 分字段结构
 
@@ -144,7 +163,8 @@ chunk_hash 逐字存在于摘要存储文本；失败重试 N 次后放弃压缩
 [policy]
 compact_trigger_ratio = 0.85      # 默认；0.40 保留为「质量实验档」，须配观测数据使用
 compact_reserve_abs = 12000       # 吸收工具输出突发；按预算缩放 min(12000, 25% × 预算)
-# trigger = min(max_context_tokens - compact_reserve_abs, ratio × max_context_tokens)
+# reserve = min(compact_reserve_abs, max_context_tokens / 4)
+# trigger = min(max_context_tokens - reserve, floor(ratio × max_context_tokens))
 ```
 
 配套规则（采纳自会话管理轮）：
@@ -154,6 +174,14 @@ compact_reserve_abs = 12000       # 吸收工具输出突发；按预算缩放 m
    「最近读过的文件」工作集（至多 5 个，超 5000 token 退化为指针）；
 2. **观测三指标**不变：每千轮压缩次数、摘要 token 均值、压缩后首轮引用验证
    通过率——若 0.40 实验档在自家数据上质量增益覆盖缓存+摘要成本，再下调默认；
+   触发与否与触发所用的两个数记在 `context.built` 的 `compaction` 载荷里
+   （`triggered` / `raw_total` / `adjusted_total` / `max_context_tokens` /
+   `trigger` / `reserve`，字段清单见
+   [reference](reference.md) 的 Event vocabulary）——**记事实，不在读的时候重算**，
+   否则换了预算再读就答不出当时到底触发没有；**比较的两边都是 `adjusted_total`**：
+   `trigger` 用 `max_context_tokens` 计价，那是 *adjusted* 的天花板（`exceeded` 与预算
+   自己的申领用的是同一个单位），拿 `raw_total` 去比会把触发点挪动一个系数——按 §2.1 的
+   默认 1.25，写成「预算 75% 的线」实际要到 93.75% 才翻；
 3. **fail-closed 断言**（OpenClaw safeguard 式，替代旧「指针可解析」软断言）：
    必需分字段存在、`evidence_refs` 的 chunk_hash 逐字存在于摘要存储文本；
    失败重试 N 次后放弃压缩、保留原史，失败写 run 记录——防「丢约束/丢决策」

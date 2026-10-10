@@ -67,7 +67,6 @@ fn windows_volume_info(path: &Path) -> VolumeInfo {
     use windows_sys::Win32::Storage::FileSystem::{
         GetDriveTypeW, GetVolumeInformationW, GetVolumePathNameW,
     };
-    use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
 
     /// WCHARs for a volume root: `\\?\UNC\server\share\` is the longest shape
     /// `GetVolumePathNameW` produces, and 320 leaves headroom over `MAX_PATH`.
@@ -93,7 +92,7 @@ fn windows_volume_info(path: &Path) -> VolumeInfo {
 
     // SAFETY: `root` is the NUL-terminated buffer `GetVolumePathNameW` just
     // filled in.
-    let remote = unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE };
+    let remote = remote_of(unsafe { GetDriveTypeW(root.as_ptr()) });
 
     let mut label = [0u16; NAME_CHARS];
     let mut serial = 0u32;
@@ -117,19 +116,49 @@ fn windows_volume_info(path: &Path) -> VolumeInfo {
     let coarse = if described == 0 {
         None
     } else {
-        let end = fs_name
-            .iter()
-            .position(|&unit| unit == 0)
-            .unwrap_or(fs_name.len());
-        Some(is_coarse_filesystem(&String::from_utf16_lossy(
-            &fs_name[..end],
-        )))
+        Some(is_coarse_filesystem(&wide_cstring(&fs_name)))
     };
 
-    VolumeInfo {
-        remote: Some(remote),
-        coarse,
+    VolumeInfo { remote, coarse }
+}
+
+/// What `GetDriveTypeW`'s return says about remoteness.
+///
+/// The two failure values (`DRIVE_UNKNOWN`, `DRIVE_NO_ROOT_DIR`) answer
+/// "unknown", not "no": the doc above promises both failures degrade to
+/// unknown, and `== DRIVE_REMOTE` as the whole mapping broke that promise
+/// for this call — an unreadable volume was reported as a local one. Every
+/// known local kind answers `false`.
+#[cfg(windows)]
+fn remote_of(drive_type: u32) -> Option<bool> {
+    use windows_sys::Win32::System::WindowsProgramming::{
+        DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, DRIVE_UNKNOWN,
+    };
+    match drive_type {
+        DRIVE_REMOTE => Some(true),
+        DRIVE_UNKNOWN | DRIVE_NO_ROOT_DIR => None,
+        _ => Some(false),
     }
+}
+
+/// A Windows wide string cut at its first NUL — the terminator
+/// `GetVolumeInformationW` writes, not a character of the name.
+///
+/// Split out because the cut is the whole reason the FAT relaxation is
+/// reachable: reading to the first **non-zero** unit instead yields an empty
+/// name, `is_coarse_filesystem("")` is `false`, and `coarse` is then
+/// `Some(false)` for every volume — so `index_service`'s content-check path
+/// (D40 §4.3) never fires and a real change on a two-second filesystem is
+/// skipped as "stat did not move". Nothing observed that: the only Windows
+/// assertion checked `coarse.is_some()`, and `is_coarse_filesystem`'s own
+/// tests take `&str` and never reach this slice.
+#[cfg(any(windows, test))]
+fn wide_cstring(units: &[u16]) -> String {
+    let end = units
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(units.len());
+    String::from_utf16_lossy(&units[..end])
 }
 
 /// The non-Windows answer to [`volume_info`]: nothing, and not "no".
@@ -150,8 +179,13 @@ fn windows_volume_info(_path: &Path) -> VolumeInfo {
 /// cannot tell the two apart — the case D40 §4.3 sends to a content check.
 /// Comparison is case-insensitive and whole-label: Windows reports `FAT`,
 /// `FAT32` and `exFAT`, and nothing else in practice starts with `FAT`.
+/// `pub` would only be hiding `dead_code` off Windows, where nothing calls
+/// it: the one production caller is `windows_volume_info`, and the tests are
+/// the other. The gate is local instead, so the crate's export surface says
+/// what the crate actually offers.
 #[must_use]
-pub fn is_coarse_filesystem(label: &str) -> bool {
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_coarse_filesystem(label: &str) -> bool {
     let upper = label.trim().to_ascii_uppercase();
     upper == "EXFAT" || upper.starts_with("FAT")
 }
@@ -176,6 +210,33 @@ mod tests {
         assert!(!is_coarse_filesystem("ext4"));
         assert!(!is_coarse_filesystem("APFS"));
         assert!(!is_coarse_filesystem(""));
+        assert!(
+            !is_coarse_filesystem("NOTFAT"),
+            "a label that merely contains the family name is not of it — \
+             the case the substring mutation must fail"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_drive_type_maps_its_failures_to_unknown() {
+        // `DRIVE_UNKNOWN` and `DRIVE_NO_ROOT_DIR` are GetDriveTypeW's two
+        // failure returns; `== DRIVE_REMOTE` as the whole mapping read them
+        // as "local", and the crate doc promises the opposite.
+        use windows_sys::Win32::System::WindowsProgramming::{
+            DRIVE_CDROM, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, DRIVE_REMOVABLE,
+            DRIVE_UNKNOWN,
+        };
+        assert_eq!(remote_of(DRIVE_REMOTE), Some(true));
+        assert_eq!(remote_of(DRIVE_FIXED), Some(false));
+        assert_eq!(remote_of(DRIVE_REMOVABLE), Some(false));
+        assert_eq!(remote_of(DRIVE_CDROM), Some(false));
+        assert_eq!(
+            remote_of(DRIVE_UNKNOWN),
+            None,
+            "a drive type we could not read is not a local one"
+        );
+        assert_eq!(remote_of(DRIVE_NO_ROOT_DIR), None);
     }
 
     #[test]
@@ -203,6 +264,51 @@ mod tests {
     /// pinned here. What *is* pinned is that `doctor` and `watch` surface it
     /// (`network_volume` on the health report, `network_volume` on a watch
     /// line) and that both render the same sentence.
+    /// The cutter, fed a synthetic UTF-16 buffer instead of a live volume —
+    /// the only way to tell "first NUL" from "first non-zero" without a disk
+    /// whose label happens to start with a NUL.
+    #[test]
+    fn the_volume_name_is_cut_at_the_first_nul_and_nowhere_else() {
+        let wide = |text: &str, pad: Vec<u16>| {
+            let mut units: Vec<u16> = text.encode_utf16().collect();
+            units.extend(pad);
+            units
+        };
+
+        assert_eq!(
+            wide_cstring(&wide("FAT", vec![0, 0x58])),
+            "FAT",
+            "the terminator ends the name; whatever follows it is not part of it"
+        );
+        assert_eq!(
+            wide_cstring(&wide("NTFS", vec![0, 0x58])),
+            "NTFS",
+            "…so a non-FAT label reads back whole, and `is_coarse_filesystem` \
+             says no — which is what the content check depends on"
+        );
+        assert_eq!(
+            wide_cstring(&wide("exFAT", Vec::new())),
+            "exFAT",
+            "with no terminator the whole buffer is the name"
+        );
+        assert_eq!(
+            wide_cstring(&[]),
+            "",
+            "and an empty buffer is an empty name"
+        );
+
+        // The half that the mutants actually change: cutting at the first
+        // non-zero unit gives "" for every label, and `""` is not coarse.
+        assert!(
+            is_coarse_filesystem("FAT"),
+            "…so a FAT label has to survive the cut as `FAT`, not as empty"
+        );
+        assert!(
+            !is_coarse_filesystem(&wide_cstring(&wide("NTFS", vec![0, 0x58]))),
+            "…and NTFS has to survive as NTFS"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn on_windows_a_resolvable_path_answers_both_questions() {

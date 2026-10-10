@@ -18,10 +18,9 @@
 //!    per-block gate (§12: 定界渲染 + 确定性校验才是防线): a `web` / `agent`
 //!    block must be exactly one well-formed region wrapping its body, a
 //!    trusted block must contain no markers at all. [`validate_untrusted_regions`]
-//!    is the public check the run layer applies to assembled or stored
-//!    text (replayed history bodies are verbatim by contract and are its
-//!    caller-side duty). A delimiting bypass fails the per-block gate at
-//!    runtime instead of only in CI.
+//!    is the public check for assembled or stored text; history replay calls
+//!    it before a stored body enters a request. The per-block gate runs for
+//!    evidence, so a delimiting bypass fails at runtime instead of only in CI.
 //!
 //! Role separation stays a weak guarantee (§12); this boundary does not
 //! rely on it. The contract delimits `web` / `agent` only — whether `paper`
@@ -73,7 +72,7 @@ pub enum DelimiterError {
 
 /// Hex-escape everything outside `[A-Za-z0-9:./_-]` so the value cannot
 /// forge marker syntax or smuggle control characters into the prompt.
-pub fn escape_label(value: &str) -> String {
+pub(crate) fn escape_label(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
         if is_safe_label_char(c) {
@@ -124,7 +123,7 @@ fn is_escaped_form(label: &str) -> bool {
 /// replacement (`<<\<<` ends in `<<`, gluing to the next `<`). With
 /// `\x3c\x3c\x3c` the output can never contain `<<<` — asserted below and
 /// re-proved by [`validate_untrusted_regions`].
-pub fn escape_content_sentinels(text: &str) -> String {
+pub(crate) fn escape_content_sentinels(text: &str) -> String {
     let out = text.replace("<<<", "\\x3c\\x3c\\x3c");
     debug_assert!(!out.contains("<<<"), "sentinel escaping must be total");
     out
@@ -235,7 +234,7 @@ pub(crate) fn render_evidence_block(fragment_id: &str, item: &EvidenceItem) -> S
 ///   markers are rejected, not ignored);
 /// - every marker label is in escaped form and its origin is `web` or
 ///   `agent`.
-pub fn validate_untrusted_regions(rendered: &str) -> Result<(), DelimiterError> {
+pub(crate) fn validate_untrusted_regions(rendered: &str) -> Result<(), DelimiterError> {
     let mut cursor = 0usize;
     while let Some(rel) = rendered[cursor..].find(UNTRUSTED_OPEN_PREFIX) {
         let start = cursor + rel;
@@ -292,7 +291,10 @@ pub fn validate_untrusted_regions(rendered: &str) -> Result<(), DelimiterError> 
 /// This is the non-vacuous half of the defense: a delimiting bypass
 /// (unwrapped `web` block) fails here even though the generic region scan
 /// would pass vacuously.
-pub fn validate_evidence_block(origin: OriginClass, rendered: &str) -> Result<(), DelimiterError> {
+pub(crate) fn validate_evidence_block(
+    origin: OriginClass,
+    rendered: &str,
+) -> Result<(), DelimiterError> {
     let untrusted = matches!(origin, OriginClass::Web | OriginClass::Agent);
     if !untrusted {
         if rendered.contains(UNTRUSTED_OPEN_PREFIX) || rendered.contains(UNTRUSTED_CLOSE) {
@@ -324,7 +326,7 @@ pub fn validate_evidence_block(origin: OriginClass, rendered: &str) -> Result<()
     validate_untrusted_regions(rendered)
 }
 
-/// Canonical tools serialization (`context-retrieval.md` §1.3): the caller's
+/// Canonical tools serialization (`context-retrieval.md` §1 第 3 条): the caller's
 /// list order is identity — a reordered list is a different request and
 /// changes `request_hash`, so the list is never sorted — and field order is
 /// fixed. A tool whose `parameters_json` is not a JSON object is dropped with
@@ -538,7 +540,7 @@ mod tests {
 
     #[test]
     fn tools_keep_the_callers_order() {
-        // 序即身份 (context-retrieval.md §1.3): the list keeps the caller's
+        // 序即身份 (context-retrieval.md §1 第 3 条): the list keeps the caller's
         // order — sorting it would collapse two different requests into one
         // serialization. Field order stays fixed (the map is sorted).
         let tools = vec![
@@ -623,6 +625,47 @@ mod tests {
         ));
     }
 
+    /// The two gates that stand between a half-written region and the
+    /// `expect("counted above")` immediately below them.
+    ///
+    /// Every existing fixture has all four markers or none, so weakening
+    /// either conjunct changed nothing: `(open, close)` of `(1, 0)` and
+    /// `(0, 1)` were never driven, and `||` → `&&` let them through to an
+    /// `expect` on a security check — a validator that returns `Err`
+    /// becoming a panic. The trailing-junk half is the same shape: the
+    /// close marker may be followed by an empty tail or by a newline,
+    /// and nothing else.
+    #[test]
+    fn a_half_written_region_and_trailing_junk_are_rejected() {
+        let good = render_evidence_block("f0001", &item("note:web/a.md", OriginClass::Web, "body"));
+        assert!(
+            validate_evidence_block(OriginClass::Web, &good).is_ok(),
+            "the fixture itself has to be well-formed first: {good:?}"
+        );
+
+        for (label, broken) in [
+            ("open but no close", good.replace(UNTRUSTED_CLOSE, "")),
+            ("close but no open", good.replace(UNTRUSTED_OPEN_PREFIX, "")),
+        ] {
+            assert!(
+                matches!(
+                    validate_evidence_block(OriginClass::Web, &broken),
+                    Err(DelimiterError::MissingRegion)
+                ),
+                "{label} must be rejected as a missing region, not walked into
+                 the expect below the gate: {broken:?}"
+            );
+        }
+
+        assert!(
+            matches!(
+                validate_evidence_block(OriginClass::Web, &format!("{good}junk")),
+                Err(DelimiterError::MissingRegion)
+            ),
+            "anything after the close marker besides a newline is rejected"
+        );
+    }
+
     #[test]
     fn two_regions_in_one_block_fail_the_coverage_gate() {
         let two = "<<<untrusted web a>>>\nx\n<<<end untrusted>>>\n<<<untrusted web b>>>\ny\n<<<end untrusted>>>";
@@ -638,6 +681,25 @@ mod tests {
         assert!(!block.contains(UNTRUSTED_OPEN_PREFIX));
         assert!(block.ends_with("body"));
         assert!(validate_evidence_block(OriginClass::System, &block).is_ok());
+    }
+
+    /// The length check before the escape's own bytes is what keeps
+    /// `bytes[i + 1..i + 3]` in bounds. Take it away — by widening the offset
+    /// arithmetic or by requiring both halves of the disjunction — and a label
+    /// that simply ends in a backslash stops being *rejected* and starts
+    /// panicking, on a function whose whole job is deciding whether an
+    /// untrusted label is exactly what `escape_label` produced.
+    #[test]
+    fn a_label_ending_in_a_lone_backslash_is_rejected_not_indexed() {
+        assert!(!is_escaped_form("\\"));
+        assert!(!is_escaped_form("\\x"));
+        assert!(!is_escaped_form("\\xA"));
+        assert!(!is_escaped_form("a\\"));
+        assert!(!is_escaped_form("ab\\"));
+        // A well-formed escape still passes, so the fixture is not simply
+        // rejecting everything after a backslash.
+        assert!(is_escaped_form("a\\x41b"));
+        assert!(is_escaped_form("plain-label_2"));
     }
 
     #[test]

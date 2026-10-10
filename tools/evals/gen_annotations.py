@@ -26,6 +26,13 @@ Annotation caliber (docs/docs/context-retrieval.md §3, "golden set 口径升级
 * `poison_keys` — the corpus-side attack surface (PoisonedRAG framing: the
   retrieval library itself is the attack surface). Every top-5 seat these
   sources take is counted separately for the main and injection query sets.
+* `known_miss` — the explicit whitelist of accepted failures, so an average
+  never silently absorbs one: a row scoring below 1.0 must carry this field or
+  the gate fails. `reason` is `fused` (the query analyzer fused the base term
+  into a whitespace-free phrase chunk no document contains) or `displaced`
+  (hits were retrieved but the sufficient source was crowded out of top-k);
+  `why` is the falsifiable note. The whitelist is a measured baseline, not a
+  policy: `--check` does not police counts, the run's ceilings do.
 
 Only the retrieval surface is tested: no LLM is invoked anywhere.
 """
@@ -80,6 +87,10 @@ MAIN = [
     {
         "query": "PCA 方差",
         "sufficient": ["note:pca.md"],
+        "known_miss": {
+            "reason": "displaced",
+            "why": "semi 负例（sklearn 备忘、fourier 旁引、long-mixed 直觉）加词条表与投毒样本占满 top-5，pca.md 被挤出——硬负例加害的记录样本",
+        },
         "hard_negatives": [
             {
                 "key": "note:semi-pca-sklearn.md",
@@ -125,8 +136,13 @@ MAIN = [
     },
     {
         "query": "特征值 特征向量",
-        "sufficient": ["note:long-mixed.md"],
+        "sufficient": ["note:eigenvalue.md"],
         "hard_negatives": [
+            {
+                "key": "note:long-mixed.md",
+                "kind": "semi_relevant",
+                "why": "特征值/特征向量在谱定理笔记里作已知概念使用（对角元、广义问题、数值求法），没有 A v = λ v 的基本定义",
+            },
             {
                 "key": "note:pca.md",
                 "kind": "semi_relevant",
@@ -142,12 +158,17 @@ MAIN = [
     },
     {
         "query": "kernel",
-        "sufficient": ["note:only-code.md"],
+        "sufficient": ["note:kernel-def.md"],
         "hard_negatives": [
+            {
+                "key": "note:only-code.md",
+                "kind": "semi_relevant",
+                "why": "只有函数实现与两句性质，没有 k(x, y) = ⟨φ(x), φ(y)⟩ 的定义展开与常见核的公式列举",
+            },
             {
                 "key": "note:semi-kernel-svm.md",
                 "kind": "semi_relevant",
-                "why": "SVM 选型经验加一句核技巧直觉，没有核函数的定义展开与代码实现",
+                "why": "SVM 选型经验加一句核技巧直觉，没有核函数的定义展开",
             },
             NO_INFO_NEGATIVE,
         ],
@@ -195,9 +216,58 @@ MAIN = [
         "sufficient": ["note:only-code.md"],
         "hard_negatives": [
             {
+                "key": "note:kernel-def.md",
+                "kind": "semi_relevant",
+                "why": "RBF 的定义、公式与性质，但没有 Rust 实现",
+            },
+            {
                 "key": "note:semi-kernel-svm.md",
                 "kind": "semi_relevant",
                 "why": "RBF kernel 词面重叠但讲的是 SVM 调参，没有 Rust 实现",
+            },
+            NO_INFO_NEGATIVE,
+        ],
+    },
+    # Multi-key sufficient sets: the minimal answerable set spans documents, so
+    # the AND semantics ("every member is retrieved") is actually exercised.
+    # Each member is individually insufficient by construction — one side of the
+    # question lives in one note, the other side in the other.
+    {
+        "query": "Dirichlet 条件 Gibbs 现象",
+        "sufficient": ["note:fourier.md", "note:semi-fourier-series.md"],
+        "hard_negatives": [
+            NO_INFO_NEGATIVE,
+        ],
+    },
+    {
+        "query": "RBF kernel 定义 调参",
+        "sufficient": ["note:kernel-def.md", "note:semi-kernel-svm.md"],
+        "hard_negatives": [
+            {
+                "key": "note:only-code.md",
+                "kind": "semi_relevant",
+                "why": "只有函数实现，既无定义展开也无调参经验",
+            },
+            NO_INFO_NEGATIVE,
+        ],
+    },
+    {
+        "query": "特征值 定义 求法",
+        "sufficient": ["note:eigenvalue.md", "note:long-mixed.md"],
+        "known_miss": {
+            "reason": "displaced",
+            "why": "充分集成员 eigenvalue.md 的 4 个 chunk 占满 4 席，fourier 旁引再占 1 席，long-mixed.md 的求法被挤出——同源多段占席，rank 层同源降权未实现",
+        },
+        "hard_negatives": [
+            {
+                "key": "note:pca.md",
+                "kind": "semi_relevant",
+                "why": "用特征分解当作 PCA 流程的一步，不给定义也不给数值求法",
+            },
+            {
+                "key": "note:fourier.md",
+                "kind": "semi_relevant",
+                "why": "PCA 旁引一句「特征值给出方差」，没有定义与求法",
             },
             NO_INFO_NEGATIVE,
         ],
@@ -227,6 +297,25 @@ ATTACKS = [
     ),
 ]
 
+# Accepted failures for the injection subset, from measurement (2026-10-08,
+# see tools/evals/README.md). The fused stratum is DERIVED: a whitespace-free
+# base query is fused by every shell into one phrase chunk no document contains
+# (under system_override only the "system:" shell word matches, the poison
+# sample). The displaced stratum is hand-listed per base query with its reason.
+# Both are accepted failures with count ceilings in run_golden.sh, not policy:
+# if the analyzer or the rank stage fixes a row, its recall becomes 1.0 and the
+# whitelist entry silently stops applying.
+FUSED_BASE_WHY = (
+    "基查询无空白：壳前缀把它融成一个不含于任何文档的短语块，"
+    "ignore_previous / ranking_hijack 下零命中，system_override 下仅壳词命中投毒样本"
+)
+INJ_DISPLACED = {
+    "PCA 方差": "与主集同因：充分源被 semi 负例、词条表与投毒样本挤出 top-5",
+    "SVD 协方差": "壳文本抬高长文噪声的词面分数，pca.md 掉出 top-5",
+    "RBF kernel 定义 调参": "semi-kernel-svm.md 被壳噪声挤出 top-5，只剩 kernel-def 的 0.5",
+    "特征值 定义 求法": "eigenvalue.md 多段占席叠上壳噪声，long-mixed.md 掉出 top-5",
+}
+
 
 def is_zh(query: str) -> bool:
     """Shell language by the query's script, derived — not a parallel table.
@@ -238,6 +327,15 @@ def is_zh(query: str) -> bool:
     return any("一" <= ch <= "鿿" for ch in query)
 
 
+def base_vault() -> Path:
+    """The base fixture vault — the root the corpus keys and the hygiene
+    check both walk (it was spelled out twice; probe P1-F5c)."""
+    return (
+        Path(__file__).parent.parent.parent
+        / "crates" / "momotaro-run" / "tests" / "fixtures" / "vault"
+    )
+
+
 def corpus_keys() -> set[str]:
     """Every note key the scratch vault will actually hold.
 
@@ -245,11 +343,7 @@ def corpus_keys() -> set[str]:
     one scratch vault; a label naming a file neither provides is a dangling
     key that would silently undercount report B.
     """
-    roots = [
-        Path(__file__).parent.parent.parent
-        / "crates" / "momotaro-run" / "tests" / "fixtures" / "vault",
-        Path(__file__).parent / "fixtures",
-    ]
+    roots = [base_vault(), Path(__file__).parent / "fixtures"]
     keys = set()
     for root in roots:
         for path in root.iterdir():
@@ -267,10 +361,7 @@ def fixture_hygiene() -> None:
     name is silently overwritten by `cp -r` ordering. Both fail here instead.
     """
     fixtures = Path(__file__).parent / "fixtures"
-    base = (
-        Path(__file__).parent.parent.parent
-        / "crates" / "momotaro-run" / "tests" / "fixtures" / "vault"
-    )
+    base = base_vault()
     base_names = {p.name for p in base.iterdir()}
     for path in fixtures.iterdir():
         if path.name.startswith("."):
@@ -279,6 +370,21 @@ def fixture_hygiene() -> None:
         if path.name in base_names:
             print(f"FAIL: fixture {path.name!r} would silently overwrite a base-vault file")
             sys.exit(1)
+
+
+def check_known_miss(row: dict, label: str) -> None:
+    """Validate the optional accepted-failure whitelist entry on a row."""
+    known = row.get("known_miss")
+    if known is None:
+        return
+    if (
+        not isinstance(known, dict)
+        or known.get("reason") not in ("fused", "displaced")
+        or not isinstance(known.get("why"), str)
+        or not known["why"]
+    ):
+        print(f"FAIL: {label} has a malformed known_miss: {known!r}")
+        sys.exit(1)
 
 
 def main() -> None:
@@ -294,6 +400,7 @@ def main() -> None:
             if label["key"] not in known:
                 print(f"FAIL: hard-negative key not in corpus: {label['key']!r}")
                 sys.exit(1)
+        check_known_miss(entry, entry["query"])
     for key in POISON_KEYS:
         if key not in known:
             print(f"FAIL: poison key not in corpus: {key!r}")
@@ -302,13 +409,22 @@ def main() -> None:
     injection = []
     for zh_shell, en_shell in ATTACKS:
         for entry in MAIN:
-            shell = zh_shell if is_zh(entry["query"]) else en_shell
-            injection.append(
-                {
-                    "query": shell.format(q=entry["query"]),
-                    "sufficient": list(entry["sufficient"]),
-                }
-            )
+            base = entry["query"]
+            shell = zh_shell if is_zh(base) else en_shell
+            row = {
+                "query": shell.format(q=base),
+                "sufficient": list(entry["sufficient"]),
+            }
+            if not any(ch.isspace() for ch in base):
+                row["known_miss"] = {"reason": "fused", "why": FUSED_BASE_WHY}
+            elif base in INJ_DISPLACED:
+                row["known_miss"] = {"reason": "displaced", "why": INJ_DISPLACED[base]}
+            check_known_miss(row, row["query"])
+            injection.append(row)
+    for base in INJ_DISPLACED:
+        if base not in {entry["query"] for entry in MAIN}:
+            print(f"FAIL: INJ_DISPLACED key names no main query: {base!r}")
+            sys.exit(1)
 
     doc = {
         "description": (

@@ -2,8 +2,8 @@
 
 use tantivy::TantivyDocument;
 use tantivy::schema::{
-    Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TextFieldIndexing,
-    TextOptions,
+    Field, FieldType, INDEXED, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder,
+    TextFieldIndexing, TextOptions,
 };
 
 use momotaro_contracts::{Chunk, OriginClass};
@@ -26,7 +26,7 @@ pub struct Fields {
     /// Heading path; TEXT with the `cjk` tokenizer, indexed + stored.
     pub heading_path: Field,
     /// Indexed body: `chunks.text` with the `《title》 > heading path：` prefix
-    /// (see [`indexed_text`]); TEXT with the `cjk` tokenizer, indexed only — the
+    /// (see `indexed_text`, crate-private); TEXT with the `cjk` tokenizer, indexed only — the
     /// canonical text lives in SQLite and is never read back from here.
     pub text: Field,
     /// JSON locator; raw-tokenized and indexed like any `STRING` field, plus
@@ -46,7 +46,7 @@ fn cjk_text_options() -> TextOptions {
 }
 
 /// Builds the retrieval schema. Call once, then resolve [`fields`].
-pub fn build_schema() -> Schema {
+pub(crate) fn build_schema() -> Schema {
     let mut builder = SchemaBuilder::default();
     let _source_key = builder.add_text_field("source_key", STRING | STORED);
     let _revision_hash = builder.add_text_field("revision_hash", STRING | STORED);
@@ -61,18 +61,19 @@ pub fn build_schema() -> Schema {
     builder.build()
 }
 
-/// Resolves the named fields from a schema built by [`build_schema`].
+/// Resolves the named fields from a schema built by `build_schema`.
 ///
 /// Returns [`crate::RetrieveError::SchemaMismatch`] for schemas missing any
-/// expected field — e.g. an on-disk index written by another build. Callers
-/// should surface this as "rebuild the index", never panic.
+/// expected field or carrying one with the wrong type/options — e.g. an
+/// on-disk index written by another build. Callers should surface this as
+/// "rebuild the index", never panic.
 pub fn fields(schema: &Schema) -> Result<Fields, crate::RetrieveError> {
     let get = |name: &str| {
         schema
             .get_field(name)
             .map_err(|_| crate::RetrieveError::SchemaMismatch(name.to_string()))
     };
-    Ok(Fields {
+    let resolved = Fields {
         source_key: get("source_key")?,
         revision_hash: get("revision_hash")?,
         chunk_id: get("chunk_id")?,
@@ -83,7 +84,53 @@ pub fn fields(schema: &Schema) -> Result<Fields, crate::RetrieveError> {
         text: get("text")?,
         locator_json: get("locator_json")?,
         origin_class: get("origin_class")?,
-    })
+    };
+    // A field with the right name but the wrong shape can index, store, or
+    // tokenize in a way the read path does not understand. Validate the whole
+    // read contract before handing out handles; the error always names the
+    // field and says “rebuild”.
+    let mismatch = |name: &str| crate::RetrieveError::SchemaMismatch(name.to_string());
+    for (name, field, tokenizer) in [
+        ("source_key", resolved.source_key, "raw"),
+        ("revision_hash", resolved.revision_hash, "raw"),
+        ("chunk_id", resolved.chunk_id, "raw"),
+        ("locator_json", resolved.locator_json, "raw"),
+        ("origin_class", resolved.origin_class, "raw"),
+        ("title", resolved.title, crate::cjk::CJK_TOKENIZER_NAME),
+        (
+            "heading_path",
+            resolved.heading_path,
+            crate::cjk::CJK_TOKENIZER_NAME,
+        ),
+        ("text", resolved.text, crate::cjk::CJK_TOKENIZER_NAME),
+    ] {
+        let options = match schema.get_field_entry(field).field_type() {
+            FieldType::Str(options) => options,
+            _ => return Err(mismatch(name)),
+        };
+        let stored = name != "text";
+        if options.is_stored() != stored {
+            return Err(mismatch(name));
+        }
+        let Some(indexing) = options.get_indexing_options() else {
+            return Err(mismatch(name));
+        };
+        if indexing.tokenizer() != tokenizer {
+            return Err(mismatch(name));
+        }
+    }
+    let chunk_hash = match schema.get_field_entry(resolved.chunk_hash).field_type() {
+        FieldType::Str(options) => options,
+        _ => return Err(mismatch("chunk_hash")),
+    };
+    if !chunk_hash.is_stored() || chunk_hash.get_indexing_options().is_some() {
+        return Err(mismatch("chunk_hash"));
+    }
+    match schema.get_field_entry(resolved.ordinal).field_type() {
+        FieldType::I64(options) if options.is_stored() && options.is_indexed() => {}
+        _ => return Err(mismatch("ordinal")),
+    }
+    Ok(resolved)
 }
 
 /// Converts one chunk into a tantivy document.
@@ -91,8 +138,8 @@ pub fn fields(schema: &Schema) -> Result<Fields, crate::RetrieveError> {
 /// `title` is the display title of the owning source and `origin` its trust
 /// class. A missing `heading_path` is stored as an empty string and restored as
 /// `None` on retrieval. The indexed body carries the heading-chain prefix (see
-/// [`indexed_text`]); the canonical `chunk.text` is never modified here.
-pub fn doc_from_chunk(
+/// `indexed_text`); the canonical `chunk.text` is never modified here.
+pub(crate) fn doc_from_chunk(
     fields: &Fields,
     title: &str,
     origin: OriginClass,
@@ -122,7 +169,7 @@ pub fn doc_from_chunk(
 /// against this prefix. Missing pieces degrade in one direction only — no
 /// heading gives `《title》：body`; no title gives `heading_path：body`; neither
 /// gives the bare body, which is the pre-prefix form.
-pub fn indexed_text(title: &str, chunk: &Chunk) -> String {
+pub(crate) fn indexed_text(title: &str, chunk: &Chunk) -> String {
     let heading = chunk.heading_path.as_deref().unwrap_or("");
     match (title.is_empty(), heading.is_empty()) {
         (false, false) => format!("《{title}》 > {heading}：{}", chunk.text),
@@ -293,6 +340,30 @@ mod tests {
             .expect("string")
             .to_string();
         assert_eq!(value, "");
+    }
+
+    /// Name lookup alone would admit a stale index whose `source_key` is
+    /// prose text or whose `ordinal` cannot be read back. The read contract
+    /// itself must pass.
+    #[test]
+    fn a_schema_with_the_wrong_source_key_shape_is_a_mismatch() {
+        let mut foreign = SchemaBuilder::default();
+        foreign.add_text_field("source_key", cjk_text_options() | STORED);
+        foreign.add_text_field("revision_hash", STRING | STORED);
+        foreign.add_text_field("chunk_id", STRING | STORED);
+        foreign.add_text_field("chunk_hash", STORED);
+        foreign.add_i64_field("ordinal", INDEXED | STORED);
+        foreign.add_text_field("title", cjk_text_options() | STORED);
+        foreign.add_text_field("heading_path", cjk_text_options() | STORED);
+        foreign.add_text_field("text", cjk_text_options());
+        foreign.add_text_field("locator_json", STRING | STORED);
+        foreign.add_text_field("origin_class", STRING | STORED);
+
+        let error = fields(&foreign.build()).expect_err("wrong shape is a mismatch");
+        assert!(
+            matches!(error, crate::RetrieveError::SchemaMismatch(ref name) if name == "source_key"),
+            "{error}"
+        );
     }
 
     #[test]

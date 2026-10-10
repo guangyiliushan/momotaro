@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use momotaro_contracts::{AnchorKind, Degradation, EdgeKind, LinkSource, nfc_text};
-use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, LinkType, Parser, Tag, TagEnd};
 
 /// One extracted link record — the `metadata_json.links` shape (`§5 第 2 条`).
 ///
@@ -81,7 +81,7 @@ impl Extracted {
 pub fn analyze(text: &str, excluded: &[Range<usize>]) -> (Extracted, Outline) {
     let mut out = Extracted::default();
     let mut outline = Outline::default();
-    let parser = Parser::new_ext(text, Options::ENABLE_TABLES | Options::ENABLE_WIKILINKS);
+    let parser = Parser::new_ext(text, crate::PARSE_OPTIONS);
 
     let mut stack: Vec<(u8, String)> = Vec::new();
     let mut heading_text = String::new();
@@ -118,8 +118,20 @@ pub fn analyze(text: &str, excluded: &[Range<usize>]) -> (Extracted, Outline) {
                 heading_text.clear();
             }
             Event::Text(t) if in_heading => heading_text.push_str(&t),
+            // Inline code inside a heading is heading text (the outline and
+            // the `heading_path` both stand on this collector), and the
+            // parser emits `Event::Code` beside `Event::Text`. The body's
+            // `text_run` deliberately does not collect code spans: a `[[x]]`
+            // written inside inline code is not a link.
+            Event::Code(t) if in_heading => heading_text.push_str(&t),
             Event::Text(t) if !in_code_block => text_run.push_str(&t),
             Event::End(TagEnd::Heading(_)) => {
+                // A heading collects its text into a buffer of its own, so
+                // the body's trailing scan never sees it: a `[[|alias]]` with
+                // no destination that pulldown-cmark did not turn into a link
+                // would vanish silently from a `#` heading while the same text
+                // in a paragraph is reported (`§5 第 6 条` names this shape).
+                scan_remnants(&heading_text, &mut out);
                 if let Some((_, slot)) = stack.last_mut() {
                     *slot = heading_text.trim().to_string();
                 }
@@ -441,11 +453,16 @@ fn is_block_id(id: &str) -> bool {
 fn is_external(target: &str) -> bool {
     // A URI, not a vault path: `scheme://…` in any spelling, plus `mailto:`.
     // A bare `arxiv:1234`-shaped name has no `//` and stays a (dangling) name.
-    let lower = target.to_ascii_lowercase();
-    if lower.starts_with("mailto:") {
+    // Allocation-free (probe P1-F2): this runs once per link on the indexing
+    // hot path, and the case-folding happens per compared byte rather than by
+    // lowercasing the whole target first.
+    if target
+        .get(..7)
+        .is_some_and(|head| head.eq_ignore_ascii_case("mailto:"))
+    {
         return true;
     }
-    lower.split_once(':').is_some_and(|(scheme, rest)| {
+    target.split_once(':').is_some_and(|(scheme, rest)| {
         rest.starts_with("//")
             && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
             && scheme
@@ -690,6 +707,24 @@ mod tests {
         );
     }
 
+    /// The markdown half of the embed axis: `![alt](target.md)` is an embed
+    /// edge too, and every Embed assertion until this one was written in
+    /// wikilink spelling — the `(true, false)` arm of the mapping could fall
+    /// to `Link` with the whole suite green.
+    #[test]
+    fn a_markdown_image_is_an_embed_edge() {
+        let out = extract_links("![alt](target.md)", &[]);
+        assert_eq!(
+            out.links,
+            [record(
+                "target.md",
+                EdgeKind::Embed,
+                LinkSource::Markdown,
+                None
+            )]
+        );
+    }
+
     #[test]
     fn a_markdown_link_keeps_its_raw_target_and_decodes_later() {
         let out = extract_links("[t](my%20note.md#Head)", &[]);
@@ -766,6 +801,24 @@ mod tests {
         );
     }
 
+    /// The heading half of `a_refused_shape_in_prose_is_reported_once`.
+    ///
+    /// `§5 第 6 条` names `[[|alias]]` by shape, and the paragraph case was
+    /// covered — but heading text is collected into a separate buffer that
+    /// the body's trailing scan never sees, so a refused shape on a `#`
+    /// heading produced no code at all while the identical text in a
+    /// paragraph produced one.
+    #[test]
+    fn a_refused_shape_in_a_heading_is_reported_too() {
+        let out = extract_links("# a [[|alias]] heading", &[]);
+        assert!(out.links.is_empty());
+        assert_eq!(
+            out.losses,
+            [Degradation::UnknownLinkSyntax],
+            "a refused shape is a loss wherever it appears, heading included"
+        );
+    }
+
     #[test]
     fn an_excluded_span_hides_its_links() {
         let text = "before [[a]] scene [[b]] after [[c]]";
@@ -823,7 +876,15 @@ mod tests {
         // h1-h6 stack, one witness.
         let policy: momotaro_contracts::IndexPolicy =
             serde_json::from_str("{}").expect("policy defaults");
-        for chunk in crate::chunk_markdown("note:x.md", "h", text, &policy) {
+        for chunk in crate::chunk_markdown_with(
+            "note:x.md",
+            "h",
+            text,
+            &policy,
+            crate::chunker::SourceOffset::default(),
+            &[],
+            None,
+        ) {
             if let Some(path) = &chunk.heading_path {
                 let levels: Vec<String> = path.split(" > ").map(str::to_owned).collect();
                 assert!(
@@ -850,6 +911,66 @@ mod tests {
         assert!(
             !anchor_still_exists(AnchorKind::Heading, "Child#Parent", &outline),
             "levels are ordered: the tail must match"
+        );
+
+        // The empty-level guard is redundant *because of this*: an empty
+        // heading level never reaches an outline (the builder filters empty
+        // stack slots), so no path could ever match an empty level and the
+        // guard has nothing left to refuse. Pin the filter — if it goes, the
+        // guard becomes load-bearing again.
+        let with_empty = outline_of(
+            "#
+
+## Child
+
+text
+",
+        );
+        assert!(
+            with_empty
+                .headings
+                .iter()
+                .all(|path| path.iter().all(|level| !level.is_empty())),
+            "an empty heading level never reaches an outline: {:?}",
+            with_empty.headings
+        );
+        assert!(!anchor_still_exists(AnchorKind::Heading, "", &with_empty));
+    }
+
+    /// The one place a markdown target is decoded — the extraction side
+    /// deliberately stores it raw, and its own witness says "decoding is
+    /// resolution's job". This is that job: a `%20` in a markdown link has to
+    /// find the file whose name holds a space, and a wikilink target has to
+    /// stay exactly as written.
+    #[test]
+    fn a_markdown_target_is_decoded_here_and_a_wikilink_is_not() {
+        let ns = Namespace::new([("my note.md", "note:my note.md")]);
+
+        assert_eq!(
+            resolve("my%20note.md", "", LinkSource::Markdown, &ns),
+            Resolution::Resolved("note:my note.md".to_owned()),
+            "the markdown half decodes, so the link finds its file"
+        );
+        assert!(
+            matches!(
+                resolve("my%20note.md", "", LinkSource::Wikilink, &ns),
+                Resolution::Dangling
+            ),
+            "a wikilink is never decoded — `my%20note.md` is its own name, \
+             and decoding it would resolve a target nobody wrote"
+        );
+    }
+
+    /// Inline code is heading text for the outline too: the anchor a reader
+    /// writes matches the rendered spelling (`#Foo bar baz`), or a link to a
+    /// heading that is on the page is reported stale — and the row lands in
+    /// the audit log as an error that never happened.
+    #[test]
+    fn inline_code_is_heading_text_for_the_outline() {
+        let outline = outline_of("# Foo `bar` baz\n\ntext\n");
+        assert!(
+            anchor_still_exists(AnchorKind::Heading, "Foo bar baz", &outline),
+            "the rendered spelling matches: {outline:?}"
         );
     }
 
@@ -995,12 +1116,137 @@ mod tests {
         );
     }
 
+    /// `End(CodeBlock)` is what puts the text run back in play. Latch the flag
+    /// and every paragraph after the first fence is read as code, so a refused
+    /// `[[…]]` written in prose never reaches the scan — a loss `§5 第 6 条`
+    /// names by shape and this doc's own fence test would have you believe is
+    /// quiet forever.
+    #[test]
+    fn a_refused_shape_after_a_code_block_is_reported_too() {
+        let out = extract_links("```\ncode\n```\n\na [[|alias]] b", &[]);
+        assert!(out.links.is_empty());
+        assert_eq!(
+            out.losses,
+            [Degradation::UnknownLinkSyntax],
+            "the fence is over; what follows is prose again: {:?}",
+            out.losses
+        );
+    }
+
+    /// A block end closes the run, so an opener in one paragraph and its closer
+    /// in the next are two halves of nothing — stitching them invents a remnant
+    /// nobody wrote and reports a loss that did not happen.
+    #[test]
+    fn the_run_does_not_stitch_across_a_block_boundary() {
+        let out = extract_links("[[\n\ntext]]", &[]);
+        assert!(
+            out.losses.is_empty(),
+            "the brackets belong to different paragraphs: {:?}",
+            out.losses
+        );
+    }
+
+    /// Both halves of the caret-id rule (§5 第 4 条): whitespace before the `^`,
+    /// and an id the grammar admits. Relax either and `outline.block_ids`
+    /// grows a definition that was never written, so `anchor_still_exists`
+    /// answers "still there" for an anchor that is gone (stale-anchor miss).
+    #[test]
+    fn a_caret_id_needs_whitespace_before_it_and_a_legal_id_after() {
+        let outline = outline_of("abc^def\n\npara ^!!!\n\nok ^real\n");
+        assert_eq!(
+            outline.block_ids,
+            ["real"],
+            "no whitespace before the caret, and `!!!` is not an id: {:?}",
+            outline.block_ids
+        );
+    }
+
+    /// `is_block_id` is `[A-Za-z0-9-]+` and says so; a hyphen is the commonest
+    /// thing in an id. Reject it and `^my-id` stops being a definition, so a
+    /// link to it is reported stale while it is still on the page.
+    #[test]
+    fn a_block_id_may_contain_a_hyphen() {
+        let outline = outline_of("para ^my-id\n");
+        assert_eq!(outline.block_ids, ["my-id"], "{:?}", outline.block_ids);
+    }
+
+    /// Half-open on both sides, checked against the event that actually carries
+    /// the link: a span that *begins* on its end byte, or *stops* on its start
+    /// byte, does not contain it. `<=` on either operand swallows the link event
+    /// and the edge vanishes — the span excluded nothing anybody wrote.
+    ///
+    /// The range has to come from the parse, not from a guess at where `[..]`
+    /// sits: `analyze` tests every event separately, so a span adjacent to the
+    /// paragraph says nothing about the link inside it.
+    #[test]
+    fn a_span_that_touches_an_event_without_overlapping_it_hides_nothing() {
+        let text = "before [a](a.md) after";
+        let mut link_ranges: Vec<Range<usize>> = Parser::new_ext(text, crate::PARSE_OPTIONS)
+            .into_offset_iter()
+            .filter(|(event, _)| matches!(event, Event::Start(Tag::Link { .. })))
+            .map(|(_, range)| range)
+            .collect();
+        assert_eq!(link_ranges.len(), 1, "{link_ranges:?}");
+        let range = link_ranges.remove(0);
+
+        let targets = |excluded: &[Range<usize>]| -> Vec<String> {
+            extract_links(text, excluded)
+                .links
+                .iter()
+                .map(|link| link.raw_target.clone())
+                .collect()
+        };
+
+        // Opens exactly on the link's end byte: covers what follows it only.
+        assert_eq!(
+            targets(std::slice::from_ref(&(range.end..text.len()))),
+            ["a.md".to_owned()],
+            "a span starting at an event's end does not reach into it: {range:?}"
+        );
+        // Stops exactly on the link's start byte: covers what precedes it only.
+        assert_eq!(
+            targets(std::slice::from_ref(&(0..range.start))),
+            ["a.md".to_owned()],
+            "a span ending at an event's start does not reach into it: {range:?}"
+        );
+    }
+
+    /// Indented code ends *after* its last newline, which is exactly where the
+    /// next line starts. The predicate has to keep those apart: read the line
+    /// as code and its `^id` definition is swallowed by a fence it never entered.
+    #[test]
+    fn a_line_starting_exactly_where_indented_code_ends_is_not_code() {
+        let outline = outline_of("    indented code\nb ^z\n");
+        assert_eq!(
+            outline.block_ids,
+            ["z"],
+            "one line past the fence is still prose: {:?}",
+            outline.block_ids
+        );
+    }
+
     #[test]
     fn percent_decode_is_all_or_nothing() {
         assert_eq!(percent_decode("a%20b").as_deref(), Some("a b"));
         assert_eq!(percent_decode("%E4%B8%AD").as_deref(), Some("中"));
+        // Lowercase is the same alphabet: `[t](%e4%b8%ad.md)` must build the
+        // edge its uppercase twin builds, not a decode loss nobody wrote.
+        assert_eq!(percent_decode("%e4%b8%ad").as_deref(), Some("中"));
+        assert_eq!(percent_decode("%c3%a9").as_deref(), Some("\u{e9}"));
         assert_eq!(percent_decode("bad%ZZ"), None);
         assert_eq!(percent_decode("trail%"), None);
         assert_eq!(percent_decode("%FF"), None, "valid escape, invalid UTF-8");
+    }
+    /// The allocation-free `is_external` folds case per compared byte
+    /// (`eq_ignore_ascii_case`); the old whole-string lowercase folded it
+    /// wholesale. Uppercase spellings are the shapes the rewrite could have
+    /// broken — this pins them (probe P1-F2).
+    #[test]
+    fn an_uppercase_uri_scheme_is_still_external() {
+        assert!(is_external("MAILTO:someone@example.com"));
+        assert!(is_external("HTTPS://example.com/x.md"));
+        assert!(is_external("Http://example.com"));
+        assert!(!is_external("arxiv:1234"));
+        assert!(!is_external("note.md"));
     }
 }

@@ -28,7 +28,7 @@ A deterministic projection of one Source revision: the retrieval and citation lo
 _Avoid_: canonical fact, Tantivy document, embedding, passage (when you mean the stored row)
 
 **Origin class**:
-Who authored the bytes: `owner` | `paper` | `web` | `agent` | `system`. Orthogonal to Source kind (`note` | `paper` | `web`).
+Who authored the bytes: `owner` | `paper` | `web` | `agent` | `system`. Orthogonal to Source kind (`note` | `paper` | `web` | `attachment`).
 _Avoid_: trust score, provenance (provenance is the citation five-tuple)
 
 ## Human desk
@@ -51,7 +51,7 @@ _Avoid_: memory, wiki page, note, idea (when you mean the stored card)
 
 **Profile**:
 A named bundle of Run defaults (model slots, policy, toolset). It is not memory, not notes, and not a 0.x record — 0.x has only `momotaro.toml`.
-_Avoid_: persona, memory, user profile, `--profile` (that flag is timings)
+_Avoid_: persona, memory, user profile, `--profile` (a flag for it was parsed and never read; removed)
 
 ## Work and answers
 
