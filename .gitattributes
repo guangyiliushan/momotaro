@@ -1,0 +1,9 @@
+# Canonical line endings: LF in the repository and in every checkout.
+#
+# The local byte-exact guards (the CLI source pin and the golden-set byte
+# check) fail on a CRLF worktree, and `core.autocrlf` checkouts can produce
+# one — observed when the wave merges rewrote the worktree. This file makes
+# LF the single canonical form on every platform.
+#
+# Binary files are auto-detected and never converted.
+* text=auto eol=lf
