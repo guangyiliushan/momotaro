@@ -1,16 +1,16 @@
 # Retrieval evals (v0.2)
 
 Golden-set regression for lexical search. This directory is intentionally
-outside both the pnpm and Cargo workspaces (see docs/docs/python-rust.md).
+outside both the pnpm and Cargo workspaces.
 
 ## Files
 
 - `gen_annotations.py` — generates `golden_set.json` (deterministic: fixed
   order, no timestamps). Edit this file and re-run it; commit both. Also owns
   the accepted-failure whitelist (`known_miss`) and the fixture hygiene check.
-- `golden_set.json` — 15 main queries with `sufficient` sets (the minimal
-  evidence set per the context-retrieval §3 "标充分集" caliber; three of them
-  are multi-key so the AND semantics is actually exercised), per-query
+- `golden_set.json` — 15 main queries with `sufficient` sets (per-query
+  "标充分集", the minimal evidence set; three of them are multi-key so the
+  AND semantics is actually exercised), per-query
   `hard_negatives` labels (`semi_relevant` / `no_info`, each with a `why`), a
   45-entry `injection` regression subset (prompt-injection text embedded in
   the query; retrieval surface only), and `poison_keys` naming the corpus-side
@@ -40,7 +40,7 @@ outside both the pnpm and Cargo workspaces (see docs/docs/python-rust.md).
 bash tools/evals/run_golden.sh
 ```
 
-Drop the gates to get the numbers without the D16 tripwires:
+Drop the gates to get the numbers without the miss tripwires:
 
 ```bash
 bash tools/evals/run_golden.sh /tmp/momotaro-eval      # scratch dir is optional
@@ -90,7 +90,7 @@ Two strata of accepted failure, both measured, both whitelisted with a `why`:
   split keeps this stratum from diluting the robustness story: of the rows the
   analyzer can actually parse, injection recall is `1.0` for 21/33 — the gap
   there is ranking, not tokenization. (Fixing the analyzer is a separate
-  decision — the `cjk_tokenizer` config seam in context-retrieval §4.)
+  decision — the `cjk_tokenizer` config seam.)
 - **displaced (14 rows: 2 main + 12 injection)** — hits were retrieved but the
   sufficient source fell out of top-5:
   - `PCA 方差` (and its injection shells) — the recorded hard-negative harm:
@@ -104,7 +104,7 @@ Two strata of accepted failure, both measured, both whitelisted with a `why`:
     eigenvalue.md owns 4 of the 5 seats (four chunks) and fourier's aside
     takes the last, so long-mixed.md's 求法 never lands. One source's own
     chunks crowd out the other sufficient member. The rank-stage same-source
-    demotion ("BM25 分数断崖的同文档段落降权", context-retrieval §3) is the
+    demotion ("BM25 分数断崖的同文档段落降权") is the
     designed fix; until then this row names the gap.
 
 ## Blind spots, kept deliberately

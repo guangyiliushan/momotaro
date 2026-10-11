@@ -38,7 +38,7 @@ crates/           Rust engine
 docs/             this documentation site
 ```
 
-See [Architecture](docs/docs/architecture.md) for the full map.
+The domain language lives in [CONTEXT.md](CONTEXT.md); the engine lives under `crates/`.
 
 ## Documentation
 
