@@ -1,4 +1,4 @@
-//! Reading and writing `graph_links`, the derived edge table (ADR 0027).
+//! Reading and writing `graph_links`, the derived edge table.
 //!
 //! The table is an idempotent projection: one row per as-written identity,
 //! replaced wholesale per `from_source_key`. Rows carry no build history —
@@ -56,7 +56,7 @@ fn read_graph_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<GraphLink,
 /// Shared by both write paths (the file's content transaction and the
 /// projection-only replace), so the identity set cannot be built two ways.
 /// The identity set is enforced here — an as-written tuple that appears twice
-/// goes in once (ADR 0027) — and every row is written under the
+/// goes in once — and every row is written under the
 /// `from_source_key` argument, which is also the delete key; a row struct's
 /// own `from_source_key` field cannot disagree with it.
 pub(crate) fn write_edges_tx(
@@ -103,12 +103,18 @@ pub(crate) fn write_edges_tx(
 }
 
 impl crate::Store {
-    /// Replaces every projected source's edges in one transaction (ADR 0027).
+    /// Replaces every projected source's edges in one transaction.
     ///
     /// Each pair is still wholesale per `from_source_key`; the batch is the
     /// write unit so a 10k-file run pays one commit for its re-projections
     /// instead of ten thousand. The rows a parse wrote ride the file's own
     /// content transaction and never come through here.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the transaction cannot be opened, a
+    ///   projection's rewrite fails, or the commit fails; on failure nothing
+    ///   is written.
     pub fn replace_edges_many(
         &mut self,
         projections: &[(String, Vec<GraphLink>)],
@@ -123,9 +129,14 @@ impl crate::Store {
 
     /// Drops the rows of every source the walk no longer names.
     ///
-    /// The other half of "a rebuilt projection reproduces the table" (ADR
-    /// 0027): a source that left the vault must not keep rows a rebuild would
+    /// The other half of "a rebuilt projection reproduces the table": a
+    /// source that left the vault must not keep rows a rebuild would
     /// never produce. `source_keys_json` is a JSON array of the keys to keep.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the delete fails — including when
+    ///   `source_keys_json` is not valid JSON, which `json_each` rejects.
     pub fn prune_graph_edges_outside(&mut self, source_keys_json: &str) -> Result<u64, StoreError> {
         let removed = self.connection.execute(
             "DELETE FROM graph_links WHERE from_source_key NOT IN
@@ -136,6 +147,10 @@ impl crate::Store {
     }
 
     /// Row totals for the batch summary: `(rows, of which dangling)`.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when either count query fails.
     pub fn graph_counts(&self) -> Result<(u64, u64), StoreError> {
         let rows: i64 =
             self.connection
@@ -153,6 +168,14 @@ impl crate::Store {
 
     /// Every row, in insertion order — the reader the rebuild-identity check
     /// and `rm graph_links` acceptance compare through.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::UnknownGraphSpelling` when a row's `edge_kind`,
+    ///   `link_source`, or `anchor_kind` carries a spelling this build does
+    ///   not know (a newer build wrote it).
+    /// - `StoreError::Sqlite` when the query cannot be prepared or a column
+    ///   cannot be read.
     pub fn all_graph_links(&self) -> Result<Vec<GraphLink>, StoreError> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT {GRAPH_COLUMNS} FROM graph_links ORDER BY rowid"
@@ -204,7 +227,7 @@ mod tests {
         let second = store.all_graph_links().expect("read");
         assert_eq!(first, second, "re-running the projection is a no-op");
 
-        // The anchor is half the identity (ADR 0027): the same writing with two
+        // The anchor is half the identity: the same writing with two
         // anchors is two rows, and a dedupe that ignored the anchor columns
         // would silently merge them.
         let two_anchors = vec![

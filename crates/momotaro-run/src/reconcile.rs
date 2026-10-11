@@ -1,8 +1,8 @@
-//! The four reconciliation triggers (D40 §4.4): one walk, four callers.
+//! The four reconciliation triggers: one walk, four callers.
 //!
 //! Startup, the daily timer, `momotaro reconcile`, and a watcher that lost
 //! events all end here, and all of them write the same `vault.reconcile.*`
-//! batch. Reconciliation is what makes D40's first sentence true in practice —
+//! batch. Reconciliation is what makes the hint/truth split true in practice —
 //! events are the hint, and this is the truth they are checked against.
 
 use std::path::Path;
@@ -15,7 +15,7 @@ use crate::RunError;
 use crate::database_path;
 use crate::index_service::{BatchShape, RECONCILE_PLAN, run_batch};
 
-/// What one reconciliation found (D40 §4.4).
+/// What one reconciliation found.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReconcileReport {
     /// The `vault.reconcile.*` batch this run wrote.
@@ -49,8 +49,30 @@ pub fn format_reconcile(report: &ReconcileReport) -> String {
 
 /// Walk the whole vault and bring the store to it.
 ///
-/// Every one of D40 §4.4's four triggers calls this; the trigger itself is
+/// Every one of the four triggers calls this; the trigger itself is
 /// reported by the caller, which is why this type does not carry one.
+///
+/// # Errors
+///
+/// - `RunError::ConfigRead` / `RunError::ConfigParse` when `momotaro.toml`
+///   cannot be read or parsed.
+/// - `RunError::ConfigInvalid` when `[index]` names a policy this build
+///   does not implement.
+/// - `RunError::VaultOutsideWorkspace` when the configured vault resolves
+///   outside the workspace.
+/// - `RunError::VaultMissing` when the resolved vault path is not a
+///   directory.
+/// - `RunError::Ingest` when a vault walk or path check fails.
+/// - `RunError::IndexUnusable` when the index exists but cannot be used.
+/// - `RunError::StoreUnhealthy` when the workspace is not initialized or
+///   the store is not healthy.
+/// - `RunError::Store` when any store call in the batch, or the batch
+///   read-back (open + event count), fails.
+/// - `RunError::Retrieve` when the search index cannot be opened, written,
+///   or committed.
+/// - `RunError::Io` when the index directory cannot be created.
+/// - `RunError::Invariant` only on an internal bug (the batch's
+///   nameless-row invariant).
 pub fn reconcile(root: impl AsRef<Path>) -> Result<ReconcileReport, RunError> {
     let root = root.as_ref();
     let outcome = run_batch(root, None, attributes_of, BatchShape::full(RECONCILE_PLAN))?;

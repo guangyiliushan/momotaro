@@ -1,8 +1,8 @@
 //! The judgement: one citation in, one [`Verification`] out.
 //!
 //! Judgements run in a fixed order and the first one that fires wins. The
-//! order is part of the contract — architecture §14.1 lists "引用 ID 必须存在
-//! 于 `run_context_items`" first — and a test pins which judgement answers
+//! order is part of the contract — the citation ID's existence in
+//! `run_context_items` comes first — and a test pins which judgement answers
 //! when more than one is broken.
 
 use crate::citation::Citation;
@@ -50,18 +50,16 @@ impl Default for VerifyPolicy {
 ///
 /// 1. a disabled policy reports `skipped` and touches nothing;
 /// 2. the citation must name a context item this run actually handed the
-///    model — architecture §14.1 rule 1 — and one that does not is what
-///    rule 4 names `citation_invalid`;
+///    model — one that does not is reported as `citation_invalid`;
 /// 3. the chunk row must exist;
-/// 4. `source_key + revision_hash + chunk_hash` must match it exactly
-///    (§14.1 rule 2);
-/// 5. the locator must match it exactly (D5's fifth element);
-/// 6. the quoted text must be locatable inside that chunk (§14.1 rule 3).
+/// 4. `source_key + revision_hash + chunk_hash` must match it exactly;
+/// 5. the locator must match it exactly (the five-tuple's fifth element);
+/// 6. the quoted text must be locatable inside that chunk.
 ///
-/// **Where rule 1's evidence comes from.** `momotaro-store` exposes no read
+/// **Where the context-item evidence comes from.** `momotaro-store` exposes no read
 /// for `run_context_items`, so the ids arrive as `context_item_ids`: the
-/// caller — which has just written that table at architecture §10.1 step 8 —
-/// hands them over. This is the task card's 先桩后实 stub: the predicate is
+/// caller — which has just written that table —
+/// hands them over. This is a stub-first stand-in: the predicate is
 /// real, it runs first, and it fails closed (an empty slice fails every
 /// citation), but the *store-backed* read is a later task. Until it lands,
 /// this function's contract is "checked against the ids you passed", not
@@ -73,6 +71,36 @@ impl Default for VerifyPolicy {
 ///
 /// Pure and idempotent: same inputs, same verdict, no I/O beyond what the
 /// injected seam performs.
+///
+/// # Examples
+///
+/// One judgement against a store (the seam's only production implementor):
+///
+/// ```no_run
+/// use momotaro_store::Store;
+/// use momotaro_verify::verify::verify_citation;
+/// use momotaro_verify::{Citation, StoreSource, VerifyPolicy};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let store = Store::open("ws/.momotaro/momotaro.db")?;
+/// let source = StoreSource::new(&store, "ws");
+/// let citation = Citation {
+///     context_item_id: "f0001".to_owned(),
+///     source_key: "note:notes/fourier.md".to_owned(),
+///     revision_hash: "rev-1".to_owned(),
+///     chunk_id: "chunk-1".to_owned(),
+///     chunk_hash: "chash-1".to_owned(),
+///     locator_json: r#"{"start_byte":0}"#.to_owned(),
+///     quoted_text: "energy is conserved".to_owned(),
+/// };
+///
+/// // The context item must be one this run handed the model, or the verdict is
+/// // `failed` / `citation_invalid` before the store is touched.
+/// let verdict = verify_citation(&source, VerifyPolicy::enabled(), &["f0001"], &citation);
+/// println!("{:?}", verdict.status);
+/// # Ok(())
+/// # }
+/// ```
 pub fn verify_citation<S: CitationSource>(
     source: &S,
     policy: VerifyPolicy,
@@ -116,7 +144,7 @@ pub fn verify_citation<S: CitationSource>(
     }
 
     // `chunks.text` is a verbatim slice of the normalised source at the
-    // chunk's own locator, so finding the quote here is what §14.1.3 means by
+    // chunk's own locator, so finding the quote here is what the locatability rule demands:
     // "引用文本必须能定位到原始 chunk". An empty quote has nothing to locate
     // and therefore cannot satisfy it.
     if citation.quoted_text.is_empty() || !chunk.text.contains(&citation.quoted_text) {
@@ -131,10 +159,9 @@ pub fn verify_citation<S: CitationSource>(
 /// Reported under its own `source_integrity` kind rather than folded into the
 /// citation verdict, so that three documented facts stay true at once: a
 /// citation whose file has been archived still verifies from the stored chunk
-/// text (`reference.md`, "Chunk"), the loss is still reported as
-/// `source_missing` rather than silently ignored
-/// (`adr/note-rename-is-a-new-source.md`), and a hash this build cannot
-/// recompute is `unsupported` rather than `passed`.
+/// text, the loss is still reported as `source_missing` rather than
+/// silently ignored, and a hash this build cannot recompute is
+/// `unsupported` rather than `passed`.
 ///
 /// A read that fails for any reason other than absence is `unsupported`, not
 /// `failed`: "I could not open it" is not "it is not there".
@@ -464,7 +491,7 @@ mod tests {
 
     #[test]
     fn quoted_text_that_is_empty_fails() {
-        // §14.1.3: the quoted text must be locatable in the chunk. Nothing to
+        // The quoted text must be locatable in the chunk. Nothing to
         // locate cannot satisfy that, so it fails closed rather than passing
         // vacuously.
         let source = source_with_chunk();
@@ -587,8 +614,8 @@ mod tests {
 
     #[test]
     fn present_but_unhashable_bytes_report_unsupported_never_passed() {
-        // `reference.md`: source integrity means present *and* matching the
-        // hash. This crate cannot recompute the hash, so it must not claim
+        // Source integrity means present *and* matching the hash. This crate
+        // cannot recompute the hash, so it must not claim
         // the first half proves the whole thing.
         let source = source_with_bytes(BytesState::Present { hash_matches: None });
         assert_integrity(
@@ -683,7 +710,7 @@ mod tests {
 
     #[test]
     fn a_single_failing_citation_makes_the_answer_not_fully_verified() {
-        // architecture §14.1.5: the answer may still be output, but it is not
+        // The answer may still be output, but it is not
         // fully verified.
         let source = source_with_chunk();
         let mut broken = citation();
@@ -703,8 +730,8 @@ mod tests {
 
     #[test]
     fn a_missing_bytes_integrity_failure_makes_the_answer_not_fully_verified() {
-        // adr/note-rename-is-a-new-source.md: old citations fail as
-        // source_missing / source_integrity, not as a silent miss.
+        // Old citations fail as source_missing / source_integrity, not as a
+        // silent miss.
         let mut source = source_with_chunk();
         source
             .bytes
@@ -738,8 +765,8 @@ mod tests {
 
     #[test]
     fn an_answer_with_no_citations_is_not_fully_verified() {
-        // "Verified" is a positive claim. reference.md states the same rule
-        // for sparks: "Empty citations make the card `unverified`."
+        // "Verified" is a positive claim. The same rule applies to sparks:
+        // "Empty citations make the card `unverified`."
         let source = source_with_chunk();
         let v = verdict(&source, &[]);
         assert!(v.citations.is_empty());
@@ -812,9 +839,9 @@ mod tests {
     /// kind of `unsupported`, and the one that must not be confused with the
     /// other two: `NoLocalBytes` is a source where nothing was ever going to
     /// be read — no store row, no `local_path`, or a stored path this crate
-    /// refuses by form or containment (a web or arXiv source, which
-    /// `docs/docs/adr/snapshot-excludes-paper-bytes.md` says still resolves
-    /// citations from chunk text) — and `ByteHashUnchecked` is a check that
+    /// refuses by form or containment (a web or arXiv source, whose
+    /// citations still resolve from chunk text) — and `ByteHashUnchecked` is
+    /// a check that
     /// ran to completion with a hash this build cannot recompute. Both are
     /// honest states of a verified answer. A read that was attempted and
     /// failed is neither: the answer was never checked.

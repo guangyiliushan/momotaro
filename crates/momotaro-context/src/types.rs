@@ -1,17 +1,17 @@
 //! Building blocks for [`crate::build_context`].
 //!
-//! Field spellings align with `docs/docs/architecture.md` §8.1
-//! (`run_context_items`) and `docs/docs/context-retrieval.md` §3.1
-//! (`summary.v1`); wire spellings of every enum are pinned by witness tests
+//! Field spellings align with the canonical `run_context_items` columns and
+//! the `summary.v1` record shape; wire spellings of every enum are pinned by
+//! witness tests
 //! in `tests/wire_spellings.rs` (one literal pair per variant).
 
 use momotaro_contracts::{OriginClass, RetrievalHit};
 
 use crate::policy::BudgetPolicy;
-use crate::summary::SummaryV1;
+use crate::summary::Summary;
 
 /// Query intent, embedded as an enum now and routed later
-/// (`docs/docs/context-retrieval.md` §4.1: 0.x embeds the enum, no branches).
+/// (this build embeds the enum, no branches).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryIntent {
     /// Single-step factual lookup (default).
@@ -77,8 +77,8 @@ impl HistoryRole {
 
 /// The role of a [`ProviderMessage`] as the provider sees it.
 ///
-/// Retrieval evidence never renders as `system` (`architecture.md` §12.1:
-/// 检索证据不是 system prompt); policy and tool definitions live in the
+/// Retrieval evidence never renders as `system` (检索证据不是 system prompt);
+/// policy and tool definitions live in the
 /// privileged system position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -107,8 +107,8 @@ impl Role {
 }
 
 /// Which of the six context sources a fragment carries
-/// (`architecture.md` §12.2: `policy / question / history / evidence /
-/// tool_definitions / instructions`).
+/// (`policy / question / history / evidence / tool_definitions /
+/// instructions`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FragmentKind {
     /// The `policy.v1` resident text (constraints ride inside it).
@@ -156,26 +156,35 @@ impl FragmentKind {
 pub enum ContentKind {
     /// Verbatim text.
     Text,
-    /// A `summary.v1` body (`context-retrieval.md` §3.1).
-    SummaryV1,
+    /// A `summary.v1` body.
+    Summary,
 }
 
 impl ContentKind {
     /// Every variant of this enum. Witness tables that promise full
     /// coverage (`wire_spellings`) iterate this and pin its length; a
     /// new variant means extending this list, not just `as_str`.
-    pub const ALL: [Self; 2] = [Self::Text, Self::SummaryV1];
+    pub const ALL: [Self; 2] = [Self::Text, Self::Summary];
 
     /// The wire spelling of this content kind.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use momotaro_context::ContentKind;
+    ///
+    /// assert_eq!(ContentKind::Text.as_str(), "text");
+    /// assert_eq!(ContentKind::Summary.as_str(), "summary.v1");
+    /// ```
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Text => "text",
-            Self::SummaryV1 => "summary.v1",
+            Self::Summary => "summary.v1",
         }
     }
 }
 
-/// Two-stage lowering gate (`architecture.md` §12): the provider only ever
+/// Two-stage lowering gate: the provider only ever
 /// receives `visibility = provider` fragments; the trace keeps them all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {
@@ -191,8 +200,8 @@ impl Visibility {
     /// new variant means extending this list, not just `as_str`.
     pub const ALL: [Self; 2] = [Self::Provider, Self::Trace];
 
-    /// The wire spelling of this visibility (`architecture.md` §6.6:
-    /// `visibility=provider|trace_only`).
+    /// The wire spelling of this visibility
+    /// (`visibility=provider|trace_only`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Provider => "provider",
@@ -210,7 +219,7 @@ pub struct UnknownWireSpelling(String);
 ///
 /// `parameters_json` must hold a JSON object; it is embedded verbatim into the
 /// canonical tools serialization (field order fixed, list order = the caller's
-/// — 序即身份, §1 第 3 条).
+/// — 序即身份).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolDefinition {
     /// Tool name (unique within one request).
@@ -221,12 +230,12 @@ pub struct ToolDefinition {
     pub parameters_json: String,
 }
 
-/// What the history row's `summary` slot holds (`context-retrieval.md` §4).
+/// What the history row's `summary` slot holds.
 ///
 /// Three states on purpose: a `summary.v1` row whose stored text did not
 /// parse has to be distinguishable from "this row is not a summary at all".
 /// Collapsing both into an absent record would replay the raw JSON body as a
-/// normal turn and put it in front of the model, and §4 rule 3 requires the
+/// normal turn and put it in front of the model, and the fail-closed rule requires the
 /// failure to be recorded rather than silently swallowed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SummarySlot {
@@ -235,7 +244,7 @@ pub enum SummarySlot {
     /// A `summary.v1` row whose stored text parsed. Fail-closed validation
     /// against [`HistoryItem::body`] still runs in the `select_history`
     /// stage — parsing and validating are two different promises.
-    Parsed(SummaryV1),
+    Parsed(Summary),
     /// A `summary.v1` row whose stored text is not `summary.v1` JSON.
     Malformed,
 }
@@ -255,11 +264,11 @@ impl SummarySlot {
 
 /// One replayed history item.
 ///
-/// Bodies are replayed **verbatim** (`architecture.md` §6.5 History 不重写):
+/// Bodies are replayed **verbatim** (History 不重写):
 /// a turn rendered by an earlier run must reappear byte-identical, which is
 /// what keeps the request prefix stable across adjacent runs.
 ///
-/// `history_items` mapping (`context-retrieval.md` §3): `kind` = `"turn"` for
+/// `history_items` mapping: `kind` = `"turn"` for
 /// a normal turn, `"summary"` when [`Self::summary`] is not
 /// [`SummarySlot::None`]; `payload_json` carries `referenced_chunk_hashes`
 /// (a `summary.v1` mirror is reserved for a later schema — this build neither writes
@@ -267,13 +276,13 @@ impl SummarySlot {
 /// `momotaro_contracts::estimate_tokens(body)`; `round` has no column — the
 /// run layer re-derives it from the session's run order (`seq` is the
 /// run-internal write order, a different axis); a summary row is appended
-/// with `role = "user"` (§4: only-append summary.v1).
+/// with `role = "user"` (summary rows are append-only).
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryItem {
     /// Stable identifier (survives into `history_items.history_id`).
     pub history_id: String,
     /// The ask round this turn belongs to (1-based); drives the recency
-    /// guard band (`context-retrieval.md` §3).
+    /// guard band.
     pub round: u32,
     /// Which side of the conversation this turn is.
     pub role: HistoryRole,
@@ -295,7 +304,7 @@ pub struct HistoryItem {
 
 /// One evidence candidate: a [`RetrievalHit`] joined with the canonical chunk
 /// text and the trust origin it must carry end to end
-/// (`architecture.md` §12: origin_class 不中途丢弃).
+/// (origin_class 不中途丢弃).
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvidenceItem {
     /// The ranked hit (carries the full citation key set).
@@ -309,13 +318,13 @@ pub struct EvidenceItem {
 }
 
 /// Session-level pure state the ordering and dedup rules read
-/// (`context-retrieval.md` §1.1 layer 1 + §3 第 4 条).
+/// (the ordering layer plus the dedup rules).
 ///
 /// **Production does not persist this.** [`ContextBuildResult::next_session`]
 /// is what *this* build would carry forward; the run layer discards it and
 /// recomputes the ledger from the rows above on the next turn instead —
 /// canonical is append-only, so recomputation cannot drift, and a stored
-/// copy would be the second truth §1.1 forbids. The consequence is worth
+/// copy would be a second truth, which the design forbids. The consequence is worth
 /// naming: `injected` means "already in a request", so a run that failed
 /// *before* the provider call contributes nothing — that costs a repeat
 /// budget line and never costs content.
@@ -325,7 +334,7 @@ pub struct SessionState {
     /// session's builds. A reappearing chunk keeps this slot; new chunks
     /// append after.
     ///
-    /// 见证口径（`context-retrieval.md` §1.1）：「出现」= 该 chunk 的全文真的进了
+    /// 见证口径：「出现」= 该 chunk 的全文真的进了
     /// provider 请求，即 `run_context_items` 落下的那一条——不是「进了 rank 阶段」。
     /// 被预算裁掉、从未发出的 chunk 不入账：它不在任何请求前缀里，给它一个槽位既不
     /// 影响字节稳定，还会让本账本与 canonical 行成为两份真相。
@@ -338,13 +347,12 @@ pub struct SessionState {
     pub first_seen_order: Vec<String>,
     /// `chunk_hash` values whose full text already entered a provider
     /// request — including full text carried by replayed history turns.
-    /// Deduped out of later evidence selections (`context-retrieval.md`
-    /// §3 第 4 条).
+    /// Deduped out of later evidence selections.
     ///
     /// The base **narrows when a summary covers a turn**: the covered turn's
     /// hashes are released, because its text left the replay window with the
     /// demotion and a permanent blacklist would make that content unreachable
-    /// in 0.x (no `kb_read`). The release only hands fresh retrieve a chance;
+    /// in this build (no `kb_read`). The release only hands fresh retrieve a chance;
     /// it does not promise the chunk comes back.
     pub injected: Vec<String>,
     /// Next fragment-id sequence. Fragment ids are session-unique citation
@@ -361,15 +369,15 @@ pub struct SessionState {
 pub struct ContextInput {
     /// The asked question, as the user wrote it.
     pub query: String,
-    /// Query intent; embedded now, routed later (§4.1).
+    /// Query intent; embedded now, routed later.
     pub intent: QueryIntent,
     /// The `policy.v1` resident text. Constraints belong inside it
-    /// (§2 预算分配 level 1: policy + tool definitions + constraints).
+    /// (budget level 1: policy + tool definitions + constraints).
     pub policy_text: String,
-    /// Tool definitions, in the caller's order (§1 第 3 条: 序即身份 — rendering
+    /// Tool definitions, in the caller's order (序即身份 — rendering
     /// fixes the field order but never reorders the list).
     pub tool_definitions: Vec<ToolDefinition>,
-    /// The fixed instruction tail (§2 level 5).
+    /// The fixed instruction tail (budget level 5).
     pub instructions: String,
     /// Prior turns, oldest first.
     pub history: Vec<HistoryItem>,
@@ -382,8 +390,7 @@ pub struct ContextInput {
     pub budget: BudgetPolicy,
 }
 
-/// One context fragment, aligned with `run_context_items` columns
-/// (`architecture.md` §8.1).
+/// One context fragment, aligned with `run_context_items` columns.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContextFragment {
     /// Session-unique citation handle (`f0001`, …, see
@@ -427,16 +434,16 @@ pub enum OmittedReason {
     BudgetExhausted,
     /// Same `chunk_hash` as an earlier fragment in this build.
     DuplicateChunkHash,
-    /// Full text already injected in an earlier turn (§3 第 4 条).
+    /// Full text already injected in an earlier turn.
     PreviouslyInjected,
-    /// A valid `summary.v1` covers this raw turn (§3 第 2 条).
+    /// A valid `summary.v1` covers this raw turn.
     CoveredBySummary,
     /// The summary record failed fail-closed validation; the raw history
     /// falls back instead.
     SummaryValidationFailed,
-    /// Citation key set incomplete; fail-closed drop (§12 validate_citations).
+    /// Citation key set incomplete; fail-closed drop.
     IncompleteCitation,
-    /// Beyond the intent-tier top-k cap (§2.1).
+    /// Beyond the intent-tier top-k cap.
     BeyondTierMax,
     /// Untrusted delimiter rendering failed its own well-formedness check.
     DelimiterViolation,
@@ -485,7 +492,7 @@ pub struct Omission {
     pub reason: OmittedReason,
 }
 
-/// The ten pipeline stages, in contract order (`architecture.md` §12).
+/// The ten pipeline stages, in contract order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     /// Stage 1.
@@ -527,7 +534,7 @@ impl Stage {
         Self::ValidateCitations,
     ];
 
-    /// The wire spelling of this stage (the §12 name verbatim).
+    /// The wire spelling of this stage (the contract name verbatim).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NormalizeQuery => "normalize_query",
@@ -545,7 +552,7 @@ impl Stage {
 }
 
 /// Per-stage record: what passed, what was dropped and why, and how the
-/// estimated-token account moved (`architecture.md` §12: 每个阶段记录
+/// estimated-token account moved (每个阶段记录
 /// `included` / `omitted` / `omitted_reason` / `token_delta` / `duration_ms`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageRecord {
@@ -561,7 +568,7 @@ pub struct StageRecord {
     pub duration_ms: u64,
 }
 
-/// The budget accounting summary of one build (`architecture.md` §12.2).
+/// The budget accounting summary of one build.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BudgetReport {
     /// Configured ceiling.
@@ -609,7 +616,7 @@ impl ContextBuildResult {
     /// request: the tools JSON followed by the messages, framed so the
     /// stream is **append-friendly** — replaying more turns only appends,
     /// so an earlier run's bytes stay a byte prefix of a later run's
-    /// (the cache-stability contract, `context-retrieval.md` §1).
+    /// (the cache-stability contract).
     ///
     /// Layout (`momotaro.request.v1`):
     ///

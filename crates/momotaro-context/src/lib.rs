@@ -1,5 +1,4 @@
-//! `momotaro-context`: the pure context builder
-//! (`docs/docs/architecture.md` §12).
+//! `momotaro-context`: the pure context builder.
 //!
 //! [`build_context`] runs the ten contract stages over one [`ContextInput`]
 //! and returns a [`ContextBuildResult`]: the full fragment list (trace /
@@ -7,7 +6,7 @@
 //! serialization, and one [`StageRecord`] per stage recording `included` /
 //! `omitted` / `omitted_reason` / `token_delta` / `duration_ms`.
 //!
-//! Determinism (`context-retrieval.md` §1): the same session state and query
+//! Determinism: the same session state and query
 //! always produce the same provider request bytes — [`ContextBuildResult::request_bytes`]
 //! is byte-stable and append-friendly, so adjacent runs share a byte-stable
 //! prefix (the hard acceptance regression lives in
@@ -16,9 +15,37 @@
 //!
 //! Dropping is always explicit: every stage's `omitted` list pairs each
 //! dropped item with a typed [`OmittedReason`] — there is no silent path.
+//!
+//! # Examples
+//!
+//! Build one ask turn's provider context from a [`ContextInput`]; the same
+//! input always renders the same request bytes:
+//!
+//! ```
+//! use momotaro_context::{BudgetPolicy, ContextInput, QueryIntent, SessionState, build_context};
+//!
+//! let input = ContextInput {
+//!     query: "  what is BM25? ".to_string(),
+//!     intent: QueryIntent::Fact,
+//!     policy_text: "Answer from evidence only.".to_string(),
+//!     tool_definitions: Vec::new(),
+//!     instructions: "Cite sources.".to_string(),
+//!     history: Vec::new(),
+//!     evidence: Vec::new(),
+//!     session: SessionState::default(),
+//!     budget: BudgetPolicy::default(),
+//! };
+//!
+//! let first = build_context(input.clone());
+//! assert_eq!(first.normalized_query, "what is BM25?");
+//! assert_eq!(first.stages.len(), 10);
+//! assert_eq!(first.request_bytes(), build_context(input).request_bytes());
+//! ```
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(rustdoc::all)]
+#![warn(rustdoc::unescaped_backticks)]
 
 mod budget;
 mod evidence;
@@ -36,7 +63,7 @@ pub use policy::{
 };
 pub use render::{DelimiterError, UNTRUSTED_CLOSE, UNTRUSTED_OPEN_PREFIX};
 pub use summary::{
-    EMPTY_MARKER, EvidenceRef, SUMMARY_VERSION_V1, SummaryError, SummaryV1, UserDecision,
+    EMPTY_MARKER, EvidenceRef, SUMMARY_VERSION, Summary, SummaryError, UserDecision,
 };
 pub use types::{
     BudgetReport, ContentKind, ContextBuildResult, ContextFragment, ContextInput, EvidenceItem,
@@ -88,6 +115,21 @@ pub fn build_context(input: ContextInput) -> ContextBuildResult {
 /// [`build_context`] with an injected millisecond clock for the stage
 /// `duration_ms` fields (tests pin the records byte-for-byte with a fake
 /// clock; the clock never influences the request).
+///
+/// # Panics
+///
+/// Only on an internal bookkeeping invariant, not on a malformed
+/// `ContextInput`:
+///
+/// - the `work.last().expect(...)` calls right after a push (`"history
+///   work"`, `"evidence work"`) fire only if `work` were empty there,
+///   which the preceding push rules out;
+/// - the evidence stages `expect` every `Evidence` work item to carry its
+///   `evidence_index` (still in range of `input.evidence`) and its
+///   `chunk_hash`;
+/// - the rank stage `expect`s the ranked order to be a permutation of the
+///   evidence items it just extracted (`"ranked evidence present"`,
+///   `"ranked item"`).
 pub fn build_context_with_clock(
     input: ContextInput,
     clock: &dyn Fn() -> u64,
@@ -101,7 +143,7 @@ pub fn build_context_with_clock(
     // The delta counts the text the fragment will actually carry: caller
     // text is sentinel-escaped on the way into a body, so counting the raw
     // input drifts the deltas and `raw_total` apart the moment the caller
-    // writes `<<<` (probe P2: 40 vs 47). Audit-only surface, but an audit
+    // writes `<<<` (measured 40 vs 47). Audit-only surface, but an audit
     // that lies is not one.
     let question_body = escape_content_sentinels(&input.query);
     let question_tokens = item_tokens(&question_body);
@@ -152,7 +194,7 @@ pub fn build_context_with_clock(
             // `select_history` drops the malformed and the failed ones — so
             // "not a turn" here means `summary.v1`.
             content_kind: if item.summary.is_summary() {
-                CKind::SummaryV1
+                CKind::Summary
             } else {
                 CKind::Text
             },
@@ -298,7 +340,7 @@ pub fn build_context_with_clock(
                 reason: OmittedReason::DelimiterViolation,
             });
             // The item never rendered: reverse its stage-4 accounting so the
-            // stage deltas still sum to the fragment bodies (six-lens F1).
+            // stage deltas still sum to the fragment bodies.
             render_delta -= i64::from(item.token_estimate);
             render_drop_slots.push(item_slot);
             continue;
@@ -308,7 +350,7 @@ pub fn build_context_with_clock(
         item.body = rendered;
         item.token_estimate = rendered_tokens;
     }
-    // Drop by slot — item keys repeat across kinds (six-lens F5 class).
+    // Drop by slot — item keys repeat across kinds.
     for slot in render_drop_slots.into_iter().rev() {
         work.remove(slot);
     }
@@ -321,13 +363,13 @@ pub fn build_context_with_clock(
     });
 
     // ---- Stage 6: deduplicate -----------------------------------------
-    // §3 第 4 条: full text already injected (earlier turns or earlier requests)
+    // Full text already injected (earlier turns or earlier requests)
     // never re-enters; within this build the first occurrence wins.
     //
     // `released_chunk_hashes` has to be applied here as well as when the
     // carried-forward ledger is rebuilt further down: a turn a summary
-    // covers no longer carries its text, so its hashes leave the base with it
-    // (§3 第 4 条). Releasing only in `next_session` would release into a
+    // covers no longer carries its text, so its hashes leave the base with it.
+    // Releasing only in `next_session` would release into a
     // projection production discards (`SessionState`'s doc), leaving the
     // blacklist this stage actually reads permanent — the content would stay
     // switched off for the rest of the session with no `kb_read` to fetch it
@@ -393,7 +435,7 @@ pub fn build_context_with_clock(
     });
 
     // ---- Stage 7: rank -------------------------------------------------
-    // Three layers (§1.1): session position conservation > same-source
+    // Three layers: session position conservation > same-source
     // original order > first/last importance placement.
     let started = clock();
     let selected: Vec<usize> = work.iter().filter_map(|item| item.evidence_index).collect();
@@ -433,7 +475,7 @@ pub fn build_context_with_clock(
     // The position ledger is **not** booked here — see where
     // `next_first_seen` is built, after the budget and the citation check.
     // Booking it here would record chunks whose text was later trimmed away,
-    // which is the second truth `context-retrieval.md` §1.1 forbids.
+    // which is a second truth, and the design forbids one.
     stages.push(StageRecord {
         stage: Stage::Rank,
         included: ranked_included,
@@ -466,7 +508,7 @@ pub fn build_context_with_clock(
     let budget_outcome = enforce_token_budget(&candidates, &history_walk_order, &input.budget);
     // By slot, not by bare key: keys repeat across kinds (a `chunk_hash` can
     // spell a `history_id`), and first-match-by-key subtracts the wrong
-    // object's tokens when they collide — probe P4 measured −150 where −107
+    // object's tokens when they collide — measured −150 where −107
     // was due, and the stage sums stopped totalling the fragment bodies.
     let budget_delta: i64 = budget_outcome
         .dropped_slots
@@ -499,7 +541,7 @@ pub fn build_context_with_clock(
     // provider. The system message holds policy (privileged); tool
     // definitions ride the request's tools field; history replays
     // verbatim; the final user message is evidence + instructions +
-    // question (question.v1 last, §1).
+    // question (question.v1 last).
     let started = clock();
     let mut messages = lower_messages(&work);
     stages.push(StageRecord {
@@ -512,7 +554,7 @@ pub fn build_context_with_clock(
 
     // ---- Stage 10: validate_citations ----------------------------------
     // Fail-closed: no fragment enters the request without its full
-    // citation key set (architecture §12, origin_class 不中途丢弃).
+    // citation key set (origin_class 不中途丢弃).
     let started = clock();
     let mut citation_failed: Vec<String> = Vec::new();
     let mut citation_omissions = Vec::new();
@@ -524,7 +566,7 @@ pub fn build_context_with_clock(
         if !citation_keys_complete(item) {
             // Removal keys on the *key*, the reported name is separate: an
             // empty `chunk_hash` must not land as a nameless omission (the
-            // audit outlet printed `(,incomplete_citation)` — probe A4-C1),
+            // audit outlet printed `(,incomplete_citation)`),
             // and the placeholder must not be looked up as a key either.
             citation_failed.push(item.key.clone());
             citation_omissions.push(Omission {
@@ -579,11 +621,11 @@ pub fn build_context_with_clock(
     // The same fragments, one step back: each survivor's index into
     // `input.evidence`, so a caller can tell *which* of two hits sharing one
     // `chunk_hash` became the fragment — the twin's row must not inherit the
-    // survivor's `included` (probe R3a-F2). `input.evidence` is what the run
+    // survivor's `included`. `input.evidence` is what the run
     // layer built in hit order.
     let evidence_indices: Vec<usize> = work.iter().filter_map(|item| item.evidence_index).collect();
 
-    // Session position conservation ledger (`context-retrieval.md` §1.1):
+    // Session position conservation ledger:
     // a chunk earns its slot when its full text **actually entered the
     // request** — the final fragments, after the budget and the citation
     // check — not when it merely entered the rank. A chunk the budget
@@ -605,10 +647,10 @@ pub fn build_context_with_clock(
     let adjusted_total = input.budget.adjusted_total(raw_total);
     // "Already in the request" includes full text carried by the kept raw
     // history turns. A turn covered by a summary stops carrying its text, so
-    // its hashes leave the dedup base with it (§3 第 4 条): keeping them
-    // blacklisted would switch that content off permanently in 0.x, which has
-    // no `kb_read` to fetch it again. six-lens F3's "must not re-enter" only
-    // governed turns still inside the replay window; §3 第 4 条 is where that
+    // its hashes leave the dedup base with it: keeping them
+    // blacklisted would switch that content off permanently in this build, which has
+    // no `kb_read` to fetch it again. The "must not re-enter" rule only
+    // governed turns still inside the replay window; the dedup rule is where that
     // got narrowed. Release runs *before* the carried set is added, so a
     // hash that a kept turn still carries survives the release.
     //
@@ -620,7 +662,7 @@ pub fn build_context_with_clock(
     // production takes; this projection is recomputed from canonical rows on
     // the next turn instead.
     // A turn the **budget** dropped stops carrying its text for exactly the
-    // same reason a summary-covered one does: in 0.x there is no `kb_read` to
+    // same reason a summary-covered one does: in this build there is no `kb_read` to
     // fetch it again, so a hash left blacklisted switches that content off for
     // the rest of the session (A-F10.3). The stage-8 record names the turn by
     // its `history_id`, which is the fragment's key.
@@ -636,7 +678,7 @@ pub fn build_context_with_clock(
         // *evidence* fragment whose `chunk_hash` happens to spell a kept
         // turn's `history_id` used to enter this set, pull that turn's hashes
         // past the "still carried" guard below and release content that is
-        // still in front of the model (probe P4).
+        // still in front of the model.
         let dropped: std::collections::HashSet<&str> = budget_outcome
             .dropped_slots
             .iter()
@@ -645,15 +687,15 @@ pub fn build_context_with_clock(
             .collect();
         // Only a hash *no* turn that reached the request still carries may
         // leave: one kept turn inside the budget keeps its text in front of
-        // the model, and a hash in the request must stay blacklisted (§3 第 4
-        // 条 — the ordering rule the sibling test pins).
+        // the model, and a hash in the request must stay blacklisted (the dedup
+        // rule — the ordering rule the sibling test pins).
         //
         // Registered, not asserted (A4-05): summary rows count as carriers
         // here — a summary's refs keep a hash blacklisted even when the round
-        // that introduced it was budget-dropped (probe P3a/P3b: the only
+        // that introduced it was budget-dropped (the only
         // variable is the summary row, and `next_injected` flips between
-        // `["H"]` and `[]`). 0.x has no summary writer (§4 appends
-        // `summary.v1` only when compaction lands), so the branch is
+        // `["H"]` and `[]`). This build has no summary writer (a summary is appended
+        // only when compaction lands), so the branch is
         // unreachable in production; revisited when compaction does land.
         let still_carried: Vec<String> = history_selection
             .kept
@@ -713,9 +755,9 @@ pub fn build_context_with_clock(
     }
 }
 
-/// Which budget level claims a fragment kind (§2 five-level order).
+/// Which budget level claims a fragment kind (the five-level order).
 /// Exhaustive on purpose: a new [`FragmentKind`] must pick its level here
-/// or the build refuses to compile (six-lens F5).
+/// or the build refuses to compile.
 fn budget_level_of(kind: FragmentKind) -> BudgetLevel {
     match kind {
         FragmentKind::Policy | FragmentKind::ToolDefinitions => BudgetLevel::Resident,
@@ -784,7 +826,7 @@ fn citation_keys_complete(item: &WorkItem) -> bool {
     scalar_keys_complete && locator_is_object
 }
 
-/// Two-stage lowering (`architecture.md` §12): only `visibility = provider`
+/// Two-stage lowering: only `visibility = provider`
 /// fragments reach the provider request. Trace-only fragments stay in
 /// `fragments` for the run record and never enter messages or
 /// [`ContextBuildResult::request_bytes`].
@@ -844,7 +886,7 @@ mod lowering_tests {
 
     #[test]
     fn trace_fragments_never_reach_the_provider_messages() {
-        // §12 两段 lowering: provider 只收到 visibility=provider。
+        // 两段 lowering: provider 只收到 visibility=provider。
         let work = vec![
             work_item("h1", FragmentKind::History, "turn", Visibility::Provider),
             work_item(
@@ -1073,7 +1115,7 @@ mod batch3_tests {
 
     /// A turn the budget dropped carries no text into this request, so its
     /// chunks have to leave the blacklist with it — the same argument a
-    /// summary-covered turn gets (`§3 第 4 条`), and for the same reason: 0.x
+    /// summary-covered turn gets, and for the same reason: this build
     /// has no `kb_read`, so a hash the session still calls "already injected"
     /// is content nobody can put back in front of the model (A-F10.3).
     ///
@@ -1238,15 +1280,15 @@ mod batch3_tests {
         assert!(!joins_final_user(FragmentKind::History));
     }
 
-    /// §3 第 4 条的释放必须**先于**补 carried。覆盖它的轮被降级，释放
+    /// 释放必须**先于**补 carried。覆盖它的轮被降级，释放
     /// `shared`；但另一条保留轮仍带着同一份全文。顺序一旦反过来，一个**还在
     /// 请求里**的 hash 会被从 `injected` 里抹掉，下一轮它会再占一遍预算。
     ///
     /// 杀的突变：把 release 那个循环挪到 carried 循环之后。
     #[test]
     fn a_hash_a_kept_turn_still_carries_survives_the_release() {
-        let mut record = SummaryV1 {
-            version: SUMMARY_VERSION_V1.to_string(),
+        let mut record = Summary {
+            version: SUMMARY_VERSION.to_string(),
             covered_turns: vec!["h-covered".to_string()],
             first_kept_item_id: "h-sum".to_string(),
             tokens_before: 100,
@@ -1304,19 +1346,19 @@ mod batch3_tests {
         );
     }
 
-    /// §3 第 4 条 in the stage production actually reads.
+    /// The dedup release in the stage the production actually reads.
     ///
     /// The release has to reach the base the **deduplicate** stage consults,
     /// not only `next_session.injected` — which `SessionState`'s doc says the
     /// run layer discards and recomputes. Releasing only there is a release
     /// into a projection: the blacklist the build really consults stays
-    /// permanent for the rest of the session, and 0.x has no `kb_read` to
+    /// permanent for the rest of the session, and this build has no `kb_read` to
     /// fetch that content back, so a summary covering a turn would switch
     /// its chunks off forever.
     #[test]
     fn a_hash_only_a_summary_covers_leaves_the_blacklist_the_dedup_stage_reads() {
-        let mut record = SummaryV1 {
-            version: SUMMARY_VERSION_V1.to_string(),
+        let mut record = Summary {
+            version: SUMMARY_VERSION.to_string(),
             covered_turns: vec!["h-covered".to_string()],
             first_kept_item_id: "h-sum".to_string(),
             tokens_before: 100,
@@ -1383,11 +1425,11 @@ mod batch3_tests {
     }
 
     /// A replayed turn is `text`, never `summary.v1`. No summary row exists
-    /// in 0.x (ADR 0010's status marker), so every history fragment a build
+    /// in this build, so every history fragment a build
     /// emits carries the plain content kind — and nothing else in the build
     /// would notice if the "is this row a summary?" test flipped.
     #[test]
-    fn a_replayed_turn_is_marked_text_not_summary_v1() {
+    fn a_replayed_turn_is_marked_text_not_a_summary() {
         let mut input = base();
         input.history = vec![HistoryItem {
             history_id: "h-1".to_string(),
@@ -1417,10 +1459,10 @@ mod batch3_tests {
         }
     }
 
-    /// §1.1's witness: a chunk the budget trims never entered a request, so
+    /// The ledger's witness: a chunk the budget trims never entered a request, so
     /// it earns no position slot. Booking it at the **rank** stage would put
     /// this ledger out of step with the `run_context_items` rows the run
-    /// layer derives it from — the second truth §1.1 forbids — and would
+    /// layer derives it from — a second truth the design forbids — and would
     /// hand a chunk a slot in a prefix it never appeared in.
     #[test]
     fn a_chunk_the_budget_trims_earns_no_position_slot() {
@@ -1460,7 +1502,7 @@ mod batch3_tests {
         // The drop has to land in the **budget** stage, i.e. after the rank.
         // A chunk cut during selection never reaches the rank, so the
         // rank-stage ledger would satisfy this test too and the distinction
-        // §1.1 draws would go unwitnessed. Demanding the stage makes a
+        // the ledger draws would go unwitnessed. Demanding the stage makes a
         // fixture that trims too early fail loudly instead of passing.
         let keys = ["h1", "h2", "h3", "h4"];
         let budget = result

@@ -11,8 +11,8 @@ use super::portability::icloud_stub;
 
 /// Whether a file name starts with a dot (the vault's "hidden" test).
 ///
-/// One predicate for the walker and for the watcher: D40 §4.6's event-layer
-/// blacklist and §5 第 1 条's index range have to agree, or a single vault
+/// One predicate for the walker and for the watcher: the event-layer
+/// blacklist and the index range have to agree, or a single vault
 /// answers two ways — the watcher would ingest a dot-prefixed file that
 /// `index` drops. The root itself is never tested (a dot-prefixed temp root is
 /// legal), which is why this takes a name and not a path.
@@ -33,7 +33,7 @@ fn is_markdown(path: &Path) -> bool {
 /// The indexing path branches on this instead of re-deriving it from the path,
 /// and a file that is not a note is still a fact: an attachment is registered,
 /// a link is recorded, an eviction stub is reported, and none of them is
-/// silently dropped (`docs/docs/ingest-interop.md` §5 第 10 条).
+/// silently dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VaultFileKind {
     /// Markdown: chunked and indexed.
@@ -47,7 +47,7 @@ pub enum VaultFileKind {
     /// An iCloud eviction stub (`.name.icloud`): the note it stands for is not
     /// on this device. Dot-prefixed like every other hidden entry, and kept
     /// out of the index exactly as it always was — classified so that a row
-    /// can say what happened to the note (D42).
+    /// can say what happened to the note.
     IcloudPlaceholder,
 }
 
@@ -69,8 +69,16 @@ pub struct VaultEntry {
 /// `.git`, `.obsidian`, and `.momotaro` never contribute files, and so is every
 /// other dot-prefixed file — except an iCloud eviction stub, which is
 /// classified to become a row that says what happened to the note it stands
-/// for (D42). The root itself is exempt from the hidden check so dot-prefixed
+/// for. The root itself is exempt from the hidden check so dot-prefixed
 /// temp roots work.
+///
+/// # Errors
+///
+/// - `IngestError::VaultMissing` when `vault_root` does not exist or is not
+///   a directory.
+/// - `IngestError::Io` when the root's metadata cannot be read for any other
+///   reason, or when the traversal fails part-way: an entry error fails the
+///   whole walk closed rather than returning a partial list.
 pub fn walk_entries(vault_root: &Path) -> Result<Vec<VaultEntry>, IngestError> {
     let metadata = fs::metadata(vault_root).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -91,7 +99,7 @@ pub fn walk_entries(vault_root: &Path) -> Result<Vec<VaultEntry>, IngestError> {
         .into_iter()
         // Prune dot-prefixed directories (and their subtrees) by their own
         // file name; dot-prefixed files reach `classify`, which drops every
-        // one of them except an iCloud eviction stub (D42). The root itself
+        // one of them except an iCloud eviction stub. The root itself
         // is exempt so dot-prefixed temp roots work.
         .filter_entry(|entry| {
             entry.depth() == 0 || !entry.file_type().is_dir() || !is_hidden(entry.file_name())
@@ -123,8 +131,7 @@ pub fn walk_entries(vault_root: &Path) -> Result<Vec<VaultEntry>, IngestError> {
 /// was seen. A directory (outside the root itself) is not a file and is not kept;
 /// the walk does not descend into links either, so no target is walked twice.
 /// Dot-prefixed files are not vault content either — the only one kept is an
-/// iCloud eviction stub, whose whole point is that its absence can be reported
-/// (D42).
+/// iCloud eviction stub, whose whole point is that its absence can be reported.
 fn classify(entry: &walkdir::DirEntry) -> Option<VaultFileKind> {
     let name = entry.file_name();
     let stub = name.to_str().is_some_and(icloud_stub);
@@ -157,6 +164,14 @@ fn classify(entry: &walkdir::DirEntry) -> Option<VaultFileKind> {
 ///
 /// Kept for rename matching, collision reporting and display. It is never an
 /// identity: the key is.
+///
+/// # Errors
+///
+/// - `IngestError::OutsideVault` when `path` is not beneath `vault_root`, or
+///   its relative name is empty or carries an absolute, prefix, or `..`
+///   component.
+/// - `IngestError::InvalidUtf8` when a component of the relative name is not
+///   valid UTF-8 — refused rather than folded onto U+FFFD.
 pub fn raw_name_for(vault_root: &Path, path: &Path) -> Result<String, IngestError> {
     relative_name(vault_root, path)
 }
@@ -166,6 +181,17 @@ pub fn raw_name_for(vault_root: &Path, path: &Path) -> Result<String, IngestErro
 /// Delegates to [`momotaro_contracts::note_source_key`]: NFC on the tail only,
 /// case preserved verbatim, `/` the only separator, and absolute or
 /// `..`-bearing tails rejected.
+///
+/// # Errors
+///
+/// - `IngestError::OutsideVault` when `path` is not beneath `vault_root`, or
+///   its relative name is empty or carries an absolute, prefix, or `..`
+///   component.
+/// - `IngestError::InvalidUtf8` when a component of the relative name is not
+///   valid UTF-8 — refused rather than folded onto U+FFFD.
+/// - `IngestError::InvalidSourceKey` when `momotaro_contracts::note_source_key`
+///   rejects the derived tail (empty after normalization, an absolute form, a
+///   `..` component, or a NUL byte). The message carries the observed reason.
 pub fn source_key_for(vault_root: &Path, path: &Path) -> Result<String, IngestError> {
     let raw = relative_name(vault_root, path)?;
     momotaro_contracts::note_source_key(&raw)
@@ -312,7 +338,7 @@ mod tests {
                 ("note.md".to_string(), VaultFileKind::Note),
                 // Everything else that is a regular file is registered rather
                 // than ignored: a `.txt` nobody can search is still a fact
-                // about the vault (§5 第 10 条).
+                // about the vault.
                 ("notes.txt".to_string(), VaultFileKind::Attachment),
                 ("pic.png".to_string(), VaultFileKind::Attachment),
                 // The list is leaf names, so the nested note reads as `inner.md`.
@@ -441,7 +467,7 @@ mod tests {
     }
 
     /// The vault layer hands the key builder a name in whatever spelling the
-    /// filesystem reports; the key must be the NFC form (D42). Walks a real
+    /// filesystem reports; the key must be the NFC form. Walks a real
     /// directory so the walk -> key pipeline is exercised end to end.
     #[test]
     fn source_key_normalizes_a_decomposed_file_name_to_nfc() {

@@ -1,5 +1,4 @@
-//! Fragment rendering and the untrusted-content boundary
-//! (`docs/docs/architecture.md` §12 定界渲染).
+//! Fragment rendering and the untrusted-content boundary.
 //!
 //! **Delimiting is a security boundary, not formatting.** `web` / `agent`
 //! chunks wrap in unified open/close markers carrying a source label
@@ -15,14 +14,14 @@
 //!    open a fake one. Trusted (`owner` / `paper`) text is escaped too:
 //!    trust decides *delimiting*, never whether forging is possible.
 //! 3. **Deterministic validation** — [`validate_evidence_block`] is the
-//!    per-block gate (§12: 定界渲染 + 确定性校验才是防线): a `web` / `agent`
+//!    per-block gate (定界渲染 + 确定性校验才是防线): a `web` / `agent`
 //!    block must be exactly one well-formed region wrapping its body, a
 //!    trusted block must contain no markers at all. [`validate_untrusted_regions`]
 //!    is the public check for assembled or stored text; history replay calls
 //!    it before a stored body enters a request. The per-block gate runs for
 //!    evidence, so a delimiting bypass fails at runtime instead of only in CI.
 //!
-//! Role separation stays a weak guarantee (§12); this boundary does not
+//! Role separation stays a weak guarantee; this boundary does not
 //! rely on it. The contract delimits `web` / `agent` only — whether `paper`
 //! (外部但结构化) should also be delimited is a registered contract
 //! question, but paper text can no longer *forge* regions (mechanism 2).
@@ -225,7 +224,7 @@ pub(crate) fn render_evidence_block(fragment_id: &str, item: &EvidenceItem) -> S
 }
 
 /// Deterministic validation of rendered untrusted regions over raw bytes
-/// (§12: 定界渲染 + 确定性校验才是防线).
+/// (定界渲染 + 确定性校验才是防线).
 ///
 /// Proves:
 /// - every `<<<untrusted …` marker is closed by `<<<end untrusted>>>`;
@@ -326,7 +325,7 @@ pub(crate) fn validate_evidence_block(
     validate_untrusted_regions(rendered)
 }
 
-/// Canonical tools serialization (`context-retrieval.md` §1 第 3 条): the caller's
+/// Canonical tools serialization: the caller's
 /// list order is identity — a reordered list is a different request and
 /// changes `request_hash`, so the list is never sorted — and field order is
 /// fixed. A tool whose `parameters_json` is not a JSON object is dropped with
@@ -540,7 +539,7 @@ mod tests {
 
     #[test]
     fn tools_keep_the_callers_order() {
-        // 序即身份 (context-retrieval.md §1 第 3 条): the list keeps the caller's
+        // 序即身份: the list keeps the caller's
         // order — sorting it would collapse two different requests into one
         // serialization. Field order stays fixed (the map is sorted).
         let tools = vec![

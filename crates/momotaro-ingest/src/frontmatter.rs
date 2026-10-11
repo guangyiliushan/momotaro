@@ -1,7 +1,6 @@
 //! The `---` block at the top of a note: parsed, kept, and taken out of the index text.
 //!
-//! The block is Obsidian's data, not ours (D41.5 in
-//! `docs/docs/ingest-interop.md`): unknown fields are first-class, the block is
+//! The block is Obsidian's data, not ours: unknown fields are first-class, the block is
 //! never folded back into the note, and a block that does not parse is kept
 //! verbatim while the body is indexed anyway. What comes out of here belongs in
 //! `source_revisions.metadata_json`; the *body* is what gets chunked, which is
@@ -101,7 +100,7 @@ pub enum FrontmatterParse {
     Json(String),
     /// A block that was there but could not be read: kept verbatim, with the
     /// line and the reason, and the body still indexed
-    /// (`frontmatter_parse_error`, D41.5).
+    /// (`frontmatter_parse_error`).
     Failed {
         /// The block's text, delimiter lines excluded, exactly as written.
         raw: String,
@@ -126,6 +125,25 @@ pub enum FrontmatterParse {
 ///
 /// The returned body is a slice of `source`, so byte and line offsets can be
 /// recovered from it — see the module documentation.
+///
+/// # Examples
+///
+/// ```
+/// use momotaro_ingest::frontmatter::{FrontmatterParse, Value, split};
+///
+/// let source = "---\ntitle: A\ntags:\n- one\n- two\n---\n\n# Body\n";
+/// let (parsed, body) = split(source);
+/// assert_eq!(body, "\n# Body\n");
+/// assert!(source.ends_with(body), "the body is a slice of the input");
+///
+/// let FrontmatterParse::Parsed(block) = parsed else {
+///     panic!("the block parses");
+/// };
+/// let title = block.fields.iter().find(|field| field.key == "title").expect("title");
+/// assert_eq!(title.value, Value::Scalar("A".to_owned()));
+/// let tags = block.fields.iter().find(|field| field.key == "tags").expect("tags");
+/// assert_eq!(tags.value, Value::List(vec!["one".to_owned(), "two".to_owned()]));
+/// ```
 pub fn split(source: &str) -> (FrontmatterParse, &str) {
     let Some((block, body)) = take_block(source) else {
         return (FrontmatterParse::Absent, source);
@@ -212,7 +230,7 @@ fn split_ending(line: &str) -> (&str, &str) {
 
 /// Whether a key's inline text opens a block scalar (`|` or `>`).
 ///
-/// YAML 1.2.2 §8.1.1: the header is the only thing that gives the lines under a
+/// YAML 1.2.2: the header is the only thing that gives the lines under a
 /// key the meaning of content, so this is the precondition for treating them as
 /// such — without it a column-0 `#` line after `title: A` would be read as
 /// title text, which it is not.
@@ -223,7 +241,7 @@ fn is_block_scalar_header(inline: &str) -> bool {
 /// A one-line `[a, b]` with only plain or quoted scalars inside, as a list.
 ///
 /// The shape the official property types actually use for `tags` and friends
-/// (YAML 1.2.2 §7.4.1, and Obsidian's own JSON properties use the same array).
+/// (YAML 1.2.2, and Obsidian's own JSON properties use the same array).
 /// `None` means "not this shape", including anything nested, multi-line, or
 /// carrying a comma inside a quoted element: this parser does not model those,
 /// and guessing them is what the `Raw` fallback exists to avoid.
@@ -277,8 +295,8 @@ impl Pending {
             // A value *and* list items on one field: a shape this parser does
             // not model — nothing is guessed, the whole field keeps its source
             // lines (the rule the `unmodelled` arm above applies). Reading it
-            // as a list used to drop the inline value silently (probe A2-02:
-            // `tags: draft` + `- archived` lost `draft`).
+            // as a list used to drop the inline value silently
+            // (`tags: draft` + `- archived` lost `draft`).
             Value::Raw(self.source.join("\n"))
         } else if !self.list.is_empty() {
             Value::List(self.list)
@@ -334,7 +352,7 @@ fn parse_block(block: &str) -> Result<Vec<Field>, (usize, Reason)> {
                 Some(open) if !open.unmodelled => {
                     if open.inline.as_deref().is_some_and(is_block_scalar_header) {
                         // A `- ` line under a block-scalar header is the scalar's
-                        // content, not a list item: YAML 1.2.2 §8.1.2 makes every
+                        // content, not a list item: YAML 1.2.2 makes every
                         // indented character content, and the reference engines
                         // read `description: |` + `  - first` as the text
                         // `- first`. The field goes raw rather than dropping the
@@ -372,7 +390,7 @@ fn parse_block(block: &str) -> Result<Vec<Field>, (usize, Reason)> {
         }
         if name.starts_with(['"', '\'', '{', '[']) {
             // A head that opens with a quote, `{` or `[` is not a plain key: a
-            // quoted key's `: ` sits after the closing quote (YAML 1.2.2 §7.4.2),
+            // quoted key's `: ` sits after the closing quote (YAML 1.2.2),
             // and a brace or bracket opens a collection, so splitting at the first
             // colon gives something like `{ "publish` beside ` false }` — wrong
             // but well-formed, which is worse than raw, because nothing downstream
@@ -498,7 +516,7 @@ mod tests {
     fn a_second_document_stays_body_text() {
         // YAML allows several documents in one stream; this crate reads the first
         // and does not look ahead, so the second `---` is ordinary text. Stated as
-        // a contract in `ingest-interop.md` §5.5.
+        // an ingestion contract.
         let source = "---\ntitle: one\n---\nbody\n\n---\ntitle: two\n---\n";
         let (frontmatter, body) = split(source);
         assert!(
@@ -724,7 +742,7 @@ mod tests {
 
     #[test]
     fn a_bullet_under_a_block_scalar_header_is_content() {
-        // YAML 1.2.2 §8.1.2: inside a literal scalar every indented character is
+        // YAML 1.2.2: inside a literal scalar every indented character is
         // content. The reference engines read this as the text "- first\n- second".
         let source = "---\ndescription: |\n  - first\n  - second\ntitle: A\n---\nbody\n";
         let (frontmatter, _) = split(source);
@@ -768,7 +786,7 @@ mod tests {
         let source = "---\n# a note to self\n{ \"publish\": false }\n---\nbody\n";
         let (frontmatter, _) = split(source);
         let field = field(&frontmatter, "{ \"publish\"");
-        // The whole line, not just the variant: D41 writes this string into
+        // The whole line, not just the variant: this string is written into
         // `source_revisions.metadata_json.frontmatter`, so a `Raw` that lost its
         // bytes is data loss with the right type on it.
         assert_eq!(
@@ -781,7 +799,7 @@ mod tests {
 
     #[test]
     fn a_quoted_key_is_not_split_at_its_inner_colon() {
-        // YAML 1.2.2 §7.4.2: with a quoted key the `: ` sits after the closing
+        // YAML 1.2.2: with a quoted key the `: ` sits after the closing
         // quote. Splitting at the first colon produced a key of `"a` beside a
         // value of `"b": value` — wrong, well-formed, and undetectable downstream.
         let source = "---\n\"a: b\": value\n---\nbody\n";
@@ -820,12 +838,12 @@ mod tests {
         );
     }
 
-    /// YAML 1.2.2 §8.1.1 again, the other way round: only a `|` or `>` header
+    /// YAML 1.2.2 again, the other way round: only a `|` or `>` header
     /// makes the lines under a key scalar content. Without one, `- item` is a
     /// list item — but a value *and* list items on one field is a shape this
     /// parser does not model, so nothing is guessed: the field keeps its
     /// source lines. (It used to read as a list with the inline value
-    /// silently dropped — probe A2-02.)
+    /// silently dropped.)
     #[test]
     fn an_inline_value_beside_list_items_is_raw_not_a_half_read_list() {
         let source = "---\ntags: draft\n- archived\n---\nbody\n";

@@ -1,7 +1,49 @@
 //! SQLite-backed canonical storage for Momotaro.
+//!
+//! # Examples
+//!
+//! Open a store in a scratch directory, initialize the schema, append one
+//! audit event, and read it back:
+//!
+//! ```
+//! use momotaro_store::{NewStoreEvent, Store};
+//!
+//! let dir = std::env::temp_dir().join(format!("momotaro-store-{}", std::process::id()));
+//! let _ = std::fs::remove_dir_all(&dir);
+//! std::fs::create_dir_all(&dir).expect("create the scratch directory");
+//!
+//! let mut store = Store::open(dir.join("momotaro.db")).expect("open the store");
+//! store.init_schema().expect("initialize the schema");
+//!
+//! store
+//!     .append_store_event(&NewStoreEvent {
+//!         occurred_at: 1_700_000_000,
+//!         batch_id: "example-batch",
+//!         seq: 1,
+//!         domain: "ingest",
+//!         event_type: "ingest.started",
+//!         source_key: None,
+//!         outcome: None,
+//!         reason_code: None,
+//!         message: None,
+//!         data_json: "{}",
+//!         external_id: None,
+//!     })
+//!     .expect("append the event");
+//!
+//! let newest = store.latest_store_events(1).expect("read the log");
+//! assert_eq!(newest.len(), 1);
+//! assert_eq!(newest[0].batch_id, "example-batch");
+//! assert_eq!(newest[0].event_type, "ingest.started");
+//!
+//! drop(store);
+//! std::fs::remove_dir_all(&dir).expect("clean up the scratch directory");
+//! ```
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(rustdoc::all)]
+#![warn(rustdoc::unescaped_backticks)]
 
 use std::path::{Path, PathBuf};
 
@@ -31,7 +73,7 @@ pub use runs::{
 };
 
 /// Table holding multi-value store metadata. Never the schema version: that
-/// lives in `PRAGMA user_version` (D46).
+/// lives in `PRAGMA user_version`.
 const SCHEMA_TABLE: &str = "schema_meta";
 
 /// The version key a pre-`user_version` build wrote into `schema_meta`. Kept
@@ -50,7 +92,7 @@ pub const APPLICATION_ID: i32 = 0x4D4D_4F54;
 // guarantee cannot be lost by editing the constant alone.
 const _: () = assert!(APPLICATION_ID > 0 && (APPLICATION_ID as u32) < (1u32 << 31));
 
-/// Identity of the source-key scheme this build writes (D42 / ADR 0002).
+/// Identity of the source-key scheme this build writes.
 /// Bumping it means the keys of an existing store are a different species.
 pub const KEY_SCHEME: &str = "v2";
 
@@ -62,7 +104,7 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
 
     /// A `graph_links` row this build cannot read: a vocabulary spelling from
-    /// a newer one (ADR 0027 rows are typed at both ends).
+    /// a newer one (both ends of a link row are typed).
     #[error("graph_links row has unknown {column} spelling {value:?}")]
     UnknownGraphSpelling {
         /// Which vocabulary column the spelling sits in.
@@ -152,7 +194,7 @@ pub enum StoreError {
         actual: String,
     },
 
-    /// A pre-migration backup failed, so the migration never started (D46).
+    /// A pre-migration backup failed, so the migration never started.
     #[error("pre-migration backup failed: {0}")]
     BackupFailed(String),
 
@@ -189,7 +231,11 @@ pub(crate) fn invalid_value(column: &'static str, value: impl Into<String>) -> S
 /// Read through SQL on a scratch in-memory connection — never ffi or `unsafe` —
 /// so `doctor` can report them even when the workspace database is missing,
 /// unreadable, or belongs to somebody else. That is exactly when the engine
-/// version matters most.
+///
+/// # Errors
+///
+/// - `StoreError::Sqlite` when the scratch in-memory connection cannot be
+///   opened, or when one of the engine queries fails.
 pub fn sqlite_facts() -> Result<SqliteFacts, StoreError> {
     let connection = Connection::open_in_memory()?;
     let version: String = connection.query_row("SELECT sqlite_version()", [], |row| row.get(0))?;
@@ -239,7 +285,27 @@ impl Store {
     /// The engine-discipline PRAGMAs are applied only once the file is known to
     /// be ours or brand new: `journal_mode = WAL` rewrites the file header, so
     /// applying it to somebody else's database would be exactly the pollution
-    /// `application_id` exists to prevent.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the database cannot be opened or created,
+    ///   or when a PRAGMA statement fails. Refusals are not errors here:
+    ///   `open` only gates its file-modifying PRAGMAs on them.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use momotaro_store::Store;
+    ///
+    /// # fn main() -> Result<(), momotaro_store::StoreError> {
+    /// let store = Store::open("workspace/.momotaro/momotaro.db")?;
+    /// assert_eq!(
+    ///     store.path(),
+    ///     std::path::Path::new("workspace/.momotaro/momotaro.db")
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref().to_path_buf();
         let connection = Connection::open(&path)?;
@@ -288,7 +354,7 @@ impl Store {
 
         // A store written before `user_version` became the carrier cannot be
         // migrated safely: its rows carry pre-scheme keys, and mixing two key
-        // species in one database is silent corruption (Q2). Checked before the
+        // species in one database is silent corruption. Checked before the
         // object test so a real legacy store gets this message rather than
         // "contains objects we did not create".
         if version == 0
@@ -328,13 +394,47 @@ impl Store {
 
     /// Creates the initial schema if missing, then applies pending migrations.
     ///
-    /// Order is the contract (D46): identity check → version read →
+    /// Order is the contract: identity check → version read →
     /// `schema_meta` and the file-identity stamp (idempotent writes on every
     /// store this build can adopt) → verified backup of an existing store →
     /// migrations → key-scheme stamp. The load-bearing clause is the backup
     /// strictly before any *migration* DDL
     /// (`a_blocked_backup_stops_the_migration_before_any_ddl`); the last step
-    /// is pinned by `a_migration_failure_leaves_the_key_scheme_unstamped`.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::ForeignDatabase` when `application_id` names a file
+    ///   this build did not create.
+    /// - `StoreError::SchemaTooNew` when the stored `user_version` is newer
+    ///   than this build supports.
+    /// - `StoreError::LegacyStore` when the file predates the `user_version`
+    ///   carrier.
+    /// - `StoreError::NoIdentity` when the file claims a version but carries
+    ///   no Momotaro identity.
+    /// - `StoreError::ForeignObjects` when the file already holds objects
+    ///   this build did not create.
+    /// - `StoreError::BackupFailed` when the pre-migration backup of an
+    ///   existing store cannot be taken or verified.
+    /// - `StoreError::Sqlite` when any statement fails: the gate's reads, the
+    ///   schema create, the identity stamp, a migration step, or the
+    ///   key-scheme write.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use momotaro_store::Store;
+    ///
+    /// # fn main() -> Result<(), momotaro_store::StoreError> {
+    /// let mut store = Store::open("workspace/.momotaro/momotaro.db")?;
+    /// store.init_schema()?;
+    ///
+    /// // Running it again against a current store is a no-op, not an error.
+    /// store.init_schema()?;
+    /// let health = store.health()?;
+    /// assert_eq!(health.status, momotaro_contracts::WorkspaceStatus::Ready);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn init_schema(&mut self) -> Result<(), StoreError> {
         // Refusals first, writes later — decided by the *same* predicate
         // `Store::open` consults before touching the file header.
@@ -359,7 +459,7 @@ impl Store {
                 .execute_batch(&format!("PRAGMA application_id = {APPLICATION_ID};"))?;
         }
 
-        // D46: an existing store is backed up and verified before any migration
+        // An existing store is backed up and verified before any migration
         // runs. A brand-new file has nothing to lose.
         if version > 0 && version < CURRENT_SCHEMA_VERSION {
             let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
@@ -377,13 +477,23 @@ impl Store {
     }
 
     /// Reads the schema version from `PRAGMA user_version`; `0` means "no
-    /// schema yet".
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the `PRAGMA user_version` read fails.
+    /// - `StoreError::InvalidSchemaVersion` when the stored value does not
+    ///   fit an unsigned integer.
     pub fn schema_version(&self) -> Result<Option<SchemaVersion>, StoreError> {
         let version = self.user_version()?;
         Ok((version > 0).then_some(SchemaVersion(version)))
     }
 
-    /// Reads the raw `PRAGMA user_version` (the authoritative carrier, D46).
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the `PRAGMA user_version` read fails.
+    /// - `StoreError::InvalidSchemaVersion` when the stored value does not
+    ///   fit an unsigned integer.
     pub fn user_version(&self) -> Result<u32, StoreError> {
         let value: i64 = self
             .connection
@@ -391,14 +501,21 @@ impl Store {
         u32::try_from(value).map_err(|_| StoreError::InvalidSchemaVersion(value.to_string()))
     }
 
-    /// Reads `PRAGMA application_id`.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the `PRAGMA application_id` read fails.
     pub fn application_id(&self) -> Result<i32, StoreError> {
         Ok(self
             .connection
             .query_row("PRAGMA application_id", [], |row| row.get(0))?)
     }
 
-    /// Reads one `schema_meta` value.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the read fails — including when
+    ///   `schema_meta` does not exist yet (the store is not initialized).
     pub fn metadata(&self, key: &str) -> Result<Option<String>, StoreError> {
         Ok(self
             .connection
@@ -410,7 +527,11 @@ impl Store {
             .optional()?)
     }
 
-    /// Upserts one `schema_meta` value.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the upsert fails — including when
+    ///   `schema_meta` does not exist yet (the store is not initialized).
     pub fn set_metadata(&self, key: &str, value: &str) -> Result<(), StoreError> {
         self.connection.execute(
             &format!(
@@ -460,7 +581,15 @@ impl Store {
         self.metadata(LEGACY_SCHEMA_VERSION_KEY)
     }
 
-    /// Returns non-mutating health facts.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the `PRAGMA user_version` read fails.
+    /// - `StoreError::InvalidSchemaVersion` when the stored version does not
+    ///   fit an unsigned integer.
+    ///
+    /// Refusals are reported, not raised: an unwritable workspace comes back
+    /// as `WorkspaceStatus::Invalid` carrying the refusal text.
     pub fn health(&self) -> Result<HealthReport, StoreError> {
         let schema_version = self.schema_version()?;
 
@@ -475,7 +604,7 @@ impl Store {
                 sqlite: None,
                 message: Some(refusal.to_string()),
                 // The store holds a database path, not a workspace: it cannot
-                // say anything about a mount (D40 §4.8), and `None` is the
+                // say anything about a mount, and `None` is the
                 // honest answer to a question it was never asked.
                 network_volume: None,
             });
@@ -515,7 +644,13 @@ impl Store {
     ///
     /// Status and version come from [`Store::health`] — one derivation, so the
     /// two answers cannot drift — and the counts are read only when the
-    /// canonical tables are known to exist.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the health derivation or a count query
+    ///   fails.
+    /// - `StoreError::InvalidSchemaVersion` when the stored schema version
+    ///   does not fit an unsigned integer.
     pub fn stats(&self) -> Result<StatsReport, StoreError> {
         let health = self.health()?;
         let initialized = health.status == WorkspaceStatus::Ready;
@@ -627,16 +762,16 @@ mod tests {
                 "version carrier, no identity, foreign objects",
                 "PRAGMA user_version = 3; CREATE TABLE notes (id INTEGER PRIMARY KEY);".to_owned(),
             ),
-            // v5 names in a file that is not ours: the new tables are no more
+            // schema-5 names in a file that is not ours: the new tables are no more
             // adoptable than `chunks` was.
             (
-                "v5 table names, no identity",
+                "schema-5 table names, no identity",
                 "CREATE TABLE answers (answer_id TEXT PRIMARY KEY);
                  CREATE TABLE graph_links (from_source_key TEXT NOT NULL);"
                     .to_owned(),
             ),
             (
-                "version carrier, no identity, v5 table names",
+                "version carrier, no identity, schema-5 table names",
                 "PRAGMA user_version = 5;
                  CREATE TABLE graph_links (from_source_key TEXT NOT NULL);"
                     .to_owned(),
@@ -751,7 +886,7 @@ mod tests {
         // other builds must match, and the comparison above cannot see a
         // changed constant.
         assert_eq!(APPLICATION_ID, 0x4D4D_4F54, "ASCII `MMOT`");
-        // schema_meta is left for multi-value metadata (D46 / Q2).
+        // schema_meta is left for multi-value metadata.
         assert_eq!(
             store
                 .metadata("key_scheme")
@@ -828,16 +963,16 @@ mod tests {
         );
     }
 
-    /// Seeds a faithful v2 store: the exact v2 DDL of migration step 2 (both
+    /// Seeds a faithful schema-2 store: the exact schema-2 DDL of migration step 2 (both)
     /// tables and both indexes), the file identity, and the version carrier —
     /// but no `raw_name` column.
     ///
-    /// Winding a v3 store's version back is NOT the same thing (the v3 DDL
+    /// Winding a schema-3 store's version back is NOT the same thing (the schema-3 DDL
     /// would then re-run and fail, correctly). Stores written by this repo's
     /// *old* builds recorded the version in `schema_meta` and are refused as
-    /// `LegacyStore`; this shape is what a future v2 → v3 migration will see.
-    fn seed_v2_store(path: &Path) {
-        let connection = rusqlite::Connection::open(path).expect("open v2 store");
+    /// `LegacyStore`; this shape is what a future schema-2 → schema-3 migration will see.
+    fn seed_store_at_schema_2(path: &Path) {
+        let connection = rusqlite::Connection::open(path).expect("open the schema-2 store");
         connection
             .execute_batch(&format!(
                 "PRAGMA application_id = {APPLICATION_ID};
@@ -872,7 +1007,7 @@ mod tests {
                  INSERT INTO schema_meta (key, value) VALUES ('key_scheme', 'v2');
                  PRAGMA user_version = 2;"
             ))
-            .expect("seed a v2 store");
+            .expect("seed a schema-2 store");
     }
 
     /// The identity stamp before the migrations is a contract **no fixture
@@ -960,11 +1095,11 @@ mod tests {
     fn a_blocked_backup_stops_the_migration_before_any_ddl() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("momotaro.db");
-        seed_v2_store(&path);
+        seed_store_at_schema_2(&path);
 
         // Block every plausible temp-artifact name with a *directory*: the
         // pre-cleanup then fails, so `VACUUM INTO` never runs and the migration
-        // must refuse to start (distribution-trust §8.2). This pins the `?`
+        // must refuse to start. This pins the `?`
         // wiring in `init_schema` specifically — a mutation that ignored the
         // backup error left every other test green.
         let now = std::time::SystemTime::now()
@@ -991,7 +1126,7 @@ mod tests {
         );
         assert!(
             !column_exists(&store, "source_revisions", "raw_name"),
-            "and none of the v3 DDL ran"
+            "and none of the schema-3 DDL ran"
         );
     }
 
@@ -1024,7 +1159,7 @@ mod tests {
     fn pending_migration_writes_a_verified_backup_first() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("momotaro.db");
-        seed_v2_store(&path);
+        seed_store_at_schema_2(&path);
 
         let mut store = Store::open(&path).expect("reopen store");
         store.init_schema().expect("migrate with backup");
@@ -1053,14 +1188,14 @@ mod tests {
                 .filter_map(Result::ok)
                 .any(|column| column == "raw_name")
         };
-        assert!(has_raw_name, "v3 adds the raw_name column");
+        assert!(has_raw_name, "schema 3 adds the raw_name column");
     }
 
     #[test]
     fn a_migration_failure_leaves_the_key_scheme_unstamped() {
         // The documented order puts the key-scheme stamp AFTER the migrations,
         // so a migration that fails must not leave the stamp behind. The seed
-        // carries `raw_name` already (the v3 ALTER then fails) and no
+        // carries `raw_name` already (the schema-3 ALTER then fails) and no
         // `key_scheme` row — stamping first would answer `Some("v2")` here.
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("momotaro.db");
@@ -1103,7 +1238,7 @@ mod tests {
         let mut store = Store::open(&path).expect("open store");
         store
             .init_schema()
-            .expect_err("the v3 ALTER fails on the seeded raw_name");
+            .expect_err("the schema-3 ALTER fails on the seeded raw_name");
         assert_eq!(
             store.metadata("key_scheme").expect("read key_scheme"),
             None,
@@ -1111,14 +1246,14 @@ mod tests {
         );
     }
 
-    /// Seeds a faithful v4 store: the v2 tables and indexes, the v3 `raw_name`
+    /// Seeds a faithful schema-4 store: the schema-2 tables and indexes, the schema-3 `raw_name`
     /// ALTER (exactly as a migrated store carries it, last in `table_info`),
-    /// the v4 `store_events` table with its two partial indexes, the file
+    /// the schema-4 `store_events` table with its two partial indexes, the file
     /// identity, and the version carrier. The rows in `source_revisions` /
-    /// `chunks` / `store_events` are sentinels: the v5 migration only adds
+    /// `chunks` / `store_events` are sentinels: the schema-5 migration only adds
     /// tables and must not touch these — not their rows, not their DDL.
-    fn seed_v4_store(path: &Path) {
-        let connection = rusqlite::Connection::open(path).expect("open v4 store");
+    fn seed_store_at_schema_4(path: &Path) {
+        let connection = rusqlite::Connection::open(path).expect("open the schema-4 store");
         connection
             .execute_batch(&format!(
                 "PRAGMA application_id = {APPLICATION_ID};
@@ -1189,7 +1324,7 @@ mod tests {
                     NULL, NULL, NULL, '{{}}', NULL);
                  PRAGMA user_version = 4;"
             ))
-            .expect("seed a v4 store");
+            .expect("seed a schema-4 store");
     }
 
     /// One column as `PRAGMA table_info` reports it: name, declared type,
@@ -1220,10 +1355,10 @@ mod tests {
             .expect("read table_info")
     }
 
-    /// The v5 tables exactly as architecture §8.1 / §8.2 and multi-agent §5.1
-    /// declare them. One list per table, columns in declaration order — a
+    /// The schema-5 tables exactly as the migration declares them. One list
+    /// per table, columns in declaration order — a
     /// column missing from the migration step turns its assertion red.
-    const V5_SHAPES: &[(&str, &[ColumnShape])] = &[
+    const SHAPES_AT_SCHEMA_5: &[(&str, &[ColumnShape])] = &[
         (
             "sessions",
             &[
@@ -1417,11 +1552,11 @@ mod tests {
     ];
 
     #[test]
-    fn the_v5_tables_have_their_contract_columns() {
+    fn the_schema_5_tables_have_their_contract_columns() {
         let (_dir, mut store) = raw_temp_store();
         store.init_schema().expect("initialize schema");
 
-        for (table, expected) in V5_SHAPES {
+        for (table, expected) in SHAPES_AT_SCHEMA_5 {
             let expected: Vec<OwnedColumnShape> = expected
                 .iter()
                 .map(|(name, ty, notnull, dflt, pk)| {
@@ -1511,7 +1646,8 @@ mod tests {
         out
     }
 
-    /// DDL text and full row content of the tables v5 must not rebuild.
+    /// DDL text and full row content of the tables the schema-5 migration
+    /// must not rebuild.
     fn existing_tables_facts(path: &Path) -> Vec<(String, String, Vec<Vec<String>>)> {
         let connection =
             rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -1533,10 +1669,10 @@ mod tests {
     }
 
     #[test]
-    fn a_v4_store_migrates_to_v5_without_touching_the_existing_tables() {
+    fn a_store_at_schema_4_migrates_to_schema_5_without_touching_the_existing_tables() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("momotaro.db");
-        seed_v4_store(&path);
+        seed_store_at_schema_4(&path);
         let before = existing_tables_facts(&path);
 
         let mut store = Store::open(&path).expect("reopen store");
@@ -1556,13 +1692,13 @@ mod tests {
         assert_eq!(
             existing_tables_facts(&path),
             before,
-            "the v3/v4 tables keep their DDL and their rows"
+            "the schema-3 and schema-4 tables keep their DDL and their rows"
         );
     }
 
     #[test]
-    fn a_migrated_v4_store_and_a_fresh_store_land_on_the_same_shape() {
-        // The two supported paths into the current schema — migrating a v4
+    fn a_store_migrated_from_schema_4_and_a_fresh_store_land_on_the_same_shape() {
+        // The two supported paths into the current schema — migrating a store at schema 4
         // store and initializing a brand-new file — must arrive at the same
         // tables, columns and indexes.
         let fresh_dir = tempfile::tempdir().expect("create temp dir");
@@ -1572,8 +1708,8 @@ mod tests {
 
         let migrated_dir = tempfile::tempdir().expect("create temp dir");
         let migrated_path = migrated_dir.path().join("momotaro.db");
-        seed_v4_store(&migrated_path);
-        let mut migrated = Store::open(&migrated_path).expect("open v4 store");
+        seed_store_at_schema_4(&migrated_path);
+        let mut migrated = Store::open(&migrated_path).expect("open the schema-4 store");
         migrated.init_schema().expect("migrate to current");
 
         assert_eq!(
@@ -1584,9 +1720,9 @@ mod tests {
     }
 
     #[test]
-    fn a_store_stamped_v5_in_the_index_window_converges_on_the_fresh_shape() {
-        // Step 5 shipped in two spellings: builds in the window before W2.4
-        // created v5 databases without `idx_graph_links_from`, and a migration
+    fn a_store_stamped_at_schema_5_in_the_index_window_converges_on_the_fresh_shape() {
+        // Step 5 shipped in two spellings: the earlier builds created
+        // schema-5 databases without `idx_graph_links_from`, and a migration
         // chain only runs steps greater than the stored version — so that shape
         // needs step 6 to converge. This test stands the window shape up and
         // pins the convergence.
@@ -1610,28 +1746,30 @@ mod tests {
         assert_eq!(
             schema_shape(&fresh),
             schema_shape(&window),
-            "the in-window v5 shape converges on the fresh shape"
+            "the in-window schema-5 shape converges on the fresh shape"
         );
     }
 
     #[test]
-    fn a_store_stamped_v6_migrates_to_exactly_the_fresh_shape() {
-        // The two supported paths into schema 8: migrating a v6 store and
-        // initializing a brand-new file. v6 is what every build before step 7
+    fn a_store_stamped_at_schema_6_migrates_to_exactly_the_fresh_shape() {
+        // The two supported paths into schema 8: migrating a store at schema 6 and
+        // initializing a brand-new file. schema 6 is what every build before step 7
         // left behind — the run tables with no `run_id` index — and step 8
-        // added the two `session_id` indexes, so the v6 shape is the fresh
+        // added the two `session_id` indexes, so the schema-6 shape is the fresh
         // shape minus exactly those six indexes.
         let fresh_dir = tempfile::tempdir().expect("create temp dir");
         let fresh_path = fresh_dir.path().join("momotaro.db");
         let mut fresh = Store::open(&fresh_path).expect("open fresh store");
         fresh.init_schema().expect("initialize fresh");
 
-        let v6_dir = tempfile::tempdir().expect("create temp dir");
-        let v6_path = v6_dir.path().join("momotaro.db");
+        let dir_at_schema_6 = tempfile::tempdir().expect("create temp dir");
+        let path_at_schema_6 = dir_at_schema_6.path().join("momotaro.db");
         {
-            let mut v6 = Store::open(&v6_path).expect("open v6 store");
-            v6.init_schema().expect("initialize");
-            v6.connection
+            let mut store_at_schema_6 =
+                Store::open(&path_at_schema_6).expect("open the schema-6 store");
+            store_at_schema_6.init_schema().expect("initialize");
+            store_at_schema_6
+                .connection
                 .execute_batch(
                     "DROP INDEX idx_retrievals_run;
                      DROP INDEX IF EXISTS idx_llm_turns_run_seq;
@@ -1641,10 +1779,10 @@ mod tests {
                      DROP INDEX idx_history_items_session;
                      PRAGMA user_version = 6;",
                 )
-                .expect("rewind to the v6 shape");
+                .expect("rewind to the schema-6 shape");
         }
         assert_eq!(
-            declared_indexes(&Store::open(&v6_path).expect("read v6")),
+            declared_indexes(&Store::open(&path_at_schema_6).expect("read the schema-6 store")),
             [
                 "idx_chunks_rev",
                 "idx_graph_links_from",
@@ -1652,63 +1790,66 @@ mod tests {
                 "idx_store_events_external",
                 "idx_store_events_source",
             ],
-            "the v6 fixture really is v6: neither a run_id index nor a session index exists yet"
+            "the fixture really is at schema 6: no run_id index or session index exists yet"
         );
 
-        let mut v6 = Store::open(&v6_path).expect("reopen v6 store");
-        v6.init_schema().expect("migrate to current");
+        let mut store_at_schema_6 =
+            Store::open(&path_at_schema_6).expect("reopen the schema-6 store");
+        store_at_schema_6.init_schema().expect("migrate to current");
 
         assert_eq!(
-            v6.user_version().expect("read user_version"),
+            store_at_schema_6.user_version().expect("read user_version"),
             CURRENT_SCHEMA_VERSION
         );
         assert_eq!(
             schema_shape(&fresh),
-            schema_shape(&v6),
-            "the v6 path and the fresh path land on the same schema"
+            schema_shape(&store_at_schema_6),
+            "the schema-6 path and the fresh path land on the same schema"
         );
-        // The migration is preceded by a verified backup (D46), named from the
+        // The migration is preceded by a verified backup, named from the
         // version constants rather than from a literal.
         assert!(
             !backup_files(
-                v6_dir.path(),
+                dir_at_schema_6.path(),
                 &format!("backup-v6-to-v{CURRENT_SCHEMA_VERSION}-")
             )
             .is_empty(),
-            "a migration from v6 is backed up first"
+            "a migration from schema 6 is backed up first"
         );
     }
 
-    /// The one-step upgrade a pre-v8 machine actually takes: a store already
-    /// at v7 (step 7's four `run_id` indexes, no session indexes) running
+    /// The one-step upgrade a pre-schema-8 install actually takes: a store already
+    /// at schema 7 (step 7's four `run_id` indexes, no session indexes) running
     /// **step 8 alone**.
     ///
-    /// The v6 fixture crosses two steps at once, so nothing exercised 7→8 on
-    /// its own — and that is the path every real W3.10 install takes. (The
-    /// collision test below also starts from v7, but it is about a stale index
+    /// The schema-6 fixture crosses two steps at once, so nothing exercised 7→8 on
+    /// its own — and that is the path a real install takes. (The
+    /// collision test below also starts from schema 7, but it is about a stale index
     /// *name*, not about the migration landing.)
     #[test]
-    fn a_store_stamped_v7_migrates_through_step_eight_alone() {
+    fn a_store_stamped_at_schema_7_migrates_through_step_eight_alone() {
         let fresh_dir = tempfile::tempdir().expect("create temp dir");
         let fresh_path = fresh_dir.path().join("momotaro.db");
         let mut fresh = Store::open(&fresh_path).expect("open fresh store");
         fresh.init_schema().expect("initialize fresh");
 
-        let v7_dir = tempfile::tempdir().expect("create temp dir");
-        let v7_path = v7_dir.path().join("momotaro.db");
+        let dir_at_schema_7 = tempfile::tempdir().expect("create temp dir");
+        let path_at_schema_7 = dir_at_schema_7.path().join("momotaro.db");
         {
-            let mut v7 = Store::open(&v7_path).expect("open v7 store");
-            v7.init_schema().expect("initialize");
-            v7.connection
+            let mut store_at_schema_7 =
+                Store::open(&path_at_schema_7).expect("open the schema-7 store");
+            store_at_schema_7.init_schema().expect("initialize");
+            store_at_schema_7
+                .connection
                 .execute_batch(
                     "DROP INDEX idx_runs_session;
                      DROP INDEX idx_history_items_session;
                      PRAGMA user_version = 7;",
                 )
-                .expect("rewind to the v7 shape");
+                .expect("rewind to the schema-7 shape");
         }
         assert_eq!(
-            declared_indexes(&Store::open(&v7_path).expect("read v7")),
+            declared_indexes(&Store::open(&path_at_schema_7).expect("read the schema-7 store")),
             [
                 "idx_answers_run",
                 "idx_chunks_rev",
@@ -1720,30 +1861,33 @@ mod tests {
                 "idx_store_events_source",
                 "idx_verifications_run",
             ],
-            "the v7 fixture really is v7: the four run_id indexes are there, \
+            "the fixture really is at schema 7: the four run_id indexes are there, \
              neither session index is"
         );
 
-        let mut v7 = Store::open(&v7_path).expect("reopen v7");
-        v7.init_schema().expect("migrate through step 8");
+        let mut store_at_schema_7 =
+            Store::open(&path_at_schema_7).expect("reopen the schema-7 store");
+        store_at_schema_7
+            .init_schema()
+            .expect("migrate through step 8");
 
         assert_eq!(
-            v7.user_version().expect("read user_version"),
+            store_at_schema_7.user_version().expect("read user_version"),
             CURRENT_SCHEMA_VERSION
         );
         assert_eq!(
             schema_shape(&fresh),
-            schema_shape(&v7),
+            schema_shape(&store_at_schema_7),
             "one step lands the same schema a fresh store builds"
         );
         assert!(
             !backup_files(
-                v7_dir.path(),
+                dir_at_schema_7.path(),
                 &format!("backup-v7-to-v{CURRENT_SCHEMA_VERSION}-")
             )
             .is_empty(),
             "the migration is preceded by a verified backup, named from the \
-             version constants (D46)"
+             version constants"
         );
     }
 
@@ -1769,7 +1913,7 @@ mod tests {
                      CREATE INDEX idx_answers_run ON chunks(source_key);
                      PRAGMA user_version = 6;",
                 )
-                .expect("rewind to a colliding v6");
+                .expect("rewind to a colliding schema 6");
         }
 
         let mut store = Store::open(&path).expect("reopen");
@@ -1904,7 +2048,7 @@ mod tests {
     /// `CREATE INDEX IF NOT EXISTS` keys on the name across the whole schema,
     /// not on the table — the same trap step 7 already documents. A
     /// `idx_runs_session` left sitting on `chunks` would skip the creation,
-    /// stamp v8, and leave `runs.session_id` uncovered while `doctor` reported
+    /// stamp schema 8, and leave `runs.session_id` uncovered while `doctor` reported
     /// ready; step 8 drops first, so the state converges.
     #[test]
     fn a_colliding_session_index_name_does_not_leave_a_table_uncovered() {
@@ -1921,7 +2065,7 @@ mod tests {
                      CREATE INDEX idx_runs_session ON chunks(source_key);
                      PRAGMA user_version = 7;",
                 )
-                .expect("rewind to a colliding v7");
+                .expect("rewind to a colliding schema 7");
         }
 
         let mut store = Store::open(&path).expect("reopen");
@@ -2010,7 +2154,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("momotaro.db");
         {
-            // What this repo's own pre-v3 builds wrote: the full v2 shape, the
+            // What this repo's own pre-schema-3 builds wrote: the full schema-2 shape, the
             // version in `schema_meta`, and no application id at all. Such a
             // store cannot be migrated — its rows carry pre-scheme keys — so it
             // is refused instead of half-adopted.
@@ -2127,9 +2271,9 @@ mod tests {
     }
 
     #[test]
-    fn v1_database_migrates_forward_and_keeps_rows() {
+    fn a_database_at_schema_1_migrates_forward_and_keeps_rows() {
         let (_dir, mut store) = raw_temp_store();
-        // A v1 store of ours: the identity stamp comes with the version carrier
+        // A schema-1 store of ours: the identity stamp comes with the version carrier
         // (same change), so this is what our own older builds actually left.
         store
             .connection
@@ -2139,7 +2283,7 @@ mod tests {
                  INSERT INTO schema_meta (key, value) VALUES ('sentinel', 'keep-me');
                  PRAGMA user_version = 1;"
             ))
-            .expect("create v1 baseline");
+            .expect("create the schema-1 baseline");
 
         store.init_schema().expect("migrate to current");
 
@@ -2284,7 +2428,7 @@ mod tests {
                 "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                  PRAGMA user_version = 1;",
             )
-            .expect("write v1 schema");
+            .expect("write a schema-1 store");
 
         let report = store.stats().expect("stats");
         assert_eq!(report.status, WorkspaceStatus::Invalid);
@@ -2295,7 +2439,7 @@ mod tests {
     #[test]
     fn current_origins_returns_the_class_of_each_current_source() {
         // The rebuild path looks up one class per source key, and a wrong or
-        // missing entry silently changes what a source *is* (T1.8 weights read
+        // missing entry silently changes what a source *is* (the origin weights read
         // this), so the query is pinned here as well as through the index.
         let (_dir, mut store) = raw_temp_store();
         store.init_schema().expect("schema");
@@ -2406,8 +2550,8 @@ mod tests {
         // The one explicit index list, pinned: sqlite_autoindex_* rows come
         // with their constraints and are excluded (`sql` is NULL for them), so
         // this asserts what the schema *declares* — a new or dropped explicit
-        // index is a schema change this test must see (the step-5 assertion the
-        // v5 batch deferred to W2.4, extended by step 7's four `run_id`
+        // index is a schema change this test must see (the step-5 assertion deferred
+        // to the graph-links work, extended by step 7's four `run_id`
         // indexes and step 8's two `session_id` indexes).
         let dir = tempfile::tempdir().expect("temp dir");
         let mut store = Store::open(dir.path().join("momotaro.db")).expect("open");

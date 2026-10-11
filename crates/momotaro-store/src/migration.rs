@@ -1,7 +1,7 @@
 //! Sequential forward-only schema migrations.
 //!
 //! Every step is exactly one transaction and the version stamp
-//! (`PRAGMA user_version`) is the last statement inside it (D46): a crash
+//! (`PRAGMA user_version`) is the last statement inside it: a crash
 //! mid-migration rolls back to the previous consistent version instead of
 //! leaving a half-migrated database.
 
@@ -47,7 +47,7 @@ CREATE INDEX IF NOT EXISTS idx_revisions_current ON source_revisions(source_key)
     ),
     // 2 -> 3: key scheme v2 — the raw spelling of a name beside its key.
     (3, "ALTER TABLE source_revisions ADD COLUMN raw_name TEXT;"),
-    // 3 -> 4: the store's own audit log (ADR 0026). `id` is the rowid: no
+    // 3 -> 4: the store's own audit log. `id` is the rowid: no
     // `AUTOINCREMENT`, which SQLite's own advice prices at extra CPU, memory,
     // disk and IO for a strictly worse guarantee than insertion order.
     // `UNIQUE (batch_id, seq)` carries an autoindex that already serves
@@ -77,17 +77,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_store_events_external
 CREATE INDEX IF NOT EXISTS idx_store_events_source
   ON store_events(source_key) WHERE source_key IS NOT NULL;",
     ),
-    // 4 -> 5: the v0.3 canonical tables, batched per the W3.1 + W3.2 + W2.4
-    // merge decision. The eleven run-time tables are architecture §8.1
-    // verbatim (the `decision_rationale` / `assumptions` / `supersedes`
-    // columns on `answers` and `run_context_items` are multi-agent §5.1's
-    // early-embed columns, appended at the end in the v3 `raw_name` manner),
-    // and `graph_links` is the eight-column derived table of architecture
-    // §8.2 in the table's own column order — `to_source_key` is NULL exactly
+    // 4 -> 5: the canonical tables, batched into one step when three work items
+    // merged. The eleven run-time tables are declared in full
+    // (the `decision_rationale` / `assumptions` / `supersedes`
+    // columns on `answers` and `run_context_items` are the
+    // early-embed columns, appended at the end in the schema-3 `raw_name` manner),
+    // and `graph_links` is the eight-column derived table in the table's own
+    // column order — `to_source_key` is NULL exactly
     // for a dangling link, which stays a first-class row, and `raw_target`
     // keeps the target as written for a later resolve. Row identity and the
-    // replace granularity of `graph_links` are pinned by ADR 0027 (decided
-    // with W2.4): identity is the as-written six-tuple, replacement is per
+    // replace granularity of `graph_links` were decided with the edge-building
+    // work: identity is the as-written six-tuple, replacement is per
     // `from_source_key`, and the table is derived — it can be rebuilt with
     // a different shape without touching canonical data. The tables already
     // present (source_revisions, chunks, store_events) are not rebuilt.
@@ -98,7 +98,7 @@ CREATE INDEX IF NOT EXISTS idx_store_events_source
     // answers) got their indexes in step 7 — `run_trace` scans those tables per
     // run. The one explicit index declared here is `graph_links(from_source_key)`
     // — that table declares no key, and every projection replace deletes by
-    // `from_source_key` (ADR 0027).
+    // `from_source_key`.
     (
         5,
         "CREATE TABLE IF NOT EXISTS sessions (
@@ -106,8 +106,8 @@ CREATE INDEX IF NOT EXISTS idx_store_events_source
   parent_session_id TEXT,
   project_id TEXT,                   -- 可空；创建时绑定，此后不可变
   title TEXT NOT NULL,
-  title_source TEXT NOT NULL DEFAULT 'derived',  -- derived | user | llm；user 改名后永不被自动标题覆盖；0.x 只写 derived
-  profile_id TEXT,                   -- 0.x 不写；无 profiles 表
+  title_source TEXT NOT NULL DEFAULT 'derived',  -- derived | user | llm；user 改名后永不被自动标题覆盖；本构建只写 derived
+  profile_id TEXT,                   -- 本构建不写；无 profiles 表
   first_user_message TEXT,          -- 列表预览与检索喂料
   archived INTEGER NOT NULL DEFAULT 0,
   archived_at INTEGER,
@@ -134,7 +134,7 @@ CREATE TABLE IF NOT EXISTS runs (
   model TEXT,
   context_window INTEGER,
   max_output_tokens INTEGER,
-  result_digest TEXT,               -- 图节点蒸馏结果（v0.9 起；1-2K token 上限）
+  result_digest TEXT,               -- 图节点蒸馏结果（1-2K token 上限）
   failure_note TEXT,                -- 失败 run 的部分产出+标注，不静默吞（图节点共识）
   deadline_at INTEGER,              -- 显式超时（图节点）
   created_at INTEGER NOT NULL,
@@ -196,9 +196,9 @@ CREATE TABLE IF NOT EXISTS run_context_items (
   source_ref_json TEXT,
   token_estimate INTEGER NOT NULL,
   body_hash TEXT NOT NULL,
-  decision_rationale TEXT,          -- multi-agent §5.1 埋点（≤50 token 决策摘要）
-  assumptions TEXT,                 -- multi-agent §5.1 埋点
-  supersedes TEXT,                  -- multi-agent §5.1 埋点：指向被取代工件
+  decision_rationale TEXT,          -- 埋点（≤50 token 决策摘要）
+  assumptions TEXT,                 -- 埋点
+  supersedes TEXT,                  -- 埋点：指向被取代工件
   PRIMARY KEY (run_id, ordinal)
 );
 CREATE TABLE IF NOT EXISTS llm_turns (
@@ -211,10 +211,10 @@ CREATE TABLE IF NOT EXISTS llm_turns (
   status TEXT NOT NULL,            -- started | finished | failed
   input_tokens INTEGER,
   output_tokens INTEGER,
-  cached_tokens INTEGER,           -- provider 缓存命中的输入 token（0.3 起）
+  cached_tokens INTEGER,           -- provider 缓存命中的输入 token
   billable_tokens INTEGER,         -- 实际计费口径（折扣后），未知为 NULL
-  slot TEXT,                       -- answer | utility（RunSpec 冻结快照，D25）
-  reasoning_tokens INTEGER,        -- 思考 token（按输出价计费口径，D26）
+  slot TEXT,                       -- answer | utility（RunSpec 冻结快照）
+  reasoning_tokens INTEGER,        -- 思考 token（按输出价计费口径）
   raw_ref TEXT,
   created_at INTEGER NOT NULL,
   finished_at INTEGER
@@ -225,9 +225,9 @@ CREATE TABLE IF NOT EXISTS answers (
   text TEXT NOT NULL,
   prompt_hash TEXT NOT NULL,
   created_at INTEGER NOT NULL,
-  decision_rationale TEXT,          -- multi-agent §5.1 埋点（≤50 token 决策摘要）
-  assumptions TEXT,                 -- multi-agent §5.1 埋点
-  supersedes TEXT                   -- multi-agent §5.1 埋点：指向被取代工件
+  decision_rationale TEXT,          -- 埋点（≤50 token 决策摘要）
+  assumptions TEXT,                 -- 埋点
+  supersedes TEXT                   -- 埋点：指向被取代工件
 );
 CREATE TABLE IF NOT EXISTS answer_citations (
   answer_id TEXT NOT NULL,
@@ -258,12 +258,12 @@ CREATE TABLE IF NOT EXISTS graph_links (
   link_source TEXT NOT NULL,       -- which syntax produced it
   anchor_kind TEXT,                -- what the anchor points at, when the link has one
   anchor_raw TEXT,                 -- the anchor as written
-  created_at INTEGER NOT NULL      -- the ingested_at of the revision carrying the link (ADR 0027)
+  created_at INTEGER NOT NULL      -- the ingested_at of the revision carrying the link
 );
 CREATE INDEX IF NOT EXISTS idx_graph_links_from ON graph_links (from_source_key);",
     ),
     // 5 -> 6: `idx_graph_links_from` joined the step-5 SQL after that step had
-    // already shipped (W2.4), so databases stamped v5 by builds in the window
+    // already shipped, so databases stamped schema 5 by builds in the window
     // between the two carry the same version number without the index — and a
     // migration chain only runs steps *greater* than the stored version. This
     // step converges both shapes; it is a no-op where the index exists. Shipped
@@ -275,7 +275,7 @@ CREATE INDEX IF NOT EXISTS idx_graph_links_from ON graph_links (from_source_key)
     ),
     // 6 -> 7: an index on the child key of each `run_id` relationship.
     //
-    // sqlite.org/foreignkeys.html §3 ("Required and Suggested Database
+    // SQLite's foreign-key guidance ("Required and Suggested Database
     // Indexes") is the standing guidance: "Indices are not required for child
     // key columns but they are almost always beneficial." … "So, in most real
     // systems, an index should be created on the child key columns of each
@@ -284,7 +284,7 @@ CREATE INDEX IF NOT EXISTS idx_graph_links_from ON graph_links (from_source_key)
     // Read against this schema, precisely: the DDL declares no `REFERENCES`
     // clause, so SQLite does not enforce these as foreign keys — they are
     // child keys by construction, and `run_trace` is what reads them
-    // (`WHERE run_id = ?1` on all four). Without an index §3 says such queries
+    // (`WHERE run_id = ?1` on all four). Without an index such queries
     // "are forced to do a linear scan of the entire child table". The other
     // `run_id` tables already have a covering index of their own: `runs`
     // (primary key), `run_events` / `run_context_items` / `history_items`
@@ -293,7 +293,7 @@ CREATE INDEX IF NOT EXISTS idx_graph_links_from ON graph_links (from_source_key)
     // Each index is dropped before it is created: `CREATE INDEX IF NOT EXISTS`
     // checks the *name* across the whole schema, not the table, so a store
     // where `idx_answers_run` already existed on some other table would skip
-    // the creation, stamp v7, and leave `answers` uncovered while `doctor`
+    // the creation, stamp schema 7, and leave `answers` uncovered while `doctor`
     // reported ready. A name this build owns in a database this build owns is
     // ours to replace; an index is derived, and rebuilding it inside the step's
     // transaction costs nothing on the ordinary path where it does not exist.
@@ -311,7 +311,7 @@ CREATE INDEX idx_verifications_run ON verifications(run_id);",
     // 7 -> 8: an index on `session_id` for the two tables a continued `ask`
     // reads in full on every turn.
     //
-    // `optoverview` §2: "The general rule is that indexes are only useful if
+    // SQLite's own rule: "The general rule is that indexes are only useful if
     // there are WHERE-clause constraints on the left-most columns of the
     // index." `history_for_session` constrains `session_id` and nothing else;
     // `turn_runs_for_session` constrains it first and adds `EXISTS(...)`
@@ -323,7 +323,7 @@ CREATE INDEX idx_verifications_run ON verifications(run_id);",
     //
     // Same DROP-then-CREATE discipline as step 7 (see there): `IF NOT EXISTS`
     // matches the *name* across the whole schema, not the table, so a stale
-    // name elsewhere would skip creation, stamp v8, and leave the column
+    // name elsewhere would skip creation, stamp schema 8, and leave the column
     // uncovered while `doctor` reported ready.
     (
         8,
@@ -345,7 +345,7 @@ CREATE INDEX idx_history_items_session ON history_items(session_id);",
     // `WHERE run_id = ?` lookup the dropped index did. Same DROP-then-CREATE
     // discipline as steps 7 and 8 (see step 7): `IF NOT EXISTS` matches the
     // *name*, so a stale index of this name on another table would skip
-    // creation, stamp v9, and leave the pair unprotected while `doctor`
+    // creation, stamp schema 9, and leave the pair unprotected while `doctor`
     // reported ready.
     (
         9,
@@ -367,12 +367,12 @@ pub(crate) fn apply_pending(connection: &mut Connection, version: u32) -> Result
 }
 
 /// Applies one step: all of its SQL and the version stamp in a single
-/// transaction, with the stamp written last (D46). A failure rolls the whole
+/// transaction, with the stamp written last. A failure rolls the whole
 /// step back and leaves the previous version in place.
 fn apply_step(connection: &mut Connection, target: u32, sql: &str) -> Result<(), StoreError> {
     let transaction = connection.transaction()?;
     transaction.execute_batch(sql)?;
-    // The version stamp is the last statement in the transaction (D46).
+    // The version stamp is the last statement in the transaction.
     transaction.execute_batch(&format!("PRAGMA user_version = {target};"))?;
     transaction.commit()?;
     Ok(())
@@ -388,11 +388,12 @@ mod tests {
     /// The guard is `target > version`, and turning it into `>=` re-runs one
     /// step. That is harmless for `CREATE … IF NOT EXISTS`, but step 3 is
     /// `ALTER TABLE source_revisions ADD COLUMN raw_name` — not idempotent —
-    /// so a store reporting v3 with the column already present would refuse to
+    /// so a store reporting schema 3 with the column already present would refuse to
     /// open at all. No fixture could tell either way: the intermediate-version
-    /// ones (`seed_v2_store`, `seed_v4_store`, the v6 and v7 rewinds) re-run
-    /// steps that are all `CREATE … IF NOT EXISTS` shaped, so re-running them
-    /// is a no-op. Step 3 is the only migration that notices — the rest of the
+    /// ones (`seed_store_at_schema_2`, `seed_store_at_schema_4`, the schema-6 and
+    /// schema-7 rewinds) re-run steps that are all `CREATE … IF NOT EXISTS` shaped,
+    /// so re-running them is a no-op. Step 3 is the only migration that notices — the
+    /// rest of the table is idempotent under a repeat.
     /// table is idempotent under a repeat.
     #[test]
     fn a_store_already_at_a_step_is_not_asked_to_take_it_again() {
@@ -442,7 +443,7 @@ mod tests {
         apply_step(&mut connection, 1, "CREATE TABLE one (x);").expect("first step succeeds");
 
         // The step creates a table and then fails: the table must vanish and
-        // the version must stay where the last successful step left it (D46).
+        // the version must stay where the last successful step left it.
         apply_step(
             &mut connection,
             2,
@@ -473,7 +474,7 @@ mod tests {
         // stamp that runs LAST can leave the step's declared version behind.
         // Moving `PRAGMA user_version = {target}` before the SQL (or deleting
         // it) makes this assertion red — the ordering is the crash-safety
-        // contract of D46, not a comment. The containment half (the stamp runs
+        // contract, not a comment. The containment half (the stamp runs
         // inside the step's transaction) is pinned by
         // `the_stamp_is_the_last_statement_inside_the_step_transaction`.
         apply_step(
@@ -493,7 +494,7 @@ mod tests {
     #[test]
     fn the_stamp_is_the_last_statement_inside_the_step_transaction() {
         // Behaviour cannot observe the crash window between two separate
-        // transactions, so the containment half of D46 is pinned structurally:
+        // transactions, so the containment property is pinned structurally:
         // within `apply_step` every write goes through the transaction handle,
         // and the version stamp sits between the step's SQL and the commit —
         // never after it, never on the raw connection. The needle literals
@@ -534,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn v9_makes_the_turn_order_key_unique() {
+    fn schema_9_makes_the_turn_order_key_unique() {
         let mut connection = Connection::open_in_memory().expect("open in-memory store");
         apply_pending(&mut connection, 0).expect("every step applies");
 

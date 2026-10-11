@@ -20,6 +20,16 @@ pub(crate) fn escape_query(raw: &str) -> String {
 }
 
 /// Trims `raw` and collapses internal whitespace runs to single spaces.
+///
+/// # Examples
+///
+/// ```
+/// use momotaro_retrieve::normalize_query;
+///
+/// assert_eq!(normalize_query("  gradient\t descent  "), "gradient descent");
+/// assert_eq!(normalize_query("傅里叶   变换"), "傅里叶 变换");
+/// assert_eq!(normalize_query(" \n "), "");
+/// ```
 pub fn normalize_query(raw: &str) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -34,6 +44,17 @@ pub fn normalize_query(raw: &str) -> String {
 /// reply into a search that silently reports zero hits instead of failing.
 ///
 /// Normalization is idempotent, so an already-normalized string may be passed.
+///
+/// # Examples
+///
+/// ```
+/// use momotaro_retrieve::is_searchable;
+///
+/// assert!(is_searchable("C++ template"));
+/// assert!(is_searchable("傅里叶"));
+/// // Punctuation only: no term survives normalization, so nothing can match.
+/// assert!(!is_searchable("  !!! ???  "));
+/// ```
 pub fn is_searchable(raw: &str) -> bool {
     normalize_query(raw).chars().any(char::is_alphanumeric)
 }

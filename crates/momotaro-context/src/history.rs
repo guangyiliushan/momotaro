@@ -1,33 +1,32 @@
-//! Multi-round history selection (`docs/docs/context-retrieval.md` §3).
+//! Multi-round history selection.
 //!
 //! The recency guard band keeps the **wider** of the last
 //! [`HISTORY_GUARD_ROUNDS`] rounds and the most recent
-//! [`HISTORY_GUARD_TOKENS`] tokens of turns (§3 第 1 条 保护带: 近 2 轮且 ≥8K
-//! token 保底，取宽者). Guard-band turns are replayed raw as a floor
-//! guarantee. Turns outside the band degrade to their `summary.v1` record
-//! (§3 第 2 条): the raw turn is dropped as
+//! [`HISTORY_GUARD_TOKENS`] tokens of turns. Guard-band turns are replayed raw as a floor
+//! guarantee. Turns outside the band degrade to their `summary.v1` record:
+//! the raw turn is dropped as
 //! [`OmittedReason::CoveredBySummary`] and the summary body is replayed
-//! instead, so old evidence never re-enters as full text (§3 第 3 条 keeps only
-//! title + pointer in `evidence_refs`).
+//! instead, so old evidence never re-enters as full text — the record keeps
+//! only title + pointer in `evidence_refs`.
 //!
-//! Fail-closed summary handling (§4 第 3 条 断言): a summary that fails
-//! [`SummaryV1::validate_against_text`](crate::summary::SummaryV1::validate_against_text) is dropped
+//! Fail-closed summary handling: a summary that fails
+//! [`Summary::validate_against_text`](crate::summary::Summary::validate_against_text) is dropped
 //! ([`OmittedReason::SummaryValidationFailed`]) and its raw turns fall
 //! back — 放弃压缩、保留原史. A validation failure is never silent and
 //! never partially applied.
 //!
-//! Bodies are replayed **verbatim** (`architecture.md` §6.5): `select`
+//! Bodies are replayed **verbatim**: `select`
 //! only decides which bodies are in, never how they read.
 
 use crate::render::validate_untrusted_regions;
-use crate::summary::SummaryV1;
+use crate::summary::Summary;
 use crate::types::{HistoryItem, Omission, OmittedReason, SummarySlot};
 
-/// The guard band keeps at least this many recent rounds (§3 第 1 条).
+/// The guard band keeps at least this many recent rounds.
 pub const HISTORY_GUARD_ROUNDS: u32 = 2;
 
-/// The guard band keeps at least this many recent raw tokens (§3 第 1 条
-/// ≥8K token 保底; the wider of the two bounds wins).
+/// The guard band keeps at least this many recent raw tokens
+/// (the wider of the two bounds wins).
 pub const HISTORY_GUARD_TOKENS: u32 = 8_000;
 
 /// What the `select_history` stage kept, dropped, and which chunk hashes
@@ -42,17 +41,17 @@ pub(crate) struct HistorySelection {
     /// carry (input to the dedup stage).
     pub carried_chunk_hashes: Vec<String>,
     /// `chunk_hash` values carried by turns that were **dropped** because a
-    /// summary covers them (§3 第 4 条).
+    /// summary covers them.
     ///
     /// Their text left the replay window with the demotion, so keeping them
-    /// blacklisted would switch that content off permanently in 0.x, which
+    /// blacklisted would switch that content off permanently in this build, which
     /// has no `kb_read` to get it back. The release only hands fresh
     /// retrieve a chance — it does not promise the chunk returns.
     pub released_chunk_hashes: Vec<String>,
 }
 
 /// The first round inside the guard band: rounds at or above it stay raw
-/// (§3 第 1 条, wider of the two bounds).
+/// (wider of the two bounds).
 pub fn guard_band_from_round(history: &[HistoryItem]) -> u32 {
     let max_round = history.iter().map(|item| item.round).max().unwrap_or(0);
     let last_rounds_start = max_round.saturating_sub(HISTORY_GUARD_ROUNDS - 1);
@@ -95,13 +94,13 @@ pub(crate) fn select_history(history: &[HistoryItem]) -> HistorySelection {
             // replayed, so a record claiming one extra covered turn demotes a
             // turn the replayed text never covered. `parse_stored` is the
             // gate over the stored text itself (it must parse at all, and
-            // §4 rule 3's transcription must be verbatim — an escaped
+            // the transcription must be verbatim — an escaped
             // spelling is not), and equality is the rest of it. `ask.rs`'s
             // `history_item` builds the record as a parse of the body, so
             // production satisfies this by construction; the check is here
             // because `HistoryItem` lets a caller build the pair by hand.
             SummarySlot::Parsed(record) => {
-                SummaryV1::parse_stored(&item.body).is_ok_and(|parsed| &parsed == record)
+                Summary::parse_stored(&item.body).is_ok_and(|parsed| &parsed == record)
             }
             SummarySlot::None | SummarySlot::Malformed => false,
         };
@@ -114,7 +113,7 @@ pub(crate) fn select_history(history: &[HistoryItem]) -> HistorySelection {
         summary_ok.push(ok);
     }
 
-    // Turns covered by a *valid* summary degrade to it (§3 第 2 条).
+    // Turns covered by a *valid* summary degrade to it.
     let mut covered: Vec<String> = Vec::new();
     for (item, ok) in history.iter().zip(&summary_ok) {
         if *ok && let SummarySlot::Parsed(record) = &item.summary {
@@ -150,7 +149,7 @@ pub(crate) fn select_history(history: &[HistoryItem]) -> HistorySelection {
                 reason: OmittedReason::CoveredBySummary,
             });
             // The text leaves the window with the turn, so the dedup base
-            // releases with it (§3 第 4 条) — only here, only for turns that
+            // releases with it — only here, only for turns that
             // really dropped. A guard-band turn a summary also claims stays
             // raw below and keeps its hashes blacklisted.
             released_chunk_hashes.extend(item.referenced_chunk_hashes.iter().cloned());
@@ -165,8 +164,8 @@ pub(crate) fn select_history(history: &[HistoryItem]) -> HistorySelection {
         }
         // Guard-band turns stay raw even if a summary claims them (保底
         // floor against a mis-cutting compressor); uncovered out-of-band
-        // turns stay raw until compaction appends their summary (§4 只
-        // 追加 summary.v1，不删不改 history_items).
+        // turns stay raw until compaction appends their summary —
+        // compaction appends `summary.v1` and never edits `history_items`.
         kept.push(index);
         carried_chunk_hashes.extend(item.referenced_chunk_hashes.iter().cloned());
     }
@@ -182,7 +181,7 @@ pub(crate) fn select_history(history: &[HistoryItem]) -> HistorySelection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::summary::{EvidenceRef, SUMMARY_VERSION_V1, SummaryV1, UserDecision};
+    use crate::summary::{EvidenceRef, SUMMARY_VERSION, Summary, UserDecision};
     use crate::types::HistoryRole;
 
     fn turn(id: &str, round: u32, body: &str) -> HistoryItem {
@@ -196,9 +195,9 @@ mod tests {
         }
     }
 
-    fn summary_record(covered: &[&str]) -> SummaryV1 {
-        let mut record = SummaryV1 {
-            version: SUMMARY_VERSION_V1.to_string(),
+    fn summary_record(covered: &[&str]) -> Summary {
+        let mut record = Summary {
+            version: SUMMARY_VERSION.to_string(),
             covered_turns: covered.iter().map(|s| (*s).to_string()).collect(),
             first_kept_item_id: "h-keep".to_string(),
             tokens_before: 100,
@@ -218,7 +217,7 @@ mod tests {
         record
     }
 
-    fn summary_item(id: &str, round: u32, record: SummaryV1) -> HistoryItem {
+    fn summary_item(id: &str, round: u32, record: Summary) -> HistoryItem {
         let stored = serde_json::to_string(&record).expect("encode");
         let mut item = turn(id, round, &stored);
         item.summary = SummarySlot::Parsed(record);
@@ -351,7 +350,7 @@ mod tests {
     /// `parse_stored`'s verbatim half is load-bearing **at the gate**, not
     /// only at the type. A summary whose evidence hash is spelled with JSON
     /// escapes decodes to the right value — a parse-only gate would accept
-    /// it and the identity would hold — but §4 rule 3 wants the hash
+    /// it and the identity would hold — but the requirement is the hash
     /// transcribed verbatim. Swap the gate's `parse_stored` for `from_stored`
     /// and this row is let through, so the swap owes a red here.
     #[test]
@@ -446,7 +445,7 @@ mod tests {
         assert_eq!(guard_band_from_round(&long), 9);
     }
 
-    /// §3 第 1 条's token floor is exact at its boundary: a tail that
+    /// The token floor is exact at its boundary: a tail that
     /// lands precisely on `HISTORY_GUARD_TOKENS` at an item already closes
     /// the floor there. A `>`-strict comparison (or a constant nudged to
     /// 8_001) pushes the floor's first round one earlier and this fails.
@@ -463,9 +462,9 @@ mod tests {
         assert_eq!(guard_band_from_round(&history), 2);
     }
 
-    /// `docs/docs/context-retrieval.md` §3 第 1 条 fixes the floor at ≥8K
+    /// The contract fixes the floor at ≥8K
     /// tokens; `HISTORY_GUARD_TOKENS` is that contract value, not a
-    /// tunable. 7_999 violates the documented 保底; 8_001 overstates it.
+    /// tunable. 7_999 violates the floor; 8_001 overstates it.
     #[test]
     fn the_token_floor_is_the_documented_eight_k() {
         assert_eq!(HISTORY_GUARD_TOKENS, 8_000);
@@ -518,7 +517,7 @@ mod tests {
             selection.omissions.iter().any(|o| {
                 o.item == "h-sum" && o.reason == OmittedReason::SummaryValidationFailed
             }),
-            "§4 rule 3 wants the failure in the omissions: {:?}",
+            "the failure must appear in the omissions: {:?}",
             selection.omissions
         );
         assert!(
@@ -530,7 +529,7 @@ mod tests {
         );
     }
 
-    /// §3 第 4 条's narrowing: hashes leave the dedup base with the turn they
+    /// The release is narrow: hashes leave the dedup base with the turn they
     /// were carried by, and only with *that* turn — a kept turn's hashes stay
     /// blacklisted, and an out-of-band turn no summary claims is untouched.
     #[test]

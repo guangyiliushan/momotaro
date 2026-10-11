@@ -181,8 +181,8 @@ fn line_number_for(starts: &[u32], byte_offset: u32) -> u32 {
 /// When that text is the *body* of a note — the note minus its frontmatter block —
 /// those ranges are relative to the slice, while the locator must address the
 /// original bytes so citation verification can slice the document directly. Pass
-/// the cut here and the locators come back source-relative. (D41 in
-/// `docs/docs/ingest-interop.md` puts the same obligation on the wiring side.)
+/// the cut here and the locators come back source-relative. (The same obligation
+/// holds on the wiring side.)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SourceOffset {
     /// Bytes cut off the front of the note.
@@ -209,16 +209,44 @@ impl SourceOffset {
 /// and the byte spans in `excluded` never become chunk text.
 ///
 /// `excluded` is how a span the caller knows is noise — the Excalidraw scene
-/// fence, thousands of bytes of compressed drawing data (§5 第 9 条) — stays out of the
+/// fence, thousands of bytes of compressed drawing data — stays out of the
 /// index without rewriting a single byte of the note: a block that intersects such
 /// a span is dropped whole, so every other chunk keeps the locator it would have
 /// had on its own. A chunk built from blocks on both sides of an excluded span has
 /// a locator that spans the window between them (an exclusion shifts nothing).
 ///
 /// `rendered_from` names the file a *rendered* text was built from — a `.canvas`,
-/// whose text comes from its JSON fields (§5 第 9 条). No byte range inside that file
+/// whose text comes from its JSON fields. No byte range inside that file
 /// spells the text out, so its chunks carry the file's own axes as a whole and a
 /// citation still resolves to the document; `offset` does not apply to them.
+///
+/// # Panics
+///
+/// The chunk-close branch carries an
+/// `expect("close implies open chunk")`: a close is only ever requested while
+/// a chunk is open, so the invariant holds by construction and the expression
+/// cannot fire as written.
+///
+/// # Examples
+///
+/// ```
+/// use momotaro_contracts::IndexPolicy;
+/// use momotaro_ingest::{SourceOffset, chunk_markdown_with};
+///
+/// let note = "# Fourier\n\nEnergy is conserved.\n";
+/// let chunks = chunk_markdown_with(
+///     "note:notes/fourier.md",
+///     "rev-1",
+///     note,
+///     &IndexPolicy::default(),
+///     SourceOffset::default(),
+///     &[],
+///     None,
+/// );
+/// assert_eq!(chunks.len(), 1);
+/// assert_eq!(chunks[0].text, "Energy is conserved.\n");
+/// assert_eq!(chunks[0].heading_path.as_deref(), Some("Fourier"));
+/// ```
 pub fn chunk_markdown_with(
     source_key: &str,
     revision_hash: &str,
@@ -272,7 +300,7 @@ pub fn chunk_markdown_with(
         // come from the last block's own span, never from the joined text length.
         // `offset` shifts both axes back into the note when this text is a body
         // slice; a rendered text has no slice to point into, so it carries the
-        // axes of the file it was rendered from instead (§5 第 9 条). `truncated`
+        // axes of the file it was rendered from instead. `truncated`
         // describes the text either way, so it stays the packing loop's flag.
         let (start_byte, end_byte, start_line, end_line) = rendered_axes.unwrap_or_else(|| {
             (
@@ -705,7 +733,7 @@ mod tests {
 
     /// An excluded span is dropped whole and nothing around it moves: the note's
     /// bytes are never rewritten, so a chunk's locator still addresses the note
-    /// (§5 第 9 条 — the Excalidraw scene fence).
+    /// (the Excalidraw scene fence).
     /// The parser options are load-bearing, not decoration: `ENABLE_TABLES`
     /// is what makes pulldown return `Tag::Table` at all. Turn it off and the
     /// same three lines come back as one paragraph — same bytes, different
@@ -931,7 +959,7 @@ mod tests {
 
     /// A rendered text's chunks point at the file it was rendered from, whatever
     /// the text itself says: the byte span is the whole document, so a citation
-    /// resolves to the document (§5 第 9 条).
+    /// resolves to the document.
     #[test]
     fn a_rendered_text_points_at_the_file_it_came_from() {
         let doc = "# Title\n\nbody\n";

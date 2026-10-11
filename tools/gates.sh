@@ -9,7 +9,7 @@
 #
 # Pick the tier by BLAST RADIUS, not by habit: the daily tier is for edits whose
 # reach is the crates you name; the close-out tier runs before a task commit, a
-# wave merge, or any key / path / schema / format change. Name the crates whose
+# merge to dev, or any key / path / schema / format change. Name the crates whose
 # behaviour the change can reach — not the crate whose file changed (contracts
 # enums, `indexed_text`, key shapes go straight to the close-out tier).
 #

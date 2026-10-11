@@ -39,7 +39,7 @@ pub(crate) const WRITER_HEAP_BYTES: usize = 50_000_000;
 /// Longest excerpt, in characters, attached to a search hit.
 const EXCERPT_CHARS: usize = 200;
 
-/// Which event family one batch writes (ADR 0026).
+/// Which event family one batch writes.
 ///
 /// `index` and the watcher write the `ingest` domain — a watcher batch *is* an
 /// ingest batch, so `doctor --coverage` reports whichever of them wrote last —
@@ -79,7 +79,7 @@ pub(crate) const WATCH_PLAN: EventPlan = EventPlan {
     ..INGEST_PLAN
 };
 
-/// What the four reconciliation triggers write (D40 §4.4).
+/// What the four reconciliation triggers write.
 pub(crate) const RECONCILE_PLAN: EventPlan = EventPlan {
     domain: "vault",
     started: "vault.reconcile.started",
@@ -120,7 +120,7 @@ impl Batch {
     }
 }
 
-/// What kind of batch this run is (D40 §4.4 / §4.7).
+/// What kind of batch this run is.
 #[derive(Debug, Clone)]
 pub(crate) struct BatchShape {
     /// The event family these rows belong to.
@@ -131,8 +131,8 @@ pub(crate) struct BatchShape {
     /// watcher batch costs a single file while its links resolve against the
     /// whole vault.
     pub only: Option<HashSet<PathBuf>>,
-    /// Gate every path before touching it (D40 §4.2 / §4.3) and put each
-    /// rebuilt file's row inside its own transaction (D40 §4.7).
+    /// Gate every path before touching it and put each
+    /// rebuilt file's row inside its own transaction.
     pub gated: bool,
 }
 
@@ -162,17 +162,16 @@ pub(crate) struct BatchOutcome {
     /// What the caller renders.
     pub report: IndexReport,
     /// Keys the walk no longer names, whatever the caller asked for — the
-    /// deletion check runs on every batch because the walk runs on every batch
-    /// (D40 §4.2).
+    /// deletion check runs on every batch because the walk runs on every batch.
     pub removed: u64,
-    /// Paths to hand back to the watcher's retry queue: torn reads (D40 §4.5)
-    /// and guard refusals (D40 §4.7). The batch recorded an error row for a
+    /// Paths to hand back to the watcher's retry queue: torn reads
+    /// and guard refusals. The batch recorded an error row for a
     /// torn read and nothing at all for a refusal — either way the watcher
     /// backs off, then gives up to the daily reconcile.
     pub retry: Vec<PathBuf>,
 }
 
-/// What the cheap pass concluded about one path (D40 §4.2 / §4.3).
+/// What the cheap pass concluded about one path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Gate {
     /// The path holds no file any more.
@@ -191,7 +190,7 @@ pub(crate) enum Gate {
     /// real change, so the rebuild path has to be forced.
     ForceRebuild,
     /// There is work — new bytes, a moved path, a changed fingerprint, or a
-    /// racy file whose bytes matched and so earns its row (D40 §4.3).
+    /// racy file whose bytes matched and so earns its row.
     Proceed,
 }
 
@@ -242,7 +241,7 @@ pub(crate) fn gate(
     if !stat_matches {
         return Ok(verdict(false, false, None));
     }
-    // D40 §4.3: a coarse filesystem (FAT/exFAT, two-second ticks) can leave a
+    // A coarse filesystem (FAT/exFAT, two-second ticks) can leave a
     // rewritten file with a stat that still matches, so the shortcut is not
     // available there either. `gate` only ever runs because an event arrived,
     // which is exactly the clause's "最近 N 秒内有事件"; the label and the store
@@ -256,7 +255,7 @@ pub(crate) fn gate(
     {
         return Ok(verdict(true, false, None));
     }
-    // The stat proves nothing here, so compare the bytes (D40 §4.3). Which
+    // The stat proves nothing here, so compare the bytes. Which
     // bytes, and which hash, are the stored revision's to say: an attachment's
     // column is `revision_hash_reader` over its raw bytes while a note's is
     // `revision_hash` over its normalized text, and hashing one with the other
@@ -279,8 +278,8 @@ pub(crate) fn gate(
     };
     // `Some(true)`: same bytes — the event was false, but this file is racy,
     // so it earns its `skipped` row, and that row is what advances
-    // `recorded_at` past the file's mtime and clears the raciness (D40 §4.3,
-    // git's `--refresh`). A `None` never reaches that rule: see `verdict`.
+    // `recorded_at` past the file's mtime and clears the raciness (git's
+    // `--refresh`). A `None` never reaches that rule: see `verdict`.
     Ok(verdict(true, true, hash_matches))
 }
 
@@ -290,8 +289,8 @@ pub(crate) fn gate(
 /// no longer asks a Markdown question of a `.png`: `register_attachment` writes
 /// `revision_hash_reader`'s answer into the column, so this is the same hash on
 /// the same bytes. The bracketing stats are the torn-read guarantee
-/// [`read_stable`] gives a note (D40 §4.2), and the bytes stream through the
-/// hasher rather than being held whole (D40 §4.3's content check has to run
+/// [`read_stable`] gives a note, and the bytes stream through the
+/// hasher rather than being held whole (the content check has to run
 /// here too, and a vault may hold a video).
 ///
 /// `None` is "the stat did not answer": an unreadable file and a torn one are
@@ -313,13 +312,13 @@ fn stable_raw_hash(path: &Path) -> Option<String> {
 /// A torn read is not an `IndexFileErrorKind`: it is not a classification of
 /// *what* failed but a statement that the bytes were never one version, and
 /// the batch records it as an I/O row while the watcher backs off and
-/// requeues (D40 §4.5). Typing it keeps the watcher from having to match on a
+/// requeues. Typing it keeps the watcher from having to match on a
 /// message, which this repo forbids.
 #[derive(Debug)]
 enum PassError {
     /// The file changed while it was read; nothing was written.
     Torn,
-    /// The transaction's first step refused the unit (D40 §4.7): the whole
+    /// The transaction's first step refused the unit: the whole
     /// unit rolled back and the caller requeues rather than records a
     /// failure — nothing was written, so nothing failed.
     Guard,
@@ -351,15 +350,15 @@ impl From<StoreError> for PassError {
 /// A store step that has to keep the guard's refusal distinguishable.
 ///
 /// `store_step` classifies every store failure as `store`, which is right for
-/// the reads — but §4.7 says a guard rejection *requeues*, and a row that says
+/// the reads — but a guard rejection *requeues*, and a row that says
 /// "store error" would say the opposite of what happened: the unit rolled
 /// back and nothing was attempted. The classification stays identical for
 /// every other failure; only the refusal keeps its own variant.
-/// The store half of D40 §4.3's "same bytes under a fresh fingerprint" branch,
+/// The store half of the "same bytes under a fresh fingerprint" branch,
 /// shared by the note and the attachment pass.
 ///
 /// Same `revision_hash`, so no new revision: only the mutable columns move,
-/// and they move in one transaction with the guard D40 §4.7 requires — the
+/// and they move in one transaction with the guard the contract requires — the
 /// first step re-checks the stat the bytes were read under. The two passes
 /// differ in what they write (a note carries re-derived metadata and
 /// re-projected edges; an attachment carries its fingerprint and no rows),
@@ -405,8 +404,8 @@ fn commit_step<T>(
     })
 }
 
-/// Whether the caller insists on the content path although the stat matches
-/// (D40 §4.3): the stat was racy and the bytes differ.
+/// Whether the caller insists on the content path although the stat matches:
+/// the stat was racy and the bytes differ.
 fn forced(mode: &ProcessMode) -> bool {
     matches!(
         mode,
@@ -417,8 +416,7 @@ fn forced(mode: &ProcessMode) -> bool {
     )
 }
 
-/// The transaction's first step: re-check the stat the bytes were read under
-/// (D40 §4.7).
+/// The transaction's first step: re-check the stat the bytes were read under.
 ///
 /// A refusal rolls the whole unit back and the caller requeues — the file
 /// moved between our read and our write, so what we hold describes nothing
@@ -426,7 +424,7 @@ fn forced(mode: &ProcessMode) -> bool {
 ///
 /// The comparison is [`is_torn`] — the same predicate the read half of this
 /// contract runs, negated. It used to be written out a third time here after
-/// round 12 had already collapsed the other two into one definition, which is
+/// the other two had already collapsed into one definition, which is
 /// exactly how three "did this file move" answers drift apart again.
 ///
 /// What that predicate is: the stamp compared **exactly**, not through
@@ -448,10 +446,10 @@ fn guard_against<'a>(
     }
 }
 
-/// One file's read with a stat on each side (D40 §4.2).
+/// One file's read with a stat on each side.
 enum StableRead {
     /// The bytes. The two stats matched, so the caller needs neither of them —
-    /// the guard re-reads the file at commit time (D40 §4.7).
+    /// the guard re-reads the file at commit time.
     Stable(Vec<u8>),
     /// The file changed between the two stats, so the buffer holds two
     /// versions of it. It is dropped here and never handed on.
@@ -496,7 +494,7 @@ fn is_torn(before: &fs::Metadata, after: &fs::Metadata) -> bool {
     !crate::watch::same_stat(before, after)
 }
 
-/// Whether a matching stat can be trusted for this file (D40 §4.3).
+/// Whether a matching stat can be trusted for this file.
 ///
 /// git's rule with git's reference: an entry is racily clean when its mtime is
 /// at or after the moment the index file itself was last written, because a
@@ -509,7 +507,7 @@ fn is_racy(mtime_secs: i64, last_written: i64) -> bool {
 }
 
 /// The moment the store was last written — the boundary [`is_racy`] measures
-/// against (D40 §4.3).
+/// against.
 ///
 /// Read once per batch: nothing inside a gate loop writes to the store, so the
 /// answer cannot change under it, and reading it per path costs a query to
@@ -531,7 +529,7 @@ fn mtime_secs(metadata: &fs::Metadata) -> i64 {
         .map_or(0, |since| since.as_secs() as i64)
 }
 
-/// Batch-level stat inputs (D40 §4.3): the store's last write moment and
+/// Batch-level stat inputs: the store's last write moment and
 /// whether the volume is coarse. Read once per batch and carried to every
 /// cheap skip, so all three ask the same question.
 #[derive(Clone, Copy)]
@@ -553,7 +551,7 @@ impl StatProbe {
     }
 }
 
-/// The verdict on one file, given what the cheap pass found (D40 §4.2 / §4.3).
+/// The verdict on one file, given what the cheap pass found.
 ///
 /// Split out from [`gate`] so every combination can be pinned without a
 /// machine that can preserve an mtime while changing a file's bytes — which no
@@ -562,13 +560,13 @@ impl StatProbe {
 /// * stat differs, or there is no row: there is work.
 /// * stat matches and is not racy: a false event, dropped with no row.
 /// * stat matches, is racy, and the bytes agree: still no work, but the file
-///   earns the row that clears its raciness (D40 §4.3).
+///   earns the row that clears its raciness.
 /// * stat matches, is racy, and the bytes differ: the skip rule would swallow
 ///   a real change, so the rebuild path is forced.
 /// * stat matches, is racy, and the comparison could not run (a torn read, a
 ///   lock, or a normalization failure): the skip rule would be clearing a
 ///   raciness nobody disproved — the rebuild path is forced, and a read that
-///   tears *there* goes to the retry queue (D40 §4.5).
+///   tears *there* goes to the retry queue.
 fn verdict(stat_matches: bool, racy: bool, hash_matches: Option<bool>) -> Gate {
     if !stat_matches {
         return Gate::Proceed;
@@ -611,14 +609,14 @@ fn index_fault(root: &Path) -> Option<String> {
 /// much there is to serve.
 ///
 /// The writer commits a batch's documents in one step, after the per-file
-/// store commits (ADR 0026's order), so a crash in that window leaves current
+/// store commits, so a crash in that window leaves current
 /// chunks whose documents never landed — and nothing else says so: a re-run
 /// skips those files (their fingerprints match) and `reconcile` reads only
 /// state that agrees. `doctor` turns this into an `Invalid` naming the
 /// command that repairs it.
 ///
 /// The store side counts only chunks of **current** revisions
-/// (`all_current_chunks`): rows retained for older revisions (ADR 0022) stay
+/// (`all_current_chunks`): rows retained for older revisions stay
 /// in the store on purpose and never had documents. `None` — nothing to
 /// report — covers a workspace whose index does not exist yet (owned by
 /// `index_fault`) or one whose store or index cannot be opened here.
@@ -706,7 +704,7 @@ fn store_chunk_count(root: &Path) -> Option<u64> {
     Some(store.counts().ok()?.chunks)
 }
 
-/// Reads the most recent **ingest** batch back out of the audit log (ADR 0026).
+/// Reads the most recent **ingest** batch back out of the audit log.
 ///
 /// `Ok(None)` covers both "nothing has ever been written here" — no database file
 /// at all, which the caller turns into "run `init`" — and "a store with no ingest
@@ -717,6 +715,14 @@ fn store_chunk_count(root: &Path) -> Option<u64> {
 /// answers for it when it is not usable, so this path cannot drift from what
 /// `doctor` says. It also asks for the newest *ingest* row rather than the newest
 /// row, because the table carries several domains.
+///
+/// # Errors
+///
+/// - `RunError::StoreUnhealthy` when the database file exists but is not
+///   usable (empty, uninitialized, foreign, or older schema).
+/// - `RunError::Store` when opening the database or reading the newest
+///   ingest batch and its events fails. An absent database is `Ok(None)`,
+///   not an error.
 pub fn coverage_report(root: impl AsRef<Path>) -> Result<Option<CoverageReport>, RunError> {
     let root = root.as_ref();
     if matches!(store_file(root), StoreFile::Absent) {
@@ -741,7 +747,7 @@ pub fn coverage_report(root: impl AsRef<Path>) -> Result<Option<CoverageReport>,
 /// The fallback is for rows written before the lists existed (and for the
 /// refusal rows, which never carry one), and it consults **both** vocabularies:
 /// `reason_code` holds the first degradation, or the first warning on a row
-/// with no degradation (§5 第 8 条 ⑤), and a reader that tried only one
+/// with no degradation, and a reader that tried only one
 /// vocabulary would report a warning as a failure. A code neither vocabulary
 /// knows is a fact about the batch, not noise — the same posture as an
 /// unreadable outcome below.
@@ -1023,7 +1029,7 @@ mod tests {
 
     /// The expand half of the same fix has no end-to-end witness: the failure
     /// returns `Err` and takes the `run_id` with it, so no test can read that
-    /// run's turn row back (the same seam §20 registers twice). What *can* be
+    /// run's turn row back (the same seam, registered twice). What *can* be
     /// pinned is that the branch calls the builder the ask half is witnessed
     /// through — a call site deleted here would otherwise be silent, and
     /// `cargo-mutants` deletes calls as a matter of course.
@@ -1082,13 +1088,13 @@ X
         assert_eq!(strip_code_fence("```"), "");
     }
 
-    /// §5 第 4 条's carve-out has **two** fences: `non_note_keys`, and the
+    /// The anchor carve-out has **two** fences: `non_note_keys`, and the
     /// `kind == Note` guard on the revision. The first is built from *this
     /// batch's* entries, so it is empty for a target that is not in the batch
     /// — a note the watcher just touched, linking to an attachment indexed
     /// earlier. The second fence is the one that stands there.
     ///
-    /// Registered since round 8 as a structural equivalent ("the outline
+    /// Filed as a structural equivalent ("the outline
     /// builder filters empty levels" class); it is not. A full battery finally
     /// drove it: `revision.kind == SourceKind::Note` → `true` survived the
     /// whole suite, because every fixture reached the first fence instead.
@@ -1219,7 +1225,7 @@ X
 
     #[test]
     fn a_named_failure_carries_its_row_and_an_unnameable_one_carries_nothing() {
-        // The terminal write only lands a §18 payload for a failure this layer
+        // The terminal write only lands an error-taxonomy payload for a failure this layer
         // can name — `failure_row`'s catch-all is `unreachable!`, so guessing a
         // category would panic rather than invent an attribution. Both halves
         // of that decision are pure and therefore testable without a store.
@@ -1234,7 +1240,7 @@ X
         };
         let (data, note) = expand_failure_payload(&RunError::Llm(auth)).expect("named");
         let row: serde_json::Value = serde_json::from_str(&data).expect("payload is JSON");
-        assert_eq!(row["category"], "llm_auth", "the §18 category");
+        assert_eq!(row["category"], "llm_auth", "the error-taxonomy category");
         assert_eq!(row["attribution"], "user", "and its attribution");
         assert_eq!(row["retryable"], false, "and its retryability");
         assert_eq!(
@@ -1249,7 +1255,7 @@ X
         let (data, note) = expand_failure_payload(&RunError::RewriteUnusable).expect("named");
         let row: serde_json::Value = serde_json::from_str(&data).expect("payload is JSON");
         // A 2xx that searched nothing is a malformed completion, not a provider
-        // outage — that is what §18 spells for it.
+        // outage — that is what the error taxonomy spells for it.
         assert_eq!(row["category"], "llm_malformed");
         assert!(
             note.expect("the note names the failure")
@@ -1261,7 +1267,7 @@ X
         // taxonomy never decided: the run is abandoned to the sweep instead.
         assert!(
             expand_failure_payload(&RunError::IndexNotBuilt("gone".to_owned())).is_none(),
-            "an index fault carries no §18 row"
+            "an index fault carries no failure payload"
         );
     }
 
@@ -1270,7 +1276,7 @@ X
         // The shape the coverage row's `data_json` carries, pinned on the pure
         // function that builds it — the empty payload is exactly `{}`, each list
         // is written only when it is non-empty, and a row can carry both
-        // vocabularies at once (§5 第 8 条).
+        // vocabularies at once.
         let empty = RowPayload {
             degradations: &[],
             warnings: &[],
@@ -1315,7 +1321,7 @@ X
             }),
             "{\"warnings\":[\"icloud_placeholder\"]}"
         );
-        // An ambiguous link carries its writing and its candidates (§5 第 3 条):
+        // An ambiguous link carries its writing and its candidates:
         // the audit of a no-edge decision.
         assert_eq!(
             payload_json(&RowPayload {
@@ -1333,7 +1339,7 @@ X
             "{\"ambiguous\":[{\"candidates\":[\"note:a/note.md\",\"note:b/note.md\"],\"raw_target\":\"note\"}],\"degradations\":[\"ambiguous_wikilink\"]}"
         );
         // A stale anchor carries which one (target + raw), like the ambiguous
-        // candidates do — the audit of a kept-but-unverified edge (§5 第 4 条).
+        // candidates do — the audit of a kept-but-unverified edge.
         assert_eq!(
             payload_json(&RowPayload {
                 degradations: &[Degradation::StaleAnchor],
@@ -1370,13 +1376,13 @@ X
         assert_eq!(
             out.losses,
             [Degradation::UnknownLinkSyntax],
-            "and the drop is reported, never silent (§5 第 7 条)"
+            "and the drop is reported, never silent"
         );
     }
 
     #[test]
     fn the_links_blob_record_is_the_contract_shape() {
-        // The persisted record is contract (§5 第 2 条): exact keys, exact
+        // The persisted record is contract: exact keys, exact
         // spellings, nulls where the anchor is absent — asserted against the
         // literal JSON so a drift cannot agree with itself.
         let input = chunk_input("body [[x]]", VaultFileKind::Note);
@@ -1403,50 +1409,50 @@ X
     #[test]
     fn every_code_carries_the_sentence_this_table_pins() {
         // The two match blocks below are written by hand, and what a row's
-        // reader sees is their output — a review's probe swapped two sentences
-        // and no assertion noticed. The whole table is pinned here: a swap
+        // reader sees is their output; a swap between two sentences once went
+        // unnoticed. The whole table is pinned here: a swap
         // fails, and the enums' exhaustiveness keeps a new code from having no
         // sentence at all.
         for (code, sentence) in [
             (
                 Degradation::FrontmatterParseError,
-                "the file was indexed; its frontmatter block could not be read (D41.5)",
+                "the file was indexed; its frontmatter block could not be read",
             ),
             (
                 Degradation::UnresolvedWikilink,
-                "the file was indexed; a wikilink points at a note that is not here (D41.1)",
+                "the file was indexed; a wikilink points at a note that is not here",
             ),
             (
                 Degradation::AmbiguousWikilink,
-                "the file was indexed; a wikilink matches more than one note, so no edge was built (D41.2)",
+                "the file was indexed; a wikilink matches more than one note, so no edge was built",
             ),
             (
                 Degradation::StaleAnchor,
-                "the file was indexed; a heading anchor does not exist in its target (D41.3)",
+                "the file was indexed; a heading anchor does not exist in its target",
             ),
             (
                 Degradation::MarkdownLinkDecodeError,
-                "the file was indexed; a markdown link's target could not be decoded (D41.4)",
+                "the file was indexed; a markdown link's target could not be decoded",
             ),
             (
                 Degradation::UnknownLinkSyntax,
-                "the file was indexed; a link uses a syntax this build does not know (D41.6)",
+                "the file was indexed; a link uses a syntax this build does not know",
             ),
             (
                 Degradation::CanvasParseError,
-                "the file was indexed; its canvas block could not be read as JSON (D41.8)",
+                "the file was indexed; its canvas block could not be read as JSON",
             ),
             (
                 Degradation::ExcalidrawDetected,
-                "the file was indexed; its Excalidraw scene stays out of the index (D41.7)",
+                "the file was indexed; its Excalidraw scene stays out of the index",
             ),
             (
                 Degradation::SymlinkEncountered,
-                "the path is a symlink; it was recorded, not followed (D41.9)",
+                "the path is a symlink; it was recorded, not followed",
             ),
             (
                 Degradation::AttachmentUnindexed,
-                "the file was registered; its bytes are not searchable on purpose (D41.10)",
+                "the file was registered; its bytes are not searchable on purpose",
             ),
         ] {
             assert_eq!(
@@ -1458,19 +1464,19 @@ X
         for (warning, sentence) in [
             (
                 Warning::OneDrivePlaceholder,
-                "the file is a cloud placeholder; its bytes are not on this device, so nothing was read (D42)",
+                "the file is a cloud placeholder; its bytes are not on this device, so nothing was read",
             ),
             (
                 Warning::IcloudPlaceholder,
-                "the file is an iCloud eviction stub; the note it stands for is not on this device (D42)",
+                "the file is an iCloud eviction stub; the note it stands for is not on this device",
             ),
             (
                 Warning::WindowsIncompatibleName,
-                "the name is one Windows' naming rules reserve; tools and sync clients that follow them will refuse it (D42)",
+                "the name is one Windows' naming rules reserve; tools and sync clients that follow them will refuse it",
             ),
             (
                 Warning::SourceRemoved,
-                "the path no longer holds a file; its rows stay as history and the next reconcile converges the projections (D40 §4.2)",
+                "the path no longer holds a file; its rows stay as history and the next reconcile converges the projections",
             ),
         ] {
             assert_eq!(warning_message(warning), sentence, "{warning:?}");
@@ -1524,7 +1530,7 @@ X
 
     #[test]
     fn a_canvas_that_does_not_read_as_an_object_is_the_failure_case() {
-        // The spec has no rules for unreadable JSON, so the rule is ours (§5.9):
+        // The spec has no rules for unreadable JSON, so the rule is ours:
         // text that does not read as a canvas object is kept verbatim and reported,
         // rather than quietly indexed as JSON noise. An empty object is not that
         // case — it is a canvas with nothing in it.
@@ -1595,7 +1601,7 @@ X
         );
     }
 
-    /// D40 §4.7 checks the file *as a whole*: mtime **and** length. The
+    /// The guard checks the file *as a whole*: mtime **and** length. The
     /// existing test moves both; this one moves only the timestamp — the shape
     /// a same-size rewrite takes, and the commonest one (edit one word, keep the
     /// byte count; or a coarse filesystem that rounds the stamp). `||` would let
@@ -1692,7 +1698,7 @@ X
         );
     }
 
-    /// `read_stable`'s contract is the absolute half of D40 §4.2: torn bytes
+    /// `read_stable`'s contract is the absolute half: torn bytes
     /// never reach a caller that would commit them. The read itself cannot be
     /// staged, so the predicate it runs is fed two real stats that disagree on
     /// **one** half each — the two cases an `&&` would let through.
@@ -1812,7 +1818,7 @@ X
         );
     }
 
-    /// `mtime_secs` is the whole of D40 §4.3's "recent is not trustworthy": it
+    /// `mtime_secs` is the whole of the "recent is not trustworthy" rule: it
     /// feeds `is_racy(mtime, last_written)`, and git's rule is that entry. Feed
     /// it a constant and that branch is dead in any workspace that has ever
     /// written the store — the recent-rewrite case the content check exists for
@@ -1869,7 +1875,7 @@ X
     /// revision. `files_indexed` feeds the summary line, the `ingest.finished`
     /// payload, `reconcile`'s `changed` and the watch line, so a `+=` that
     /// stopped adding was a lie in four places at once.
-    /// D40 §4.3 for attachments, the half the note path already had: a file
+    /// The raciness rule for attachments, the half the note path already had: a file
     /// rewritten behind a stat that still matches has to reach the content
     /// check, and the content check has to say the bytes moved. `stable_raw_hash`
     /// answering "the stat did not answer" instead routes it to `Proceed`, the
@@ -2123,7 +2129,7 @@ X
         // three separate commits into `commit_source_refresh`'s place with the
         // whole suite green.
         //
-        // Deliberate extension (W3.7, the run units): the ask module's run
+        // Deliberate extension (the run units): the ask module's run
         // write sites are counted here too, with the same teeth — a call site
         // that drops a save, duplicates one, or hand-splices its own writes
         // moves these numbers. The counts are the current shape on purpose:
@@ -2143,7 +2149,7 @@ X
         // transaction shape and share `commit_refresh`, so the call is counted
         // once. (`register_attachment` used to run `update_revision_fingerprint`
         // as a bare autocommit UPDATE with no guard in the same transaction as
-        // its edges — D40 §4.7 promises the watcher one unit per file, kind or
+        // its edges — the contract promises the watcher one unit per file, kind or
         // not — and the count of two was what caught that.)
         assert_eq!(
             source.matches(refresh).count(),
@@ -2174,7 +2180,7 @@ X
             (concat!("store.commit_run", "_answer("), 1),
             (concat!("store.commit_run", "_terminal("), 1),
             (concat!("store.append_run", "_event("), 2),
-            // W3.11 added the session row as the ask module's tenth write
+            // The session row is the ask module's tenth write
             // site. It is a different family from the run units, so without
             // this needle a hand-spliced `create_session` would move the
             // count to zero and stay invisible — which is the exact hole the
@@ -2472,7 +2478,7 @@ X
 
     #[test]
     fn the_tail_sweep_is_the_only_row_writer() {
-        // ADR 0026: rows settle at the batch tail in both shapes — a
+        // Rows settle at the batch tail in both shapes — a
         // `stale_anchor` verdict is a settled-state fact, and a row written
         // while the batch still walks flips with walk order (the watcher used
         // to write its rows early and a two-path debounce batch could report
@@ -2489,7 +2495,7 @@ X
 
     #[test]
     fn a_failed_watched_file_gets_exactly_one_row() {
-        // ADR 0026: one `ingest.coverage` row per file per batch. Under the
+        // One `ingest.coverage` row per file per batch. Under the
         // watcher both `process_file` and `pass_one` used to write the refusal
         // — two rows and a double-counted error — so this drives a real
         // failure through `pass_one` and counts what landed.
@@ -2581,7 +2587,7 @@ X
 
     #[test]
     fn the_guard_refuses_when_the_file_moves_under_the_commit() {
-        // D40 §4.7: the guard is the transaction's first step, so it has to be
+        // The guard is the transaction's first step, so it has to be
         // able to say no. The store's own tests cover `commit_source_file`'s
         // `guard()?`; this one covers *this* guard — the stat re-check — whose
         // refusal is what the watcher requeues on.
@@ -2611,7 +2617,7 @@ X
 
     #[test]
     fn the_gate_verdict_answers_each_question_differently() {
-        // The whole of D40 §4.2 / §4.3 in six assertions. Pinned as a pure
+        // The whole gate contract in six assertions. Pinned as a pure
         // function because no portable test can change a file's bytes while
         // leaving its mtime and size alone — which is the one input that
         // distinguishes `Drop` from `ForceRebuild`.
@@ -2643,8 +2649,8 @@ X
         );
     }
 
-    /// The clock every audit column reads: `store_events.occurred_at` (ADR 0026
-    /// says that column *is* "when it happened") and
+    /// The clock every audit column reads: `store_events.occurred_at` (that column *is*
+    /// "when it happened" here) and
     /// `source_revisions.ingested_at`, which `project_links` then copies into
     /// `graph_links.created_at`. Nothing reads those back, so a reader that
     /// answered a constant would date the whole log to 1970 unnoticed.
@@ -2702,8 +2708,8 @@ X
         );
     }
 
-    /// D40 §4.5 and §4.7 each name the batch shape that decides whether a row
-    /// gets written, and both say the same thing backwards: the watcher never
+    /// The batch shape — not the kind of failure — decides whether a row
+    /// gets written, and both arms say the same thing backwards: the watcher never
     /// writes for a file it could not read, and `index` never writes for a file
     /// a guard refused. Reproducing either needs a race — a file that moves
     /// between two stats, or between the read and the commit — so the source is
@@ -2715,11 +2721,11 @@ X
         assert_eq!(
             production.matches("if !shape.gated").count(),
             2,
-            "one per arm: Torn (§4.5) and Requeued (§4.7)"
+            "one per arm: Torn and Requeued"
         );
     }
 
-    /// D40 §4.7 is a promise about *files*, not about kinds: the guard is the
+    /// That promise is about *files*, not about kinds: the guard is the
     /// transaction's first step and a refusal rolls back into the retry queue.
     /// The note path had it from the commit that introduced it;
     /// `register_attachment` was written in that same commit with `|| Ok(())`
@@ -2755,7 +2761,7 @@ X
             3,
             "every write classifies a refusal as a refusal: the shared              refresh commit, plus one write per pass"
         );
-        // D40 §4.3 is the same rule twice: a stat that matches on a racy or
+        // The same rule, twice: a stat that matches on a racy or
         // coarse filesystem is not evidence, so both passes drop the shortcut
         // when the cheap pass told them to re-check the bytes.
         assert_eq!(
@@ -2863,7 +2869,7 @@ X
     /// The wiring half of `mark_index_pending_clears_the_fingerprint`: the
     /// helper is only the effect — the calls that owe it are the failed
     /// `upsert_source` arms, **one per branch** that commits store rows first
-    /// and the index second (D40's two-step file transaction). Two such
+    /// and the index second (the two-step file transaction). Two such
     /// branches exist: the content path, and the same-bytes refresh path
     /// (which is also the repair path for a prior run that failed here). A
     /// per-branch obligation is what this pins — not "exactly one call site",
@@ -2929,7 +2935,7 @@ X
         }
     }
 
-    /// D40 §4.3's predicate matrix: a matched stat can vouch only outside
+    /// The racy-predicate matrix: a matched stat can vouch only outside
     /// the racy window and off a coarse volume. The window's `>=` is git's
     /// whole test — a file whose mtime lands **on** the store's write moment
     /// is exactly the one a same-tick rewrite can hide behind.
@@ -3047,7 +3053,7 @@ X
         assert_eq!(report.files_skipped, 0, "racy: no cheap skip");
         drop(writer);
 
-        // Control: the same file with a probe that can vouch skips.
+        // Control: the same file with a stat probe that can vouch skips.
         let mut writer = index.writer(WRITER_HEAP_BYTES).expect("writer");
         let mut claimed = HashMap::new();
         let ctx = PassContext {
@@ -3314,8 +3320,8 @@ fn fingerprint_matches(metadata_json: &str, metadata: &fs::Metadata) -> bool {
 }
 
 /// The revision's metadata blob: the stat fingerprint, what the frontmatter
-/// block turned out to be, and the two facts edge rebuilding replays from
-/// (`§5 第 2/4/5 条`): the `links` extraction plus its `link_losses`, and the
+/// block turned out to be, and the two facts edge rebuilding replays from:
+/// the `links` extraction plus its `link_losses`, and the
 /// `outline` anchors are validated against.
 fn revision_metadata(
     fingerprint: &str,
@@ -3475,8 +3481,8 @@ fn degradations_of(frontmatter: &FrontmatterParse) -> Vec<Degradation> {
     }
 }
 
-/// The code lists one coverage row carries (`ingest-interop.md` §5 第 8 条):
-/// what the file lost, the warnings it earned (D42), and — for a
+/// The code lists one coverage row carries:
+/// what the file lost, the warnings it earned, and — for a
 /// `windows_incompatible_name` row — the components the warning is about. One
 /// bundle, so the row writer takes one payload argument instead of three, and
 /// a third vocabulary would not grow its parameter list again.
@@ -3485,9 +3491,9 @@ struct RowPayload<'a> {
     warnings: &'a [Warning],
     windows_names: &'a [String],
     /// Every ambiguous link of the file: the writing and the candidates it
-    /// matched (`§5 第 3 条`) — the audit a no-edge decision leaves behind.
+    /// matched — the audit a no-edge decision leaves behind.
     ambiguous: &'a [(String, Vec<String>)],
-    /// Every checked anchor that no longer exists in its target (`§5 第 4 条`).
+    /// Every checked anchor that no longer exists in its target.
     stale: &'a [(String, String)],
 }
 
@@ -3607,38 +3613,36 @@ fn record_coverage(
 /// What one degradation code means.
 ///
 /// Exhaustive on purpose: a code with no sentence is a compile error, so adding
-/// D41's next nine cannot silently inherit the frontmatter wording.
+/// The other nine codes cannot silently inherit the frontmatter wording.
 fn degradation_message(code: Degradation) -> &'static str {
     match code {
         Degradation::FrontmatterParseError => {
-            "the file was indexed; its frontmatter block could not be read (D41.5)"
+            "the file was indexed; its frontmatter block could not be read"
         }
         Degradation::UnresolvedWikilink => {
-            "the file was indexed; a wikilink points at a note that is not here (D41.1)"
+            "the file was indexed; a wikilink points at a note that is not here"
         }
         Degradation::AmbiguousWikilink => {
-            "the file was indexed; a wikilink matches more than one note, so no edge was built (D41.2)"
+            "the file was indexed; a wikilink matches more than one note, so no edge was built"
         }
         Degradation::StaleAnchor => {
-            "the file was indexed; a heading anchor does not exist in its target (D41.3)"
+            "the file was indexed; a heading anchor does not exist in its target"
         }
         Degradation::MarkdownLinkDecodeError => {
-            "the file was indexed; a markdown link's target could not be decoded (D41.4)"
+            "the file was indexed; a markdown link's target could not be decoded"
         }
         Degradation::UnknownLinkSyntax => {
-            "the file was indexed; a link uses a syntax this build does not know (D41.6)"
+            "the file was indexed; a link uses a syntax this build does not know"
         }
         Degradation::CanvasParseError => {
-            "the file was indexed; its canvas block could not be read as JSON (D41.8)"
+            "the file was indexed; its canvas block could not be read as JSON"
         }
         Degradation::ExcalidrawDetected => {
-            "the file was indexed; its Excalidraw scene stays out of the index (D41.7)"
+            "the file was indexed; its Excalidraw scene stays out of the index"
         }
-        Degradation::SymlinkEncountered => {
-            "the path is a symlink; it was recorded, not followed (D41.9)"
-        }
+        Degradation::SymlinkEncountered => "the path is a symlink; it was recorded, not followed",
         Degradation::AttachmentUnindexed => {
-            "the file was registered; its bytes are not searchable on purpose (D41.10)"
+            "the file was registered; its bytes are not searchable on purpose"
         }
     }
 }
@@ -3647,20 +3651,20 @@ fn degradation_message(code: Degradation) -> &'static str {
 ///
 /// Exhaustive on purpose, like [`degradation_message`]: a warning with no
 /// sentence is a compile error. The sentences describe the fact, not the row
-/// state — the same code rides an `indexed` row and a `skipped` one (§5 第 8 条 ⑤).
+/// state — the same code rides an `indexed` row and a `skipped` one.
 fn warning_message(code: Warning) -> &'static str {
     match code {
         Warning::OneDrivePlaceholder => {
-            "the file is a cloud placeholder; its bytes are not on this device, so nothing was read (D42)"
+            "the file is a cloud placeholder; its bytes are not on this device, so nothing was read"
         }
         Warning::IcloudPlaceholder => {
-            "the file is an iCloud eviction stub; the note it stands for is not on this device (D42)"
+            "the file is an iCloud eviction stub; the note it stands for is not on this device"
         }
         Warning::WindowsIncompatibleName => {
-            "the name is one Windows' naming rules reserve; tools and sync clients that follow them will refuse it (D42)"
+            "the name is one Windows' naming rules reserve; tools and sync clients that follow them will refuse it"
         }
         Warning::SourceRemoved => {
-            "the path no longer holds a file; its rows stay as history and the next reconcile converges the projections (D40 §4.2)"
+            "the path no longer holds a file; its rows stay as history and the next reconcile converges the projections"
         }
     }
 }
@@ -3700,7 +3704,7 @@ fn index_step(
 }
 
 /// Marks a committed revision so its next stat comparison cannot skip the
-/// failed index write. This is the store-side backstop for D40's two-step file
+/// failed index write. This is the store-side backstop for the two-step file
 /// transaction: store rows commit first, the index commits second.
 fn mark_index_pending(
     store: &mut Store,
@@ -3733,6 +3737,43 @@ fn file_error(
 /// changed or new files append a revision and replace their chunks. Per-file
 /// failures are recorded in the report; the batch never aborts on one bad
 /// file. The tantivy writer commits once at the end.
+///
+/// # Errors
+///
+/// - `RunError::ConfigRead` / `RunError::ConfigParse` when `momotaro.toml`
+///   cannot be read or parsed.
+/// - `RunError::ConfigInvalid` when `[index]` names a policy this build
+///   does not implement.
+/// - `RunError::VaultOutsideWorkspace` when the configured vault, or a
+///   `path_override`, resolves outside the workspace.
+/// - `RunError::VaultMissing` when the vault path is not a directory.
+/// - `RunError::Ingest` when a vault walk or path check fails.
+/// - `RunError::IndexUnusable` when the index exists but cannot be used.
+/// - `RunError::StoreUnhealthy` when the workspace is not initialized or
+///   the store is not healthy.
+/// - `RunError::Store` when any store call in the batch fails.
+/// - `RunError::Retrieve` when the search index cannot be opened, written,
+///   or committed.
+/// - `RunError::Io` when the index directory cannot be created.
+/// - `RunError::Invariant` only on an internal bug (the batch's
+///   nameless-row invariant).
+///
+/// # Examples
+///
+/// ```no_run
+/// use momotaro_run::index_workspace;
+///
+/// # fn main() -> Result<(), momotaro_run::RunError> {
+/// // `None` walks the vault `momotaro.toml` names; `Some(path)` narrows the
+/// // walk to that path, which has to sit inside the workspace.
+/// let report = index_workspace("my-workspace", None)?;
+/// println!("{} files indexed", report.files_indexed);
+/// for error in &report.errors {
+///     println!("{error:?}");
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub fn index_workspace(
     root: impl AsRef<Path>,
     path_override: Option<&Path>,
@@ -3764,7 +3805,7 @@ pub(crate) fn index_workspace_with(
 }
 
 /// The link-resolution namespace and the non-note key set from one walked
-/// batch (§5 第 3 条 / §5 第 4 条): keys ride the walk's own order here, and
+/// batch: keys ride the walk's own order here, and
 /// resolution never depends on that order because the namespace is complete
 /// before any file is processed.
 fn build_namespace(
@@ -3772,8 +3813,8 @@ fn build_namespace(
     entries: &[momotaro_ingest::VaultEntry],
 ) -> (Vec<(String, String)>, HashSet<String>) {
     let mut namespace_pairs: Vec<(String, String)> = Vec::new();
-    // Attachment and canvas keys ride the same pass, for the anchor carve-out
-    // (§5 第 4 条): a fragment on such a target is not an anchor — a PDF page
+    // Attachment and canvas keys ride the same pass, for the anchor carve-out:
+    // a fragment on such a target is not an anchor — a PDF page
     // number, a canvas subpath, neither is a heading.
     let mut non_note_keys: HashSet<String> = HashSet::new();
     for entry in entries {
@@ -3792,7 +3833,7 @@ fn build_namespace(
     (namespace_pairs, non_note_keys)
 }
 
-/// Deletions, at vault scale (D40 §4.2's delete half): a key the walk no
+/// Deletions, at vault scale (the delete half): a key the walk no
 /// longer names becomes a skipped row. A walk that did not cover the whole
 /// vault cannot say what is absent — `index --vault sub` names fewer files on
 /// purpose, and every source outside the override would look deleted.
@@ -3827,7 +3868,7 @@ fn collect_removals(
     }
     Ok(removals)
 }
-/// The batch loop, with the event family it writes injected (D40 §4.4).
+/// The batch loop, with the event family it writes injected.
 ///
 /// `index` hands it a full [`BatchShape`] over [`INGEST_PLAN`]; the four
 /// reconciliation triggers hand it a full one over [`RECONCILE_PLAN`]; the
@@ -3847,7 +3888,7 @@ pub(crate) fn run_batch(
 
     let vault_root = match path_override {
         // An override is an operator convenience, not a way out of the
-        // workspace: ADR 0024 makes every stored path workspace-relative, so an
+        // workspace: every stored path is workspace-relative, so an
         // escaping override would be recorded as something that cannot round
         // trip back through `resolve_local_path`.
         Some(override_path) => {
@@ -3864,10 +3905,10 @@ pub(crate) fn run_batch(
     if !vault_root.is_dir() {
         return Err(RunError::VaultMissing { path: vault_root });
     }
-    // The delete half and the edge prune are whole-vault questions (D40 §4.2):
+    // The delete half and the edge prune are whole-vault questions:
     // a narrowed walk (`index --vault sub`) names fewer files on purpose and
     // cannot speak for keys outside it. An override that names the vault root
-    // itself IS a whole-vault walk — `usage.md`'s `momotaro index <path>`
+    // itself IS a whole-vault walk — `momotaro index <path>`
     // example is exactly that call — so it takes the same route as the
     // no-override run. Both directions of `is_within` are the equality the
     // containment contract knows: the helper canonicalizes both sides, which
@@ -3904,7 +3945,7 @@ pub(crate) fn run_batch(
 
     let entries = walk_entries(&vault_root)?;
 
-    // The namespace every link resolves against (§5 第 3 条): every walked
+    // The namespace every link resolves against: every walked
     // path that has a key, keyed by its vault-relative tail. Built before any
     // processing so resolution never depends on walk order — a link to a file
     // processed later resolves exactly like one processed earlier.
@@ -3923,11 +3964,11 @@ pub(crate) fn run_batch(
         duration_ms: 0,
     };
 
-    // D40 §4.2: a watcher's path is a hint, not a fact. The cheap pass runs
+    // A watcher's path is a hint, not a fact. The cheap pass runs
     // *before* the batch opens, so a false event costs one stat and writes
     // nothing at all — not even `started`.
     //
-    // D40 §4.3: both answers are about the volume and the batch, not about
+    // Both answers are about the volume and the batch, not about
     // the file: read them once for the whole loop, for **both** shapes — the
     // pass-side skips consult the same probe, and a Batch that never read it
     // trusted a matched fingerprint no matter how racy.
@@ -3973,7 +4014,7 @@ pub(crate) fn run_batch(
         .collect();
     let removals = collect_removals(&store, &keep_keys, whole_vault)?;
     // A removal is a row like any other, so it counts where rows are counted
-    // (ADR 0026: "the rows are the breakdown"). It is also a file this batch
+    // ("the rows are the breakdown"). It is also a file this batch
     // accounted for: without the pair below, `doctor --coverage` counted a
     // `skipped` row that the `ingest.finished` payload did not — same batch,
     // two answers — and the summary line read "N of M" with M one short of the
@@ -3996,7 +4037,7 @@ pub(crate) fn run_batch(
     let search_index = SearchIndex::open_or_create(&index_dir(root))?;
     let mut writer = search_index.writer(WRITER_HEAP_BYTES)?;
 
-    // The batch's own edges (ADR 0026): `started` before any file work, so a
+    // The batch's own edges: `started` before any file work, so a
     // reader can tell "running" from "never started"; `finished` last, after
     // every per-file row, so a batch is never called complete while a file is
     // still unrecorded.
@@ -4012,7 +4053,7 @@ pub(crate) fn run_batch(
         reason_code: None,
         message: None,
         // No `files_scanned` here. This event's only promise is "a batch is
-        // running" (ADR 0026); the counts live on `ingest.finished`, where
+        // running"); the counts live on `ingest.finished`, where
         // `summarize_coverage` reads them. An announced count on the *started*
         // row was written by one side and read by none.
         data_json: "{}",
@@ -4027,9 +4068,9 @@ pub(crate) fn run_batch(
     );
 
     let mut claimed: HashMap<String, String> = HashMap::new();
-    // Coverage rows are written after the data batch (ADR 0026: data first,
+    // Coverage rows are written after the data batch (data first,
     // events after): `stale_anchor` is decided against the state every file
-    // left behind, never against walk order (§4 第 7 条) — in both shapes.
+    // left behind, never against walk order — in both shapes.
     // The two halves of a removal land in one batch but in a safe order: the
     // index delete is queued here and made durable at the writer's commit, and
     // the demotion waits until after the coverage rows (the tail below) — a
@@ -4101,7 +4142,7 @@ pub(crate) fn run_batch(
                 retry.push(file.to_path_buf());
                 // The batch records what it could not read; the watcher backs
                 // off and tries again, because a row here would claim a file
-                // was read when it never was (D40 §4.5).
+                // was read when it never was.
                 if !shape.gated {
                     pending.push(PendingRow {
                         source_key: Some(source_key.clone()),
@@ -4118,7 +4159,7 @@ pub(crate) fn run_batch(
                 }
             }
             // A guard refusal wrote nothing, so a gated batch has no row to
-            // write — only the retry (D40 §4.7). A batch has no retry queue,
+            // write — only the retry. A batch has no retry queue,
             // so it says what happened instead of dropping the file silently.
             PassOne::Requeued {
                 source_key,
@@ -4151,7 +4192,7 @@ pub(crate) fn run_batch(
                 outcome,
                 // `None` when the file's own transaction carried the edges
                 // (the unit); `Some` for a projection-only path, whose rows
-                // the sweep writes in its batch (ADR 0027).
+                // the sweep writes in its batch.
                 replace_rows: findings.replace_rows,
                 anchors: findings.anchors,
                 ambiguous: findings.ambiguous,
@@ -4162,7 +4203,7 @@ pub(crate) fn run_batch(
     writer.commit()?;
 
     // The data sweep: every projection-only row set commits together — one
-    // transaction for the batch, each source still wholesale (ADR 0027) — and
+    // transaction for the batch, each source still wholesale — and
     // the rows of sources this walk no longer names go with it: a rebuilt table
     // never produced them, so leaving them would break "a rebuild reproduces
     // every row".
@@ -4191,14 +4232,14 @@ pub(crate) fn run_batch(
 
     // The event sweep: every file's data — chunks, blobs, rows — is settled, so
     // an anchor check sees the run's final state and the codes cannot depend on
-    // walk order (§4 第 7 条). Data first, events after (ADR 0026).
+    // walk order. Data first, events after.
     let mut graph_ambiguous = 0u64;
     let mut graph_stale = 0u64;
     for row in pending {
         let stale = stale_anchors(&store, &row.anchors, &non_note_keys)?;
         graph_ambiguous += row.ambiguous.len() as u64;
         graph_stale += stale.len() as u64;
-        // Every row settles here — the one writer, in both shapes (ADR 0026).
+        // Every row settles here — the one writer, in both shapes.
         flush_row(&mut store, &mut report, &mut batch, row, stale)?;
     }
 
@@ -4244,19 +4285,19 @@ pub(crate) fn run_batch(
     })
 }
 
-/// One `ingest.coverage` row for one file (ADR 0026).
+/// One `ingest.coverage` row for one file.
 ///
 /// `outcome` is one of `indexed | skipped | metadata_refreshed | error`.
 ///
 /// `reason_code` is set in four cases, and a reader must branch on the pair,
 /// never on the outcome alone: an `error` row carries the stable spelling of the
 /// error kind; an `indexed` or `metadata_refreshed` row carries the degradation
-/// code of something the file lost on the way in (`frontmatter_parse_error`,
-/// D41.5) — it is in the index anyway; a `skipped` row carries the code of what
-/// kept it out (`symlink_encountered`, §5 第 10 条); and any non-`error` row
-/// whose file earned a D42 warning carries it when no degradation outranks it
+/// code of something the file lost on the way in (`frontmatter_parse_error`) —
+/// it is in the index anyway; a `skipped` row carries the code of what
+/// kept it out (`symlink_encountered`); and any non-`error` row
+/// whose file earned a warning carries it when no degradation outranks it
 /// (`onedrive_placeholder` and `icloud_placeholder` on `skipped` rows,
-/// `windows_incompatible_name` on every read-state — §5 第 8 条 ⑤).
+/// `windows_incompatible_name` on every read-state).
 fn coverage_event<'a>(
     batch: &'a Batch,
     seq: i64,
@@ -4281,7 +4322,7 @@ fn coverage_event<'a>(
     }
 }
 
-/// What one file's pass through [`process_file`] did (ADR 0026's outcomes).
+/// What one file's pass through [`process_file`] did.
 ///
 /// `Clone` because a watcher row is built from the outcome *and* returned to
 /// its caller, and building the same outcome twice would let the two disagree.
@@ -4292,9 +4333,9 @@ pub(crate) struct FileOutcome {
     warnings: Vec<Warning>,
 }
 
-/// The outcome word `store_events.outcome` carries (ADR 0026) — the one axis
+/// The outcome word `store_events.outcome` carries — the one axis
 /// production branches on. The payloads were identical across the three enum
-/// variants and nothing matched on them (probe P2-F2), so they are a kind
+/// variants and nothing matched on them, so they are a kind
 /// field instead of three struct variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FileOutcomeKind {
@@ -4306,7 +4347,7 @@ pub(crate) enum FileOutcomeKind {
     Skipped,
     /// Same bytes under a new path or spelling: the mutable columns moved.
     /// The lists are re-derived on this path too, or a file whose block cannot
-    /// be read would read as clean here (§5 第 8 条).
+    /// be read would read as clean here.
     MetadataRefreshed,
     /// A revision and its chunks were written. `degradations` carries whatever
     /// the file lost on the way in, in the enum's declaration order — the file
@@ -4316,7 +4357,7 @@ pub(crate) enum FileOutcomeKind {
 }
 
 impl FileOutcomeKind {
-    /// The wire spelling written to `store_events.outcome` (ADR 0026).
+    /// The wire spelling written to `store_events.outcome`.
     fn as_str(self) -> &'static str {
         match self {
             Self::Skipped => FileOutcome::SKIPPED,
@@ -4363,18 +4404,18 @@ impl FileOutcome {
         }
     }
 
-    /// The wire spelling written to `store_events.outcome` (ADR 0026).
+    /// The wire spelling written to `store_events.outcome`.
     fn as_str(&self) -> &'static str {
         self.kind.as_str()
     }
 
     /// The whole degradation list: the row's `data_json` and the per-code
-    /// counts read it (§5 第 8 条 ③④).
+    /// counts read it.
     fn degradations(&self) -> &[Degradation] {
         &self.degradations
     }
 
-    /// The whole warning list (D42), in the enum's declaration order: the row's
+    /// The whole warning list, in the enum's declaration order: the row's
     /// `data_json` and the per-code counts read it, the same way they read the
     /// degradations.
     fn warnings(&self) -> &[Warning] {
@@ -4387,10 +4428,10 @@ impl FileOutcome {
         self.degradations.first().copied()
     }
 
-    /// Adds one code and restores the declaration order (§5 第 8 条).
+    /// Adds one code and restores the declaration order.
     ///
     /// The event sweep calls this: `stale_anchor` is decided against the run's
-    /// final state, after every file's data is written (§4 第 7 条), so it joins
+    /// final state, after every file's data is written, so it joins
     /// the list last while the row still reads in enum order.
     fn push_degradation(&mut self, code: Degradation) {
         self.degradations.push(code);
@@ -4399,10 +4440,10 @@ impl FileOutcome {
     }
 }
 
-/// What the caller wants from one file's pass (D40 §4.2 / §4.3 / §4.7).
+/// What the caller wants from one file's pass.
 pub(crate) enum ProcessMode {
     /// The batch. The walk took the stat this pass compares against, the
-    /// coverage rows ride the batch-tail sweep (ADR 0026), and a matching
+    /// coverage rows ride the batch-tail sweep, and a matching
     /// fingerprint is enough to skip.
     Batch,
     /// The watcher. A matching fingerprint is *not* enough when the stat is
@@ -4422,19 +4463,19 @@ pub(crate) enum ProcessMode {
 pub(crate) struct PassContext<'a> {
     /// The vault the key is derived against.
     pub vault_root: &'a Path,
-    /// The workspace every stored path is relative to (ADR 0024).
+    /// The workspace every stored path is relative to.
     pub workspace_root: &'a Path,
     /// The chunking policy.
     pub policy: &'a IndexPolicy,
-    /// The namespace this batch's links resolve against (§5 第 3 条).
+    /// The namespace this batch's links resolve against.
     pub ns: &'a Namespace,
-    /// Attachment and canvas keys, for the anchor carve-out (§5 第 4 条).
+    /// Attachment and canvas keys, for the anchor carve-out.
     pub non_note_keys: &'a HashSet<String>,
     /// The injected attribute reader (see [`index_workspace_with`]).
     pub attributes_of: &'a dyn Fn(&Path) -> io::Result<u32>,
     /// The open search index.
     pub search_index: &'a SearchIndex,
-    /// Batch-level stat inputs (D40 §4.3), read once per batch.
+    /// Batch-level stat inputs, read once per batch.
     pub stat_probe: StatProbe,
 }
 
@@ -4442,7 +4483,7 @@ pub(crate) struct PassContext<'a> {
 ///
 /// The batch turns every variant into a row at its tail; the watcher writes
 /// the row inside this call, because a watcher row has to land with the data
-/// it describes (D40 §4.7). Both callers see the same outcomes — the half
+/// it describes. Both callers see the same outcomes — the half
 /// where the two orchestrations must not disagree is this function, not
 /// either of them.
 pub(crate) enum PassOne {
@@ -4459,8 +4500,7 @@ pub(crate) enum PassOne {
     },
     /// The file changed while it was read, so the buffer was never one
     /// version of it. Nothing was written and there is no row — the batch
-    /// records an error row from here, the watcher backs off and requeues
-    /// (D40 §4.5).
+    /// records an error row from here, the watcher backs off and requeues.
     Torn {
         /// The key this path would have had.
         source_key: String,
@@ -4468,7 +4508,7 @@ pub(crate) enum PassOne {
         raw_name: String,
     },
     /// The guard refused: the unit rolled back and nothing was written, so
-    /// there is nothing to record — the caller requeues (D40 §4.7).
+    /// there is nothing to record — the caller requeues.
     Requeued {
         /// The key this path would have had.
         source_key: String,
@@ -4488,10 +4528,10 @@ pub(crate) enum PassOne {
     },
 }
 
-/// The sentence a torn read gets on a row (D40 §4.5).
+/// The sentence a torn read gets on a row.
 const TORN_MESSAGE: &str = "the file changed while it was being read; it was not indexed";
 
-/// What a guard refusal says, wherever it surfaces (D40 §4.7).
+/// What a guard refusal says, wherever it surfaces.
 ///
 /// One home: the guard itself, and the row a *batch* writes, because a batch
 /// has no retry queue to hand the refusal to. The watcher writes no row at
@@ -4519,7 +4559,7 @@ fn refusal_row(
 ///
 /// Shared by the batch loop and by the watcher so the two cannot disagree
 /// about what a path is, whether its bytes may be read, or what a collision
-/// costs (D42). Rows settle at the batch tail in both shapes — see
+/// costs. Rows settle at the batch tail in both shapes — see
 /// [`PassOne::Done`] — so a `stale_anchor` verdict never depends on walk
 /// order. Anything that fails at batch level (rather than at *this file*)
 /// comes back as [`RunError`], because a row is not the way to report a dead
@@ -4567,9 +4607,9 @@ pub(crate) fn pass_one(
         }
     };
 
-    // D42: two distinct files must never fold into one identity — NFC and NFD
+    // Two distinct files must never fold into one identity — NFC and NFD
     // spellings of one name, or two paths to one object. The store event table
-    // exists (schema v4, ADR 0026) and this refusal is one of its rows
+    // exists and this refusal is one of its rows
     // (`outcome = error`, `reason_code = key_collision`); what is still missing
     // is the disambiguating-suffix policy, so the pass refuses the second
     // claimant instead of silently overwriting the first.
@@ -4584,7 +4624,7 @@ pub(crate) fn pass_one(
     }
     claimed.insert(source_key.clone(), raw_name.clone());
 
-    // D42: a cloud placeholder's bytes are not on this device, and nothing may
+    // A cloud placeholder's bytes are not on this device, and nothing may
     // read them. The attributes come through the injected reader (production:
     // the real word on Windows, a constant zero elsewhere), and the question
     // runs before any content read of any kind that has content.
@@ -4619,7 +4659,7 @@ pub(crate) fn pass_one(
     let (outcome, findings) = match kind {
         // A link is not content: this version does not follow them (the vault
         // layer says so by kind), so the row is the whole record — no revision,
-        // no chunks, and nothing is ever read through the link (§5 第 10 条).
+        // no chunks, and nothing is ever read through the link.
         VaultFileKind::Symlink => {
             report.files_skipped += 1;
             (
@@ -4632,7 +4672,7 @@ pub(crate) fn pass_one(
         }
         // An iCloud eviction stub is not content either: the note it stands for
         // is not on this device, so the row is the whole record and the warning
-        // says why (D42).
+        // says why.
         VaultFileKind::IcloudPlaceholder => {
             report.files_skipped += 1;
             (
@@ -4645,11 +4685,11 @@ pub(crate) fn pass_one(
         }
         // Everything that is not a note is registered rather than read: the
         // vault's inventory is complete without pretending binary bytes are
-        // searchable (§5 第 10 条).
+        // searchable.
         VaultFileKind::Attachment => {
             // Same three answers as the note arm: a refusal requeues rather
-            // than recording a `store` row, because nothing was written
-            // (D40 §4.7). The attachment pass cannot produce `Torn` — its
+            // than recording a `store` row, because nothing was written.
+            // The attachment pass cannot produce `Torn` — its
             // guard is the check over that window — but `PassError` is one
             // type for both arms, so the arm is here.
             let passed = register_attachment(
@@ -4673,7 +4713,7 @@ pub(crate) fn pass_one(
             };
         }
         // The note path owns its own transaction, so it returns here; its row,
-        // like every row, is written at the batch tail (ADR 0026).
+        // like every row, is written at the batch tail.
         VaultFileKind::Note | VaultFileKind::Canvas => {
             let passed = process_file(
                 kind,
@@ -4704,7 +4744,7 @@ pub(crate) fn pass_one(
     };
 
     // Only arms that never touched `process_file` reach here. Their rows —
-    // like every row — settle at the batch tail sweep (ADR 0026).
+    // like every row — settle at the batch tail sweep.
     Ok(PassOne::Done {
         source_key,
         raw_name,
@@ -4714,7 +4754,7 @@ pub(crate) fn pass_one(
 }
 
 /// The four error arms the attachment and note passes answered separately
-/// (probe P2-F1: the two blocks were byte-identical). One spelling, so
+/// (the two blocks were byte-identical). One spelling, so
 /// `Torn` / `Guard` / `File` / `Run` cannot drift between them.
 fn pass_error(source_key: String, raw_name: String, error: PassError) -> Result<PassOne, RunError> {
     match error {
@@ -4735,7 +4775,7 @@ fn pass_error(source_key: String, raw_name: String, error: PassError) -> Result<
     }
 }
 
-/// One file, with the caller's row timing applied (D40 §4.7 / ADR 0026).
+/// One file, with the caller's row timing applied.
 ///
 /// The body decides what the file *is*; the batch tail decides when its row
 /// lands. Rows settle at the tail sweep in both shapes — a `stale_anchor`
@@ -4763,7 +4803,7 @@ fn process_file(
     let metadata = fs::metadata(file)
         .map_err(|error| file_error(Some(source_key), IndexFileErrorKind::Io, error))?;
     let fingerprint = fingerprint_json(&metadata);
-    // Workspace-relative and `/`-joined (ADR 0024). Computed before the skip
+    // Workspace-relative and `/`-joined. Computed before the skip
     // check on purpose: a directory move preserves the fingerprint, so a stored
     // path may only be assumed correct if it is compared.
     let local_path = momotaro_ingest::local_path_in(workspace_root, file)
@@ -4776,7 +4816,7 @@ fn process_file(
         && fingerprint_matches(&revision.metadata_json, &metadata)
         && revision.local_path.as_deref() == Some(local_path.as_str())
         && revision.raw_name.as_deref() == Some(raw_name)
-        // D40 §4.3: a matched stat only counts while it can vouch for the
+        // A matched stat only counts while it can vouch for the
         // bytes — outside the racy window, off a coarse volume. Inside the
         // window the content path decides, where the hash stands in for the
         // stat (same predicate as `gate`'s cheap skip).
@@ -4785,10 +4825,10 @@ fn process_file(
     {
         report.files_skipped += 1;
         // Nothing was *read*, but the file's links still resolve against the
-        // namespace as it stands today (ADR 0027): the rows are re-projected
+        // namespace as it stands today: the rows are re-projected
         // from the stored extraction, and what they cost the file — a target
         // that vanished, a name that turned ambiguous, a decode loss the blob
-        // remembers — rides the row (`§5 第 2 条` / `§5 第 7 条`). A blob from
+        // remembers — rides the row. A blob from
         // before the keys existed reads as no links (迁移注记).
         let extracted = parse_link_blob(&revision.metadata_json);
         let projection = project_links(
@@ -4814,7 +4854,7 @@ fn process_file(
     {
         StableRead::Stable(bytes) => bytes,
         // The two stats disagreed, so the buffer is two versions of the file.
-        // It is dropped here: D40 §4.5's absolute half is that torn bytes
+        // It is dropped here: the absolute half of the rule is that torn bytes
         // never reach a caller that would commit them.
         StableRead::Torn => return Err(PassError::Torn),
     };
@@ -4858,11 +4898,11 @@ fn process_file(
             input.rendered_from,
         );
         let title = derive_title(&input.text, source_key);
-        // One transaction for the refresh as well (D40 §4.7): the mutable
+        // One transaction for the refresh as well: the mutable
         // columns and the re-projected edges land together, so a refresh never
         // leaves one half of the file behind. No coverage row rides it — every
         // row settles at the batch tail, where its `stale_anchor` verdict is
-        // decided against the settled state (§4 第 7 条) in both shapes.
+        // decided against the settled state in both shapes.
         commit_refresh(
             store,
             source_key,
@@ -4930,7 +4970,7 @@ fn process_file(
     // The title comes from the indexed text: a `#` inside a frontmatter block is a
     // YAML comment, not a heading.
     let title = derive_title(&input.text, source_key);
-    // The parsed block rides in the revision blob (D41.5: unknown fields are
+    // The parsed block rides in the revision blob (unknown fields are
     // Obsidian's data, so the whole block is kept rather than modelled further).
     let metadata_json = revision_metadata(
         &fingerprint,
@@ -4941,7 +4981,7 @@ fn process_file(
     // Vault content is owner content — stated once, used by the revision row and
     // the index document alike, so the two can never disagree.
     let origin = OriginClass::Owner;
-    // The rows' `created_at` is this revision's `ingested_at` (ADR 0027): the
+    // The rows' `created_at` is this revision's `ingested_at`: the
     // same number the revision row records, so a rebuild reproduces the rows.
     let ingested_at = momotaro_store::now_epoch_secs();
     let projection = project_links(
@@ -4953,11 +4993,10 @@ fn process_file(
         non_note_keys,
     );
 
-    // One file, one transaction (D40's unit, `commit_source_file`): revision,
+    // One file, one transaction (`commit_source_file`): revision,
     // chunks and edges land together — a crash cannot leave half a file. No
-    // coverage row rides it: every row settles at the batch-tail sweep
-    // (ADR 0026), where its `stale_anchor` verdict is decided against the
-    // settled state in both shapes (§4 第 7 条), and where every data write
+    // coverage row rides it: every row settles at the batch-tail sweep, where its `stale_anchor` verdict is decided against the
+    // settled state in both shapes, and where every data write
     // already precedes the event that describes it ("never invent").
     let outcome = FileOutcome::indexed(
         merge_codes(input.degradations, projection.codes),
@@ -5021,8 +5060,7 @@ fn process_file(
     report.chunks_written += chunks.len() as u64;
     // What a file lost never stops the file: its text is indexed and each loss
     // becomes a code on the coverage row (`frontmatter_parse_error`,
-    // `canvas_parse_error`, `excalidraw_detected`, and the wikilink codes of
-    // `§5 第 7 条`).
+    // `canvas_parse_error`, `excalidraw_detected`, and the wikilink loss codes).
     Ok((
         outcome,
         LinkFindings {
@@ -5041,13 +5079,13 @@ pub(crate) struct LinkFindings {
     replace_rows: Option<Vec<GraphLink>>,
     /// Resolved anchors awaiting validation against settled targets.
     anchors: Vec<(String, AnchorKind, String)>,
-    /// Links that matched several notes and built no edge (`§5 第 3 条`).
+    /// Links that matched several notes and built no edge.
     ambiguous: Vec<(String, Vec<String>)>,
 }
 
 /// Writes one deferred coverage row: `stale_anchor` first (the sweep's whole
 /// reason), then the outcome's own codes, plus what the file's name is worth
-/// saying (D42).
+/// saying.
 ///
 /// One home for the merge, so the placeholder path and the ordinary path
 /// cannot disagree about what rides a row: `windows_incompatible_name` (with
@@ -5100,8 +5138,7 @@ fn flush_row(
         Ok(outcome) => {
             // The primary code and its sentence come from one place, and
             // every row writer shares it — the batch-tail sweep is the only
-            // production writer (ADR 0026: no caller writes in-transaction).
-            // (§5 第 8 条 ②⑤)
+            // production writer (no caller writes in-transaction).
             let fields = row_fields(&outcome, &raw_name, &row.ambiguous, &stale);
             record_coverage(
                 store,
@@ -5127,27 +5164,27 @@ struct ChunkInput<'a> {
     text: Cow<'a, str>,
     /// Where `text` starts in the note (zero for a canvas: its text is rendered).
     offset: SourceOffset,
-    /// Spans of `text` that must not become chunk text (the Excalidraw scene, §5 第 9 条).
+    /// Spans of `text` that must not become chunk text (the Excalidraw scene).
     excluded: Vec<Range<usize>>,
-    /// What this file lost, in enum order (§5 第 8 条).
+    /// What this file lost, in enum order.
     degradations: Vec<Degradation>,
     /// The file a *rendered* text was built from, when it was not cut out of one (a
     /// readable `.canvas`): its chunk locators then name the file itself.
     rendered_from: Option<&'a str>,
-    /// The links this file writes (`§5 第 2/5 条`): the `links` / `link_losses`
+    /// The links this file writes: the `links` / `link_losses`
     /// blob keys and the rows the projection builds.
     extracted: Extracted,
-    /// Headings and `^id` definitions for later anchors pointing here
-    /// (`§5 第 5 条`): the `outline` blob key.
+    /// Headings and `^id` definitions for later anchors pointing here:
+    /// the `outline` blob key.
     outline: Outline,
 }
 
 /// One file's row, as the four fields every reader of it branches on.
 ///
 /// Shared by every row writer — the batch-tail sweep is the only production
-/// writer (ADR 0026: no caller writes in-transaction): two spellings of
+/// writer (no caller writes in-transaction): two spellings of
 /// "which code leads a row that carries several" is exactly how they drift
-/// apart (§5 第 8 条 ②⑤).
+/// apart.
 struct RowFields {
     /// The outcome word.
     outcome: &'static str,
@@ -5167,7 +5204,7 @@ const EMPTY_PAYLOAD: &str = "{}";
 /// settled projection still owes it.
 ///
 /// The primary code is the first degradation when the file lost something and
-/// the first warning when it did not (§5 第 8 条 ②⑤); the payload carries
+/// the first warning when it did not; the payload carries
 /// every list, so a row that lost and earned several things is still counted
 /// per code.
 fn row_fields(
@@ -5206,26 +5243,26 @@ fn row_fields(
     }
 }
 
-/// One file's coverage row, deferred to the batch's event sweep (ADR 0026:
-/// data first, events after).
+/// One file's coverage row, deferred to the batch's event sweep (data first,
+/// events after).
 ///
 /// The wikilink codes ride here too: `stale_anchor` is only decidable once
 /// every file's data — and so every target's outline — is in the store, and a
-/// code decided mid-run would depend on walk order (`§4 第 7 条`).
+/// code decided mid-run would depend on walk order.
 struct PendingRow {
     source_key: Option<String>,
     raw_name: Option<String>,
     outcome: Result<FileOutcome, IndexFileError>,
-    /// Projection-only rows, written by the sweep's batch (ADR 0027).
+    /// Projection-only rows, written by the sweep's batch.
     replace_rows: Option<Vec<GraphLink>>,
     /// Resolved anchors awaiting validation: `(target key, kind, anchor text)`.
     anchors: Vec<(String, AnchorKind, String)>,
-    /// Links that matched several notes and built no edge (`§5 第 3 条`).
+    /// Links that matched several notes and built no edge.
     ambiguous: Vec<(String, Vec<String>)>,
 }
 
 /// What one file's links resolve to: the rows to write, the codes to report,
-/// and what still needs the settled state (ADR 0027).
+/// and what still needs the settled state.
 struct LinkProjection {
     rows: Vec<GraphLink>,
     codes: Vec<Degradation>,
@@ -5240,8 +5277,7 @@ fn from_dir_for(source_key: &str) -> &str {
     parent_dir(tail)
 }
 
-/// Merges two code lists into the enum's declaration order, once each
-/// (§5 第 8 条).
+/// Merges two code lists into the enum's declaration order, once each.
 fn merge_codes(mut base: Vec<Degradation>, extra: Vec<Degradation>) -> Vec<Degradation> {
     base.extend(extra);
     base.sort_unstable();
@@ -5252,7 +5288,7 @@ fn merge_codes(mut base: Vec<Degradation>, extra: Vec<Degradation>) -> Vec<Degra
 /// Resolves one extraction against the namespace and builds the rows.
 ///
 /// The rows themselves never depend on anchor validation: a stale anchor keeps
-/// its row (`§5 第 4 条`), so the table rebuilds identically whatever the
+/// its row, so the table rebuilds identically whatever the
 /// validation state. The codes ride the file's row; `stale_anchor` is added by
 /// the event sweep.
 fn project_links(
@@ -5276,7 +5312,7 @@ fn project_links(
         };
         match resolve_link(&link.raw_target, from_dir, link.link_source, ns) {
             Resolution::Resolved(target) => {
-                // An attachment target takes no anchor parse (§5 第 4 条): the
+                // An attachment target takes no anchor parse: the
                 // raw fragment is kept, the kind is NULL, and nothing is ever
                 // checked against a PDF's page numbers.
                 let is_non_note = non_note_keys.contains(&target);
@@ -5331,7 +5367,7 @@ fn project_links(
 /// `StoreError::UnknownGraphSpelling`; this **blob** is a cache of raw
 /// extractions, and a record spelled by a newer build is skipped without a
 /// panic. A blob from before the keys existed reads as no links — its files
-/// rebuild their edges when their content next changes (§5 第 2 条 迁移注记).
+/// rebuild their edges when their content next changes.
 fn parse_link_blob(metadata_json: &str) -> Extracted {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(metadata_json) else {
         return Extracted::default();
@@ -5355,7 +5391,7 @@ fn parse_link_blob(metadata_json: &str) -> Extracted {
             ) else {
                 // A record this build cannot spell is a link it cannot speak
                 // for: the row is dropped, but the loss is reported — the
-                // audit promise of §5 第 7 条 covers downgrade windows too.
+                // never-silent audit promise covers downgrade windows too.
                 out.push_loss(Degradation::UnknownLinkSyntax);
                 continue;
             };
@@ -5397,7 +5433,7 @@ fn parse_link_blob(metadata_json: &str) -> Extracted {
     out
 }
 
-/// The target-side outline stored in a revision blob (`§5 第 5 条`).
+/// The target-side outline stored in a revision blob.
 ///
 /// `None` when the key is absent (a blob older than the key): an anchor
 /// pointing here is not verifiable, and "cannot verify" is not "missing" —
@@ -5433,7 +5469,7 @@ fn outline_from_blob(metadata_json: &str) -> Option<Outline> {
 /// (`data_json`), symmetric with the ambiguous candidates.
 ///
 /// Runs in the event sweep, against the state every file's data left behind.
-/// Attachment and canvas targets are never checked (`§5 第 4 条`), and a note
+/// Attachment and canvas targets are never checked, and a note
 /// whose blob predates `outline` cannot be checked — neither reports a code.
 fn stale_anchors(
     store: &Store,
@@ -5477,7 +5513,7 @@ fn stale_anchors(
 /// something must not report clean on one of them.
 fn chunk_input<'a>(normalized: &'a str, kind: VaultFileKind) -> ChunkInput<'a> {
     // A `.canvas` is not Markdown — no `---` block, no headings — and the text it
-    // contributes is the one JSON Canvas assigns a meaning to (§5 第 9 条). Text that
+    // contributes is the one JSON Canvas assigns a meaning to. Text that
     // cannot be read as a canvas object keeps the file's own text as the body and
     // reports the code, so the file is never silently empty.
     if kind == VaultFileKind::Canvas {
@@ -5489,7 +5525,7 @@ fn chunk_input<'a>(normalized: &'a str, kind: VaultFileKind) -> ChunkInput<'a> {
                 excluded: Vec::new(),
                 degradations: Vec::new(),
                 rendered_from: Some(normalized),
-                // Canvas edge building is its own task (B7 / §5 第 2 条): a
+                // Canvas edge building is its own task: a
                 // canvas contributes no extraction yet, and none is stored.
                 extracted: Extracted::default(),
                 outline: Outline::default(),
@@ -5515,9 +5551,9 @@ fn chunk_input<'a>(normalized: &'a str, kind: VaultFileKind) -> ChunkInput<'a> {
     }
     // One extraction for both consumers (rows and blob): body links minus the
     // excluded scene, plus the frontmatter block's own links from its `raw`
-    // (§5 第 5 条: an unmodelled field shape cannot hide a link).
+    // (an unmodelled field shape cannot hide a link).
     // Frontmatter first, then the body: record order is the note's document
-    // order (§5 第 2 条), and first occurrence wins the identity dedupe.
+    // order, and first occurrence wins the identity dedupe.
     let mut extracted = extract_frontmatter_links(frontmatter_raw(&frontmatter).unwrap_or(""));
     let (body_links, outline) = analyze(body, &excluded);
     extracted.absorb(body_links);
@@ -5534,7 +5570,7 @@ fn chunk_input<'a>(normalized: &'a str, kind: VaultFileKind) -> ChunkInput<'a> {
 }
 
 /// The block's raw text, on every path that kept it (`Parsed`, `Json`,
-/// `Failed`) — the one thing link extraction reads (§5 第 5 条).
+/// `Failed`) — the one thing link extraction reads.
 fn frontmatter_raw(parse: &FrontmatterParse) -> Option<&str> {
     match parse {
         FrontmatterParse::Absent => None,
@@ -5545,7 +5581,7 @@ fn frontmatter_raw(parse: &FrontmatterParse) -> Option<&str> {
 
 /// The text a JSON Canvas contributes, or `None` when the file is not one.
 ///
-/// Only the fields the spec gives a text meaning become text (§5 第 9 条): `text` nodes
+/// Only the fields the spec gives a text meaning become text: `text` nodes
 /// verbatim (the spec says it is Markdown), `file` nodes with their `subpath`
 /// appended, `link` nodes by URL, `group` nodes by `label` when they have one — and
 /// then one `<from text> -> <to text>` line per edge. Nodes keep their array order
@@ -5641,7 +5677,7 @@ fn endpoint<'a>(id: &'a str, named: &HashMap<&str, usize>, blocks: &'a [String])
 ///
 /// The file is a source — it has a key, a revision and a coverage row — and its
 /// bytes are deliberately not searchable, which is what the row's
-/// `attachment_unindexed` says (§5 第 10 条). Two things it must not do: run
+/// `attachment_unindexed` says. Two things it must not do: run
 /// `normalize_markdown` over binary (that is Markdown's BOM/CRLF pass), and read
 /// the file into memory to hash it — a vault may hold a video, so the hash
 /// streams and the file's own bytes are never held whole.
@@ -5667,7 +5703,7 @@ fn register_attachment(
         && fingerprint_matches(&revision.metadata_json, &metadata)
         && revision.local_path.as_deref() == Some(local_path.as_str())
         && revision.raw_name.as_deref() == Some(raw_name)
-        // D40 §4.3: a matched stat only counts while it can vouch for the
+        // A matched stat only counts while it can vouch for the
         // bytes (same predicate as `gate`'s cheap skip). `gate` answered that
         // question for this file already — for an attachment against its raw
         // bytes — and a skip that trusted the stat alone would throw the
@@ -5755,6 +5791,19 @@ fn register_attachment(
 /// Rebuilds the tantivy index from canonical store chunks.
 ///
 /// Store rows are never touched; this only reconstructs the search index.
+///
+/// # Errors
+///
+/// - `RunError::Store` when the database cannot be opened, its schema
+///   initialized, or the current chunks, titles and origins read.
+/// - `RunError::StagingBlocked` when a non-directory sits at the staging
+///   path.
+/// - `RunError::DiscardFailed` when the previous staging or retired
+///   directory cannot be removed.
+/// - `RunError::Io` when a staging directory cannot be created or a swap
+///   rename fails.
+/// - `RunError::Retrieve` when the replacement index cannot be opened,
+///   built, committed, or finished.
 pub fn rebuild_index(root: impl AsRef<Path>) -> Result<RebuildReport, RunError> {
     let root = root.as_ref();
     let started = Instant::now();
@@ -5764,7 +5813,7 @@ pub fn rebuild_index(root: impl AsRef<Path>) -> Result<RebuildReport, RunError> 
 
     let chunks = store.all_current_chunks()?;
     // One key set for both lookups: the two wrappers each rebuilt the same
-    // `HashSet` from the same chunks (probe P2-F3).
+    // `HashSet` from the same chunks.
     let keys: HashSet<&str> = chunks
         .iter()
         .map(|chunk| chunk.source_key.as_str())
@@ -5873,7 +5922,7 @@ pub struct SearchOutput {
     /// Ranked hits.
     pub hits: Vec<SearchHit>,
     /// The run this search created, when it created one: `--mode expand`
-    /// records one (`architecture.md` §10.2), lexical creates none. Absent from
+    /// records one, lexical creates none. Absent from
     /// the JSON when there is none, so the lexical payload is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
@@ -5940,9 +5989,39 @@ fn enrich_hits(store: &mut Store, hits: Vec<RetrievalHit>) -> Result<Vec<SearchH
 
 /// Searches the built index; the index must exist.
 ///
-/// Pure Tantivy BM25: no LLM call, no token spent (`architecture.md` §10.2).
+/// Pure Tantivy BM25: no LLM call, no token spent.
 /// Refuses exactly as the shared `open_search_index` / `open_search_store`
 /// helpers describe, both of which run before a single query is executed.
+///
+/// # Errors
+///
+/// - `RunError::IndexUnusable` when an index directory exists but cannot be
+///   used.
+/// - `RunError::StoreUnhealthy` when the store is not usable — a missing or
+///   empty database, or one this build refuses.
+/// - `RunError::IndexNotBuilt` when no index has ever been built (the
+///   store has no chunks to put in one).
+/// - `RunError::Store` when the store cannot be opened or a hit's chunk or
+///   title cannot be read.
+/// - `RunError::Retrieve` when the index cannot be opened or the search
+///   itself fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// use momotaro_run::search_workspace;
+///
+/// # fn main() -> Result<(), momotaro_run::RunError> {
+/// let found = search_workspace("my-workspace", "spectral theorem", 5)?;
+/// assert_eq!(found.query, "spectral theorem");
+/// for hit in &found.hits {
+///     println!("{} {}: {}", hit.hit.rank, hit.hit.source_key, hit.excerpt);
+/// }
+/// // Lexical search records no run; `--mode expand` is the one that does.
+/// assert_eq!(found.run_id, None);
+/// # Ok(())
+/// # }
+/// ```
 pub fn search_workspace(
     root: impl AsRef<Path>,
     query: &str,
@@ -5962,9 +6041,9 @@ pub fn search_workspace(
     })
 }
 
-/// How many queries `--mode expand` asks the model for (§10.2's "N").
+/// How many queries `--mode expand` asks the model for.
 ///
-/// A constant, not a knob: architecture §7 lists the workspace's configuration
+/// A constant, not a knob: the workspace's configuration
 /// surface and the rewrite width is not on it.
 const EXPANDED_QUERY_COUNT: usize = 4;
 
@@ -5979,8 +6058,7 @@ for a lexical BM25 search over a personal note vault. Reply with a JSON array of
 strings and nothing else: no prose, no code fence. Each entry is one short query, in the same \
 language as the user's query, and none of them repeats the input verbatim.";
 
-/// Runs `--mode expand`: one short LLM rewrite → N queries → BM25 each → RRF
-/// (`architecture.md` §10.2).
+/// Runs `--mode expand`: one short LLM rewrite → N queries → BM25 each → RRF.
 ///
 /// Every gate runs **before** the provider is called: `--no-llm`, the network
 /// policy (`--allow-network` ∨ `[policy].allow_network`), and a usable index
@@ -5990,12 +6068,36 @@ language as the user's query, and none of them repeats the input verbatim.";
 /// The result is ranked by [`momotaro_retrieve::fuse_rrf`], whose tie-break is
 /// documented and tested there: same input lists, same order.
 ///
-/// Recorded as the `mode = search` run it is (`architecture.md` §10.2), so the
+/// Recorded as the `mode = search` run it is, so the
 /// rewrite, its retrieval and its token usage are all replayable with
 /// `momotaro trace <run_id>` and the `run_id` comes back on [`SearchOutput`].
-/// Once accepted the run always reaches a terminal event (D15): an expected
-/// failure lands its §18 row, anything else is abandoned to the next sweep,
+/// Once accepted the run always reaches a terminal event: an expected
+/// failure lands its failure payload, anything else is abandoned to the next sweep,
 /// exactly as `ask` abandons an unexpected store error.
+///
+/// # Errors
+///
+/// - `RunError::PolicyRefused` when `--no-llm` forbids the rewrite call or
+///   the network policy refuses the provider.
+/// - `RunError::IndexUnusable` / `RunError::IndexNotBuilt` /
+///   `RunError::StoreUnhealthy` when the pre-flight index and store gates
+///   refuse.
+/// - `RunError::ConfigRead` / `RunError::ConfigParse` when `momotaro.toml`
+///   cannot be read or parsed.
+/// - `RunError::ConfigInvalid` when `[model].model_id` or
+///   `[model].thinking` is missing or unsupported.
+/// - `RunError::SpecInvalid` when the frozen `RunSpec` fails validation.
+/// - `RunError::Store` / `RunError::Retrieve` for any store or index
+///   failure after acceptance — abandoned to the next sweep.
+/// - `RunError::Llm` and `RunError::RewriteUnusable` when the rewrite call
+///   fails or its answer holds no searchable query; the run lands its
+///   failure payload before the error returns.
+///
+/// # Panics
+///
+/// Only if an internal invariant breaks: the `expect` on
+/// `serde_json::to_string(&spec)` fires when the frozen run spec cannot be
+/// serialized to JSON (it always can — the spec is plain data).
 pub fn expand_search_workspace<T: momotaro_llm::ProviderTransport + ?Sized>(
     root: impl AsRef<Path>,
     query: &str,
@@ -6069,7 +6171,7 @@ pub fn expand_search_workspace<T: momotaro_llm::ProviderTransport + ?Sized>(
         now,
     );
 
-    // ---- terminal: a run that was accepted always ends (D15) --------------
+    // ---- terminal: a run that was accepted always ends --------------------
     match result {
         Ok(hits) => {
             store.commit_run_terminal(&run_id, TerminalEvent::Finished, "{}", None, now)?;
@@ -6080,7 +6182,7 @@ pub fn expand_search_workspace<T: momotaro_llm::ProviderTransport + ?Sized>(
             })
         }
         Err(error) => {
-            // A failure this layer can name lands its §18 row. Anything else —
+            // A failure this layer can name lands its failure payload. Anything else —
             // a store or index error — is abandoned to the next sweep, exactly
             // as `ask` abandons an unexpected store error: the sweep's
             // condition is "ended without terminal".
@@ -6098,10 +6200,10 @@ pub fn expand_search_workspace<T: momotaro_llm::ProviderTransport + ?Sized>(
     }
 }
 
-/// The frozen spec of a search run (§10.1 step 3), carrying the knobs this
+/// The frozen spec of a search run, carrying the knobs this
 /// command actually used.
 ///
-/// D25 maps `expand` onto the `utility` slot at `low`; that slot has no
+/// `expand` is mapped onto the `utility` slot at `low`; that slot has no
 /// configuration yet, so the rewrite runs on the answer slot's model — the spec
 /// records **what ran**, not what the mapping will one day choose.
 fn search_spec(
@@ -6134,7 +6236,7 @@ fn provider_of(config: &WorkspaceConfig) -> String {
         .unwrap_or_else(|| "openai-compatible".to_owned())
 }
 
-/// The §18 payload for a failure this layer can name, or `None` for one it
+/// The error-taxonomy payload for a failure this layer can name, or `None` for one it
 /// cannot — `failure_row`'s catch-all is `unreachable!`, so passing a category
 /// the taxonomy has not decided would panic rather than invent an attribution.
 fn expand_failure_payload(error: &RunError) -> Option<(String, Option<String>)> {
@@ -6178,7 +6280,7 @@ fn run_expand<T: momotaro_llm::ProviderTransport + ?Sized>(
         tools: Vec::new(),
         max_tokens: REWRITE_MAX_TOKENS,
     };
-    // §L6 (I4-F1): expand records the provider request's own hash
+    // Expand records the provider request's own hash
     // (`LlmRequest::request_hash`, model included) — the ask path records
     // the context stream hash instead (model-free, append-stable; see the
     // note at ask.rs's write site). The two domains are adjudicated together
@@ -6209,7 +6311,7 @@ fn run_expand<T: momotaro_llm::ProviderTransport + ?Sized>(
 
     // `llm.started` precedes the send, as it does on the ask path: the two
     // run-creating flows must not disagree about which half of the pair they
-    // write (reference.md lists both as stable; `append_run_event`'s doc says
+    // write (both spellings are stable; `append_run_event`'s doc says
     // these exist for the moments that write no table rows).
     store.append_run_event(
         run_id,
@@ -6251,7 +6353,7 @@ fn run_expand<T: momotaro_llm::ProviderTransport + ?Sized>(
     let queries = expanded_queries(&rewrite.text, EXPANDED_QUERY_COUNT);
     // "No usable query" is the *retriever's* question, not "the list is empty":
     // a reply of `["!!!"]` parses fine and searches nothing, and reporting that
-    // as a successful expand that found zero hits would be the lie §10.2 rules
+    // as a successful expand that found zero hits would be the lie the contract rules
     // out. The predicate is the same one `SearchIndex::search` uses.
     if !queries
         .iter()

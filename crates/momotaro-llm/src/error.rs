@@ -12,7 +12,7 @@ use thiserror::Error as ThisError;
 
 /// Why one provider call failed.
 ///
-/// Every kind rolls up to its `docs/docs/architecture.md` §18 category via
+/// Every kind rolls up to a category of the error taxonomy via
 /// [`Self::category`], so upstream `run_events` can record a category for
 /// every failure without inventing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,8 +53,8 @@ const HTTP_MONTHS: [&str; 12] = [
 ];
 
 impl LlmErrorKind {
-    /// The `docs/docs/architecture.md` §18 error-taxonomy category this kind
-    /// rolls up to, spelled exactly as that table spells it.
+    /// The error-taxonomy category this kind rolls up to, spelled exactly as
+    /// the taxonomy spells it.
     pub fn category(self) -> &'static str {
         match self {
             Self::Auth => "llm_auth",
@@ -68,12 +68,12 @@ impl LlmErrorKind {
 
     /// Whether resending the identical request could plausibly succeed.
     ///
-    /// Deliberately narrower than — and named apart from — §18's Retryable
+    /// Deliberately narrower than — and named apart from — the taxonomy's
     /// column: that column answers "may the run recover?" (overflow = maybe,
     /// by re-asking with less context), while this answers "may the *same
     /// bytes* succeed on a second send?" — which is the only retry
     /// [`crate::complete`] ever performs. Upstream `run_events.retryable` must
-    /// be read from the §18 table via [`Self::category`], never from this
+    /// be read from the taxonomy via [`Self::category`], never from this
     /// method.
     pub fn same_bytes_retryable(self) -> bool {
         matches!(self, Self::RateLimit | Self::Provider)
@@ -280,6 +280,17 @@ fn http_date_epoch(value: &str) -> Option<u64> {
 /// unprintable characters are dropped — C0/C1 controls can drive the terminal,
 /// and the bidi / zero-width format characters can hide or reorder the rest of
 /// the line. Same rule as `momotaro-run`'s private `sanitize`.
+///
+/// # Examples
+///
+/// ```
+/// use momotaro_llm::sanitize;
+///
+/// // A line break cannot split a foreign message into two terminal lines.
+/// assert_eq!(sanitize("first\nsecond"), "first second");
+/// // A zero-width joiner is dropped rather than printed.
+/// assert_eq!(sanitize("a\u{200d}b"), "ab");
+/// ```
 pub fn sanitize(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_whitespace() { ' ' } else { c })
@@ -401,8 +412,8 @@ mod tests {
 
     #[test]
     fn the_taxonomy_categories_are_the_architecture_spellings() {
-        // Flipped together with the §18 rows that gave the last three kinds
-        // their categories; every failure must land in the table.
+        // Every failure must land in the taxonomy; the last three kinds
+        // were added together with their categories.
         for (kind, expected) in [
             (LlmErrorKind::Auth, "llm_auth"),
             (LlmErrorKind::RateLimit, "llm_rate_limit"),
@@ -419,14 +430,14 @@ mod tests {
     fn same_request_retryability_follows_the_taxonomy_where_it_speaks() {
         assert!(!LlmErrorKind::Auth.same_bytes_retryable());
         assert!(LlmErrorKind::RateLimit.same_bytes_retryable());
-        // §18 says "maybe" for run-level recovery (re-ask smaller); the same
+        // Run-level recovery says "maybe" (re-ask smaller); the same
         // bytes would overflow again, so the client never resends.
         assert!(!LlmErrorKind::ContextOverflow.same_bytes_retryable());
         // None of the remaining kinds are retryable either: a refused request
         // and an unreadable body would fail identically on a second send.
         assert!(!LlmErrorKind::Rejected.same_bytes_retryable());
         assert!(!LlmErrorKind::Malformed.same_bytes_retryable());
-        // The run-level Retryable column is the §18 table's, not this method's:
+        // The run-level Retryable column is the taxonomy's, not this method's:
         // overflow disagrees with it on purpose (maybe vs false).
         assert!(LlmErrorKind::Provider.same_bytes_retryable());
     }

@@ -1,14 +1,14 @@
 //! Pre-migration backups: `VACUUM INTO` → verify → atomic rename.
 //!
-//! Step order follows D32 / D46: write to a temp name, verify the artifact with
+//! Step order: write to a temp name, verify the artifact with
 //! `quick_check`, then publish by atomic rename. An interrupted run only wastes
 //! an artifact and never touches the live database.
 //!
-//! Not implemented here, and not silently assumed: the D32 snapshot manifest
+//! Not implemented here, and not silently assumed: the snapshot manifest
 //! belongs to the snapshot flow (desktop → mobile), which has no consumer for a
 //! pre-migration copy yet; and the disk-space pre-check is left to `VACUUM INTO`
 //! itself failing, which surfaces as a failed backup — fail-closed, no skip
-//! option (§8.2).
+//! option.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -61,7 +61,7 @@ pub(crate) fn backup_before_migration_with(
         .map_err(|error| StoreError::BackupFailed(format!("vacuum into: {error}")))?;
 
     // Verify the artifact before it may replace anything: `quick_check` reads
-    // the whole file, which is also the first corruption screening (D32 L-backup).
+    // the whole file, which is also the first corruption screening.
     if let Err(error) = verify(&temp) {
         let _ = fs::remove_file(&temp);
         return Err(error);
@@ -77,7 +77,7 @@ pub(crate) fn backup_before_migration_with(
 /// Verifies a backup artifact: it must open read-only and pass `quick_check`.
 ///
 /// `quick_check` reads the whole file, which is also the first corruption
-/// screening of the snapshot (D32 L-backup). Kept separate from the four-step
+/// screening of the snapshot. Kept separate from the four-step backup
 /// so its teeth can be tested without manufacturing a broken `VACUUM INTO`.
 pub(crate) fn verify_artifact(path: &Path) -> Result<(), StoreError> {
     let artifact = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -233,8 +233,8 @@ mod tests {
         let mut store = Store::open(&path).expect("open store");
         store.init_schema().expect("init schema");
 
-        // distribution-trust §8.2: a backup that cannot be produced means the
-        // migration refuses to start, with no skip option.
+        // A backup that cannot be produced means the migration refuses to
+        // start, with no skip option.
         let missing = dir.path().join("gone-away");
         let error = backup_before_migration(&store.connection, &missing, 2, 3)
             .expect_err("a missing directory must fail the backup");

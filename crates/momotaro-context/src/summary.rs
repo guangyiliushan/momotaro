@@ -1,9 +1,8 @@
-//! `summary.v1`: the field-separated compaction record
-//! (`docs/docs/context-retrieval.md` §3.1).
+//! `summary.v1`: the field-separated compaction record.
 //!
-//! The record is **explicitly not a constraint carrier** (§3.1): constraints
+//! The record is **explicitly not a constraint carrier**: constraints
 //! live in the system resident layer and must never depend on compaction
-//! surviving. Fail-closed validation (§4 第 3 条) is the last gate against
+//! surviving. Fail-closed validation is the last gate against
 //! losing decisions or constraints:
 //!
 //! 1. every required field is present (enforced by the type: no `Option`),
@@ -13,20 +12,22 @@
 //!    summary text — the model must transcribe hashes, never paraphrase.
 //!
 //! A record that fails validation is never used: the compressor side gives
-//! up after N retries and keeps the raw history (§4), and the reader side
+//! up after N retries and keeps the raw history, and the reader side
 //! ([`crate::build_context`]'s `select_history` stage) drops the summary and
 //! falls back to the raw turns.
+//!
+//! The accepted wire version lives in [`SUMMARY_VERSION`]'s value; no identifier
+//! in this module carries one.
 
 use serde::{Deserialize, Serialize};
 
-/// The literal written for an empty scalar field (§3.1 结构规则 1).
+/// The literal written for an empty scalar field.
 pub const EMPTY_MARKER: &str = "(none)";
 
 /// The only accepted `version` field value.
-pub const SUMMARY_VERSION_V1: &str = "v1";
+pub const SUMMARY_VERSION: &str = "v1";
 
-/// One user decision plus its one-line reason (Pi Key Decisions format,
-/// §3.1 结构规则 3).
+/// One user decision plus its one-line reason (Pi Key Decisions format).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserDecision {
@@ -37,7 +38,7 @@ pub struct UserDecision {
 }
 
 /// One evidence pointer: title + claim, hash kept verbatim
-/// (§3 结构规则 2: 精确保存 chunk_hash / 标题，不许转述).
+/// (chunk_hash / 标题精确保存，不许转述).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceRef {
@@ -49,10 +50,10 @@ pub struct EvidenceRef {
     pub claim: String,
 }
 
-/// The `summary.v1` record (§3.1 JSON schema, all fields required).
+/// The `summary.v1` record (all fields required).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SummaryV1 {
+pub struct Summary {
     /// Schema version; must be `"v1"`.
     pub version: String,
     /// `history_id` values this summary condenses.
@@ -89,7 +90,7 @@ pub enum SummaryError {
     HashNotVerbatim(String),
 }
 
-impl SummaryV1 {
+impl Summary {
     /// Rewrite empty scalar fields to [`EMPTY_MARKER`]. List fields keep
     /// their array shape (`[]` stays `[]`) so the schema stays assertable.
     pub fn normalize(&mut self) {
@@ -122,13 +123,56 @@ impl SummaryV1 {
         }
     }
 
-    /// Fail-closed validation against the stored summary text (§3.1 断言).
+    /// Fail-closed validation against the stored summary text.
     ///
     /// The required-fields half is structural (no `Option` on the type); this
     /// function pins the two semantic halves: the version spelling and the
     /// verbatim hash transcription.
+    ///
+    /// # Errors
+    ///
+    /// - `SummaryError::VersionMismatch` when `version` is not `"v1"`.
+    /// - `SummaryError::EmptyField` when a field is empty instead of
+    ///   carrying the `(none)` marker: `first_kept_item_id`,
+    ///   `next_action_hint`, a `user_decisions` decision or reason, a
+    ///   covered turn, an open question, or an `evidence_refs` chunk hash,
+    ///   title, or claim.
+    /// - `SummaryError::HashNotVerbatim` when an
+    ///   `evidence_refs[].chunk_hash` does not appear verbatim in
+    ///   `stored_text`.
+    ///
+    /// # Examples
+    ///
+    /// A record whose evidence hash is absent from the stored text is refused —
+    /// hashes must be transcribed, never paraphrased:
+    ///
+    /// ```
+    /// use momotaro_context::{Summary, SummaryError};
+    ///
+    /// let stored = r#"{
+    ///   "version": "v1",
+    ///   "covered_turns": [],
+    ///   "first_kept_item_id": "h-3",
+    ///   "tokens_before": 4200,
+    ///   "user_decisions": [],
+    ///   "open_questions": [],
+    ///   "evidence_refs": [
+    ///     {"chunk_hash": "cafe1234", "title": "Fourier", "claim": "linear"}
+    ///   ],
+    ///   "next_action_hint": "compare with dense"
+    /// }"#;
+    ///
+    /// let mut record = Summary::from_stored(stored).expect("valid summary.v1 JSON");
+    /// assert!(record.validate_against_text(stored).is_ok());
+    ///
+    /// record.evidence_refs[0].chunk_hash = "cafe9999".to_string();
+    /// assert!(matches!(
+    ///     record.validate_against_text(stored),
+    ///     Err(SummaryError::HashNotVerbatim(hash)) if hash == "cafe9999"
+    /// ));
+    /// ```
     pub fn validate_against_text(&self, stored_text: &str) -> Result<(), SummaryError> {
-        if self.version != SUMMARY_VERSION_V1 {
+        if self.version != SUMMARY_VERSION {
             return Err(SummaryError::VersionMismatch(self.version.clone()));
         }
         if self.first_kept_item_id.is_empty() {
@@ -178,14 +222,55 @@ impl SummaryV1 {
     /// The replay path parses a row whose text it does not own, and a summary
     /// it cannot parse is a malformed row rather than a claim to check — the
     /// semantic half is [`Self::validate_against_text`], owned by
-    /// `select_history` (§4 rule 3). This is the one JSON parse on the type;
+    /// `select_history`. This is the one JSON parse on the type;
     /// the two callers pick which half they need.
+    ///
+    /// # Errors
+    ///
+    /// - `SummaryError::Malformed` when `stored_text` is not a
+    ///   `summary.v1` JSON document.
     pub fn from_stored(stored_text: &str) -> Result<Self, SummaryError> {
         serde_json::from_str(stored_text).map_err(|_| SummaryError::Malformed)
     }
 
     /// Parse the stored summary text and run [`Self::validate_against_text`]
     /// against that same text.
+    ///
+    /// # Errors
+    ///
+    /// - `SummaryError::Malformed` when the text is not a `summary.v1`
+    ///   JSON document.
+    /// - `SummaryError::VersionMismatch` when `version` is not `"v1"`.
+    /// - `SummaryError::EmptyField` when a scalar field is empty instead
+    ///   of carrying the `(none)` marker.
+    /// - `SummaryError::HashNotVerbatim` when an
+    ///   `evidence_refs[].chunk_hash` is not verbatim in the stored text.
+    ///
+    /// # Examples
+    ///
+    /// Parse and validate a stored record in one call — the composed gate over
+    /// JSON text the caller does not own:
+    ///
+    /// ```
+    /// use momotaro_context::Summary;
+    ///
+    /// let stored = r#"{
+    ///   "version": "v1",
+    ///   "covered_turns": ["h-1", "h-2"],
+    ///   "first_kept_item_id": "h-3",
+    ///   "tokens_before": 4200,
+    ///   "user_decisions": [{"decision": "use BM25", "reason": "baseline first"}],
+    ///   "open_questions": ["what about dense?"],
+    ///   "evidence_refs": [
+    ///     {"chunk_hash": "cafe1234", "title": "Fourier", "claim": "linear"}
+    ///   ],
+    ///   "next_action_hint": "compare with dense"
+    /// }"#;
+    ///
+    /// let summary = Summary::parse_stored(stored).expect("valid summary.v1 text");
+    /// assert_eq!(summary.tokens_before, 4200);
+    /// assert_eq!(summary.user_decisions[0].decision, "use BM25");
+    /// ```
     pub fn parse_stored(stored_text: &str) -> Result<Self, SummaryError> {
         let record = Self::from_stored(stored_text)?;
         record.validate_against_text(stored_text)?;
@@ -197,9 +282,9 @@ impl SummaryV1 {
 mod tests {
     use super::*;
 
-    fn sample() -> SummaryV1 {
-        SummaryV1 {
-            version: SUMMARY_VERSION_V1.to_string(),
+    fn sample() -> Summary {
+        Summary {
+            version: SUMMARY_VERSION.to_string(),
             covered_turns: vec!["h-1".to_string(), "h-2".to_string()],
             first_kept_item_id: "h-3".to_string(),
             tokens_before: 6543,
@@ -217,7 +302,7 @@ mod tests {
         }
     }
 
-    fn stored_text_of(record: &SummaryV1) -> String {
+    fn stored_text_of(record: &Summary) -> String {
         serde_json::to_string(record).expect("encode summary")
     }
 
@@ -225,7 +310,7 @@ mod tests {
     fn a_well_formed_summary_round_trips() {
         let record = sample();
         let stored = stored_text_of(&record);
-        let parsed = SummaryV1::parse_stored(&stored).expect("valid summary parses");
+        let parsed = Summary::parse_stored(&stored).expect("valid summary parses");
         assert_eq!(parsed, record);
     }
 
@@ -233,7 +318,7 @@ mod tests {
     fn every_field_is_required_by_the_type() {
         // Removing any one key from the JSON is a **deserialization**
         // failure — no field is optional — and the key set is the fixture's
-        // own: a new SummaryV1 field must land here (the count pin) and
+        // own: a new Summary field must land here (the count pin) and
         // survive removal. The assertion asks `from_stored`, the syntax half,
         // and nothing else: `parse_stored` would not show what this claims.
         // Its semantic half backstops three of the eight from a sneaked
@@ -251,14 +336,14 @@ mod tests {
         assert_eq!(
             keys.len(),
             8,
-            "SummaryV1 grew or shrank a field: update this pin"
+            "Summary grew or shrank a field: update this pin"
         );
         for key in keys {
             let mut without = object.clone();
             without.remove(&key);
             let text = serde_json::to_string(&without).expect("re-encode");
             assert!(
-                matches!(SummaryV1::from_stored(&text), Err(SummaryError::Malformed)),
+                matches!(Summary::from_stored(&text), Err(SummaryError::Malformed)),
                 "{key} must be required by the type: a missing key is a \
                  deserialization failure, not a later validation one"
             );
@@ -293,7 +378,7 @@ mod tests {
             .expect("encode")
             .replace("cafe1234", "caf\\u00651234");
         assert!(matches!(
-            SummaryV1::parse_stored(&stored),
+            Summary::parse_stored(&stored),
             Err(SummaryError::HashNotVerbatim(_))
         ));
     }
@@ -304,7 +389,7 @@ mod tests {
         record.version = "v2".to_string();
         let stored = stored_text_of(&record);
         assert!(matches!(
-            SummaryV1::parse_stored(&stored),
+            Summary::parse_stored(&stored),
             Err(SummaryError::VersionMismatch(v)) if v == "v2"
         ));
     }
@@ -340,7 +425,7 @@ mod tests {
         let stored = stored_text_of(&sample());
         // The syntax half alone: see the note above.
         let required =
-            |text: &str| matches!(SummaryV1::from_stored(text), Err(SummaryError::Malformed));
+            |text: &str| matches!(Summary::from_stored(text), Err(SummaryError::Malformed));
         for field in [
             "\"version\":\"v1\"",
             "\"covered_turns\":[\"h-1\",\"h-2\"]",
@@ -389,7 +474,7 @@ mod tests {
 
     #[test]
     fn every_empty_scalar_is_rejected_with_its_field_name() {
-        type Mutate = fn(&mut SummaryV1);
+        type Mutate = fn(&mut Summary);
         let cases: Vec<(Mutate, &str)> = vec![
             (
                 |r| r.first_kept_item_id = String::new(),
@@ -423,7 +508,7 @@ mod tests {
             let mut record = sample();
             mutate(&mut record);
             let stored = stored_text_of(&record);
-            let outcome = SummaryV1::parse_stored(&stored);
+            let outcome = Summary::parse_stored(&stored);
             assert!(
                 matches!(outcome, Err(SummaryError::EmptyField(f)) if f == field),
                 "field {field} must be rejected with its name, got {outcome:?}"
@@ -433,13 +518,13 @@ mod tests {
 
     #[test]
     fn an_empty_scalar_without_the_marker_is_rejected() {
-        let record = SummaryV1 {
+        let record = Summary {
             next_action_hint: String::new(),
             ..sample()
         };
         let stored = stored_text_of(&record);
         assert!(matches!(
-            SummaryV1::parse_stored(&stored),
+            Summary::parse_stored(&stored),
             Err(SummaryError::EmptyField("next_action_hint"))
         ));
     }
@@ -447,6 +532,6 @@ mod tests {
     fn unknown_fields_are_rejected_fail_closed() {
         let stored = stored_text_of(&sample());
         let tampered = stored.replacen("{", "{\"surprise\":1,", 1);
-        assert!(SummaryV1::parse_stored(&tampered).is_err());
+        assert!(Summary::parse_stored(&tampered).is_err());
     }
 }

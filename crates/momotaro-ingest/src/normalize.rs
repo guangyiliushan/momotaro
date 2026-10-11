@@ -3,6 +3,25 @@
 use super::IngestError;
 
 /// Decode bytes to UTF-8, strip a leading BOM, and normalize CRLF/CR to LF.
+///
+/// # Errors
+///
+/// - `IngestError::InvalidUtf8` when `bytes` is not valid UTF-8. The message
+///   names the input as `source bytes`.
+///
+/// # Examples
+///
+/// ```
+/// # use momotaro_ingest::{IngestError, normalize_markdown};
+/// # fn main() -> Result<(), IngestError> {
+/// let text = normalize_markdown(b"\xEF\xBB\xBFline one\r\nline two")?;
+/// assert_eq!(text, "line one\nline two");
+///
+/// let invalid = normalize_markdown(&[0xFF, 0xFE]);
+/// assert!(matches!(invalid, Err(IngestError::InvalidUtf8(_))));
+/// # Ok(())
+/// # }
+/// ```
 pub fn normalize_markdown(bytes: &[u8]) -> Result<String, IngestError> {
     let decoded = std::str::from_utf8(bytes)
         .map_err(|_| IngestError::InvalidUtf8("source bytes".to_string()))?;

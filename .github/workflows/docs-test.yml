@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # Node 20 actions are removed from runners; every pin below is a
-      # 40-character commit SHA on the Node 24 line (D39: tag pins are rewritable).
+      # 40-character commit SHA on the Node 24 line — tag pins are rewritable.
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

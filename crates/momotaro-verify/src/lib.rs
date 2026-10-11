@@ -1,4 +1,4 @@
-//! Deterministic citation verification (`docs/docs/architecture.md` §14).
+//! Deterministic citation verification.
 //!
 //! This crate answers one question — *does this citation actually point at
 //! what the store says it points at?* — and answers it without a model.
@@ -6,8 +6,8 @@
 //! Three properties the tests pin down:
 //!
 //! * **Zero tokens, zero LLM.** There is no `momotaro-llm` dependency and no
-//!   provider slot here (`docs/docs/reference.md`, "Model slot": *the
-//!   verifier has no slot and never spends tokens*). A model cannot declare
+//!   provider slot here: the verifier has no slot and never spends
+//!   tokens. A model cannot declare
 //!   its own citations valid, because nothing in this crate can ask one.
 //! * **Only an exact match passes.** `source_key + revision_hash +
 //!   chunk_hash` and the locator are compared verbatim against the stored
@@ -21,15 +21,46 @@
 //!
 //! The verdict for missing source bytes is a separate `source_integrity`
 //! result rather than a citation failure, so that a citation whose file was
-//! archived away still verifies from the stored chunk text
-//! (`docs/docs/reference.md`, "Chunk") while the integrity check reports the
-//! loss.
+//! archived away still verifies from the stored chunk text while the
+//! integrity check reports the loss.
 //!
 //! This crate never writes. Persisting `verifications` rows and the
 //! `answer_citations.verified` flag is `momotaro-run`'s step 12.
+//!
+//! # Examples
+//!
+//! Judging an answer needs a store to read:
+//!
+//! ```no_run
+//! use momotaro_store::Store;
+//! use momotaro_verify::{Citation, StoreSource, VerifyPolicy, verify_answer};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let store = Store::open("ws/.momotaro/momotaro.db")?;
+//! let source = StoreSource::new(&store, "ws");
+//! let citation = Citation {
+//!     context_item_id: "f0001".to_owned(),
+//!     source_key: "note:notes/fourier.md".to_owned(),
+//!     revision_hash: "rev-1".to_owned(),
+//!     chunk_id: "chunk-1".to_owned(),
+//!     chunk_hash: "chash-1".to_owned(),
+//!     locator_json: r#"{"start_byte":0}"#.to_owned(),
+//!     quoted_text: "energy is conserved".to_owned(),
+//! };
+//!
+//! let verdict = verify_answer(&source, VerifyPolicy::enabled(), &["f0001"], &[citation]);
+//! println!("{:?}", verdict.citations[0].status);
+//! // `fully_verified()` is the one derived flag: every citation passed and no
+//! // integrity check vetoes the answer.
+//! println!("fully verified: {}", verdict.fully_verified());
+//! # Ok(())
+//! # }
+//! ```
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(rustdoc::all)]
+#![warn(rustdoc::unescaped_backticks)]
 
 pub mod citation;
 pub mod error;
@@ -77,10 +108,9 @@ mod tests {
             .collect()
     }
 
-    /// **Zero tokens, zero LLM.** `docs/docs/reference.md`, "Model slot":
-    /// *the verifier has no slot and never spends tokens* — and a model
-    /// cannot declare its own citations valid because nothing here can ask
-    /// one. Adding a network or model client to the manifest fails this test
+    /// **Zero tokens, zero LLM.** The verifier has no slot and never spends
+    /// tokens — and a model cannot declare its own citations valid because
+    /// nothing here can ask one. Adding a network or model client to the manifest fails this test
     /// before any prompt could be written.
     #[test]
     fn the_manifest_declares_only_the_expected_dependency_sections() {
@@ -120,8 +150,7 @@ mod tests {
 
         assert!(
             !manifest.contains("momotaro-llm"),
-            "the verifier has no model slot and never spends tokens \
-             (docs/docs/reference.md, \"Model slot\")"
+            "the verifier has no model slot and never spends tokens"
         );
     }
 }

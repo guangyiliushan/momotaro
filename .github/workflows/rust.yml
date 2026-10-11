@@ -24,7 +24,7 @@ on:
   schedule:
     # Advisories and yanks land between commits. On a schedule the whole file
     # runs against the default branch, so a dependency that was fine yesterday
-    # is disclosed today without anyone having to remember to look (D39).
+    # is disclosed today without anyone having to remember to look.
     - cron: "17 6 * * *"
 
 permissions:
@@ -38,7 +38,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      # Node 20 actions are removed from runners; pin 40-char SHAs on the Node 24 line (D39).
+      # Node 20 actions are removed from runners; pin 40-char SHAs on the Node 24 line.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install toolchain
         run: rustup show active-toolchain || rustup toolchain install
@@ -66,8 +66,8 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           # `--locked` is a global flag, so it has to precede the subcommand —
-          # which is what the action's two argument inputs are for (D39's
-          # `cargo deny --locked check`). Feature coverage is not a CLI flag in
+          # which is what the action's two argument inputs are for (the
+          # `cargo deny --locked check` spelling). Feature coverage is not a CLI flag in
           # cargo-deny 0.20; it comes from `[graph] all-features = true`.
           arguments: --locked
           command: check

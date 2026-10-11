@@ -1,7 +1,24 @@
 //! Versioned contracts shared by the Momotaro runtime surfaces.
+//!
+//! # Examples
+//!
+//! Build a canonical source key from a vault-relative path, then round-trip a
+//! kind through its wire spelling:
+//!
+//! ```
+//! use momotaro_contracts::{SourceKind, note_source_key};
+//!
+//! let key = note_source_key("docs/ml/attention.md").unwrap();
+//! assert_eq!(key, "note:docs/ml/attention.md");
+//!
+//! let kind: SourceKind = "paper".parse().unwrap();
+//! assert_eq!(kind.as_str(), "paper");
+//! ```
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(rustdoc::all)]
+#![warn(rustdoc::unescaped_backticks)]
 
 use std::path::PathBuf;
 
@@ -60,20 +77,46 @@ pub enum SourceKeyError {
 /// one file literally named `docs\ml\a.md` and the nested path `docs/ml/a.md`
 /// remain two identities.
 ///
-/// Key rules (ADR 0002 / D42): the tail is NFC-normalized; case is preserved
+/// Key rules: the tail is NFC-normalized; case is preserved
 /// verbatim; `/` is the only separator; `.` components are dropped; absolute
 /// and `..`-bearing tails are rejected. A key is an identity, never a
 /// filesystem path. NFKC and case folding are forbidden — folding two distinct
 /// Linux files into one identity is a data-loss class accident. No byte of a
 /// name is ever rewritten: characters illegal on Windows (`:`, `\`, …) are
-/// kept verbatim, because the vault layer indexes such names and warns (D42)
+/// kept verbatim, because the vault layer indexes such names and warns
 /// while the key layer must keep two distinct files distinct.
+///
+/// # Errors
+///
+/// - `SourceKeyError::Nul` when the tail contains a NUL byte.
+/// - `SourceKeyError::Absolute` when the tail is an absolute path (POSIX,
+///   UNC, or drive-absolute form).
+/// - `SourceKeyError::ParentDir` when the tail contains a `..` component.
+/// - `SourceKeyError::Empty` when no name component remains after empty
+///   and `.` components are dropped.
+///
+/// # Examples
+///
+/// The tail is NFC-normalized, so a decomposed spelling and its composed
+/// form yield the same key; absolute and `..`-bearing tails are refused:
+///
+/// ```
+/// use momotaro_contracts::note_source_key;
+///
+/// let composed = note_source_key("docs/caf\u{e9}.md").unwrap();
+/// let decomposed = note_source_key("docs/cafe\u{301}.md").unwrap();
+/// assert_eq!(composed, decomposed);
+/// assert_eq!(composed, "note:docs/caf\u{e9}.md");
+///
+/// assert!(note_source_key("/etc/hosts").is_err());
+/// assert!(note_source_key("docs/../secret.md").is_err());
+/// ```
 pub fn note_source_key(vault_relative: &str) -> Result<String, SourceKeyError> {
     let tail = normalize_key_tail(vault_relative)?;
     Ok(format!("{NOTE_SCHEME}{tail}"))
 }
 
-/// NFC-normalizes a string for comparison against key tails (D42).
+/// NFC-normalizes a string for comparison against key tails.
 ///
 /// Comparison follows the key's normalization; folding does not — this is
 /// never case-folded and never NFKC. Readers that match user-typed text (link
@@ -167,7 +210,7 @@ pub struct HealthReport {
     /// `None` is "nothing could be read", which is not `false` — a reader that
     /// collapsed the two would stop warning on exactly the machines the
     /// warning exists for. `Some(false)` means the volumes were read and are
-    /// local. Set by the surfaces that know the workspace (D31 / D40 §4.8);
+    /// local. Set by the surfaces that know the workspace;
     /// the store itself has no workspace context and reports `None`.
     #[serde(default)]
     pub network_volume: Option<bool>,
@@ -196,10 +239,24 @@ pub struct SqliteFacts {
 
 /// Whether a `sqlite3_libversion_number()` value sits in the WAL-reset window.
 ///
-/// Upstream wording (sqlite.org/wal.html §11): the bug is "likely present in all
+/// Upstream wording (sqlite.org/wal.html): the bug is "likely present in all
 /// versions of SQLite from 3.7.0 (2010-07-21) through 3.51.2 (2026-01-09)", and
 /// "fixed in version 3.51.3 (2026-03-13) and later". Two releases inside the
 /// window were patched in place: 3.44.6 and 3.50.7.
+///
+/// # Examples
+///
+/// ```
+/// use momotaro_contracts::is_wal_reset_window;
+///
+/// assert!(is_wal_reset_window(3_007_000));
+/// assert!(is_wal_reset_window(3_050_000));
+/// // The two releases patched inside the window are not affected.
+/// assert!(!is_wal_reset_window(3_044_006));
+/// assert!(!is_wal_reset_window(3_050_007));
+/// // 3.51.3 is the first release upstream calls fixed (exclusive bound).
+/// assert!(!is_wal_reset_window(3_051_003));
+/// ```
 pub fn is_wal_reset_window(version_number: i32) -> bool {
     /// 3.7.0 — where WAL reset landed.
     const FIRST_AFFECTED: i32 = 3_007_000;
@@ -249,8 +306,8 @@ pub enum SourceKind {
     Web,
     /// A vault file that is registered rather than indexed: images, audio,
     /// video, PDFs and anything else the whitelist does not read. It is a
-    /// source (it has a key and a revision) with no chunks — `docs/docs/
-    /// ingest-interop.md` §5 第 10 条 says which files these are, and why the
+    /// source (it has a key and a revision) with no chunks; the whitelist
+    /// decides which files these are, so the
     /// index never pretends its bytes are searchable.
     Attachment,
 }
@@ -359,7 +416,7 @@ pub struct SourceRevision {
     /// Remote URI, when the source has one.
     pub uri: Option<String>,
     /// Workspace-relative, `/`-joined path when the source lives on disk
-    /// (ADR 0024) — never absolute.
+    /// — never absolute.
     pub local_path: Option<String>,
     /// The file name exactly as the vault spelled it, kept for rename matching,
     /// collision reporting and display. Never an identity: the key is.
@@ -487,7 +544,7 @@ pub enum IndexFileErrorKind {
     /// reports it for content, so the narrower wording was wrong.
     InvalidUtf8,
     /// The path is not a name inside the vault root. Covers the wider
-    /// workspace case too: since ADR 0024 every stored path is
+    /// workspace case too: every stored path is
     /// workspace-relative, so a path outside the workspace that contains the
     /// vault cannot be described either.
     OutsideVault,
@@ -530,7 +587,7 @@ pub struct IndexFileError {
     pub message: String,
 }
 
-/// What a file lost on the way into the index (D41).
+/// What a file lost on the way into the index.
 ///
 /// The code rides the row it happened to; the row's state is a separate axis.
 /// Most of them ride an `indexed` row — most losses are about a file that went
@@ -539,37 +596,37 @@ pub struct IndexFileError {
 /// the attachment earned: `skipped`, `metadata_refreshed` or `indexed`,
 /// depending on why it was visited. [`CoverageReport::degradations`] counts on
 /// exactly those two axes, because a summary that guessed the state from the
-/// code contradicted its own counts (D41 / §5 第 8 条 ⑤).
+/// code contradicted its own counts.
 ///
-/// Every one of D41's ten has a producer as of W2.4 (§5 第 5–10 条); what each
+/// Every one of the ten has a producer; what each
 /// code means is its own variant's sentence. Having them typed is what keeps
 /// `degradation_message` exhaustive and stops a sentence from claiming to be
 /// about the wrong code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Degradation {
-    /// The frontmatter block could not be read (D41.5); the body was indexed.
+    /// The frontmatter block could not be read; the body was indexed.
     FrontmatterParseError,
-    /// A `[[wikilink]]` points at a note that is not in the vault (D41.1).
+    /// A `[[wikilink]]` points at a note that is not in the vault.
     UnresolvedWikilink,
-    /// A `[[wikilink]]` matches more than one note, so no edge is built (D41.2).
+    /// A `[[wikilink]]` matches more than one note, so no edge is built.
     AmbiguousWikilink,
-    /// A `#heading` anchor does not exist in the target (D41.3); the edge is kept.
+    /// A `#heading` anchor does not exist in the target; the edge is kept.
     StaleAnchor,
-    /// A markdown link's target could not be percent-decoded (D41.4).
+    /// A markdown link's target could not be percent-decoded.
     MarkdownLinkDecodeError,
-    /// A private link syntax this build does not know (D41.6), e.g. Dendron's.
+    /// A private link syntax this build does not know, e.g. Dendron's.
     UnknownLinkSyntax,
-    /// A `.canvas` block that is not readable as JSON (D41.8); the file keeps its
+    /// A `.canvas` block that is not readable as JSON; the file keeps its
     /// bytes and still gets indexed.
     CanvasParseError,
-    /// A note that is an Excalidraw drawing (D41.7): the compressed scene stays
+    /// A note that is an Excalidraw drawing: the compressed scene stays
     /// out of the index while the note's other sections are indexed normally.
     ExcalidrawDetected,
-    /// A symlink under the vault (D41.9). The first version does not follow them,
+    /// A symlink under the vault. The first version does not follow them,
     /// so the link is recorded rather than read.
     SymlinkEncountered,
-    /// A file that is registered rather than indexed (D41.10): images, audio,
+    /// A file that is registered rather than indexed: images, audio,
     /// video and PDFs get a revision with no chunks, so the vault's coverage is
     /// answerable even though their bytes are not searchable.
     AttachmentUnindexed,
@@ -624,7 +681,7 @@ impl Degradation {
     }
 }
 
-/// What will not survive another platform, though nothing was lost here (D42).
+/// What will not survive another platform, though nothing was lost here.
 ///
 /// A warning is not a [`Degradation`]: the ten degradations say what a file
 /// lost on the way into the index, while a warning is a standing fact about
@@ -633,13 +690,13 @@ impl Degradation {
 /// Nothing was lost by the file, the ten stay ten, and a reader that
 /// counts degradations is not taught a fourth kind of loss. The two
 /// vocabularies share the `reason_code` column and a row's `data_json`; a
-/// reader must consult both before calling a code unknown (ADR 0026, "A
-/// warning is not a degradation").
+/// reader must consult both before calling a code unknown — a warning is
+/// not a degradation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Warning {
     /// A cloud placeholder (`FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`): its bytes
-    /// are not on this device, so it was not read (D42).
+    /// are not on this device, so it was not read.
     ///
     /// The explicit rename is load-bearing: `snake_case` alone would split the
     /// product name into `one_drive_placeholder`, and the witness test pins the
@@ -647,17 +704,17 @@ pub enum Warning {
     #[serde(rename = "onedrive_placeholder")]
     OneDrivePlaceholder,
     /// An iCloud eviction stub (`.name.icloud`): the note it stands for is not
-    /// here; the stub itself is skipped and never read (D42).
+    /// here; the stub itself is skipped and never read.
     IcloudPlaceholder,
     /// A name Windows' own naming rules reserve (reserved device name, reserved
     /// character, trailing dot or space): indexed here, refused or mangled by
-    /// the tools and sync clients that follow the rules (D42).
+    /// the tools and sync clients that follow the rules.
     WindowsIncompatibleName,
-    /// The path a watcher just reported no longer holds a file (D40 §4.2's
-    /// delete half, and a real deletion).
+    /// The path a watcher just reported no longer holds a file — the
+    /// delete half, and a real deletion.
     ///
     /// Nothing is written for the *file* — keys in history are never
-    /// rewritten (ADR 0014: a rename is delete+create and no stored
+    /// rewritten (a rename is delete+create and no stored
     /// `source_key` is ever updated) and the store keeps the old revision as
     /// history — so the row is the whole record of the decision. It rides
     /// `outcome = skipped` because that is what the four outcome values already
@@ -715,10 +772,10 @@ impl Warning {
     }
 }
 
-/// How a `graph_links` edge was expressed (architecture §8.2, ADR 0027).
+/// How a `graph_links` edge was expressed.
 ///
-/// The vocabulary closed with W2.4. `canvas_card` / `canvas_edge` have no
-/// producer yet — canvas edge building is its own task (§5 第 2 条) — and are
+/// The vocabulary is closed. `canvas_card` / `canvas_edge` have no
+/// producer yet — canvas edge building is its own task — and are
 /// typed now so the vocabulary closes instead of drifting when that task
 /// lands. A frontmatter link is [`Self::Link`] + [`LinkSource::Frontmatter`]:
 /// frontmatter is singled out on the `link_source` axis, an embed on this one.
@@ -770,7 +827,7 @@ impl EdgeKind {
     }
 }
 
-/// Which syntax produced a `graph_links` edge (architecture §8.2, ADR 0027).
+/// Which syntax produced a `graph_links` edge.
 ///
 /// "Which syntax produced it" with one carve-out the build matrix fixes:
 /// a link written inside frontmatter is [`Self::Frontmatter`] even when its
@@ -788,7 +845,7 @@ pub enum LinkSource {
     /// Produced by canvas structure (a file node or an arrow; producer pending).
     Canvas,
     /// Written inside frontmatter — singled out there even when the syntax is a
-    /// wikilink (§5 第 2 条).
+    /// wikilink.
     Frontmatter,
 }
 
@@ -823,17 +880,17 @@ impl LinkSource {
     }
 }
 
-/// What a link's anchor points at, when it has one (architecture §8.2).
+/// What a link's anchor points at, when it has one.
 ///
 /// The whole vocabulary: `heading` (`#H1#H2` multi-level included) and `block`
 /// (`#^id`). A NULL on the row means no anchor — or a fragment that is not an
-/// anchor, like a PDF page parameter (§5 第 4 条: attachment targets are never
-/// anchor-parsed). `span` is not an anchor kind: it is the chunk's own
+/// anchor, like a PDF page parameter: attachment targets are never
+/// anchor-parsed. `span` is not an anchor kind: it is the chunk's own
 /// line-interval locator (`Chunk::locator_json`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnchorKind {
-    /// A `#heading` text anchor, matched by level text (§5 第 4 条).
+    /// A `#heading` text anchor, matched by level text.
     Heading,
     /// A `#^id` block anchor; the id charset is `[A-Za-z0-9-]+`.
     Block,
@@ -861,7 +918,7 @@ impl AnchorKind {
     }
 }
 
-/// One `graph_links` row: an as-written link edge (architecture §8.2, ADR 0027).
+/// One `graph_links` row: an as-written link edge.
 ///
 /// Identity is the as-written six-tuple; `to_source_key` is a resolution
 /// product and `created_at` is the `ingested_at` of the revision whose content
@@ -882,7 +939,7 @@ pub struct GraphLink {
     pub anchor_kind: Option<AnchorKind>,
     /// The anchor exactly as written; `None` when the link has none. It can
     /// outlive `anchor_kind`: an attachment's page fragment is kept raw while
-    /// the kind is NULL (`§5 第 4 条`).
+    /// the kind is NULL.
     pub anchor_raw: Option<String>,
     /// The `ingested_at` of the revision whose content carries the link.
     pub created_at: i64,
@@ -912,8 +969,8 @@ impl CoverageCounts {
     }
 }
 
-/// What the most recent ingest batch did, read back out of `store_events`
-/// (ADR 0026). `None` comes back from `momotaro_run::coverage_report` when no
+/// What the most recent ingest batch did, read back out of `store_events`.
+/// `None` comes back from `momotaro_run::coverage_report` when no
 /// batch was ever recorded — never because one failed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoverageReport {
@@ -928,7 +985,7 @@ pub struct CoverageReport {
     /// Rows whose file only moved or was re-spelled.
     pub refreshed: u64,
     /// What the rows carrying a code lost on the way in, counted per code **and per
-    /// row state** (D41).
+    /// row state**.
     ///
     /// The state is the row's, never the code's: the same code rides rows that are in
     /// the index anyway and rows nothing was read for (`symlink_encountered` on a
@@ -938,7 +995,7 @@ pub struct CoverageReport {
     /// clean one in this report: the row says `indexed` and the code was only in the
     /// event table.
     pub degradations: BTreeMap<Degradation, CoverageCounts>,
-    /// What the rows carrying a warning said (D42), counted like [`Self::degradations`].
+    /// What the rows carrying a warning said, counted like [`Self::degradations`].
     ///
     /// A warning is not a loss: the file is in the index, or was skipped, and the
     /// code says what will not survive another platform — a name no ordinary
@@ -969,20 +1026,20 @@ pub struct CoverageFailure {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexReport {
     /// Identifier of this indexing batch, as written to `store_events`
-    /// (ADR 0026): one `index` run, one batch.
+    /// — one `index` run, one batch.
     pub batch_id: String,
     /// Files this batch accounted for: every file the vault walk kept — notes,
     /// canvases, attachments, links and eviction stubs alike, since all of them
-    /// get rows (第 10 条 for the attachment/symlink half, 第 6 条 for the one
-    /// the blacklist lets through) — plus each key the walk no longer names,
-    /// because a removal gets a row too (D40 §4.2) and `files_skipped` counts
-    /// that row (ADR 0026).
+    /// get rows — attachments and symlinks included, and the one
+    /// the blacklist lets through — plus each key the walk no longer names,
+    /// because a removal gets a row too and `files_skipped` counts
+    /// that row.
     pub files_scanned: u64,
     /// Files nothing was read for: the fingerprint was unchanged, the walk saw a
     /// link it does not follow, the file is an eviction stub or a cloud
-    /// placeholder, or the source's file is gone altogether (D40 §4.2 — that row
+    /// placeholder, or the source's file is gone altogether — that row
     /// carries `Warning::SourceRemoved`, and it counts here so this field and
-    /// [`Self::files_scanned`] stay a partition of it). All are skips, and the
+    /// [`Self::files_scanned`] stay a partition of it. All are skips, and the
     /// row's code says which.
     pub files_skipped: u64,
     /// Files that produced a new revision or refresh.
@@ -1018,6 +1075,17 @@ pub fn is_cjk(c: char) -> bool {
 ///
 /// CJK characters count as one token each; other characters count as one
 /// token per four characters, rounded up. Deterministic and allocation-free.
+///
+/// # Examples
+///
+/// ```
+/// use momotaro_contracts::estimate_tokens;
+///
+/// assert_eq!(estimate_tokens(""), 0);
+/// assert_eq!(estimate_tokens("abcd"), 1);
+/// assert_eq!(estimate_tokens("abcde"), 2);
+/// assert_eq!(estimate_tokens("あいう"), 3);
+/// ```
 pub fn estimate_tokens(text: &str) -> u32 {
     let mut cjk: u32 = 0;
     let mut other: u32 = 0;
@@ -1031,7 +1099,7 @@ pub fn estimate_tokens(text: &str) -> u32 {
     cjk + other.div_ceil(4)
 }
 
-/// What kind of work one run performs (`architecture.md` §9: the closed set).
+/// What kind of work one run performs (the closed set).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunMode {
@@ -1057,8 +1125,7 @@ impl RunMode {
     }
 }
 
-/// Which provider endpoint one turn uses (`reference.md`, "Model slot" —
-/// D25's closed semantic enum).
+/// Which provider endpoint one turn uses (a closed semantic enum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelSlot {
@@ -1078,9 +1145,8 @@ impl ModelSlot {
     }
 }
 
-/// The semantic thinking tier (`reference.md`, "Model slot" — D26's four
-/// semantic steps, frozen into the RunSpec; provider parameter names live
-/// and die with the adapter, these do not).
+/// The semantic thinking tier — four semantic steps, frozen into the RunSpec;
+/// provider parameter names live and die with the adapter, these do not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingTier {
@@ -1106,9 +1172,9 @@ impl ThinkingTier {
     }
 }
 
-/// The three events that drive a run's terminal status (`harness.md` §1:
+/// The three events that drive a run's terminal status:
 /// `runs.status` is a projection of exactly one of these, landed in the same
-/// transaction as the status update).
+/// transaction as the status update.
 ///
 /// Not serialized: the wire holds the event name ([`TerminalEvent::as_str`],
 /// on `run_events`) or the projected status ([`TerminalEvent::projected_status`],
@@ -1125,11 +1191,11 @@ pub enum TerminalEvent {
 }
 
 impl TerminalEvent {
-    /// The event name as `reference.md` spells it.
+    /// The event name as the wire vocabulary spells it.
     ///
-    /// `Cancelled` is in the enum and **not** in that document's stable list:
-    /// it has a round-trip test and no producer, so `reference.md` files it
-    /// with the reserved spellings rather than the shipped ones.
+    /// `Cancelled` is in the enum and **not** in the stable shipped list:
+    /// it has a round-trip test and no producer, so it is filed with the
+    /// reserved spellings rather than the shipped ones.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Finished => "run.finished",
@@ -1148,7 +1214,7 @@ impl TerminalEvent {
     }
 }
 
-/// The run-event vocabulary (`reference.md`, "Event vocabulary") as one
+/// The run-event vocabulary as one
 /// spelling source. `run.finished` / `run.failed` / `run.cancelled` are
 /// spelled by [`TerminalEvent`] and not repeated here — `cancelled` among
 /// them because it is the same *spelling*, not because it is shipped; see
@@ -1174,8 +1240,8 @@ pub mod run_event {
     pub const ANSWER_FINALIZED: &str = "answer.finalized";
 }
 
-/// The frozen specification of one run (`architecture.md` §6.4 / §10.1
-/// step 3): every knob that shaped the work, snapshotted at acceptance so a
+/// The frozen specification of one run — every knob that shaped the work,
+/// snapshotted at acceptance so a
 /// later config edit cannot rewrite what this run was asked to do.
 ///
 /// The serialization is the freeze: `runs.run_spec_json` holds exactly
@@ -1188,25 +1254,24 @@ pub struct RunSpec {
     pub mode: RunMode,
     /// The asked question, as the user wrote it.
     pub query: String,
-    /// Which model slot serves this run (D25: `ask` maps to `answer`).
+    /// Which model slot serves this run (`ask` maps to `answer`).
     pub slot: ModelSlot,
-    /// The thinking tier frozen for this run (D26).
+    /// The thinking tier frozen for this run.
     pub thinking: ThinkingTier,
     /// The provider model id, as configured for the slot.
     pub model: String,
     /// Output ceiling handed to the provider.
     pub max_output_tokens: u32,
-    /// Context budget of the build (§2 预算分配).
+    /// Context budget of the build.
     pub max_context_tokens: u32,
-    /// Whether tools may touch the network (Beta 默认保守: false).
+    /// Whether tools may touch the network (this build defaults conservative: false).
     pub allow_network: bool,
-    /// Whether tools may write files (Beta 默认保守: false).
+    /// Whether tools may write files (this build defaults conservative: false).
     pub allow_write: bool,
 }
 
 /// Why a [`RunSpec`] was refused. Typed so the caller reports the field,
-/// not a string to pattern-match (`architecture.md` §19: "RunSpec 校验失败
-/// 有明确错误").
+/// not a string to pattern-match: a validation failure names its field.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RunSpecError {
     /// The question is empty.
@@ -1219,13 +1284,42 @@ pub enum RunSpecError {
     #[error("run spec: max_output_tokens is zero")]
     ZeroOutput,
     /// The context budget is zero — the build could not keep its own
-    /// fixed levels honest (§6.6).
+    /// fixed levels honest.
     #[error("run spec: max_context_tokens is zero")]
     ZeroContext,
 }
 
 impl RunSpec {
     /// Checks the frozen spec against its own invariants.
+    ///
+    /// # Errors
+    ///
+    /// - `RunSpecError::EmptyQuery` when `query` is empty after trimming.
+    /// - `RunSpecError::EmptyModel` when `model` is empty after trimming.
+    /// - `RunSpecError::ZeroOutput` when `max_output_tokens` is zero.
+    /// - `RunSpecError::ZeroContext` when `max_context_tokens` is zero.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use momotaro_contracts::{ModelSlot, RunMode, RunSpec, RunSpecError, ThinkingTier};
+    ///
+    /// let mut spec = RunSpec {
+    ///     mode: RunMode::Ask,
+    ///     query: "what is BM25?".to_string(),
+    ///     slot: ModelSlot::Answer,
+    ///     thinking: ThinkingTier::Medium,
+    ///     model: "answer-model".to_string(),
+    ///     max_output_tokens: 2048,
+    ///     max_context_tokens: 8192,
+    ///     allow_network: false,
+    ///     allow_write: false,
+    /// };
+    /// assert!(spec.validate().is_ok());
+    ///
+    /// spec.query = "   ".to_string();
+    /// assert_eq!(spec.validate(), Err(RunSpecError::EmptyQuery));
+    /// ```
     pub fn validate(&self) -> Result<(), RunSpecError> {
         if self.query.trim().is_empty() {
             return Err(RunSpecError::EmptyQuery);
@@ -1243,9 +1337,8 @@ impl RunSpec {
     }
 }
 
-/// The severity of an expected error on the run timeline (`architecture.md`
-/// §18: expected errors land in `run_events` with `category / severity /
-/// attribution / retryable`).
+/// The severity of an expected error on the run timeline: expected errors
+/// land in `run_events` with `category / severity / attribution / retryable`.
 ///
 /// The spelling is a closed lowercase set in this repository's wire style and
 /// maps mechanically onto OpenTelemetry's log severity ranges (the
@@ -1330,31 +1423,31 @@ pub mod source_ref {
     pub const ORIGIN_CLASS: &str = "origin_class";
 }
 
-/// One `runs` row, exactly as stored (`architecture.md` §8.1) — the frozen
+/// One `runs` row, exactly as stored — the frozen
 /// record of an accepted unit of work. Shared by the store's read path and
-/// every surface that renders a trace (`reference.md`, "Run").
+/// every surface that renders a trace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRecord {
     /// Run identity (opaque, traceable).
     pub run_id: String,
     /// Session this run belongs to, when it belongs to one.
     pub session_id: Option<String>,
-    /// The run this one is an explicit retry of (harness §2).
+    /// The run this one is an explicit retry of.
     pub parent_run_id: Option<String>,
     /// Bound project, when there is one.
     pub project_id: Option<String>,
-    /// Task-graph coordinates (v0.9; unused by 0.x ask).
+    /// Task-graph coordinates (unused by the ask path).
     pub graph_id: Option<String>,
-    /// Task-graph coordinates (v0.9; unused by 0.x ask).
+    /// Task-graph coordinates (unused by the ask path).
     pub node_id: Option<String>,
-    /// Which attempt of the parent this is (harness: retries are new runs).
+    /// Which attempt of the parent this is (retries are new runs).
     pub attempt: i64,
     /// What kind of work this run performs.
     pub mode: String,
     /// The asked question, as the user wrote it.
     pub query: String,
     /// `accepted | running | finished | failed | cancelled` — a projection of
-    /// the terminal event (harness §1), never written beside it.
+    /// the terminal event, never written beside it.
     pub status: String,
     /// The idempotency key, when the caller supplied one.
     pub client_request_id: Option<String>,
@@ -1370,12 +1463,12 @@ pub struct RunRecord {
     pub context_window: Option<i64>,
     /// Output ceiling recorded at freeze.
     pub max_output_tokens: Option<i64>,
-    /// Graph-node distillate (v0.9; unused by 0.x).
+    /// Graph-node distillate (unused by the ask path).
     pub result_digest: Option<String>,
-    /// What a failed run still produced, annotated (multi-agent §5.1:
-    /// 失败必标注部分产出).
+    /// What a failed run still produced, annotated: a failed run must record
+    /// its partial output.
     pub failure_note: Option<String>,
-    /// Explicit deadline (graph nodes; unused by 0.x).
+    /// Explicit deadline (graph nodes; unused by the ask path).
     pub deadline_at: Option<i64>,
     /// When the run was accepted.
     pub created_at: i64,
@@ -1383,14 +1476,14 @@ pub struct RunRecord {
     pub finished_at: Option<i64>,
 }
 
-/// One `run_events` row: the run timeline (`harness.md` §6 — `run_events` 是
-/// 事实，`runs.status` 是投影).
+/// One `run_events` row: the run timeline — `run_events` are facts,
+/// `runs.status` is a projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunEventRecord {
     /// Position in the run's timeline, monotonic per run.
     pub seq: i64,
-    /// Event name from the stable vocabulary (`reference.md`, "Event
-    /// vocabulary"): `run.accepted`, `context.built`, …
+    /// Event name from the stable vocabulary:
+    /// `run.accepted`, `context.built`, …
     pub event_type: String,
     /// The event's payload. JSON by convention; the store does not parse it.
     pub data_json: String,
@@ -1398,7 +1491,7 @@ pub struct RunEventRecord {
     pub created_at: i64,
 }
 
-/// One `retrievals` row with its ranked hits (`architecture.md` §8.1).
+/// One `retrievals` row with its ranked hits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalRecord {
     /// Retrieval identity.
@@ -1417,7 +1510,7 @@ pub struct RetrievalRecord {
     pub hits: Vec<RetrievalHitRecord>,
 }
 
-/// One `retrieval_hits` row, exactly as stored (`architecture.md` §8.1):
+/// One `retrieval_hits` row, exactly as stored:
 /// the hit's citation key set plus what the context stage later decided about
 /// it (included in the model's context, or omitted and why). The display
 /// extras a [`RetrievalHit`] carries (`ordinal`, `heading_path`) are chunk
@@ -1448,8 +1541,8 @@ pub struct RetrievalHitRecord {
     pub omitted_reason: Option<String>,
 }
 
-/// One `run_context_items` row: what the model actually saw (`architecture.md`
-/// §8.1, aligned with `momotaro-context`'s `ContextFragment`).
+/// One `run_context_items` row: what the model actually saw, aligned with
+/// `momotaro-context`'s `ContextFragment`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextItemRecord {
     /// The run whose context this was.
@@ -1474,16 +1567,16 @@ pub struct ContextItemRecord {
     /// Hash of the `body` bytes (the store layer's algorithm, documented
     /// there).
     pub body_hash: String,
-    /// multi-agent §5.1 埋点（≤50 token 决策摘要）.
+    /// Decision summary (≤50 tokens) for this output.
     pub decision_rationale: Option<String>,
-    /// multi-agent §5.1 埋点.
+    /// Assumptions recorded alongside the output.
     pub assumptions: Option<String>,
-    /// multi-agent §5.1 埋点：指向被取代工件.
+    /// Points at the artefact this one supersedes.
     pub supersedes: Option<String>,
 }
 
 /// One `llm_turns` row: exactly one provider exchange, however many attempts
-/// it took (`reference.md`, "LLM turn").
+/// it took.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmTurnRecord {
     /// Turn identity.
@@ -1504,13 +1597,13 @@ pub struct LlmTurnRecord {
     pub input_tokens: Option<i64>,
     /// Output tokens as reported (NULL = not reported).
     pub output_tokens: Option<i64>,
-    /// Provider-reported cache-hit input tokens (0.3 起).
+    /// Provider-reported cache-hit input tokens.
     pub cached_tokens: Option<i64>,
     /// The provider's actual billing basis, when it reports one.
     pub billable_tokens: Option<i64>,
-    /// `answer | utility` — the frozen RunSpec's slot (D25).
+    /// `answer | utility` — the frozen RunSpec's slot.
     pub slot: Option<String>,
-    /// Thinking tokens inside the output (D26; billed at output rates).
+    /// Thinking tokens inside the output (billed at output rates).
     pub reasoning_tokens: Option<i64>,
     /// The provider's response id, when it exposes one (recorded verbatim).
     pub raw_ref: Option<String>,
@@ -1520,8 +1613,7 @@ pub struct LlmTurnRecord {
     pub finished_at: Option<i64>,
 }
 
-/// One `verifications` row: an independent deterministic result
-/// (`reference.md`, "Verification").
+/// One `verifications` row: an independent deterministic result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationRecord {
     /// Verification identity.
@@ -1540,7 +1632,7 @@ pub struct VerificationRecord {
     pub created_at: i64,
 }
 
-/// One `answers` row: the durable output of a run (`reference.md`, "Answer").
+/// One `answers` row: the durable output of a run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnswerRecord {
     /// Answer identity.
@@ -1553,18 +1645,18 @@ pub struct AnswerRecord {
     pub prompt_hash: String,
     /// When it was written.
     pub created_at: i64,
-    /// multi-agent §5.1 埋点（≤50 token 决策摘要）.
+    /// Decision summary (≤50 tokens) for this output.
     pub decision_rationale: Option<String>,
-    /// multi-agent §5.1 埋点.
+    /// Assumptions recorded alongside the output.
     pub assumptions: Option<String>,
-    /// multi-agent §5.1 埋点：指向被取代工件.
+    /// Points at the artefact this one supersedes.
     pub supersedes: Option<String>,
     /// The citations this answer asserts, in citation order.
     pub citations: Vec<AnswerCitationRecord>,
 }
 
 /// One `answer_citations` row: the five-tuple binding of one claim
-/// (`reference.md`, "Answer citation" — only the five-tuple makes a citation
+/// (only the five-tuple makes a citation
 /// verifiable).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnswerCitationRecord {
@@ -1586,8 +1678,8 @@ pub struct AnswerCitationRecord {
     pub verified: bool,
 }
 
-/// One `history_items` row: an appended conversation turn (`architecture.md`
-/// §6.5 — history 只追加).
+/// One `history_items` row: an appended conversation turn — history is
+/// only ever appended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryItemRecord {
     /// Stable identity (survives across session replay).
@@ -1605,7 +1697,7 @@ pub struct HistoryItemRecord {
     pub role: String,
     /// `text | summary.v1`.
     pub content_kind: String,
-    /// The body replayed verbatim (§6.5 History 不重写).
+    /// The body replayed verbatim (history is never rewritten).
     pub body: String,
     /// Carries `referenced_chunk_hashes` (a `summary.v1` mirror is reserved
     /// for a later schema — this build neither writes nor reads it).
@@ -1621,7 +1713,7 @@ pub struct HistoryItemRecord {
 }
 
 /// The full replay bundle of one run: every row one run wrote, in read order
-/// (`harness.md` §6.2 — `run_events` + canonical tables rebuild the complete
+/// (`run_events` + canonical tables rebuild the complete
 /// timeline; `trace`'s implementation is that property's acceptance).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunTrace {
@@ -1916,7 +2008,7 @@ mod tests {
         assert_eq!(
             AnchorKind::from_code("span"),
             None,
-            "`span` is the chunk locator's kind, never an anchor kind (§5 第 4 条)"
+            "`span` is the chunk locator's kind, never an anchor kind"
         );
     }
 
@@ -1944,7 +2036,7 @@ mod tests {
 
     #[test]
     fn the_graph_vocabularies_spell_exactly_as_the_contract_table() {
-        // Literals taken from architecture §8.2's three tables — written here
+        // Literals taken from the three contract tables — written here
         // by hand, so a spelling that drifts in `as_str` fails against the
         // contract text instead of against itself.
         assert_eq!(
@@ -1965,7 +2057,7 @@ mod tests {
     fn every_failure_kind_spells_the_same_on_the_wire() {
         // The terminal reads Display, the JSON reads serde; if they drift, "branch
         // on the kind" silently means two different things. The list below is
-        // hand-written: a review measured that a ninth variant IS NOT forced into
+        // hand-written: a ninth variant is not forced into
         // this loop, so adding one means adding it here too.
         for kind in [
             IndexFileErrorKind::KeyCollision,
@@ -2101,7 +2193,7 @@ mod tests {
         assert_eq!(hit, decoded);
     }
 
-    // --- source-key contract (ADR 0002 / D42) ---
+    // --- source-key contract ---
 
     #[test]
     fn every_source_kind_is_in_all() {
@@ -2233,7 +2325,7 @@ mod tests {
 
     /// A backslash is a legal filename character on POSIX. Rewriting it to `/`
     /// would be a silent rename and would fold two distinct vault files into
-    /// one identity (independent-review finding, 2026-09-16).
+    /// one identity.
     #[test]
     fn note_key_keeps_backslashes_verbatim() {
         assert_eq!(note_source_key(r"a\b.md").unwrap(), r"note:a\b.md");
@@ -2249,8 +2341,8 @@ mod tests {
     }
 
     /// A single leading backslash is Windows root-relative but a legal POSIX
-    /// name; like other Windows-illegal names it is kept verbatim (D42 indexes
-    /// such names and warns at the vault layer).
+    /// name; like other Windows-illegal names it is kept verbatim — the vault
+    /// layer indexes such names and warns.
     #[test]
     fn note_key_keeps_leading_backslash_name_verbatim() {
         assert_eq!(
@@ -2290,7 +2382,7 @@ mod tests {
 
     #[test]
     fn note_key_keeps_windows_illegal_characters_verbatim() {
-        // `:` is legal on POSIX; D42 indexes such names and warns, so the key
+        // `:` is legal on POSIX; the vault indexes such names and warns, so the key
         // layer must not rewrite or reject them.
         assert_eq!(note_source_key("a:b.md").unwrap(), "note:a:b.md");
         // The length guard is the thing that keeps `bytes[2]` readable: a

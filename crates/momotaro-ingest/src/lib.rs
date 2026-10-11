@@ -2,15 +2,55 @@
 //!
 //! Turns vault Markdown files into deterministic `SourceRevision` + `Chunk`
 //! sets. Pure where possible; only `walk`/file reads touch the filesystem.
+//!
+//! # Examples
+//!
+//! Normalize a note, take its frontmatter out of the index text, and chunk the
+//! body while keeping locators on the note:
+//!
+//! ```
+//! # use momotaro_ingest::IngestError;
+//! # fn main() -> Result<(), IngestError> {
+//! use momotaro_contracts::IndexPolicy;
+//! use momotaro_ingest::{
+//!     SourceOffset, chunk_markdown_with, frontmatter, normalize_markdown, revision_hash,
+//! };
+//!
+//! let note = normalize_markdown(
+//!     b"---\ntitle: Fourier\n---\n\n# Fourier\n\nEnergy is conserved.",
+//! )?;
+//! let (parsed, body) = frontmatter::split(&note);
+//! assert!(matches!(parsed, frontmatter::FrontmatterParse::Parsed(_)));
+//! assert_eq!(body, "\n# Fourier\n\nEnergy is conserved.");
+//!
+//! // Locators must address the note, not the body slice: carry the offset.
+//! let offset = SourceOffset::before_body(&note, body);
+//! let chunks = chunk_markdown_with(
+//!     "note:notes/fourier.md",
+//!     &revision_hash(&note),
+//!     body,
+//!     &IndexPolicy::default(),
+//!     offset,
+//!     &[],
+//!     None,
+//! );
+//! assert_eq!(chunks.len(), 1);
+//! assert_eq!(chunks[0].text, "Energy is conserved.");
+//! assert_eq!(chunks[0].heading_path.as_deref(), Some("Fourier"));
+//! # Ok(())
+//! # }
+//! ```
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(rustdoc::all)]
+#![warn(rustdoc::unescaped_backticks)]
 
 use momotaro_contracts::IndexFileErrorKind;
 
 /// The shared parsing base for this crate's three passes (`collect_blocks`,
 /// `analyze`, `first_h1`): one const, so a parser option cannot land in two
-/// of the three places (probe P1-F4). `union` is a `const fn` (bitflags 2.x).
+/// of the three places. `union` is a `const fn` (bitflags 2.x).
 pub(crate) const PARSE_OPTIONS: pulldown_cmark::Options =
     pulldown_cmark::Options::ENABLE_TABLES.union(pulldown_cmark::Options::ENABLE_WIKILINKS);
 
@@ -54,7 +94,7 @@ pub enum IngestError {
     /// A path argument is not beneath the vault root.
     #[error("path {0} is outside vault root")]
     OutsideVault(String),
-    /// A path argument is not beneath the workspace root (ADR 0024).
+    /// A path argument is not beneath the workspace root.
     #[error("path {0} is outside the workspace")]
     OutsideWorkspace(String),
     /// A derived source key violated the key contract.

@@ -1,19 +1,19 @@
 //! Run bookkeeping: the `runs`, `run_events`, `retrievals`, `retrieval_hits`,
 //! `run_context_items`, `llm_turns`, `answers`, `answer_citations`,
-//! `verifications` and `history_items` tables (`architecture.md` §8.1), and
+//! `verifications` and `history_items` tables, and
 //! the one-transaction units that write them.
 //!
 //! The units are the run-side family of [`Store::commit_source_file`]: each
 //! lands its rows **and its vocabulary event in the same `BEGIN IMMEDIATE`**
 //! — the event-rides-the-transaction shape that closes the lost-event window
-//! (`harness.md` §1 for the terminal coupling: `runs.status` is a projection
+//! (the terminal coupling: `runs.status` is a projection
 //! of the terminal event, and the two never exist apart; the intermediate
 //! writes get the same shape because a data row whose event is missing is a
 //! timeline that lies about what happened).
 //!
 //! `run_events.seq` is assigned by the store inside each unit's transaction
 //! (`MAX(seq) + 1` per run); the `(run_id, seq)` primary key is the backstop
-//! (`harness.md` §6). Every row names its own run and the unit cross-checks
+//! Every row names its own run and the unit cross-checks
 //! the parameter against it before anything is written — a row about another
 //! run riding this unit would claim work that is not there, the same rule
 //! `commit_source_file` enforces for its event. The two names are one fact,
@@ -42,8 +42,7 @@ pub struct NewRunEvent {
 
 /// The input half of one `runs` row — everything the caller knows at
 /// acceptance time. `status` is not here because it is not the caller's to
-/// say: creation writes `accepted`, and only terminal events move it
-/// (`harness.md` §1).
+/// say: creation writes `accepted`, and only terminal events move it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewRun {
     /// Run identity (opaque; the caller generates it).
@@ -60,8 +59,8 @@ pub struct NewRun {
     pub mode: String,
     /// The asked question, as the user wrote it.
     pub query: String,
-    /// Idempotency key: replaying the same request returns the same run
-    /// (`harness.md` §1), so this is `UNIQUE` and looked up first.
+    /// Idempotency key: replaying the same request returns the same run,
+    /// so this is `UNIQUE` and looked up first.
     pub client_request_id: Option<String>,
     /// Hash of `run_spec_json`'s exact bytes.
     pub run_spec_hash: String,
@@ -109,16 +108,16 @@ impl CreateRunOutcome {
     }
 }
 
-/// The event payload of the crash sweep's `run.failed` (`harness.md` §2:
-/// `data.category = interrupted`, `attribution = system`,
+/// The event payload of the crash sweep's `run.failed`
+/// (`data.category = interrupted`, `attribution = system`,
 /// `retryable = true`). A literal: the store neither parses nor validates
-/// payload JSON (ADR 0026).
+/// payload JSON.
 pub(crate) const INTERRUPTED_DATA: &str = "{\"attribution\":\"system\",\"category\":\"interrupted\",\"retryable\":true,\"severity\":\"error\"}";
 
-/// The input half of one `sessions` row (`architecture.md` §8.1).
+/// The input half of one `sessions` row.
 ///
 /// `title` is `NOT NULL` in the DDL, so the caller brings one; `ask` derives
-/// it from the first query, which is why `title_source` exists — 0.x only
+/// it from the first query, which is why `title_source` exists — this build only
 /// ever writes `derived`, and a user's rename is never overwritten by it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewSession {
@@ -130,7 +129,7 @@ pub struct NewSession {
     pub title_source: String,
     /// The session's first question, kept whole.
     pub first_user_message: Option<String>,
-    /// Project bound at creation; immutable afterward (ADR 0003).
+    /// Project bound at creation; immutable afterward.
     pub project_id: Option<String>,
     /// When the session was created; also `updated_at` and `last_activity_at`.
     pub created_at: i64,
@@ -149,8 +148,8 @@ pub struct SessionRecord {
     pub first_user_message: Option<String>,
     /// When the session was created.
     pub created_at: i64,
-    /// When the session last took a turn — the recency axis
-    /// `architecture.md` documents as distinct from `created_at`.
+    /// When the session last took a turn — the recency axis, distinct
+    /// from `created_at`.
     pub last_activity_at: Option<i64>,
 }
 
@@ -160,7 +159,66 @@ impl Store {
     ///
     /// Replaying a request that carries the same `client_request_id` returns
     /// the run that key already created and writes nothing — idempotent by
-    /// construction (`harness.md` §1). A run without a key is never deduped.
+    /// construction. A run without a key is never deduped.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::IdempotencyConflict` when the `client_request_id`
+    ///   already names a run whose stored `run_spec_hash` differs from this
+    ///   request's.
+    /// - `StoreError::Sqlite` when any statement of the transaction — the
+    ///   replay lookup, the clock clamp, the insert, the event append, or the
+    ///   commit — fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use momotaro_store::{CreateRunOutcome, NewRun, NewRunEvent, Store};
+    ///
+    /// # fn main() -> Result<(), momotaro_store::StoreError> {
+    /// # let mut store = Store::open("workspace/.momotaro/momotaro.db")?;
+    /// # store.init_schema()?;
+    /// let spec_json = "{\"mode\":\"ask\",\"query\":\"what is PCA?\"}";
+    /// let run = NewRun {
+    ///     run_id: "run-1".to_owned(),
+    ///     session_id: None,
+    ///     parent_run_id: None,
+    ///     project_id: None,
+    ///     attempt: 1,
+    ///     mode: momotaro_contracts::RunMode::Ask.as_str().to_owned(),
+    ///     query: "what is PCA?".to_owned(),
+    ///     client_request_id: Some("req-1".to_owned()),
+    ///     // Hex of the sha256 over the frozen spec bytes, computed by the
+    ///     // caller that froze them.
+    ///     run_spec_hash: "114113e6fe1d2346ebc50dbecac3794e0984a5a8ab72aab941b82322870d6212"
+    ///         .to_owned(),
+    ///     run_spec_json: spec_json.to_owned(),
+    ///     provider: Some("openai-compatible".to_owned()),
+    ///     model: Some("gpt-4o-mini".to_owned()),
+    ///     context_window: Some(128_000),
+    ///     max_output_tokens: Some(1_024),
+    ///     created_at: 1_700_000_000,
+    /// };
+    /// let accepted = NewRunEvent {
+    ///     event_type: momotaro_contracts::run_event::ACCEPTED.to_owned(),
+    ///     data_json: "{}".to_owned(),
+    ///     created_at: 1_700_000_000,
+    /// };
+    ///
+    /// let outcome = store.commit_run_create(&run, &accepted)?;
+    /// assert!(outcome.created());
+    ///
+    /// // The same key replays to the same run, and writes nothing.
+    /// let replay = store.commit_run_create(&run, &accepted)?;
+    /// assert_eq!(
+    ///     replay,
+    ///     CreateRunOutcome::Existing {
+    ///         run_id: "run-1".to_owned()
+    ///     }
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn commit_run_create(
         &mut self,
         run: &NewRun,
@@ -192,8 +250,8 @@ impl Store {
         }
         // `created_at` is transaction time and must not go backwards: an NTP
         // step would let a later run sort before an earlier one, and the round
-        // axis orders by `(runs.created_at, run_id)` (`context-retrieval.md`
-        // §3). Same clamp `store_events.recorded_at` applies. This reads
+        // axis orders by `(runs.created_at, run_id)`. Same clamp
+        // `store_events.recorded_at` applies. This reads
         // `MAX(created_at)` by full scan — `runs` gains a row per ask, and the
         // integer primary key `recorded_at` takes its max from is exactly what
         // `runs` does not have.
@@ -236,6 +294,11 @@ impl Store {
     /// Creates one session row. `session_id` is the primary key, so a second
     /// call for the same id is a constraint failure rather than a silently
     /// second session — the caller checks first and refuses.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the insert fails — including a second row
+    ///   for one `session_id`, which the primary key rejects.
     pub fn create_session(&mut self, session: &NewSession) -> Result<(), StoreError> {
         self.connection.execute(
             "INSERT INTO sessions (
@@ -257,6 +320,10 @@ impl Store {
 
     /// Whether a session with this id exists — the check that turns a typo'd
     /// `--session` into an error instead of a silently new conversation.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the lookup fails.
     pub fn session_exists(&self, session_id: &str) -> Result<bool, StoreError> {
         let found: Option<i64> = self
             .connection
@@ -277,7 +344,12 @@ impl Store {
     /// writes both, but until now nothing could read them back: the row was
     /// write-only and an empty title would have passed every test in the
     /// repo. Also the cheapest way to count sessions, which is how a replayed
-    /// request proves it minted no second conversation (`harness.md` §1).
+    /// request proves it minted no second conversation.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the statement cannot be prepared or the
+    ///   rows cannot be read back.
     pub fn sessions(&self) -> Result<Vec<SessionRecord>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT session_id, title, title_source, first_user_message, created_at,
@@ -303,8 +375,12 @@ impl Store {
     ///
     /// Ordering is `(created_at, run_id, seq)`: `created_at` alone is not a
     /// total order — SQLite returns ties in an undefined sequence — so the
-    /// run id breaks them and `seq` orders the rows inside one run
-    /// (`context-retrieval.md` §3).
+    /// run id breaks them and `seq` orders the rows inside one run.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the statement cannot be prepared or the
+    ///   rows cannot be read back.
     pub fn history_for_session(
         &self,
         session_id: &str,
@@ -318,12 +394,17 @@ impl Store {
         Ok(rows)
     }
 
-    /// The session's turn runs, oldest first — the axis `context-retrieval.md`
-    /// §3 numbers rounds by.
+    /// The session's turn runs, oldest first — the axis rounds are
+    /// numbered by.
     ///
     /// Only runs that actually wrote history count. A failed `ask` leaves no
     /// rows, and if it still consumed a round number the recency guard band
     /// would silently protect one real turn instead of two.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the statement cannot be prepared or the
+    ///   rows cannot be read back.
     pub fn turn_runs_for_session(&self, session_id: &str) -> Result<Vec<String>, StoreError> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT runs.run_id FROM runs
@@ -339,8 +420,8 @@ impl Store {
     /// The session's `run_context_items`, for the runs that wrote history —
     /// the same run set [`Self::turn_runs_for_session`] numbers rounds by.
     ///
-    /// This is the source of `first_seen_order` (`context-retrieval.md`
-    /// §1.1), which is why the predicate has to match the round axis exactly:
+    /// This is the source of `first_seen_order`, which is why the predicate
+    /// has to match the round axis exactly:
     /// two different run sets would give the ledger and the guard band two
     /// different ideas of what a turn is. The SQL cannot carry the round
     /// order — it needs `runs.created_at`, which lives on the other table —
@@ -351,6 +432,11 @@ impl Store {
     /// [`momotaro_contracts::ContextItemRecord`]: this runs once per
     /// `ask --session` turn and `body` is the largest blob in the schema,
     /// so reading it to discard it is work the row set exists to avoid.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the statement cannot be prepared or the
+    ///   rows cannot be read back.
     pub fn context_items_for_session(
         &self,
         session_id: &str,
@@ -376,6 +462,13 @@ impl Store {
 
     /// Commits the `accepted → running` step in one `BEGIN IMMEDIATE`: the
     /// status projection and its `run.started` event land together.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::RunMissing` when no run with `run_id` exists.
+    /// - `StoreError::InvalidValue` when the run exists but its status is
+    ///   already past `accepted` (the value reports the status found).
+    /// - `StoreError::Sqlite` when any statement of the transaction fails.
     pub fn commit_run_start(
         &mut self,
         run_id: &str,
@@ -402,6 +495,34 @@ impl Store {
     /// `llm.started`): those are pure events, and an event with no data half
     /// has no half-state to close. Everything that lands rows takes the event
     /// on its unit instead.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::RunMissing` when no run with `run_id` exists.
+    /// - `StoreError::Sqlite` when the lookup, the event append or the commit
+    ///   fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use momotaro_store::{NewRunEvent, Store};
+    ///
+    /// # fn main() -> Result<(), momotaro_store::StoreError> {
+    /// # let mut store = Store::open("workspace/.momotaro/momotaro.db")?;
+    /// # store.init_schema()?;
+    /// let started = NewRunEvent {
+    ///     event_type: momotaro_contracts::run_event::LLM_STARTED.to_owned(),
+    ///     data_json: "{}".to_owned(),
+    ///     created_at: 1_700_000_000,
+    /// };
+    ///
+    /// store.append_run_event("run-1", &started)?;
+    ///
+    /// // An id no run ever had is refused, not written down.
+    /// assert!(store.append_run_event("no-such-run", &started).is_err());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn append_run_event(
         &mut self,
         run_id: &str,
@@ -416,6 +537,13 @@ impl Store {
 
     /// Commits one retrieval in one `BEGIN IMMEDIATE`: the `retrievals` row,
     /// its `retrieval_hits`, and the `retrieval.finished` event together.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::InvalidValue` (column `run_id`) when `retrieval.run_id`
+    ///   differs from the `run_id` argument.
+    /// - `StoreError::RunMissing` when no run with `run_id` exists.
+    /// - `StoreError::Sqlite` when any statement of the transaction fails.
     pub fn commit_run_retrieval(
         &mut self,
         run_id: &str,
@@ -452,6 +580,13 @@ impl Store {
 
     /// Commits one context build in one `BEGIN IMMEDIATE`: the
     /// `run_context_items` rows and the `context.built` event together.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::InvalidValue` (column `run_id`) when an item's `run_id`
+    ///   differs from the `run_id` argument.
+    /// - `StoreError::RunMissing` when no run with `run_id` exists.
+    /// - `StoreError::Sqlite` when any statement of the transaction fails.
     pub fn commit_run_context(
         &mut self,
         run_id: &str,
@@ -498,6 +633,13 @@ impl Store {
     /// `llm_turns` row and the `llm.finished` event together. The turn row
     /// lands for failed exchanges too (status `failed`) — its usage columns
     /// are the record of what the attempt spent.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::InvalidValue` (column `run_id`) when the turn's
+    ///   `run_id` differs from the `run_id` argument.
+    /// - `StoreError::RunMissing` when no run with `run_id` exists.
+    /// - `StoreError::Sqlite` when any statement of the transaction fails.
     pub fn commit_run_llm_turn(
         &mut self,
         run_id: &str,
@@ -544,6 +686,13 @@ impl Store {
 
     /// Commits one verification batch in one `BEGIN IMMEDIATE`: the
     /// `verifications` rows and the `citation.validated` event together.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::InvalidValue` (column `run_id`) when a verification's
+    ///   `run_id` differs from the `run_id` argument.
+    /// - `StoreError::RunMissing` when no run with `run_id` exists.
+    /// - `StoreError::Sqlite` when any statement of the transaction fails.
     pub fn commit_run_verifications(
         &mut self,
         run_id: &str,
@@ -584,6 +733,15 @@ impl Store {
     /// `answer.finalized` event together. An answer never lands without its
     /// citations (an uncited answer is a legitimate state — a *half* answer
     /// is not: the two would be indistinguishable).
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::InvalidValue` (column `run_id`) when `answer.run_id` or
+    ///   a history item's `run_id` differs from the `run_id` argument.
+    /// - `StoreError::InvalidValue` (column `session_id`) when a history
+    ///   item's session differs from the run's stored session.
+    /// - `StoreError::RunMissing` when no run with `run_id` exists.
+    /// - `StoreError::Sqlite` when any statement of the transaction fails.
     pub fn commit_run_answer(
         &mut self,
         run_id: &str,
@@ -605,7 +763,7 @@ impl Store {
         // gains a phantom round and the guard band protects one turn fewer
         // than exist. `idx_history_items_session` is why that column is read
         // directly rather than joined off `runs`, so the agreement has to be
-        // enforced where the row is written (`context-retrieval.md` §3).
+        // enforced where the row is written.
         let run_session: Option<String> = tx.query_row(
             "SELECT session_id FROM runs WHERE run_id = ?1",
             params![run_id],
@@ -653,7 +811,7 @@ impl Store {
         // clock step between the two writes replays the conversation
         // **backwards** while the rounds stay monotone — and
         // `guard_band_from_round` accumulates its 8000-token bound over
-        // whichever sequence it was handed (`context-retrieval.md` §3).
+        // whichever sequence it was handed.
         // Both sequences are then non-decreasing in insertion order and ties
         // fall to `run_id`, so the two axes cannot come apart. Same clamp
         // `runs.created_at` and `store_events.recorded_at` already apply.
@@ -698,7 +856,7 @@ impl Store {
             )?;
         }
         // `sessions.last_activity_at` is documented as「recency 排序，区别于
-        // created_at」(`architecture.md`) — a column set once at insert and
+        // created_at」 — a column set once at insert and
         // never again would contradict that comment from the second turn on.
         // Bumped inside the same unit as the history it describes, and
         // clamped to its own stored value so a clock step back cannot make a
@@ -727,15 +885,21 @@ impl Store {
     }
 
     /// Commits one run's terminal step in one `BEGIN IMMEDIATE` — the
-    /// coupling `harness.md` §1 makes non-negotiable: the terminal event and
+    /// coupling is non-negotiable: the terminal event and
     /// the status update it projects land atomically, so
     /// 「status=finished 但没有 terminal 事件」and its mirror cannot exist.
     ///
     /// The status is **derived from the event** (one spelling source:
     /// [`TerminalEvent::projected_status`]), not passed separately. A run
     /// that is already terminal — or missing — is refused and nothing lands.
-    /// `failure_note` annotates a failed run's partial output (multi-agent
-    /// §5.1: 失败必标注部分产出).
+    /// `failure_note` annotates a failed run's partial output (失败必标注部分产出).
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::RunMissing` when no run with `run_id` exists.
+    /// - `StoreError::InvalidValue` when the run exists but is already
+    ///   terminal (the value reports the status found).
+    /// - `StoreError::Sqlite` when any statement of the transaction fails.
     pub fn commit_run_terminal(
         &mut self,
         run_id: &str,
@@ -777,6 +941,10 @@ impl Store {
     /// what a successful one leaves behind — is invisible to it; asking whether
     /// `--mode expand` or a refused `ask` created a run needs the terminal
     /// count, not the sweep.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the count query fails.
     pub fn run_count(&self) -> Result<u64, StoreError> {
         // Same shape as `count_batch`: SQLite counts come back signed.
         let count = self
@@ -785,23 +953,29 @@ impl Store {
         Ok(u64::try_from(count).unwrap_or(u64::MAX))
     }
 
-    /// The deterministic crash sweep (`harness.md` §2): every run left
+    /// The deterministic crash sweep: every run left
     /// `accepted` or `running` with no terminal event is closed as
     /// `failed(interrupted)` — the terminal unit per run, so an interrupted
     /// sweep is itself resumable. Returns the swept run ids.
     ///
     /// Callers: the run engine's store opens (`ask` / `trace`). Read-only
-    /// inspectors do not sweep — `doctor` writes nothing (`usage.md`), so
+    /// inspectors do not sweep — `doctor` writes nothing, so
     /// "the run engine's open sweeps" is where the rule is implemented.
     ///
-    /// The「属于已死进程」half of `harness.md` §2 is **not** a third clause in
-    /// this predicate — §2 now says so itself. It is implied by 0.x's
-    /// single-writer discipline (harness §5), which also records that
+    /// The「属于已死进程」half is **not** a third clause in
+    /// this predicate. It is implied by this build's single-writer
+    /// discipline, which also records that
     /// discipline's known breach: two concurrent CLIs across sessions sweep
     /// each other's *live* runs. Not evaluated here; a live run cannot
     /// coexist with this sweep **in one** process. A future desktop that
     /// opens a second writer mid-run owes the clause a real liveness check
     /// before that happens.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the pending-run scan or a per-run terminal
+    ///   unit fails. A failure aborts the sweep partway; the runs not yet
+    ///   closed are swept by the next call.
     pub fn sweep_interrupted_runs(&mut self) -> Result<Vec<String>, StoreError> {
         let pending: Vec<String> = self
             .connection
@@ -815,7 +989,7 @@ impl Store {
         for run_id in pending {
             // The note names the last step that completed, so a swept run's
             // partial output is annotated rather than swallowed
-            // (multi-agent §5.1). `none` when the timeline is empty.
+            // `none` when the timeline is empty.
             let last: Option<String> = self
                 .connection
                 .query_row(
@@ -851,6 +1025,10 @@ impl Store {
     }
 
     /// Reads the run one idempotency key names, when one exists.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the lookup fails.
     pub fn run_id_for_client_request(
         &self,
         client_request_id: &str,
@@ -871,6 +1049,10 @@ impl Store {
     /// Replay is equal to the *same request*, not merely the same key: ask
     /// compares the caller's freshly frozen hash to the stored one before it
     /// replays.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the lookup fails.
     pub fn run_request_hash_for_client_request(
         &self,
         client_request_id: &str,
@@ -885,8 +1067,35 @@ impl Store {
             .map_err(StoreError::from)
     }
 
-    /// Reads everything one run wrote, in replay order (`harness.md` §6.2:
-    /// `run_events` + canonical tables rebuild the complete timeline).
+    /// Reads everything one run wrote, in replay order (`run_events` +
+    /// canonical tables rebuild the complete timeline).
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Invariant` when the store holds more than one `answers`
+    ///   row for the run.
+    /// - `StoreError::Sqlite` when any of the timeline statements fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use momotaro_store::Store;
+    ///
+    /// # fn main() -> Result<(), momotaro_store::StoreError> {
+    /// # let store = Store::open("workspace/.momotaro/momotaro.db")?;
+    /// match store.run_trace("run-1")? {
+    ///     Some(trace) => {
+    ///         println!("{} is {}", trace.run.run_id, trace.run.status);
+    ///         for event in &trace.events {
+    ///             println!("{} {}", event.seq, event.event_type);
+    ///         }
+    ///     }
+    ///     // An id no run ever had is an answer, not an error.
+    ///     None => println!("no such run"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn run_trace(&self, run_id: &str) -> Result<Option<RunTrace>, StoreError> {
         let Some(run) = self.run_record(run_id)? else {
             return Ok(None);
@@ -1089,8 +1298,8 @@ const SELECT_HISTORY_ITEM: &str = "SELECT
 ///
 /// Read by exactly one query, [`Store::sweep_interrupted_runs`] — which is
 /// also what makes it a *dead-run* predicate rather than a liveness test: a
-/// row matching it has no terminal event, which in 0.x's single-writer
-/// discipline (`harness.md` §5) means its process is gone, since the sweep
+/// row matching it has no terminal event, which in this build's single-writer
+/// discipline means its process is gone, since the sweep
 /// itself runs in the open that would have to coexist with it. `ask` used to
 /// ask the same predicate as a "session busy" refusal before it swept; that
 /// refusal could only ever fire on a run about to be reaped, so it now lets
@@ -1112,15 +1321,15 @@ const ACTIVE_RUN_PREDICATE: &str = "status IN ('accepted', 'running')
 /// different ideas of what a turn is — and only one direction of that
 /// mismatch is loud, because a stray item would sort last rather than error.
 ///
-/// `context-retrieval.md` §3 defines a round as an **ask** run, and this
-/// predicate does not say `runs.mode = 'ask'`. That is equivalent in 0.x and
+/// A round is defined as an **ask** run, and this
+/// predicate does not say `runs.mode = 'ask'`. That is equivalent in this build and
 /// only because `mode = search` runs are created with `session_id = NULL`
 /// (`index_service.rs`), so they cannot match the first clause at all; the
 /// day another mode starts writing session-scoped history the two stop being
 /// the same set. Adding the clause now would mean adding it to
 /// [`Store::history_for_session`] too — which reads `history_items`, a table
 /// with no `mode` column, so it would need a subquery and give up the
-/// left-most-column use of `idx_history_items_session` that schema v8 exists
+/// left-most-column use of `idx_history_items_session` that schema 8 exists
 /// for. Registered as the latent gap it is rather than paid for today.
 const TURN_RUNS_PREDICATE: &str = "runs.session_id = ?1
                AND EXISTS (
@@ -1546,7 +1755,7 @@ mod tests {
         );
     }
 
-    /// The terminal coupling, spelled the way `harness.md` §1 demands: the
+    /// The terminal coupling: the
     /// status is a projection of the terminal event and the two never exist
     /// apart. This test carries the direction "the event fails — the status
     /// stays"; the mirror ("a status can never claim a terminal whose event
@@ -1636,7 +1845,7 @@ mod tests {
     }
 
     /// Replaying a request with the same `client_request_id` returns the run
-    /// that key already created (`harness.md` §8.2): same run, no second row,
+    /// that key already created: same run, no second row,
     /// no second acceptance event.
     #[test]
     fn replaying_a_client_request_returns_the_same_run() {
@@ -1689,7 +1898,7 @@ mod tests {
         assert_eq!(scalar(&store, "SELECT COUNT(*) FROM run_events"), 1);
     }
 
-    /// A session binds its project when the row is created (ADR 0003); NULL is
+    /// A session binds its project when the row is created; NULL is
     /// the unbound state, never a deferred decision.
     #[test]
     fn a_session_stores_the_project_bound_at_creation() {
@@ -1766,7 +1975,7 @@ mod tests {
 
     /// The sweep closes exactly the dangling: `accepted` or `running` with no
     /// terminal event, annotated with the last step that completed
-    /// (`harness.md` §2 / multi-agent §5.1). Terminal runs are untouched, and
+    /// Terminal runs are untouched, and
     /// a second sweep finds nothing.
     #[test]
     fn the_sweep_closes_dangling_runs_as_interrupted() {
@@ -1908,7 +2117,7 @@ mod tests {
     }
 
     /// `seq` climbs per run and per run only — the store assigns the next one
-    /// inside each unit (`harness.md` §6.1).
+    /// inside each unit.
     #[test]
     fn event_seqs_climb_per_run() {
         let (_dir, mut store) = temp_store();
@@ -1966,7 +2175,7 @@ mod tests {
 
     /// The store owns the turn order key: two turns of one run cannot share a
     /// `seq`, or `run_trace`'s `ORDER BY seq` replay order would fall to
-    /// SQLite's unspecified scan order (`idx_llm_turns_run_seq`, schema v9).
+    /// SQLite's unspecified scan order (`idx_llm_turns_run_seq`, schema 9).
     #[test]
     fn a_duplicate_llm_turn_seq_is_refused() {
         let (_dir, mut store) = temp_store();
@@ -2374,7 +2583,7 @@ mod tests {
             created_at_of(&store, "run-later-by-clock"),
             1_000,
             "a clock that stepped backwards must not sort a later run first \
-             (context-retrieval.md §3 orders rounds by (created_at, run_id))"
+             (rounds order by (created_at, run_id))"
         );
     }
 
@@ -2647,8 +2856,8 @@ mod tests {
         accepted(&mut store, &run_at("run-done", Some("sess-1"), 101));
 
         // Contradictory on purpose: status still says running while a
-        // terminal event is present. The event wins (`harness.md` §1: status
-        // is a projection). `commit_run_terminal` would move the status too,
+        // terminal event is present. The event wins — status is a projection.
+        // `commit_run_terminal` would move the status too,
         // so this shape is built by hand with raw SQL — the API cannot make
         // it, which is exactly why it is worth pinning.
         store
@@ -2828,8 +3037,8 @@ mod tests {
         );
     }
 
-    /// A clock step must not pull the replay axis away from the round axis
-    /// (`context-retrieval.md` §3). The round axis clamps
+    /// A clock step must not pull the replay axis away from the round axis.
+    /// The round axis clamps
     /// `runs.created_at`; if `history_items.created_at` did not, the
     /// conversation would replay in the **opposite** order to the rounds
     /// that number it, and `guard_band_from_round` would walk the history
@@ -2862,8 +3071,8 @@ mod tests {
 
     /// Two turn runs in the *same second*: `created_at` alone cannot order
     /// them — SQLite leaves a full tie in an undefined sequence — so
-    /// `run_id` is the second key `context-retrieval.md` §3 calls
-    /// 「缺一不可」. The fixture inserts them **in reverse id order**, so only
+    /// `run_id` is the second key, 「缺一不可」. The fixture inserts them
+    /// **in reverse id order**, so only
     /// that tiebreak can put them right; dropping it from either query hands
     /// the guard band the wrong two rounds while the replay says otherwise.
     #[test]

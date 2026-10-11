@@ -1,4 +1,4 @@
-//! Stateless OpenAI-compatible LLM client (`docs/docs/architecture.md` §16).
+//! Stateless OpenAI-compatible LLM client.
 //!
 //! The crate answers exactly one question — given `model / messages / tools /
 //! max_tokens`, what did the provider return? — and reports `text / usage /
@@ -11,7 +11,7 @@
 //!   canonical serialization — the exact bytes [`complete`] sends — so tool
 //!   order participates in the hash for the same reason it participates in the
 //!   provider's prompt cache: the provider's cache key *is* the serialization
-//!   order of the tools JSON (context-retrieval.md §1).
+//!   order of the tools JSON.
 //! * **Retry is bounded by output.** At most one retry, and only while nothing
 //!   is observable yet: a failure that lands after a 2xx body exists is
 //!   reported as-is, never replayed.
@@ -24,9 +24,44 @@
 //! crates; built-in for this crate's own tests). [`http`] is the one production
 //! implementation of that seam; it is built and configured by tests, never
 //! called, so CI cannot reach the network.
+//!
+//! # Examples
+//!
+//! Build one request, then read the canonical body a transport sends and the
+//! hash that identifies it:
+//!
+//! ```
+//! use momotaro_llm::{LlmRequest, Message, Role};
+//!
+//! let request = LlmRequest {
+//!     model: "gpt-4o-mini".to_string(),
+//!     messages: vec![Message {
+//!         role: Role::User,
+//!         content: "hello".to_string(),
+//!     }],
+//!     tools: vec![],
+//!     max_tokens: 256,
+//! };
+//!
+//! // Object keys come out lexicographic at every level; arrays keep the
+//! // caller's order.
+//! assert_eq!(
+//!     request.canonical_json(),
+//!     concat!(
+//!         r#"{"max_tokens":256,"messages":[{"content":"hello","role":"user"}],"#,
+//!         r#""model":"gpt-4o-mini","tools":[]}"#
+//!     )
+//! );
+//! assert_eq!(
+//!     request.request_hash(),
+//!     "b990e32c882ad832ae7264023fb7febcfcb9ac6df49dc2abe49f84404ce9ebe7"
+//! );
+//! ```
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(rustdoc::all)]
+#![warn(rustdoc::unescaped_backticks)]
 
 pub mod error;
 #[cfg(any(test, feature = "test-util"))]
@@ -46,7 +81,7 @@ use response::parse_response;
 
 /// Send one request and decode one completion.
 ///
-/// Retry policy (architecture §16: "只在可观察输出前 retry"): at most one
+/// Retry policy (retry only before observable output): at most one
 /// retry per call, and only for a failure that happened while no provider
 /// output was observable yet. Output becomes observable the moment a 2xx body
 /// exists — even one we cannot read — so a failure from that point on is
@@ -55,8 +90,70 @@ use response::parse_response;
 /// Both outcomes record how many sends they took ([`LlmOutput::attempts`] /
 /// [`LlmError::attempts`]). When a permitted retry also failed, the reported
 /// failure is the last attempt's and `attempts` is what records the retry.
-/// One call is one `llm_turns` row: a silent retry is not a second turn
-/// (reference.md, "LLM turn").
+/// One call is one `llm_turns` row: a silent retry is not a second turn.
+///
+/// # Errors
+///
+/// The last attempt's [`LlmError`], its [`LlmErrorKind`] classified from
+/// the provider reply — or from the [`TransportError`] when no reply
+/// arrived at all:
+///
+/// - `LlmErrorKind::Auth` when the provider answered 401/403.
+/// - `LlmErrorKind::RateLimit` when the provider answered 429.
+/// - `LlmErrorKind::ContextOverflow` when the reply is a 413, or any 4xx
+///   carrying the `context_length_exceeded` code.
+/// - `LlmErrorKind::Rejected` when the reply is any other 4xx, a 501, or a
+///   status outside the wire contract.
+/// - `LlmErrorKind::Provider` when the reply is a 408 or most 5xx, or when
+///   the transport failed before any reply existed.
+/// - `LlmErrorKind::Malformed` when a 2xx body is not a readable
+///   completion.
+///
+/// # Examples
+///
+/// Any [`ProviderTransport`] can be handed in, so the exchange is scriptable:
+///
+/// ```
+/// use momotaro_llm::{
+///     complete, FinishReason, LlmRequest, Message, ProviderTransport, Role, TransportError,
+///     TransportReply,
+/// };
+///
+/// /// The seam's simplest implementation: one canned reply, no socket.
+/// struct Stub;
+///
+/// impl ProviderTransport for Stub {
+///     fn send(&self, _body: &str) -> Result<TransportReply, TransportError> {
+///         Ok(TransportReply {
+///             status: 200,
+///             body: serde_json::json!({
+///                 "id": "chatcmpl-1",
+///                 "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+///                 "usage": {"prompt_tokens": 3, "completion_tokens": 5},
+///             })
+///             .to_string(),
+///             retry_after: None,
+///         })
+///     }
+/// }
+///
+/// let request = LlmRequest {
+///     model: "test-model".to_string(),
+///     messages: vec![Message {
+///         role: Role::User,
+///         content: "hello".to_string(),
+///     }],
+///     tools: vec![],
+///     max_tokens: 64,
+/// };
+///
+/// let output = complete(&Stub, &request).expect("the stub answers");
+/// assert_eq!(output.text, "hi");
+/// assert_eq!(output.finish_reason, FinishReason::Stop);
+/// assert_eq!(output.usage.input_tokens, Some(3));
+/// assert_eq!(output.usage.output_tokens, Some(5));
+/// assert_eq!(output.attempts, 1, "one send, so no retry was needed");
+/// ```
 pub fn complete<T: ProviderTransport + ?Sized>(
     transport: &T,
     request: &LlmRequest,
@@ -228,7 +325,7 @@ mod tests {
     fn when_a_permitted_retry_also_fails_the_reported_failure_is_the_second_attempt() {
         // One exchange, one account: the terminal failure is the second
         // attempt's, and `attempts` is what records that a retry happened
-        // (reference.md, "LLM turn" — a silent retry is not a second turn).
+        // (a silent retry is not a second turn).
         let fake = FakeLlm::new();
         fake.enqueue_reply(500, r#"{"error": {"message": "first"}}"#);
         fake.enqueue_reply(429, r#"{"error": {"message": "second"}}"#);

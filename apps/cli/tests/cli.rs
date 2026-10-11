@@ -1,7 +1,7 @@
 //! End-to-end CLI tests against a copy of the checked-in fixture vault.
 //!
-//! The vault is staged *inside* the temporary workspace: since ADR 0024 every
-//! stored path is workspace-relative, so a vault outside the workspace root is
+//! The vault is staged *inside* the temporary workspace: every stored
+//! path is workspace-relative, so a vault outside the workspace root is
 //! refused by design.
 
 mod common;
@@ -11,8 +11,7 @@ use std::process::Command;
 
 #[test]
 fn reconcile_exits_zero_on_a_healthy_workspace() {
-    // The exit code is the contract a script gates on (usage.md, "Exit
-    // codes"); the library returning `Ok` says nothing about this arm.
+    // The exit code is the contract a script gates on; the library returning `Ok` says nothing about this arm.
     let tempdir = tempfile::tempdir().expect("tempdir");
     stage_vault(tempdir.path());
     write_config(tempdir.path());
@@ -40,8 +39,8 @@ fn reconcile_exits_zero_on_a_healthy_workspace() {
 }
 
 /// `--mode` / `--allow-write` / `--max-context-tokens` are declared on the
-/// subcommands that read them, not globally (grill Q2). A global flag is
-/// accepted by every subcommand and ignored by all but one — which is how
+/// subcommands that read them, not globally: a global flag is accepted
+/// by every subcommand and ignored by all but one — which is how
 /// `momotaro index --mode expand --allow-write --max-context-tokens 4096`
 /// used to exit 0 with no effect at all. clap's refusal is the contract, so
 /// that is what is asserted: re-globalizing any of the three turns these
@@ -122,8 +121,8 @@ fn a_flag_only_the_subcommand_that_reads_it_declares_is_refused_elsewhere() {
 
 #[test]
 fn watch_emits_a_batch_when_a_file_changes() {
-    // R5's finding: `momotaro watch` had no test at all, which is how a batch
-    // id, a renderer and an exit path could all be wrong behind a green gate.
+    // `momotaro watch` once had no test at all, which is how a batch id, a
+    // renderer and an exit path could all be wrong behind a green gate.
     // The reader thread keeps the child from blocking on a full pipe; the wait
     // is bounded rather than a fixed sleep, so a slow machine does not flake.
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -486,7 +485,7 @@ fn control_characters_in_json_errors_are_stripped_like_the_human_outlet() {
 
 #[test]
 fn doctor_coverage_renders_sync_drive_warnings() {
-    // D42: an eviction stub and a Windows-illegal name are facts
+    // An eviction stub and a Windows-illegal name are facts
     // `doctor --coverage` must show — and they are warnings, not failures, in
     // both exits.
     let workspace = tempfile::tempdir().expect("workspace");
@@ -538,9 +537,9 @@ fn doctor_coverage_renders_sync_drive_warnings() {
 
 #[test]
 fn a_top_above_the_cap_is_refused_by_the_parser() {
-    // The pre-allocation tantivy does is driven by this number alone (probe
-    // S1-2: 20M -> 460 MB peak commit), so the parser refuses absurd values
-    // instead of letting a typo become a memory spike; 0 stays legal.
+    // The pre-allocation tantivy does is driven by this number alone (a
+    // measured 20M -> 460 MB peak commit), so the parser refuses absurd
+    // values instead of letting a typo become a memory spike; 0 stays legal.
     let workspace = tempfile::tempdir().expect("workspace");
     stage_vault(workspace.path());
     write_config(workspace.path());

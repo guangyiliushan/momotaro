@@ -8,9 +8,8 @@
 //! as it is, the same split [`crate::frontmatter`] uses for Obsidian's JSON
 //! property blocks.
 //!
-//! What a canvas contributes to the index is specified in
-//! `docs/docs/ingest-interop.md` §5.9: nodes in array order (the spec's own order —
-//! array order is the z-index), then edges as one `<from text> -> <to text>` line
+//! What a canvas contributes to the index: nodes in array order (array order
+//! is the z-index), then edges as one `<from text> -> <to text>` line
 //! each, with `id`, geometry and colors kept out of the text.
 
 use std::path::Path;

@@ -67,6 +67,12 @@ pub(crate) fn build_schema() -> Schema {
 /// expected field or carrying one with the wrong type/options — e.g. an
 /// on-disk index written by another build. Callers should surface this as
 /// "rebuild the index", never panic.
+///
+/// # Errors
+///
+/// - `RetrieveError::SchemaMismatch` when a field is missing from `schema`,
+///   or is present with the wrong type, storage setting, or tokenizer — an
+///   index written by another build. The message names the offending field.
 pub fn fields(schema: &Schema) -> Result<Fields, crate::RetrieveError> {
     let get = |name: &str| {
         schema

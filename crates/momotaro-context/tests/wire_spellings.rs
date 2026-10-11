@@ -1,4 +1,4 @@
-//! Wire-spelling witness table (database-schema B2 / test-suite F04).
+//! Wire-spelling witness table.
 //!
 //! Every enum value that can land in a DDL TEXT column or the request wire
 //! is pinned to its literal spelling here. A drift turns this file red —
@@ -174,14 +174,14 @@ fn roles_content_kinds_and_visibility_keep_their_spellings() {
 
     let kinds = [
         (ContentKind::Text, "text"),
-        (ContentKind::SummaryV1, "summary.v1"),
+        (ContentKind::Summary, "summary.v1"),
     ];
     for (kind, spelling) in kinds {
         assert_eq!(kind.as_str(), spelling);
     }
     for kind in ContentKind::ALL {
         match kind {
-            ContentKind::Text | ContentKind::SummaryV1 => {}
+            ContentKind::Text | ContentKind::Summary => {}
         }
         assert!(kinds.iter().any(|(k, _)| *k == kind), "{kind:?} missing");
     }
@@ -193,7 +193,7 @@ fn roles_content_kinds_and_visibility_keep_their_spellings() {
 
     let visibilities = [
         (Visibility::Provider, "provider"),
-        // architecture §6.6 vocabulary: provider | trace_only.
+        // visibility vocabulary: provider | trace_only.
         (Visibility::Trace, "trace_only"),
     ];
     for (visibility, spelling) in visibilities {

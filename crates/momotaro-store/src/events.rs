@@ -1,4 +1,4 @@
-//! Reading and appending the store's own audit log (`store_events`, ADR 0026).
+//! Reading and appending the store's own audit log (`store_events`).
 //!
 //! This log is the store's authority over its own work: ingest batches, feed
 //! polls, renames, annotations. It is deliberately separate from `run_events`,
@@ -36,7 +36,7 @@ pub struct NewStoreEvent<'a> {
     pub event_type: &'a str,
     /// The source this event is about, when it is about one.
     pub source_key: Option<&'a str>,
-    /// Adapter outcome — **one column, two vocabularies** (ADR 0026): feed
+    /// Adapter outcome — **one column, two vocabularies**: feed
     /// adapters write `success` | `no_results` | `upstream_error` |
     /// `parse_error`; ingest writes `indexed` | `skipped` |
     /// `metadata_refreshed` | `error` (`FileOutcome::as_str`). A reader that
@@ -47,7 +47,7 @@ pub struct NewStoreEvent<'a> {
     /// Human-readable detail; never the only copy of a fact.
     pub message: Option<&'a str>,
     /// The event's payload. JSON **by convention**, not by enforcement: the
-    /// store neither parses nor validates it (ADR 0026 puts no `CHECK` on the
+    /// store neither parses nor validates it (no `CHECK` on the
     /// column, and this crate does not depend on a JSON parser).
     pub data_json: &'a str,
     /// Provider-issued identifier, for deduplication only.
@@ -57,7 +57,7 @@ pub struct NewStoreEvent<'a> {
 /// One stored event, exactly as the row reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreEvent {
-    /// Insertion order (`rowid`); the only truthful "latest" (ADR 0026).
+    /// Insertion order (`rowid`); the only truthful "latest".
     pub id: i64,
     /// When it happened.
     pub occurred_at: i64,
@@ -162,14 +162,55 @@ impl Store {
     /// For anything that produces more than one event, use
     /// [`Store::append_store_events`]: a batch that is half written is a log
     /// that lies about what happened.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the transaction cannot be opened, the
+    ///   newest-row read fails, an insert fails, or the commit fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use momotaro_store::{NewStoreEvent, Store};
+    ///
+    /// # fn main() -> Result<(), momotaro_store::StoreError> {
+    /// # let mut store = Store::open("workspace/.momotaro/momotaro.db")?;
+    /// # store.init_schema()?;
+    /// store.append_store_event(&NewStoreEvent {
+    ///     occurred_at: 1_700_000_000,
+    ///     batch_id: "rename-1",
+    ///     seq: 1,
+    ///     domain: "ingest",
+    ///     event_type: "source_moved",
+    ///     source_key: Some("note:old.md"),
+    ///     outcome: None,
+    ///     reason_code: None,
+    ///     message: Some("renamed to note:new.md"),
+    ///     data_json: "{}",
+    ///     external_id: None,
+    /// })?;
+    ///
+    /// // The batch the event carried is the batch it landed in.
+    /// assert_eq!(store.count_batch("rename-1")?, 1);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn append_store_event(&mut self, event: &NewStoreEvent<'_>) -> Result<(), StoreError> {
         self.append_store_events(event.batch_id, std::slice::from_ref(event))
     }
 
-    /// Appends a set of events in **one transaction** (ADR 0026).
+    /// Appends a set of events in **one transaction**.
     ///
     /// `batch_id` is passed once and every event must carry it; a mismatch is a
     /// programming error, refused by name rather than written.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::InvalidValue` when an event's `batch_id` differs from
+    ///   the `batch_id` argument; the batch is refused by name and nothing
+    ///   is written.
+    /// - `StoreError::Sqlite` when the transaction cannot be opened, the
+    ///   newest-row read fails, an insert fails, or the commit fails.
     pub fn append_store_events(
         &mut self,
         batch_id: &str,
@@ -200,6 +241,10 @@ impl Store {
     /// For callers that want the number and not the rows: the read side of
     /// `store_events_for_batch` allocates per row, and a 10k-file reconcile
     /// has 10k of them.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the count query fails.
     pub fn count_batch(&self, batch_id: &str) -> Result<u64, StoreError> {
         let count = self.connection.query_row(
             "SELECT COUNT(*) FROM store_events WHERE batch_id = ?1",
@@ -218,6 +263,11 @@ impl Store {
     /// unfinished while a real batch sits one line below it. An opened batch
     /// that never closed is still returned — "started, not finished" is a
     /// fact worth reporting, and it is the one `doctor --coverage` exists for.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the query fails; no opened batch is
+    ///   `Ok(None)`, not an error.
     pub fn latest_batch_opened_in(
         &self,
         domain: &str,
@@ -238,6 +288,11 @@ impl Store {
     }
 
     /// Reads one batch in the order it was appended.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the query cannot be prepared or a row
+    ///   cannot be read.
     pub fn store_events_for_batch(&self, batch_id: &str) -> Result<Vec<StoreEvent>, StoreError> {
         let mut statement = self
             .connection
@@ -247,20 +302,30 @@ impl Store {
             .map_err(StoreError::from)
     }
 
-    /// Reads the most recently **written** events, newest first (ADR 0026: this
+    /// Reads the most recently **written** events, newest first: this
     /// is insertion order, which is why `occurred_at` may go backwards).
     ///
     /// Stays public as the unfiltered view of the log — the one the event tests
     /// speak in — while domain-scoped readers use `latest_store_events_in`.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the query cannot be prepared or a row
+    ///   cannot be read.
     pub fn latest_store_events(&self, limit: u32) -> Result<Vec<StoreEvent>, StoreError> {
         self.latest_store_events_in(None, limit)
     }
 
     /// [`Store::latest_store_events`] bounded to one `domain`.
     ///
-    /// The table carries several domains by design (ADR 0026), so "the newest
+    /// The table carries several domains by design, so "the newest
     /// row" and "the newest ingest batch" are different questions: a feed poll
     /// that ran after the last `index` must not be reported as the ingest batch.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the query cannot be prepared or a row
+    ///   cannot be read.
     pub fn latest_store_events_in(
         &self,
         domain: Option<&str>,
@@ -394,7 +459,7 @@ mod tests {
 
     #[test]
     fn a_replay_keeps_the_event_moment() {
-        // storage-events.md: the `occurred_at` / `recorded_at` pair has no
+        // The `occurred_at` / `recorded_at` pair has no
         // precedent to lean on, so the promise is pinned here — a replay or an
         // import says when it happened, not when it was written.
         let (_dir, mut store) = temp_store();

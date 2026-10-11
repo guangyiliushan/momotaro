@@ -94,6 +94,45 @@ pub struct LlmRequest {
 impl LlmRequest {
     /// The canonical JSON body: exactly what is sent to the provider and
     /// exactly what [`Self::request_hash`] covers.
+    ///
+    /// # Panics
+    ///
+    /// Only if an internal invariant breaks: the first `expect` fires when
+    /// `serde_json::to_value` cannot encode the request (it always can —
+    /// every field is JSON-native: a `serde_json::Value` tool schema,
+    /// strings, and numbers), the second when a `serde_json::Value` cannot
+    /// serialize (it always can).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use momotaro_llm::{LlmRequest, Message, Role, ToolDef};
+    ///
+    /// let request = LlmRequest {
+    ///     model: "m".to_string(),
+    ///     messages: vec![Message {
+    ///         role: Role::User,
+    ///         content: "hi".to_string(),
+    ///     }],
+    ///     tools: vec![ToolDef {
+    ///         name: "lookup".to_string(),
+    ///         description: "find a note".to_string(),
+    ///         parameters: serde_json::json!({ "type": "object", "properties": {} }),
+    ///     }],
+    ///     max_tokens: 16,
+    /// };
+    ///
+    /// // Struct fields and free-form tool schemas are sorted alike.
+    /// assert_eq!(
+    ///     request.canonical_json(),
+    ///     concat!(
+    ///         r#"{"max_tokens":16,"messages":[{"content":"hi","role":"user"}],"#,
+    ///         r#""model":"m","tools":[{"function":{"description":"find a note","#,
+    ///         r#""name":"lookup","parameters":{"properties":{},"type":"object"}},"#,
+    ///         r#""type":"function"}]}"#
+    ///     )
+    /// );
+    /// ```
     pub fn canonical_json(&self) -> String {
         // A `Value` round-trip puts every object key — struct fields and
         // free-form `parameters` schemas alike — into lexicographic order
@@ -113,6 +152,41 @@ impl LlmRequest {
     /// version: a future form change bumps the domain, which makes old and
     /// new hashes different strings that never collide — a cache keyed on the
     /// hash can hold both eras safely.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use momotaro_llm::{LlmRequest, Message, Role, ToolDef};
+    ///
+    /// let request = LlmRequest {
+    ///     model: "m".to_string(),
+    ///     messages: vec![Message {
+    ///         role: Role::User,
+    ///         content: "hi".to_string(),
+    ///     }],
+    ///     tools: vec![
+    ///         ToolDef {
+    ///             name: "first".to_string(),
+    ///             description: "one".to_string(),
+    ///             parameters: serde_json::json!({ "type": "object" }),
+    ///         },
+    ///         ToolDef {
+    ///             name: "second".to_string(),
+    ///             description: "two".to_string(),
+    ///             parameters: serde_json::json!({ "type": "object" }),
+    ///         },
+    ///     ],
+    ///     max_tokens: 64,
+    /// };
+    ///
+    /// assert_eq!(request.request_hash().len(), 64, "hex of a sha256 digest");
+    ///
+    /// // Tool order is part of the request: the provider's prompt cache is
+    /// // keyed on the serialization order of this array.
+    /// let mut reordered = request.clone();
+    /// reordered.tools.reverse();
+    /// assert_ne!(reordered.request_hash(), request.request_hash());
+    /// ```
     pub fn request_hash(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(REQUEST_HASH_DOMAIN);
@@ -183,8 +257,8 @@ mod tests {
 
     #[test]
     fn reordering_the_tools_changes_the_hash() {
-        // Contract decision (context-retrieval.md §1: 序即身份 — the tools
-        // list keeps the caller's order and is never sorted): a canonicalizer
+        // Order is identity: the tools
+        // list keeps the caller's order and is never sorted. A canonicalizer
         // that sorted the list would make this test red, and flipping this
         // test is only legal together with a contract-wording change approved
         // by the user.

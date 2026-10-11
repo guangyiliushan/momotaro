@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Momotaro retrieval eval: runs `momotaro search --json` over the golden set.
 
-Two reports over one deterministic run (docs/docs/context-retrieval.md §3):
+Two reports over one deterministic run:
 
 * report A (utility): recall@k and MRR on the `sufficient` sets — the minimal
   evidence set of source keys that answers a query. `recall = |sufficient ∩
@@ -21,7 +21,7 @@ new failure cannot hide inside a mean and a whitelist cannot quietly grow.
 Pure standard library, zero LLM. Exits 0 on pass, 1 when a gate is given and
 the metric crosses it (a metric regression), 3 when the harness itself fails
 (a search crash or bad golden file — so CI can tell the two apart). Without a
-gate the run is advisory (the D16 baseline instrument).
+gate the run is advisory (the baseline instrument).
 
 Usage:
     python tools/evals/eval_search.py --workspace <dir> --cli <path/to/momotaro-cli[.exe>] \

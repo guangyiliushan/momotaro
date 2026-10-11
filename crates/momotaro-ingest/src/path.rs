@@ -1,4 +1,4 @@
-//! Workspace-relative path facts (ADR 0024).
+//! Workspace-relative path facts.
 //!
 //! Containment is only ever decided between two *canonicalized* paths: the
 //! lexical `Path::starts_with` check does not resolve `..` and happily accepts
@@ -16,6 +16,12 @@ use super::IngestError;
 ///
 /// Resolving many files under one root should canonicalize once and then use
 /// [`local_path_in`]: canonicalizing per file is one extra syscall per file.
+///
+/// # Errors
+///
+/// - `IngestError::Io` when the root cannot be canonicalized — it does not
+///   exist, or the filesystem refuses to resolve it. The message carries the
+///   root's path.
 pub fn canonical_workspace_root(workspace_root: &Path) -> Result<PathBuf, IngestError> {
     canonical_root(workspace_root)
 }
@@ -30,6 +36,16 @@ pub fn canonical_workspace_root(workspace_root: &Path) -> Result<PathBuf, Ingest
 /// decided by comparing canonical forms, so a root that is not canonical makes
 /// the comparison meaningless — it fails closed with `OutsideWorkspace`, never
 /// silently.
+///
+/// # Errors
+///
+/// - `IngestError::Io` when the process current directory cannot be read, or
+///   `path` cannot be canonicalized through its nearest existing ancestor.
+/// - `IngestError::OutsideWorkspace` when the canonicalized `path` does not
+///   lie beneath `canonical_root`.
+/// - `IngestError::InvalidUtf8` when a component of the relative name is not
+///   valid UTF-8: the column is text, and a lossy fold could collapse two
+///   different names onto one stored path.
 pub fn local_path_in(canonical_root: &Path, path: &Path) -> Result<String, IngestError> {
     let candidate = canonicalize_existing_ancestor(path)?;
     let relative = candidate
@@ -45,6 +61,15 @@ pub fn local_path_in(canonical_root: &Path, path: &Path) -> Result<String, Inges
 /// the value out of the workspace either. The returned path is rooted at the
 /// canonicalized root, so on Windows it carries the `\\?\` verbatim prefix —
 /// strip it before showing the path to a human.
+///
+/// # Errors
+///
+/// - `IngestError::OutsideWorkspace` when the value is absolute, root- or
+///   drive-prefixed, carries a `..` component, or when the canonicalized
+///   candidate escapes the root (a symlink or junction).
+/// - `IngestError::Io` when the workspace root cannot be canonicalized, or
+///   the joined candidate cannot be canonicalized through its nearest
+///   existing ancestor.
 pub fn resolve_local_path(workspace_root: &Path, local_path: &str) -> Result<PathBuf, IngestError> {
     let relative = Path::new(local_path);
     for component in relative.components() {
@@ -66,6 +91,11 @@ pub fn resolve_local_path(workspace_root: &Path, local_path: &str) -> Result<Pat
 }
 
 /// Whether `candidate` lies inside `workspace_root` (both canonicalized).
+///
+/// # Errors
+///
+/// - `IngestError::Io` when either side cannot be canonicalized: the root
+///   directly, or the candidate through its nearest existing ancestor.
 pub fn is_within(workspace_root: &Path, candidate: &Path) -> Result<bool, IngestError> {
     let root = canonical_root(workspace_root)?;
     let resolved = canonicalize_existing_ancestor(candidate)?;

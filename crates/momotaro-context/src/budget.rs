@@ -1,4 +1,4 @@
-//! The five-level token budget (`docs/docs/context-retrieval.md` §2).
+//! The five-level token budget.
 //!
 //! `max_context_tokens` allocates by fixed priority, 先到先得不回填 — each
 //! level claims budget in order and a truncated level is never revisited:
@@ -7,18 +7,18 @@
 //! |---|---|---|
 //! | 1 | policy + tool definitions + constraints 常驻层 | 固定小预算，内容稳定 |
 //! | 2 | question | 全量保留 |
-//! | 3 | history | 近轮优先（§3 的保护带与摘要先裁过） |
+//! | 3 | history | 近轮优先（保护带与摘要先裁过） |
 //! | 4 | evidence | 意图分档 top-k，**兜底 floor 3** |
 //! | 5 | instructions | 固定尾部 |
 //!
 //! Fixed levels (1, 2, 5) are never silently dropped: when they alone
 //! exceed the budget the build still includes them and reports
-//! `exceeded` (`architecture.md` §6.6 bounds are enforced by the caller's
+//! `exceeded` (bounds are enforced by the caller's
 //! configuration, not by discarding the question). Evidence keeps a hard
-//! floor of [`EVIDENCE_FLOOR`] items — 预算再紧也保留 P1 的证据 (§2.1).
+//! floor of [`EVIDENCE_FLOOR`] items — 预算再紧也保留 P1 的证据.
 //!
 //! History walks **recent-first** inside level 3: the recency guarantee
-//! (§3 近轮全量) means the newest turns win the level's budget. Once one
+//! means the newest turns win the level's budget. Once one
 //! claim fails, the rest of the level stops claiming — an older turn never
 //! survives a dropped newer one — and every drop is an explicit
 //! [`OmittedReason::BudgetExhausted`].
@@ -26,10 +26,10 @@
 use crate::policy::BudgetPolicy;
 use crate::types::{Omission, OmittedReason};
 
-/// Global evidence floor (§2.1 下界 3) — budget-proof.
+/// Global evidence floor (下界 3) — budget-proof.
 pub const EVIDENCE_FLOOR: usize = 3;
 
-/// The five allocation levels, in contract order (§2).
+/// The five allocation levels, in contract order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetLevel {
     /// policy + tool definitions + constraints (resident).
@@ -68,11 +68,11 @@ pub struct BudgetOutcome {
     /// Keys repeat across kinds — a `chunk_hash` can spell a `history_id` —
     /// so consumers that need the *object* (its tokens, its class) match by
     /// slot; first-match-by-key takes the wrong one when they collide
-    /// (probe P4: a wrong `budget_delta`, and a kept turn's hashes released).
+    /// (observed failures: a wrong `budget_delta`, and a kept turn's hashes released).
     pub dropped_slots: Vec<usize>,
 }
 
-/// Run the five-level allocation (§2, 先到先得不回填).
+/// Run the five-level allocation (先到先得不回填).
 ///
 /// `candidates` arrive in render order; history candidates inside level 3
 /// are walked most-recent-first by the caller (they keep render order in
@@ -139,7 +139,7 @@ pub(crate) fn enforce_token_budget(
     }
 
     // Level 4: evidence in ranked order; the first EVIDENCE_FLOOR items
-    // are the hard floor (§2.1 兜底), then the same stop-on-failure rule.
+    // are the hard floor (兜底), then the same stop-on-failure rule.
     let mut evidence_out = false;
     let mut evidence_seen = 0usize;
     for (index, candidate) in candidates.iter().enumerate() {
@@ -224,7 +224,7 @@ mod tests {
     }
 
     /// The boundary is `<=`, and it is on the keeping side: an estimate that
-    /// lands **exactly** on the ceiling fits. §2.1's coefficient makes that a
+    /// lands **exactly** on the ceiling fits. The coefficient makes that a
     /// real point and not a rounding curiosity — `ceil(raw × 1.25) == 8192`
     /// first holds at raw 6553 (6553 × 1.25 = 8191.25), the one raw value
     /// that sits on the line. Flip the comparison to `<` and this item drops
@@ -247,7 +247,7 @@ mod tests {
     fn drops_report_their_slots_alongside_their_keys() {
         // The keys in `dropped` are what the stage record prints; the slots
         // are what accounting matches by — keys repeat across kinds, slots
-        // do not (probe P4).
+        // do not.
         let budget = BudgetPolicy {
             max_context_tokens: 100,
             ..BudgetPolicy::default()

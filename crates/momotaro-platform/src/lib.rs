@@ -1,7 +1,7 @@
 //! The platform reads that have no `std` answer.
 //!
 //! `std::os::windows` exposes no volume kind — no drive type, no filesystem
-//! label — so the two questions D31 and D40 §4.3 ask of a path ("is this a
+//! label — so the two questions this module asks of a path ("is this a
 //! network volume?", "does this volume timestamp coarsely?") can only be
 //! answered through the Win32 API, and an FFI call needs `unsafe`.
 //!
@@ -14,8 +14,27 @@
 //! Nothing here reads file bytes. The calls take a path, ask the volume about
 //! itself, and return; a placeholder's contents are never touched, which is
 //! the same rule `momotaro_ingest::attributes_of` follows.
+//!
+//! # Examples
+//!
+//! Ask what the volume holding a path is like:
+//!
+//! ```
+//! use momotaro_platform::{VolumeInfo, volume_info};
+//! use std::path::Path;
+//!
+//! // `UNKNOWN` is "we could not tell", which is not the same answer as "no".
+//! assert_eq!(VolumeInfo::UNKNOWN.remote, None);
+//!
+//! let info = volume_info(Path::new("."));
+//! if info.remote == Some(true) {
+//!     println!("this path sits on a network volume");
+//! }
+//! ```
 
 #![warn(missing_docs)]
+#![warn(rustdoc::all)]
+#![warn(rustdoc::unescaped_backticks)]
 
 use std::path::Path;
 
@@ -29,10 +48,10 @@ use std::path::Path;
 /// `None` as "unreported", never as a denial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VolumeInfo {
-    /// `Some(true)` when the volume is a network volume (D31, D40 §4.8).
+    /// `Some(true)` when the volume is a network volume.
     pub remote: Option<bool>,
     /// `Some(true)` when the volume timestamps coarsely enough that a matching
-    /// stat cannot be trusted across a same-tick write (D40 §4.3, FAT/exFAT).
+    /// stat cannot be trusted across a same-tick write (FAT/exFAT).
     pub coarse: Option<bool>,
 }
 
@@ -50,6 +69,21 @@ impl VolumeInfo {
 /// Windows only: everywhere else this costs no syscall and returns `UNKNOWN`,
 /// which is the truthful answer — `std` offers no volume kind on any of the
 /// platforms this project builds for.
+///
+/// # Examples
+///
+/// ```
+/// use momotaro_platform::volume_info;
+/// use std::path::Path;
+///
+/// // The answer is the volume's, so only match on it — never assume one.
+/// let info = volume_info(Path::new("."));
+/// match (info.remote, info.coarse) {
+///     (Some(true), _) => println!("network volume: no real-time promise"),
+///     (_, Some(true)) => println!("coarse timestamps: a matching stat proves nothing"),
+///     _ => println!("nothing to warn about, or nothing this build could tell"),
+/// }
+/// ```
 #[must_use]
 pub fn volume_info(path: &Path) -> VolumeInfo {
     windows_volume_info(path)
@@ -148,7 +182,7 @@ fn remote_of(drive_type: u32) -> Option<bool> {
 /// reachable: reading to the first **non-zero** unit instead yields an empty
 /// name, `is_coarse_filesystem("")` is `false`, and `coarse` is then
 /// `Some(false)` for every volume — so `index_service`'s content-check path
-/// (D40 §4.3) never fires and a real change on a two-second filesystem is
+/// never fires and a real change on a two-second filesystem is
 /// skipped as "stat did not move". Nothing observed that: the only Windows
 /// assertion checked `coarse.is_some()`, and `is_coarse_filesystem`'s own
 /// tests take `&str` and never reach this slice.
@@ -165,8 +199,8 @@ fn wide_cstring(units: &[u16]) -> String {
 ///
 /// `std` exposes no volume kind here either, and the alternatives (parsing
 /// `/proc/mounts`, calling `statfs`) would be a second implementation of a
-/// question only one caller asks. D40 §4.3's FAT relaxation therefore does
-/// not apply off Windows; the contract says so in `ingest-interop` §4 第 3 条.
+/// question only one caller asks. The FAT relaxation therefore does
+/// not apply off Windows.
 #[cfg(not(windows))]
 fn windows_volume_info(_path: &Path) -> VolumeInfo {
     VolumeInfo::UNKNOWN
@@ -176,7 +210,7 @@ fn windows_volume_info(_path: &Path) -> VolumeInfo {
 ///
 /// FAT stores mtime with a two-second resolution, so a file written inside the
 /// same tick as our write keeps the timestamp it had and a stat comparison
-/// cannot tell the two apart — the case D40 §4.3 sends to a content check.
+/// cannot tell the two apart — the case that goes to a content check.
 /// Comparison is case-insensitive and whole-label: Windows reports `FAT`,
 /// `FAT32` and `exFAT`, and nothing else in practice starts with `FAT`.
 /// `pub` would only be hiding `dead_code` off Windows, where nothing calls

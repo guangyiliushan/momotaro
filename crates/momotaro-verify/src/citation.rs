@@ -2,17 +2,16 @@
 
 /// One citation as the answer asserts it.
 ///
-/// The five-tuple is the identity of a citation (`docs/docs/architecture.md`
-/// D5 / `docs/docs/reference.md`, "Answer citation"): `source_key +
+/// The five-tuple is the identity of a citation: `source_key +
 /// revision_hash + chunk_id + chunk_hash + locator` is what makes a citation
 /// verifiable at all. Two fields sit outside the tuple:
 ///
 /// * `context_item_id` names the `run_context_items` row the model was shown
-///   (architecture §14.1, "引用 ID 必须存在于 `run_context_items`"). The model
-///   sees these as `[f0001]`-style markers, so this is an opaque string: this
+///   (the citation ID must exist in `run_context_items`). The model sees
+///   these as `[f0001]`-style markers, so this is an opaque string: this
 ///   crate neither generates nor parses it.
-/// * `quoted_text` is the span the answer claims to be quoting, which
-///   architecture §14.1 requires to be locatable in the original chunk.
+/// * `quoted_text` is the span the answer claims to be quoting, required
+///   to be locatable in the original chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Citation {
     /// The context item this citation points at.

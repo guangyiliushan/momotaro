@@ -1,14 +1,13 @@
-//! Evidence selection and the three-layer ordering
-//! (`docs/docs/context-retrieval.md` §1.1, §2, §2.1; `architecture.md` §12).
+//! Evidence selection and the three-layer ordering.
 //!
-//! Selection bounds (§2.1 evidence 兜底): the evidence count scales with the
+//! Selection bounds (evidence 兜底): the evidence count scales with the
 //! budget (at most the largest count fitting in 50% of the total budget),
 //! clamped to the intent tier (fact 3–5 / comparison 4–6 / survey 8–10) and
 //! to the global floor 3 / ceiling 10. The floor is hard: however tight the
 //! budget, P1 evidence is kept (count at least 3 when that many exist).
 //! Items beyond the cap are dropped with an explicit reason — 不静默丢。
 //!
-//! Ordering (`context-retrieval.md` §1.1), in priority order:
+//! Ordering, in priority order:
 //!
 //! 1. **session 位置守恒**: a chunk that appeared earlier keeps its
 //!    first-seen slot; new chunks append after;
@@ -20,22 +19,22 @@
 //!
 //! Retrieval scores decide *who gets in* (selection keeps retrieval order);
 //! the three layers decide *how it is placed*. The side-grouping half of
-//! the comparison tier (每侧 4–6) needs a side model that v0.3 does not
+//! the comparison tier (每侧 4–6) needs a side model that this build does not
 //! embed yet; the per-side range currently applies as the plain count
-//! range (registered as a known remaining surface).
+//! range (a known remaining surface).
 
 use crate::types::{ContextInput, Omission, OmittedReason, QueryIntent};
 
 use crate::budget::EVIDENCE_FLOOR;
 
-/// Global upper bound of the evidence count (§2.1 上界 10).
+/// Global upper bound of the evidence count (上界 10).
 const EVIDENCE_CEILING: usize = 10;
 
 /// The evidence section may use at most this share of the total budget
-/// (§2.1 不超过总预算 50%).
+/// (不超过总预算 50%).
 const EVIDENCE_BUDGET_SHARE: f64 = 0.5;
 
-/// Intent-tier count bounds (§2.1). The comparison range is the per-side
+/// Intent-tier count bounds. The comparison range is the per-side
 /// range used as the plain count range until sides are modeled.
 fn tier_bounds(intent: QueryIntent) -> (usize, usize) {
     match intent {
@@ -65,7 +64,7 @@ pub(crate) fn select_evidence(input: &ContextInput) -> SelectionOutcome {
     });
 
     // The tier band is the target range; under a tight budget the
-    // contract-literal floor is the global 3 (§2.1 下界 3, 预算再紧也保留),
+    // contract-literal floor is the global 3 (下界 3, 预算再紧也保留),
     // not the tier minimum — `tier_bounds` documents the band.
     let (_tier_min, tier_max) = tier_bounds(input.intent);
 
@@ -77,7 +76,7 @@ pub(crate) fn select_evidence(input: &ContextInput) -> SelectionOutcome {
     for &i in &candidates {
         let item_tokens = u64::from(momotaro_contracts::estimate_tokens(&input.evidence[i].text));
         // One formula only: `BudgetPolicy::adjusted_total` (no hand-copied
-        // calibration math — six-lens P1).
+        // calibration math).
         let adjusted = input.budget.adjusted_total(item_tokens) as f64;
         if used + adjusted > share {
             break;
@@ -114,7 +113,7 @@ pub(crate) fn select_evidence(input: &ContextInput) -> SelectionOutcome {
     SelectionOutcome { kept, omissions }
 }
 
-/// The three-layer order (§1.1) over the selected evidence.
+/// The three-layer order over the selected evidence.
 ///
 /// Returns indices into `input.evidence`, in final render order.
 pub(crate) fn order_evidence(input: &ContextInput, selected: &[usize]) -> Vec<usize> {
@@ -248,7 +247,7 @@ mod tests {
 
     #[test]
     fn the_best_source_leads_the_second_best_trails_and_the_rest_sit_in_the_middle() {
-        // §1.1 layer 3: 最高分源置首、次高置尾、其余居中.
+        // layer 3: 最高分源置首、次高置尾、其余居中.
         let input = input_with(
             vec![
                 item("h1", "note:a.md", 1, 1.0),
@@ -263,7 +262,7 @@ mod tests {
 
     #[test]
     fn same_source_chunks_stay_together_in_original_order() {
-        // §1.1 layer 2, even when a middle-scored source exists.
+        // layer 2, even when a middle-scored source exists.
         let input = input_with(
             vec![
                 item("h1", "note:a.md", 2, 5.0),
@@ -279,7 +278,7 @@ mod tests {
 
     #[test]
     fn first_seen_positions_win_over_scores() {
-        // §1.1 layer 1 over layer 3: the session has seen h1 and h2 (in
+        // layer 1 over layer 3: the session has seen h1 and h2 (in
         // that order); a much higher-scored newcomer appends after.
         let session = SessionState {
             first_seen_order: vec!["h1".to_string(), "h2".to_string()],
@@ -360,7 +359,7 @@ mod tests {
 
     #[test]
     fn the_evidence_floor_survives_a_tiny_budget() {
-        // §2.1: 预算再紧也保留 P1 的证据,下界 3.
+        // 预算再紧也保留 P1 的证据,下界 3.
         let mut input = input_with(
             (1..=6)
                 .map(|n| item(&format!("h{n}"), &format!("note:{n}.md"), n, 6.0 - n as f64))

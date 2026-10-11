@@ -12,12 +12,11 @@
 //! The rule below follows the plugin's own regexes (`DRAWING_COMPRESSED_REG` and
 //! `DRAWING_REG` in `src/shared/excalidrawMarkdownParsing.ts`): a `##? Drawing`
 //! heading at column 0, then — past anything that is not a backtick, blank lines
-//! included (`[^`]*`) — the first fence, whose info string must be
+//! included (``[^`]*``) — the first fence, whose info string must be
 //! `compressed-json` or `json`. Reading it that way is the point: a note with
 //! this layout is one we cannot tell apart from the plugin's output, so the safe
 //! move is to treat it as one. Where we read it more permissively than the plugin
-//! might — we require no `%%` or `# Excalidraw Data` preamble — is recorded in
-//! `docs/docs/ingest-interop.md` §5.9.
+//! might — we require no `%%` or `# Excalidraw Data` preamble — is deliberate.
 
 use std::ops::Range;
 

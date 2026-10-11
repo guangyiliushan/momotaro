@@ -1,5 +1,5 @@
-//! The platform/path test matrix (W2.6; `docs/docs/ingest-interop.md` §6.5–6.6,
-//! D42; key rows implement ADR 0002, path rows ADR 0024/0025).
+//! The platform/path test matrix (key rows implement the key scheme,
+//! path rows implement workspace containment).
 //!
 //! One named inventory for the platform matrix so both CI legs run exactly
 //! this list. Windows-only cases compile out on the ubuntu leg (`#[cfg]`), so a
@@ -11,19 +11,19 @@
 //!
 //! # The 18-vs-11 count, reconciled once (it is two counts of one surface)
 //!
-//! - **11 项** (`ingest-interop` §6.6, D42) counts *semantic rows* of the
+//! - **11 项** counts *semantic rows* of the
 //!   key-layer/sync-disk matrix, splitting on `/` with the parenthesis
 //!   protected: 大小写双写 · 仅大小写改名 · **NFD** · **NFC+NFD 双写** ·
 //!   260 长路径 · 保留名与尾随字符 · OneDrive placeholder · iCloud placeholder ·
 //!   三种路径表述同一键 · 折叠陷阱字符 · exFAT 移动盘.
-//! - **18 例** (the W2.6 card) counts *test cases* in this file: the same
+//! - **18 例** counts *test cases* in this file: the same
 //!   surface with the NFD pair merged into one case (one fixture, two
-//!   assertions) — 10 cases — plus 8 path-resolution/security cases the D42
-//!   matrix does not count (they come from the W1 vault ⊆ workspace contract):
+//!   assertions) — 10 cases — plus 8 path-resolution/security cases the key-layer
+//!   matrix does not count (they come from the vault ⊆ workspace contract):
 //!   junction · `..` 注入 · 绝对注入 POSIX · 绝对注入 盘符 · 绝对注入 UNC ·
 //!   跨卷 · 8.3 短名 · 尚未创建的路径.  11 − 1 + 8 = 18.
 //!
-//! | card 例 | D42 项 | test(s) in this file | tier | kills (mutation / falsifier) |
+//! | card 例 | 项 | test(s) in this file | tier | kills (mutation / falsifier) |
 //! |---|---|---|---|---|
 //! | junction | — | `junction_is_recorded_and_never_an_escape` | both legs (J on win, symlink on unix) | follow the link ⇒ extra walk entry; drop containment re-check ⇒ resolve escapes; a lexical `is_within` ⇒ the `!is_within` pin red |
 //! | `..` 注入 | — | `parent_dir_injection_is_rejected_everywhere` | both legs | strip-and-revalidate instead of reject ⇒ any acceptance is red |
@@ -45,8 +45,8 @@
 //! | 尚未创建的路径 | — | `not_yet_created_paths_resolve_through_the_nearest_existing_ancestor` | both legs | dropping the missing-tail re-append ⇒ `local_path_in` errors on the missing file |
 //!
 //! The card's 18 rows land on 19 named tests: the OneDrive row splits into an
-//! automated half and its one manual real-sample half (D42: "OneDrive 项只
-//! 手工一次"). Every manual test here is `#[ignore]` and **panics with setup
+//! automated half and its one manual real-sample half (OneDrive 行只手工一次).
+//! Every manual test here is `#[ignore]` and **panics with setup
 //! steps when its precondition is missing** (env var unset, or the volume
 //! feature absent), so "did not run" can never read as "passed" — and so an
 //! unfiltered `cargo test -- --ignored` is red on windows for reasons no change
@@ -62,7 +62,7 @@
 //! target by name on both legs — the workspace run above it already covers the
 //! auto tier, so the re-run costs seconds and adds no safety; the step exists
 //! so the matrix has one named, toggleable CI home. Keeping `--ignored` out of
-//! CI is the F6 rule, spelled out in the step's comment.
+//! CI is a standing rule, spelled out in the step's comment.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -225,11 +225,11 @@ fn assert_in_vault_absolute_rejected(root: &Path) {
 
 // ---------------------------------------------------------------------------
 // Path injection: junction, `..`, and the three absolute forms.
-// (Card rows 1–5; W1 vault ⊆ workspace contract, not in the D42 11.)
+// (Card rows 1–5; vault ⊆ workspace contract, not in the 11.)
 // ---------------------------------------------------------------------------
 
 /// A link is a recorded entry, never an escape and never a second copy of the
-/// content behind it (ingest-interop §5 第 10 条 / ADR 0024).
+/// content behind it.
 #[test]
 fn junction_is_recorded_and_never_an_escape() {
     let root = vault();
@@ -274,8 +274,7 @@ fn junction_is_recorded_and_never_an_escape() {
     );
 }
 
-/// A `..` component is rejected, never stripped and re-validated (D42: "不做
-/// 「剥离后重校验」").
+/// A `..` component is rejected, never stripped and re-validated.
 #[test]
 fn parent_dir_injection_is_rejected_everywhere() {
     let root = vault();
@@ -423,11 +422,11 @@ fn unc_absolute_forms_are_rejected() {
 
 // ---------------------------------------------------------------------------
 // Key layer: case, normalization, length, folding.
-// (Card rows 6–10, 13–14 = D42 items 1–6, 9–10.)
+// (Card rows 6–10, 13–14 = items 1–6, 9–10.)
 // ---------------------------------------------------------------------------
 
 /// Case is preserved verbatim at the key layer: on a case-sensitive volume the
-/// twins are two files and two identities (D42: Linux 大小写双写合法并存,
+/// twins are two files and two identities (Linux 大小写双写合法并存,
 /// 折叠 = 数据丢失级事故).
 #[test]
 fn case_double_write_stays_two_identities() {
@@ -466,7 +465,7 @@ fn case_double_write_stays_two_identities() {
     }
 }
 
-/// A rename is a new identity — including a case-only rename (ADR 0014).
+/// A rename is a new identity — including a case-only rename.
 #[test]
 fn case_only_rename_is_a_new_identity() {
     let root = vault();
@@ -498,10 +497,10 @@ fn case_only_rename_is_a_new_identity() {
 }
 
 /// An NFD name keys as its NFC form, and an NFC/NFD double write is a key
-/// collision — two files, one key. The store-side treatment (D42's 两条目都
+/// collision — two files, one key. The store-side treatment (两条目都
 /// 保留 + 消歧后缀 + 事件) is the contract's destination and 未实现: today's
 /// indexer refuses the second claimant with `reason_code = key_collision`, and
-/// the suffix policy is 本波剩余 (ADR 0002 says so itself). This row pins the
+/// the suffix policy is 未实现. This row pins the
 /// collision, not its resolution.
 ///
 /// Fixture tier: NTFS stores UTF-16 without normalizing, so both legs can
@@ -575,7 +574,7 @@ fn paths_past_260_key_exactly() {
 /// Reserved names and trailing dots/spaces are warned about (the predicate is
 /// platform-independent — the rules Explorer and sync engines enforce), and
 /// the key keeps such names byte-for-byte: the row indexes, it warns, it never
-/// rewrites (D42).
+/// rewrites.
 #[test]
 fn reserved_names_warn_and_keep_their_bytes() {
     // The warning predicate: reserved device names (first segment before `.`,
@@ -685,7 +684,7 @@ fn reserved_names_warn_and_keep_their_bytes() {
 }
 
 /// Three spellings of one path are one key: the equivalence class is NFC,
-/// `.`/empty components and a trailing separator — and nothing else (§6.1).
+/// `.`/empty components and a trailing separator — and nothing else.
 #[test]
 fn three_spellings_of_one_path_are_one_key() {
     let canonical_spelling = "a/b.md";
@@ -708,7 +707,7 @@ fn three_spellings_of_one_path_are_one_key() {
     // an OS path fact: POSIX answers `b.md/` with ENOTDIR because a trailing
     // slash demands a directory, while on Windows the resolver's join
     // normalizes the spelling before anything opens the file (raw Win32 keeps
-    // the slash — measured). Neither is a gap — §6.1's equivalence class governs key
+    // the slash — measured). Neither is a gap — the equivalence class governs key
     // construction, and `resolve_local_path` resolves stored `local_path`
     // values, which never carry a trailing slash. Both platform answers are
     // pinned below so the divergence is a recorded fact, not a surprise.
@@ -765,7 +764,7 @@ fn three_spellings_of_one_path_are_one_key() {
     );
 }
 
-/// The folding-trap characters pin both edges of the NFC key rule (D42:
+/// The folding-trap characters pin both edges of the NFC key rule (
 /// 禁用 NFKC 与 casefold; key = NFC identity).
 ///
 /// Two behaviors, deliberately different:
@@ -775,12 +774,12 @@ fn three_spellings_of_one_path_are_one_key() {
 ///   (NFKC agrees with NFC on every pin in this test; the NFKC fold the key
 ///   must not do is what the `com¹.md` byte pin in the reserved-names row
 ///   catches.)
-/// - `者` (U+8005) / `者` (U+FA5B) is the pair §6.6 names; U+FA5B is a
+/// - `者` (U+8005) / `者` (U+FA5B) is the folding pair; U+FA5B is a
 ///   canonical **singleton decomposition** of U+8005 (UnicodeData: `FA5B …
 ///   8005`), so plain NFC — the key rule itself — already maps both spellings
 ///   onto one key. It is the same class as the café NFC/NFD twins: an NFC
 ///   collision, not a distinct-key pair. The store-side treatment (两条目都
-///   保留 + 消歧后缀 + 事件, ADR 0002) is the contract's destination and 未实现
+///   保留 + 消歧后缀 + 事件) is the contract's destination and 未实现
 ///   — today's indexer refuses the second claimant with `key_collision`.
 ///   Dropping NFC for byte-identity keys would *split* this pair — the
 ///   mutation these assertions kill.
@@ -889,13 +888,13 @@ fn fold_traps_stay_distinct_and_the_nfc_pair_collides() {
 }
 
 // ---------------------------------------------------------------------------
-// Sync-disk boundaries (D42: OneDrive + iCloud — the third of D42 三条,
+// Sync-disk boundaries (OneDrive + iCloud — the third of the three,
 // the Windows-illegal-name warning, is the reserved-names row above).
-// (Card rows 11–12 = D42 items 7–8.)
+// (Card rows 11–12 = items 7–8.)
 // ---------------------------------------------------------------------------
 
 /// The criterion is exactly one bit, and an ordinary file lacks it: the
-/// read-time gate must not trip on plain files (D42: 判据只认
+/// read-time gate must not trip on plain files (判据只认
 /// `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`).
 ///
 /// The bit-level pins run everywhere (`is_cloud_placeholder` is a pure
@@ -936,7 +935,7 @@ fn placeholder_criterion_is_one_bit_and_ordinary_files_lack_it() {
 /// cannot read as "passed". What this proves beyond the injected-attribute
 /// index tests: the reader sees the bit through `fs::metadata` on a real
 /// sample, and the walk lists such a file as an ordinary file — placeholder
-/// -ness is a read-time fact, not a walk kind (D42: the check sits after
+/// -ness is a read-time fact, not a walk kind (the check sits after
 /// `fs::metadata`, before any read).
 #[cfg(windows)]
 #[test]
@@ -972,7 +971,7 @@ fn a_real_onedrive_placeholder_is_recognized_and_plain_to_the_walk() {
 }
 
 /// An iCloud eviction stub is classified so a row can say what happened to the
-/// note it stands for — and its content never enters the index (D42).
+/// note it stands for — and its content never enters the index.
 #[test]
 fn icloud_stubs_are_classified_and_never_indexed() {
     let root = vault();
@@ -1272,7 +1271,7 @@ fn eight_three_short_names_resolve_to_the_long_identity() {
 // ---------------------------------------------------------------------------
 
 /// A path that does not exist yet resolves through its nearest existing
-/// ancestor: the missing tail is kept, not dropped (W1: 尚不存在的路径按
+/// ancestor: the missing tail is kept, not dropped (尚不存在的路径按
 /// 「最近的已存在祖先」规范化后比较).
 #[test]
 fn not_yet_created_paths_resolve_through_the_nearest_existing_ancestor() {

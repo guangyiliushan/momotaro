@@ -24,10 +24,10 @@ pub(crate) mod sealed {
 
 /// What a source's on-disk bytes look like for one revision.
 ///
-/// `reference.md` defines source integrity as "the bytes named by the row are
-/// present **and match the hash**". The production seam therefore reads the
-/// canonical local bytes and streams their ingest-domain SHA-256. ADR 0023
-/// excludes paper bytes from snapshots; that is about backup copies, not a
+/// Source integrity means "the bytes named by the row are present **and
+/// match the hash**". The production seam therefore reads the canonical
+/// local bytes and streams their ingest-domain SHA-256. Paper bytes are
+/// excluded from snapshots; that is about backup copies, not a
 /// licence to call an unchecked file verified. A read that cannot hash keeps
 /// `hash_matches: None`, which the caller reports as `unsupported`, never as
 /// `passed`.
@@ -44,7 +44,7 @@ pub enum BytesState {
     /// The source has no local bytes to check at all: no store row, a row
     /// with no `local_path`, or a stored path this crate refuses — by form
     /// (`..`, rooted, drive-relative) or because it resolves outside the
-    /// workspace through a link (ADR 0024). A path that exists but resolves
+    /// workspace through a link. A path that exists but resolves
     /// nowhere is not this state: it is [`Self::Missing`].
     Absent,
 }
@@ -57,9 +57,22 @@ pub enum BytesState {
 /// never writes.
 pub trait CitationSource: sealed::Sealed {
     /// Reads one chunk by its deterministic id.
+    ///
+    /// # Errors
+    ///
+    /// - `VerifyError::Store` when the underlying store read fails; a
+    ///   `chunk_id` with no row is `Ok(None)`, not an error.
     fn chunk(&self, chunk_id: &str) -> Result<Option<Chunk>, VerifyError>;
 
     /// Reports the state of the bytes named by one source revision.
+    ///
+    /// # Errors
+    ///
+    /// - `VerifyError::Store` when the store read behind the revision row
+    ///   fails.
+    /// - `VerifyError::Io` when a filesystem step or the byte read fails for
+    ///   a reason other than absence — a refused read stays `unsupported`,
+    ///   never `source_missing`.
     fn source_bytes(
         &self,
         source_key: &str,
@@ -77,7 +90,7 @@ impl<'a> StoreSource<'a> {
     /// Binds the seam to a store and to the workspace that store describes.
     ///
     /// `workspace_root` is required because `source_revisions.local_path` is
-    /// workspace-relative (ADR 0024). This crate will not guess the root from
+    /// workspace-relative. This crate will not guess the root from
     /// the database path — that relationship is a layout convention, not a
     /// contract. A relative root is resolved **on every read** against the
     /// process's current directory — the constructor stores the spelling and
@@ -156,17 +169,16 @@ impl CitationSource for StoreSource<'_> {
         let Some(resolved) = canonicalize_existing_ancestor(&joined)? else {
             // Exactly the predicate the root arm answers — the entry exists
             // and resolves nowhere — so exactly the same verdict: the bytes
-            // named by the row are provably absent (ADR 0024, "a missing file
-            // is `source_missing`"), and `fully_verified()` vetoes on it.
+            // named by the row are provably absent, and `fully_verified()`
+            // vetoes on it.
             // `metadata` is never called on the path, so the link is not read
             // through either; that half is pinned by
             // `a_junction_that_walks_out_of_the_workspace_is_not_read`.
             return Ok(BytesState::Missing);
         };
 
-        // 3. Re-check containment between two canonicalized paths (ADR 0024:
-        //    "the result must stay inside the workspace, including no symlink
-        //    escape").
+        // 3. Re-check containment between two canonicalized paths: the result
+        //    must stay inside the workspace, including no symlink escape.
         if !resolved.starts_with(&root) {
             return Ok(BytesState::Absent);
         }
@@ -175,9 +187,9 @@ impl CitationSource for StoreSource<'_> {
         // through `fs::canonicalize`, so the walk-up does not surface it: this
         // is the residue — the window between those two syscalls, where the
         // entry is replaced or unpermissioned in between. It is a defensive
-        // arm with no fixture (mutating it away is a registered survivor,
-        // O05). O05 covers all three sites of this shape — this one and the
-        // two `ErrorKind::NotFound` guards below. Not for want of
+        // arm with no fixture (mutating it away is a survivor). This shape
+        // covers all three sites — this one and the two
+        // `ErrorKind::NotFound` guards below. Not for want of
         // reachability: every missing leaf walks `canonicalize` → NotFound →
         // `symlink_metadata` → NotFound, so both guards fire on the ordinary
         // absence path. What no fixture can produce is a `symlink_metadata`
@@ -197,8 +209,8 @@ impl CitationSource for StoreSource<'_> {
         // (`a_resolvable_symlink_leaf_is_read_through`) is `#[cfg(unix)]`,
         // because a Windows junction cannot resolve onto a file and file
         // symlinks need privilege here. So that mutation survives on Windows
-        // and dies on the ubuntu leg: registered survivor Q03, a platform
-        // survivor rather than an uncovered arm.
+        // and dies on the ubuntu leg: a platform survivor rather than an
+        // uncovered arm.
         match std::fs::metadata(&joined) {
             Ok(meta) if meta.is_file() => {
                 // Metadata and open are two syscalls, so a file removed in
@@ -330,7 +342,7 @@ fn canonicalize_existing_ancestor(path: &Path) -> Result<Option<PathBuf>, Verify
                 // program" — would report an offline server as
                 // `source_missing`, which `light-citation` forbids outright:
                 // a network failure is never "this work does not exist".
-                // Registered survivor (N12), deliberately not adopted.
+                // A known survivor — the change was deliberately not adopted.
                 let Some(name) = current.file_name() else {
                     return Err(VerifyError::Io {
                         path: current.to_path_buf(),
@@ -614,8 +626,8 @@ mod tests {
 
     #[test]
     fn a_local_path_that_would_escape_the_workspace_is_not_read() {
-        // `local_path` is workspace-relative by contract (ADR 0024); this
-        // crate refuses anything that is not, rather than resolving it.
+        // `local_path` is workspace-relative by contract; this crate refuses
+        // anything that is not, rather than resolving it.
         let f = fixture(Some("../../outside.md"));
         let source = StoreSource::new(&f.store, f.root());
         let v = integrity(&source, SOURCE_KEY, REVISION);
@@ -704,9 +716,9 @@ mod tests {
 
     /// `momotaro_ingest::path::resolve_local_path` accepts a leading `./`
     /// for this very column, and a file that is not there is `source_missing`
-    /// — not "I could not decide" (ADR 0024: *a missing file is
-    /// `source_missing`, not a fallback*; light-skills `CONFIRMED-MISSING` →
-    /// `failed`, distinct from `UNAVAILABLE` → `unsupported`).
+    /// — not "I could not decide": *a missing file is `source_missing`, not a
+    /// fallback* (light-skills `CONFIRMED-MISSING` → `failed`, distinct from
+    /// `UNAVAILABLE` → `unsupported`).
     #[test]
     fn a_leading_dot_local_path_that_is_missing_is_still_source_missing() {
         let mut f = fixture(None);
@@ -724,7 +736,7 @@ mod tests {
     }
 
     /// A path whose every component is a plain name can still walk out of the
-    /// workspace through a reparse point, and ADR 0024 requires containment
+    /// workspace through a reparse point, so containment is required
     /// *including no symlink escape*. Junctions need no elevation, so this is
     /// the escape shape that exists in the wild.
     #[cfg(windows)]
@@ -938,7 +950,7 @@ mod tests {
 
     /// A `..` that happens to land back inside the workspace is still a
     /// malformed `local_path`: the column's contract is workspace-relative
-    /// *and* `..`-free (ADR 0024), so the form check refuses it before
+    /// *and* `..`-free, so the form check refuses it before
     /// containment is asked to forgive it.
     #[test]
     fn a_dot_dot_path_that_resolves_inside_is_still_refused() {
@@ -1121,7 +1133,8 @@ mod tests {
         // The premise the whole fixture rests on: containment *forgives* this
         // path (it resolves inside the workspace on the cwd's own drive), so
         // only the form check can refuse it. Without that, containment alone
-        // would produce the verdict asserted below and CD10 would survive.
+        // would produce the verdict asserted below, leaving the form check
+        // unexercised.
         let canonical_cwd = std::fs::canonicalize(&cwd).expect("canonical cwd");
         assert!(
             std::fs::canonicalize(cwd.join(&local_path))

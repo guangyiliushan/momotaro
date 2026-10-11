@@ -1,6 +1,5 @@
 //! One file's ingest unit: revision, chunks, edges, and the file's event in a
-//! single `BEGIN IMMEDIATE` (D40's unit — the API ADR 0026 registered as
-//! follow-up work).
+//! single `BEGIN IMMEDIATE`.
 
 use momotaro_contracts::{Chunk, GraphLink};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -12,11 +11,11 @@ use crate::{Store, StoreError, invalid_value};
 impl Store {
     /// Commits one file's ingest unit in exactly one `BEGIN IMMEDIATE`.
     ///
-    /// Order inside the transaction is fixed: `guard` runs first (W2.5
+    /// Order inside the transaction is fixed: `guard` runs first (it
     /// re-checks the file's stat there; a refusal rolls the whole unit back),
     /// then the revision upsert, the replacement of the revision's chunks
-    /// (rows a reference names are retained — ADR 0022) and of the source's
-    /// `graph_links` rows (D40 / ADR 0027), and
+    /// (rows a reference names are retained) and of the source's
+    /// `graph_links` rows, and
     /// finally the file's event when the caller supplies one. Nothing is
     /// written unless the event lands with it, so a crash between data and
     /// event cannot exist inside this unit. A guard that wants its refusal
@@ -24,7 +23,7 @@ impl Store {
     /// [`StoreError::GuardRejected`]; a caller that has no end-of-transaction
     /// check to make passes a no-op, and the index batch is not one of them —
     /// both of its write sites (note and attachment) re-check the file's stat
-    /// there, because D40 §4.7's unit is per file rather than per kind.
+    /// there, because the unit is per file rather than per kind.
     ///
     /// Returns whether a revision row was actually *created*. Re-appending a
     /// pair that already exists re-adopts it instead — the shape a deleted file
@@ -32,15 +31,22 @@ impl Store {
     /// from this would otherwise claim one for a row that was already there.
     ///
     /// The event must name the revision's source: a row about another source
-    /// riding this unit would claim work that is not here (ADR 0026). The data
+    /// riding this unit would claim work that is not here. The data
     /// half replays idempotently (revision upsert; chunks replaced, rows a
-    /// reference names retained — ADR 0022 — and edges replaced wholesale);
+    /// reference names retained, and edges replaced wholesale);
     /// the event is append-only like every event, and replay
     /// semantics for it stay the caller's (`batch_id` / `seq` / `external_id`).
     ///
     /// The replace's [`ChunkReplaceReport`](crate::chunks::ChunkReplaceReport)
     /// (retained / drift) is returned beside the creation flag, so a drift
-    /// signal reaches the ingest caller instead of dying at this wrapper.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::InvalidValue` when `event.source_key` names a source
+    ///   other than the revision's.
+    /// - `StoreError::GuardRejected` when the caller's `guard` refuses the
+    ///   unit — how a stat check reports a file that moved mid-write.
+    /// - `StoreError::Sqlite` when a statement fails or the commit fails.
     pub fn commit_source_file(
         &mut self,
         revision: &NewSourceRevision<'_>,
@@ -83,7 +89,7 @@ impl Store {
         let existed = prior.is_some();
         // A re-adoption keeps the revision's first stamp (the upsert below
         // never touches `ingested_at`), so the edges carry that same stamp —
-        // ADR 0027 replays them from the revision row, and rows holding a
+        // The edges replay from the revision row, and rows holding a
         // later clock would not rebuild byte for byte.
         let restamped;
         let edges = match prior {
@@ -133,7 +139,16 @@ impl Store {
     ///
     /// Same order and same guarantees as the sibling: the guard runs first and a
     /// refusal rolls the whole unit back, the event lands with the data or not at
-    /// all, and the event must be about this source.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::InvalidValue` when `event.source_key` names a source
+    ///   other than `source_key`.
+    /// - `StoreError::GuardRejected` when the caller's `guard` refuses the
+    ///   unit — how a stat check reports a file that moved mid-write.
+    /// - `StoreError::RevisionMissing` when `(source_key, revision_hash)`
+    ///   names no stored revision — nothing was written.
+    /// - `StoreError::Sqlite` when a statement fails or the commit fails.
     #[allow(clippy::too_many_arguments)]
     pub fn commit_source_refresh(
         &mut self,
@@ -356,8 +371,8 @@ mod tests {
 
     /// The shape the replay test below cannot see: the same content returning
     /// under a later clock. The upsert re-adopts the row and keeps its first
-    /// `ingested_at`, so the edges must keep that stamp too — ADR 0027 rebuilds
-    /// them from the revision row, and rows carrying the later clock would not
+    /// `ingested_at`, so the edges must keep that stamp too — they replay
+    /// from the revision row, and rows carrying the later clock would not
     /// replay byte for byte.
     #[test]
     fn a_re_adoption_keeps_the_first_stamp_on_the_edges() {
@@ -391,7 +406,7 @@ mod tests {
 
     /// Replaying the unit is idempotent: the same input twice leaves the same
     /// rows — the data half is upsert plus replace (cited chunk rows are
-    /// retained, ADR 0022).
+    /// retained).
     #[test]
     fn replaying_the_same_unit_leaves_the_same_rows() {
         let (_dir, mut store) = temp_store();
@@ -553,7 +568,7 @@ mod tests {
 
     /// The refresh unit answers the same two questions the build unit does:
     /// the guard is first, and a refusal leaves the row's mutable columns,
-    /// its edges and the log exactly as they were (D40 §4.7).
+    /// its edges and the log exactly as they were.
     #[test]
     fn a_guard_refusal_writes_nothing_on_a_refresh() {
         let (_dir, mut store) = temp_store();
@@ -611,7 +626,7 @@ mod tests {
 
     /// What a refresh actually writes, in one unit: the mutable columns, the
     /// re-projected edges and the caller's event — no new revision, because the
-    /// bytes did not change (D40 §4.7).
+    /// bytes did not change.
     #[test]
     fn a_refresh_lands_columns_edges_and_event_in_one_unit() {
         let (_dir, mut store) = temp_store();
@@ -736,14 +751,14 @@ mod tests {
     }
 
     /// Behavior cannot see a lock mode; the contract says BEGIN IMMEDIATE
-    /// (D40 / W2.5) and this needle pins it — the migration runner's shape is
+    /// and this needle pins it — the migration runner's shape is
     /// pinned the same way. The needle is split so the test cannot count its
     /// own source text as a hit, and the search is scoped to each function
     /// body so a stray mention elsewhere cannot stand in for the real thing.
     /// Both units are in the search: a needle scoped to `commit_source_file`
     /// alone let the sibling's transaction silently drop to DEFERRED.
     ///
-    /// Deliberate extension (W3.7, the run units): the search was widened to
+    /// Deliberate extension (the run units): the search was widened to
     /// `runs.rs` and its eight `commit_run_*` units when they joined the
     /// family. The family half below enumerates the production halves'
     /// `pub fn commit_*` units and requires a one-to-one match with this
@@ -841,7 +856,7 @@ mod tests {
 
     /// An event that names another source — or names nobody — is refused by
     /// name, and a refused unit writes nothing, chunks and edges included:
-    /// riding this unit such a row would claim work that is not here (ADR 0026).
+    /// riding this unit such a row would claim work that is not here.
     #[test]
     fn an_event_for_another_source_is_refused() {
         let (_dir, mut store) = temp_store();

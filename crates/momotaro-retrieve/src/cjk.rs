@@ -17,6 +17,23 @@ pub const CJK_TOKENIZER_NAME: &str = "cjk";
 const MAX_TOKEN_CHARS: usize = 40;
 
 /// The Momotaro CJK bigram tokenizer.
+///
+/// # Examples
+///
+/// ```
+/// use momotaro_retrieve::CjkTokenizer;
+/// use tantivy::tokenizer::{TokenStream, Tokenizer};
+///
+/// let mut tokenizer = CjkTokenizer;
+/// let mut stream = tokenizer.token_stream("傅里叶变换");
+/// let mut tokens = Vec::new();
+/// while stream.advance() {
+///     tokens.push(stream.token().text.clone());
+/// }
+///
+/// // A CJK run emits overlapping bigrams rather than whole words.
+/// assert_eq!(tokens, ["傅里", "里叶", "叶变", "变换"]);
+/// ```
 #[derive(Clone, Default)]
 pub struct CjkTokenizer;
 

@@ -1,10 +1,10 @@
-//! Link extraction and resolution for graph edge building (`§5 第 2–4 条`).
+//! Link extraction and resolution for graph edge building.
 //!
 //! Everything here is pure: text in, records and answers out. The store and the
 //! vault never enter; what the caller does with a [`RawLink`] (store it in
 //! `metadata_json.links`, project it into `graph_links`) is `run`'s wiring. The
 //! parse base is the same one the chunker uses, so a wikilink is a link in
-//! exactly one place's opinion (`§5 第 6 条`).
+//! exactly one place's opinion.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -12,7 +12,7 @@ use std::ops::Range;
 use momotaro_contracts::{AnchorKind, Degradation, EdgeKind, LinkSource, nfc_text};
 use pulldown_cmark::{Event, LinkType, Parser, Tag, TagEnd};
 
-/// One extracted link record — the `metadata_json.links` shape (`§5 第 2 条`).
+/// One extracted link record — the `metadata_json.links` shape.
 ///
 /// `raw_target` and `anchor_raw` are exactly as written: a markdown link's
 /// target keeps its percent-encoding, and re-projection decodes it again
@@ -32,7 +32,7 @@ pub struct RawLink {
     pub anchor_raw: Option<String>,
 }
 
-/// What one extraction pass found (`§5 第 2 条` / `§5 第 7 条`).
+/// What one extraction pass found.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Extracted {
     /// Buildable records, document order, identity-deduped (first wins).
@@ -42,7 +42,7 @@ pub struct Extracted {
 }
 
 impl Extracted {
-    /// Records one distinct extraction loss (§5 第 7 条: the list is codes,
+    /// Records one distinct extraction loss (the list is codes,
     /// once each, declaration order by construction).
     pub fn push_loss(&mut self, code: Degradation) {
         if !self.losses.contains(&code) {
@@ -51,7 +51,7 @@ impl Extracted {
         }
     }
 
-    /// Records one link: the same writing twice is one row (ADR 0027), first
+    /// Records one link: the same writing twice is one row, first
     /// occurrence keeps its place in the document order.
     pub fn push_link(&mut self, link: RawLink) {
         if !self.links.contains(&link) {
@@ -71,13 +71,13 @@ impl Extracted {
 }
 
 /// One parse of a Markdown body: the links it writes and the outline its
-/// anchors are checked against (`§5 第 2/4 条`). One event walk feeds both —
+/// anchors are checked against. One event walk feeds both —
 /// the parse base has one opinion of the text, and the text is parsed once.
 ///
 /// `excluded` byte spans (the Excalidraw scene) are skipped like the chunker
 /// skips them: content inside one is not the note's prose. Code spans and code
 /// fences keep their `[[…]]` text — that is someone's code, not a link, and
-/// not a remnant (`§5 第 6 条`).
+/// not a remnant.
 pub fn analyze(text: &str, excluded: &[Range<usize>]) -> (Extracted, Outline) {
     let mut out = Extracted::default();
     let mut outline = Outline::default();
@@ -130,7 +130,7 @@ pub fn analyze(text: &str, excluded: &[Range<usize>]) -> (Extracted, Outline) {
                 // the body's trailing scan never sees it: a `[[|alias]]` with
                 // no destination that pulldown-cmark did not turn into a link
                 // would vanish silently from a `#` heading while the same text
-                // in a paragraph is reported (`§5 第 6 条` names this shape).
+                // in a paragraph is reported.
                 scan_remnants(&heading_text, &mut out);
                 if let Some((_, slot)) = stack.last_mut() {
                     *slot = heading_text.trim().to_string();
@@ -185,7 +185,7 @@ pub fn analyze(text: &str, excluded: &[Range<usize>]) -> (Extracted, Outline) {
     scan_remnants(&text_run, &mut out);
 
     // A `^id` definition is a line-final caret id outside any fenced code
-    // block (§5 第 4 条: end of a paragraph, its own line, or after a bullet) —
+    // block (end of a paragraph, its own line, or after a bullet) —
     // inside a fence it is code someone wrote, not a block definition.
     let mut offset = 0;
     for line in text.lines() {
@@ -213,7 +213,7 @@ fn outline_of(text: &str) -> Outline {
     analyze(text, &[]).1
 }
 
-/// Extracts the links a frontmatter block carries (`§5 第 5 条`).
+/// Extracts the links a frontmatter block carries.
 ///
 /// Always from the `raw` block text, so an unmodelled field shape cannot hide a
 /// link: only column-0 `#` comment lines are skipped, and block-scalar content
@@ -229,7 +229,7 @@ pub fn extract_frontmatter_links(raw: &str) -> Extracted {
     out
 }
 
-/// The target-side facts an anchor is checked against (`§5 第 4 条`).
+/// The target-side facts an anchor is checked against.
 ///
 /// `headings` holds one path per heading — the h1-h6 stack snapshot after that
 /// heading, empty levels filtered — mirroring the chunker's `heading_path`
@@ -242,7 +242,7 @@ pub struct Outline {
     pub block_ids: Vec<String>,
 }
 
-/// A line-final `^id` is a block definition in all three shapes (`§5 第 4 条`):
+/// A line-final `^id` is a block definition in all three shapes:
 /// end of a paragraph line, on its own line, or after a bullet. The caret must
 /// start the line or follow whitespace, and the id must run to end of line.
 fn line_final_block_id(trimmed: &str) -> Option<&str> {
@@ -256,13 +256,13 @@ fn line_final_block_id(trimmed: &str) -> Option<&str> {
     }
 }
 
-/// Whether an anchor still exists in its target's outline (`§5 第 4 条`).
+/// Whether an anchor still exists in its target's outline.
 ///
 /// Heading anchors are text anchors: the levels of `#H1#H2` match the tail of
 /// some heading's path (a single `#H` therefore matches any heading named `H`,
 /// first occurrence counting for locating, not for existence). Block anchors
 /// match a `^id` definition. Both sides are compared NFC-folded but never
-/// case-folded (D42).
+/// case-folded.
 pub fn anchor_still_exists(kind: AnchorKind, anchor_raw: &str, outline: &Outline) -> bool {
     match kind {
         AnchorKind::Block => {
@@ -288,7 +288,7 @@ pub fn anchor_still_exists(kind: AnchorKind, anchor_raw: &str, outline: &Outline
     }
 }
 
-/// A vault's linkable names: what a raw target can resolve against (`§5 第 3 条`).
+/// A vault's linkable names: what a raw target can resolve against.
 #[derive(Debug, Default)]
 pub struct Namespace {
     /// Vault-relative path (`docs/a.md`) → source key.
@@ -326,7 +326,7 @@ impl Namespace {
     }
 }
 
-/// What a raw target resolved to (`§5 第 2–3 条`).
+/// What a raw target resolved to.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Resolution {
     /// One target key.
@@ -337,7 +337,7 @@ pub enum Resolution {
     Ambiguous(Vec<String>),
 }
 
-/// Resolves one record's raw target against a [`Namespace`] (`§5 第 3 条`).
+/// Resolves one record's raw target against a [`Namespace`].
 ///
 /// Markdown targets are percent-decoded first (a record is only ever born from
 /// a successfully decoded link, so the failure branch is defensive); `./` is
@@ -417,7 +417,7 @@ pub fn parent_dir(path: &str) -> &str {
 }
 
 /// Percent-decodes one target part; `None` on a malformed escape or a result
-/// that is not UTF-8 (`§5 第 7 条`: `markdown_link_decode_error`).
+/// that is not UTF-8 (`markdown_link_decode_error`).
 pub fn percent_decode(raw: &str) -> Option<String> {
     let bytes = raw.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -453,7 +453,7 @@ fn is_block_id(id: &str) -> bool {
 fn is_external(target: &str) -> bool {
     // A URI, not a vault path: `scheme://…` in any spelling, plus `mailto:`.
     // A bare `arxiv:1234`-shaped name has no `//` and stays a (dangling) name.
-    // Allocation-free (probe P1-F2): this runs once per link on the indexing
+    // Allocation-free: this runs once per link on the indexing
     // hot path, and the case-folding happens per compared byte rather than by
     // lowercasing the whole target first.
     if target
@@ -487,7 +487,7 @@ fn classify_event_link(dest: &str, link_type: LinkType, embed: bool, out: &mut E
 }
 
 /// One classifier for every syntax: split at the first `#`, gate externals,
-/// decode markdown parts, then record (or lose) the link (`§5 第 2–6 条`).
+/// decode markdown parts, then record (or lose) the link.
 fn classify(dest: &str, edge_kind: EdgeKind, link_source: LinkSource, out: &mut Extracted) {
     let (raw_target, raw_anchor) = split_anchor(dest);
     if is_external(raw_target) {
@@ -522,7 +522,7 @@ fn classify(dest: &str, edge_kind: EdgeKind, link_source: LinkSource, out: &mut 
         raw_anchor
     };
 
-    // Anchor form check (`§5 第 6 条`): `^` anchors need an id in `[A-Za-z0-9-]+`.
+    // Anchor form check: `^` anchors need an id in `[A-Za-z0-9-]+`.
     let mut anchor_kind = None;
     let mut anchor_raw_out = None;
     if let Some(anchor_text) = anchor {
@@ -544,7 +544,7 @@ fn classify(dest: &str, edge_kind: EdgeKind, link_source: LinkSource, out: &mut 
 
     if raw_target.is_empty() {
         // `[[#H]]` names this very note: an explicit non-edge, not a lost edge
-        // (`§5 第 2 条`). `[[#]]` is nothing at all — a remnant shape.
+        // `[[#]]` is nothing at all — a remnant shape.
         if anchor_kind.is_some() {
             return;
         }
@@ -569,7 +569,7 @@ fn split_anchor(dest: &str) -> (&str, Option<&str>) {
 }
 
 /// A closed `[[…]]` shape left in text is something the parser refused —
-/// `unknown_link_syntax`, never silent (`§5 第 6 条`).
+/// `unknown_link_syntax`, never silent.
 fn scan_remnants(text: &str, out: &mut Extracted) {
     let mut idx = 0;
     while let Some(start) = text[idx..].find("[[") {
@@ -584,7 +584,7 @@ fn scan_remnants(text: &str, out: &mut Extracted) {
     }
 }
 
-/// One frontmatter line: same classifier, `frontmatter` source (`§5 第 5 条`).
+/// One frontmatter line: same classifier, `frontmatter` source.
 fn scan_frontmatter_line(line: &str, out: &mut Extracted) {
     let mut rest = line;
     while let Some(open) = rest.find("[[") {
@@ -673,7 +673,7 @@ mod tests {
 
     #[test]
     fn two_anchors_on_one_target_are_two_records() {
-        // The anchor is half of the row identity (ADR 0027): same target, same
+        // The anchor is half of the row identity: same target, same
         // syntax, different anchors means distinct edges — and collapsing them
         // would be exactly the silent merge the identity exists to refuse.
         let out = extract_links("[[x#A]] [[x#B]] [[x]]", &[]);
@@ -803,7 +803,7 @@ mod tests {
 
     /// The heading half of `a_refused_shape_in_prose_is_reported_once`.
     ///
-    /// `§5 第 6 条` names `[[|alias]]` by shape, and the paragraph case was
+    /// `[[|alias]]` is refused by shape, and the paragraph case was
     /// covered — but heading text is collected into a separate buffer that
     /// the body's trailing scan never sees, so a refused shape on a `#`
     /// heading produced no code at all while the identical text in a
@@ -1099,7 +1099,7 @@ text
 
     #[test]
     fn matching_follows_nfc_but_never_case_folds() {
-        // D42: comparison follows the key's normalization (the raw writing
+        // Comparison follows the key's normalization (the raw writing
         // never has to be normalized by its author), and case is identity —
         // folding two distinct Linux files into one match is data loss.
         let ns = Namespace::new([("caf\u{e9}.md", "note:caf\u{e9}.md")]);
@@ -1118,9 +1118,8 @@ text
 
     /// `End(CodeBlock)` is what puts the text run back in play. Latch the flag
     /// and every paragraph after the first fence is read as code, so a refused
-    /// `[[…]]` written in prose never reaches the scan — a loss `§5 第 6 条`
-    /// names by shape and this doc's own fence test would have you believe is
-    /// quiet forever.
+    /// `[[…]]` written in prose never reaches the scan — a loss this doc's own
+    /// fence test would have you believe is quiet forever.
     #[test]
     fn a_refused_shape_after_a_code_block_is_reported_too() {
         let out = extract_links("```\ncode\n```\n\na [[|alias]] b", &[]);
@@ -1146,7 +1145,7 @@ text
         );
     }
 
-    /// Both halves of the caret-id rule (§5 第 4 条): whitespace before the `^`,
+    /// Both halves of the caret-id rule: whitespace before the `^`,
     /// and an id the grammar admits. Relax either and `outline.block_ids`
     /// grows a definition that was never written, so `anchor_still_exists`
     /// answers "still there" for an anchor that is gone (stale-anchor miss).
@@ -1240,7 +1239,7 @@ text
     /// The allocation-free `is_external` folds case per compared byte
     /// (`eq_ignore_ascii_case`); the old whole-string lowercase folded it
     /// wholesale. Uppercase spellings are the shapes the rewrite could have
-    /// broken — this pins them (probe P1-F2).
+    /// broken — this pins them.
     #[test]
     fn an_uppercase_uri_scheme_is_still_external() {
         assert!(is_external("MAILTO:someone@example.com"));

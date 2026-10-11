@@ -1,12 +1,12 @@
 //! The ask run end to end, against the checked-in fixture vault and the fake
-//! provider rig (`architecture.md` §19.4: fixture vault → ingest → search →
+//! provider rig (fixture vault → ingest → search →
 //! fake LLM → citation → trace replay).
 //!
 //! The crash injection lives here, in tests, not in a manual procedure: a
 //! child process runs an ask whose provider call parks forever, the parent
 //! kills it (`TerminateProcess` — this platform's `kill -9` equivalent) and
 //! reopens the store, and the run must read back `failed(interrupted)` with
-//! its partial output annotated (`harness.md` §8.1).
+//! its partial output annotated.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -51,7 +51,7 @@ fn write_config(workspace: &Path) {
 
 /// A ready-to-ask workspace: staged vault, indexed store.
 /// The options a test asks with: network permission granted, everything else
-/// default. `ask` is a provider call, and architecture §7 keeps the network
+/// default. `ask` is a provider call, and the network is kept
 /// off until it is allowed — a test that wants an answer has to allow it.
 fn network_allowed() -> AskOptions {
     AskOptions {
@@ -151,7 +151,7 @@ fn the_fifteen_steps_land_the_tables_and_the_answer_verifies() {
         "the citation carries the five-tuple"
     );
 
-    // The three tables carry rows (W3.9's hard shape), and the timeline
+    // The three tables carry rows (the hard shape), and the timeline
     // carries the vocabulary in order.
     let trace = trace_workspace(tempdir.path(), &report.run_id).expect("trace");
     assert!(
@@ -270,7 +270,7 @@ fn replaying_the_same_client_request_returns_the_same_run() {
     assert_eq!(
         store.sessions().expect("sessions").len(),
         1,
-        "a replay mints no second session (`harness.md` §1)"
+        "a replay mints no second session"
     );
 }
 
@@ -307,7 +307,7 @@ fn ask_under_no_llm_is_refused_before_a_run_exists() {
 
 #[test]
 fn ask_without_network_permission_is_refused_before_a_run_exists() {
-    // architecture §7 keeps the network off until it is allowed, and an `ask`
+    // The network stays off until it is allowed, and an `ask`
     // is a provider call. The engine must enforce that itself: the CLI has its
     // own gate, so only this test can tell the two apart.
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -381,7 +381,7 @@ fn crash_child_parks_the_ask_mid_run() {
     unreachable!("the parking transport never returns");
 }
 
-/// The W3.7 acceptance (`harness.md` §8.1): kill -9 mid-run, reopen the
+/// The crash acceptance: kill -9 mid-run, reopen the
 /// store, and the run's terminal state is `failed(interrupted)` — with the
 /// partial output annotated and `trace` still usable.
 #[test]
@@ -437,7 +437,7 @@ fn a_killed_ask_reads_back_failed_interrupted_on_reopen() {
     child.0.kill().expect("kill the child");
     let _ = child.0.wait();
 
-    // Reopen through the run engine (its open sweeps — harness §2) and read
+    // Reopen through the run engine (its open sweeps) and read
     // the run back: terminal `failed(interrupted)`, partial output named.
     let trace = trace_workspace(&workspace, &run_id).expect("trace after the crash");
     assert_eq!(trace.run.status, "failed");
@@ -463,9 +463,9 @@ fn a_killed_ask_reads_back_failed_interrupted_on_reopen() {
     assert!(trace.answer.is_none(), "no answer for an interrupted ask");
 }
 
-/// The failure matrix (DoD 7: 引用失败显式标记，不伪装成功). Every citation
+/// The failure matrix: 引用失败显式标记，不伪装成功. Every citation
 /// failure keeps the answer on record and marks the verdict explicitly —
-/// `architecture.md` §14.1.5: 引用失败时回答可以输出，但不是 fully verified.
+/// 引用失败时回答可以输出，但不是 fully verified.
 mod citation_failures {
     use super::*;
 
@@ -501,7 +501,7 @@ Citations:
         assert_eq!(
             report.failure_note.as_deref(),
             Some("1 of 1 citations failed verification"),
-            "the partial output is annotated (multi-agent §5.1)"
+            "the partial output is annotated"
         );
     }
 
@@ -578,7 +578,7 @@ Citations:
             0,
             "no provider call for an empty retrieval"
         );
-        // And the failure lands with its §18 category on the timeline.
+        // And the failure lands with its category on the timeline.
         let trace = trace_workspace(tempdir.path(), &report.run_id).expect("trace");
         let terminal = trace.events.last().expect("terminal");
         assert_eq!(terminal.event_type, "run.failed");
@@ -611,7 +611,7 @@ Citations:
 
 /// The failure matrix's provider half: an exchange that never lands still
 /// gets its turn row (its usage columns are the attempt's record) and its
-/// §18 category on the terminal event.
+/// category on the terminal event.
 #[test]
 fn a_provider_failure_is_recorded_and_categorised() {
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -644,7 +644,7 @@ fn a_provider_failure_is_recorded_and_categorised() {
         terminal_payload["category"], "llm_provider",
         "{terminal_payload}"
     );
-    // The rest of the §18 object, read back from the terminal write: a
+    // The rest of the failure object, read back from the terminal write: a
     // literal attribution here (`"system"`) survived every test built before
     // this one — only `category` was asserted.
     assert_eq!(
@@ -654,7 +654,7 @@ fn a_provider_failure_is_recorded_and_categorised() {
     assert_eq!(terminal_payload["retryable"], true, "{terminal_payload}");
     assert_eq!(terminal_payload["severity"], "error", "{terminal_payload}");
 
-    // The §18 object under `llm.finished` is the other place this layer writes
+    // The failure object under `llm.finished` is the other place this layer writes
     // it, and until now nothing read it back — the two sites had retyped its
     // four fields by hand next to the builder that already had them, so a field
     // renamed in one place left the other quietly wrong.
@@ -730,7 +730,7 @@ fn a_failed_exchange_that_reported_usage_still_records_it_on_the_turn() {
     assert_eq!(turn.reasoning_tokens, Some(4), "{turn:?}");
     assert_eq!(turn.slot.as_deref(), Some("answer"), "{turn:?}");
 
-    // `reference.md` promises the cache summary on `llm.finished` whenever the
+    // The cache summary is promised on `llm.finished` whenever the
     // provider reports one — and this body did. The turn-row columns are
     // asserted above (the `cached_tokens` / `billable_tokens` / `reasoning_tokens`
     // block); this is the event half of the same numbers.
@@ -810,7 +810,7 @@ fn the_expand_turn_records_the_thinking_tokens_the_provider_reported() {
 ///
 /// `ask` emits `retrieval.started` and `llm.started`; expand emitted only the
 /// two `.finished` halves, so its timeline had two dangling ends — and both
-/// spellings are **stable** events in `reference.md`, while `append_run_event`'s
+/// spellings are **stable** events, while `append_run_event`'s
 /// own doc says those two exist precisely for the moments that write no table
 /// rows. `run_events` is a canonical, append-only audit table: the same named
 /// pair must not be half present depending on which of the two run-creating
@@ -889,8 +889,8 @@ fn a_successful_exchange_records_every_usage_column_on_the_turn() {
     );
     assert_eq!(turn.slot.as_deref(), Some("answer"), "{turn:?}");
 
-    // …and the event half carries the cache summary `reference.md` promises.
-    // The failure half of this promise has had a read-back since round 12; the
+    // …and the event half carries the promised cache summary.
+    // The failure half of this promise has had a read-back; the
     // success half had none, so replacing its two keys with `null` — writing
     // the event as if the provider reported nothing — left everything green.
     let finished = trace
@@ -933,7 +933,7 @@ fn an_unusable_index_fails_the_run_as_index_unavailable() {
     );
 }
 
-/// DoD 8: the index is a derived artifact — rebuilding it changes no run
+/// The index is a derived artifact — rebuilding it changes no run
 /// fact. The trace after a rebuild is the trace before it.
 #[test]
 fn rebuilding_the_index_leaves_run_history_untouched() {
@@ -962,7 +962,7 @@ fn rebuilding_the_index_leaves_run_history_untouched() {
     );
 }
 
-/// Q18 / H3: a `summary.v1` row whose stored text is not `summary.v1` JSON
+/// A `summary.v1` row whose stored text is not `summary.v1` JSON
 /// must fail closed — never be replayed as a turn. Folding it into "this row
 /// is not a summary" would put raw JSON in front of the model, which is the
 /// shape the three-state slot exists to make impossible.
@@ -1059,7 +1059,7 @@ fn a_malformed_summary_row_never_reaches_the_model_as_a_turn() {
         )
         .expect("plant the summary row");
     // Terminal, or the next `ask` refuses the session as already having an
-    // active run (`harness.md` §5).
+    // active run.
     store
         .commit_run_terminal(
             &planted_run,
@@ -1206,7 +1206,7 @@ fn expand_renders_every_hit_as_not_included_because_no_context_stage_ran() {
 }
 
 /// `sessions.last_activity_at` is documented as「recency 排序，区别于
-/// created_at」(`architecture.md`). A column set once at insert and never
+/// created_at」. A column set once at insert and never
 /// again contradicts its own comment from the second turn on — and it would
 /// be invisible, because until `Store::sessions` existed nothing could read
 /// it back. This is both the behaviour witness and the proof the column is
@@ -1347,7 +1347,7 @@ fn every_verification_row_names_the_revision_it_judged() {
 }
 
 /// The frozen spec is what a later config edit cannot rewrite
-/// (`architecture.md` §6.4), so a permission flag dropped on the way in is a
+/// so a permission flag dropped on the way in is a
 /// permission decision silently forgotten. `allow_write` merges from two
 /// sources — the flag and `[policy]` — and the merge was never observed: `||`
 /// → `&&` left every test in the workspace green while the stored spec
@@ -1394,7 +1394,7 @@ fn the_frozen_spec_records_the_write_flag_it_was_given() {
     // `a_successful_exchange_records_every_usage_column_on_the_turn`.
 }
 
-/// W3.10's B8: `hit_inclusion` had only unit assertions — nothing drove the
+/// `hit_inclusion` had only unit assertions — nothing drove the
 /// whole `format_trace` rendering, so a renderer that dropped the retrieval
 /// section (or printed its own word instead of the three spellings) would
 /// leave every unit test green.
@@ -1457,7 +1457,7 @@ fn the_rendered_trace_carries_every_retrieval_hit_and_its_treatment() {
     }
 }
 
-/// W3.11 ③: the two `[policy]` knobs reach the build, not merely the parser.
+/// The two `[policy]` knobs reach the build, not merely the parser.
 /// The trigger line recorded on `context.built` is computed from *this*
 /// config — a build that silently fell back to the 0.85/8192 defaults would
 /// record a different number.
@@ -1514,7 +1514,7 @@ fn the_policy_knobs_reach_the_compaction_trigger() {
     );
     assert!(
         compaction["triggered"].is_boolean(),
-        "`triggered` is the field §4's 观测三指标 will count, so it has to be \
+        "`triggered` is the field 观测三指标 will count, so it has to be \
          there and it has to be a verdict: {compaction}"
     );
 
@@ -1522,8 +1522,8 @@ fn the_policy_knobs_reach_the_compaction_trigger() {
     // in `max_context_tokens`, the adjusted ceiling, so the test drives the
     // line strictly *between* the two estimates, where only a comparison
     // against `adjusted_total` can see it. The arithmetic and why it costs a
-    // firing point are in `reference.md` (Event vocabulary) and
-    // `context-retrieval.md` §4; at §2.1's coefficient the band between the
+    // firing point live in the event vocabulary and the compaction
+    // rules; at the documented coefficient the band between the
     // two is a quarter of the raw estimate wide, so this is not a knife edge.
     let adjusted_total = compaction["adjusted_total"]
         .as_u64()
@@ -1531,7 +1531,7 @@ fn the_policy_knobs_reach_the_compaction_trigger() {
     assert_eq!(
         adjusted_total,
         ((raw_total as f64) * 1.25).ceil() as u64,
-        "the two estimates are related by §2.1's documented coefficient: {compaction}"
+        "the two estimates are related by the documented coefficient: {compaction}"
     );
     assert!(
         adjusted_total > raw_total,
@@ -1559,7 +1559,7 @@ fn the_policy_knobs_reach_the_compaction_trigger() {
     // could see it, because `cargo mutants` does not descend into
     // `serde_json::json!` macro bodies: `--list` shows not one mutant in the
     // range this verdict is written in, so the headline behaviour of this
-    // whole wave had zero in-diff coverage.
+    // work had zero in-diff coverage.
     assert_eq!(
         compaction_under(&format!("{:.6}", (adjusted_total as f64 + 0.5) / 4096.0))["triggered"],
         serde_json::json!(true),
@@ -1588,7 +1588,7 @@ fn the_policy_knobs_reach_the_compaction_trigger() {
     );
 }
 
-/// D26: the freeze writes the **configured** semantic tier, not a constant.
+/// The freeze writes the **configured** semantic tier, not a constant.
 /// `thinking = "high"` must reach `run_spec_json` as `"high"`, and the
 /// default `auto` as its answer-slot default `"medium"` — a mapping or a
 /// freeze that hardcodes either value turns one half of this red.
@@ -1630,7 +1630,7 @@ fn the_frozen_spec_carries_the_configured_thinking_tier() {
 /// the "is this row a summary?" test would mark the whole history
 /// `summary.v1`, and nothing else in the build would notice.
 #[test]
-fn replayed_history_fragments_are_text_not_summary_v1() {
+fn replayed_history_fragments_are_text_not_a_summary() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     ready_workspace(&tempdir);
     let fake = FakeLlm::new();
@@ -1667,10 +1667,10 @@ fn replayed_history_fragments_are_text_not_summary_v1() {
     }
 }
 
-/// The one refusal `usage.md` 多轮会话 promises — a typo'd `--session` never
+/// The one refusal 多轮会话 promises — a typo'd `--session` never
 /// mints a conversation.
 ///
-/// The **ordering** half of `harness.md` §2/§5 (sweep first, so a crashed
+/// The **ordering** half of the sweep contract (sweep first, so a crashed
 /// session is reaped rather than blocked behind this check) is a separate
 /// claim and has a separate test:
 /// `a_typo_in_the_session_id_still_reaps_the_run_the_open_was_going_to_sweep`.
@@ -1707,7 +1707,7 @@ fn an_unknown_session_is_refused_before_anything_is_written() {
 
     // The id is the one byte of caller input that reaches an error string,
     // and the CLI prints that string on both outlets. `PolicyRefused` was
-    // `&'static str` before this wave, so nothing user-supplied could get
+    // `&'static str` before sessions existed, so nothing user-supplied could get
     // here; now it can, and a bidi override in a mistyped id must not reach
     // a terminal (or a log) on either path.
     let hostile = AskOptions {
@@ -1726,9 +1726,9 @@ fn an_unknown_session_is_refused_before_anything_is_written() {
     assert_eq!(store.run_count().expect("count"), 0, "and still no run");
 }
 
-/// `harness.md` §5 and the comment in `ask_workspace` both say the sweep runs
-/// **before** the session decision — §2 specifies the sweep itself and §8.1 is
-/// the `kill -9` acceptance item, so neither is where the order lives. Until
+/// The comment in `ask_workspace` says the sweep runs **before** the session
+/// decision — the sweep rules specify the sweep itself and the `kill -9`
+/// acceptance item, so neither is where the order lives. Until
 /// now nothing could tell: the refusal test above never planted an orphan, and
 /// the orphan test below uses a session that exists, so both orders pass it. Moving
 /// `sweep_interrupted_runs()` below the gate left every test in the workspace
@@ -1792,7 +1792,7 @@ fn a_typo_in_the_session_id_still_reaps_the_run_the_open_was_going_to_sweep() {
         .expect("the planted run exists");
     assert_eq!(
         trace.run.status, "failed",
-        "the open swept on its way to the refusal — `harness.md` §8.1 is 
+        "the open swept on its way to the refusal — the sweep is 
          reachable from `--session` even when the id it was given is wrong. 
          Move the sweep below the session gate and this run is still `accepted`"
     );
@@ -1820,7 +1820,7 @@ fn a_crashed_run_in_the_session_is_swept_before_the_session_takes_another_turn()
     let session_id = first.session_id.clone().expect("a session opens");
 
     // A run left `accepted` with no terminal event — the shape a crash (or an
-    // `Err` after acceptance) leaves behind, and the reason `harness.md` §8.1
+    // `Err` after acceptance) leaves behind, and the reason the sweep
     // promises the next open reaps it. `--session` is the entry point that
     // actually blocks on this, so it is the one that has to sweep.
     let db = tempdir.path().join(".momotaro/momotaro.db");
@@ -1879,7 +1879,7 @@ fn a_crashed_run_in_the_session_is_swept_before_the_session_takes_another_turn()
         .expect("the planted run exists");
     assert_eq!(
         trace.run.status, "failed",
-        "the sweep reaped the orphan on the way in (`harness.md` §8.1)"
+        "the sweep reaped the orphan on the way in"
     );
     assert!(
         trace
@@ -1905,7 +1905,7 @@ fn a_crashed_run_in_the_session_is_swept_before_the_session_takes_another_turn()
 ///   are protected a second time by `carried_chunk_hashes` — the history row
 ///   carries its own hashes — so on a two-turn conversation an empty
 ///   `injected` changes nothing; it only bites once a turn falls out of the
-///   replay window (`context-retrieval.md` §3), which is what
+///   replay window, which is what
 ///   `momotaro-context`'s release test covers at that layer.
 #[test]
 fn the_ledger_a_turn_rebuilds_carries_its_fragment_counter_forward() {
@@ -2073,7 +2073,7 @@ fn two_real_turns_replay_the_first_request_in_front_of_the_second() {
     );
 }
 
-/// §L6 adjudication pin (I4-F1): the ask path's `llm_turns.request_hash` is
+/// The ask path's `llm_turns.request_hash` is
 /// the **context stream** hash (`request_bytes()`) — model-free — not the
 /// provider exchange's. Two identical workspaces asked with different
 /// `model_id`s must record the same hash; a hash taken over the provider

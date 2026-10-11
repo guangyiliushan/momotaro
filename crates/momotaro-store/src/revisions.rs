@@ -28,8 +28,8 @@ pub struct NewSourceRevision<'a> {
     pub title: Option<&'a str>,
     /// Remote URI, when the source has one.
     pub uri: Option<&'a str>,
-    /// Workspace-relative, `/`-joined path when the source lives on disk
-    /// (ADR 0024). Never absolute: the store only describes what lives inside
+    /// Workspace-relative, `/`-joined path when the source lives on disk.
+    /// Never absolute: the store only describes what lives inside
     /// the workspace that holds it.
     pub local_path: Option<&'a str>,
     /// The file name exactly as the vault spelled it (display / rename
@@ -145,7 +145,11 @@ impl crate::Store {
     /// it: the row becomes current again **with the mutable columns this call
     /// just read** — a source that was demoted when its file disappeared and
     /// has since come back must not keep the path and blob of its old life,
-    /// and identity (`source_key`, `revision_hash`, `ingested_at`) is untouched.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the transaction cannot be started, a
+    ///   revision statement fails, or the commit fails.
     pub fn append_revision(&mut self, revision: &NewSourceRevision<'_>) -> Result<(), StoreError> {
         let tx = self.connection.transaction()?;
         append_revision_tx(&tx, revision)?;
@@ -153,7 +157,11 @@ impl crate::Store {
         Ok(())
     }
 
-    /// Returns the current revision for `source_key`, if any.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the read fails — including a stored `kind`
+    ///   or `origin_class` spelling this build cannot decode.
     pub fn current_revision(&self, source_key: &str) -> Result<Option<SourceRevision>, StoreError> {
         query_current(&self.connection, source_key)
     }
@@ -161,7 +169,10 @@ impl crate::Store {
     /// Returns the title of the current revision for `source_key`, if any.
     ///
     /// Convenience wrapper over [`crate::Store::current_revision`] for
-    /// callers that only need the display title.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the read behind `current_revision` fails.
     pub fn current_revision_title(&self, source_key: &str) -> Result<Option<String>, StoreError> {
         Ok(self
             .current_revision(source_key)?
@@ -207,7 +218,13 @@ impl crate::Store {
     /// One trust class per source key, fetched in a single query.
     ///
     /// Mirrors [`Self::current_titles`]; a source missing from the map means
-    /// the store has no current revision for it (the column itself is NOT NULL).
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::InvalidValue` when a current revision's `origin_class`
+    ///   is NULL (a store violating its own DDL) or carries a spelling this
+    ///   build cannot decode.
+    /// - `StoreError::Sqlite` when the underlying query fails.
     pub fn current_origins(
         &self,
         source_keys: &HashSet<&str>,
@@ -223,7 +240,10 @@ impl crate::Store {
 
     /// Returns display titles for the current revision of each requested
     /// source key, in a single query. Keys without a current revision are
-    /// absent from the result.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the underlying query fails.
     pub fn current_titles(
         &self,
         source_keys: &HashSet<&str>,
@@ -239,11 +259,14 @@ impl crate::Store {
     /// its file had, and the moment the revision was written.
     ///
     /// All three, not just the key: reconcile compares this against what the
-    /// walk still names (D40 §4.2's delete half at vault scale), the row it
+    /// walk still names (the delete half at vault scale), the row it
     /// writes for a missing file is attributed by `raw_name`, and whether such
     /// a row already exists is answered by asking whether one came *after* the
     /// revision did. `raw_name` predates the column for some rows, so it stays
-    /// optional here and the caller falls back to the key's own spelling.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the read fails.
     pub fn current_sources(&self) -> Result<Vec<(String, Option<String>, i64)>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT source_key, raw_name, ingested_at FROM source_revisions WHERE is_current = 1",
@@ -261,7 +284,7 @@ impl crate::Store {
 
     /// Marks every revision of `source_key` as no longer current.
     ///
-    /// The rows stay — history is never rewritten (ADR 0014) and the chunks
+    /// The rows stay — history is never rewritten — and the chunks
     /// stay with them — but a source whose file is gone has no *current*
     /// revision, and that one bit is what three separate guarantees rest on:
     /// a later `rebuild-index` rebuilds from current revisions only, so it
@@ -269,7 +292,10 @@ impl crate::Store {
     /// its edges dangle honestly; and `current_sources` stops naming it, so the
     /// next walk does not report the same absence twice — while a file that
     /// comes back becomes current again and earns a *fresh* absence if it
-    /// disappears a second time.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the update fails.
     pub fn demote_current(&mut self, source_key: &str) -> Result<(), StoreError> {
         self.connection.execute(
             "UPDATE source_revisions SET is_current = 0 WHERE source_key = ?1 AND is_current = 1",
@@ -282,8 +308,13 @@ impl crate::Store {
     ///
     /// Used when a file's bytes did not change but its fingerprint, stored path
     /// or raw spelling moved — a directory move must not leave a stale absolute
-    /// path behind (ADR 0024). Never touches `source_key` or `revision_hash`:
-    /// identity is not mutable.
+    /// path behind. Never touches `source_key` or `revision_hash`:
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::RevisionMissing` when no stored revision matches
+    ///   `(source_key, revision_hash)` — nothing was updated.
+    /// - `StoreError::Sqlite` when the update fails.
     pub fn update_revision_fingerprint(
         &mut self,
         source_key: &str,
@@ -314,7 +345,7 @@ impl crate::Store {
 /// connection — the caller's transaction or the store's own.
 ///
 /// Split so the watcher's refresh can sit inside the same `BEGIN IMMEDIATE`
-/// as its edges and its event (D40 §4.7's "exactly one transaction"): the
+/// as its edges and its event (exactly one transaction): the
 /// statement itself is identical either way.
 pub(crate) fn update_revision_fingerprint_tx(
     connection: &Connection,

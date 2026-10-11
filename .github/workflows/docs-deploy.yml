@@ -24,7 +24,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      # Node 20 actions are removed from runners; pin 40-char SHAs on the Node 24 line (D39).
+      # Node 20 actions are removed from runners; pin 40-char SHAs on the Node 24 line.
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

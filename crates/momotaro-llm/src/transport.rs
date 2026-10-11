@@ -43,7 +43,7 @@ pub struct TransportReply {
 pub struct TransportError {
     /// Whether provider output was already observable when the failure hit
     /// (for example a body stream that died mid-way). Once output exists the
-    /// client must never retry — `docs/docs/architecture.md` §16: retry only
+    /// client must never retry: retry only
     /// before observable output.
     pub output_observed: bool,
     /// What failed, kept for diagnosis — the module's trusted-component rule
@@ -59,6 +59,12 @@ pub struct TransportError {
 /// boundary rules a production implementation inherits with this trait.
 pub trait ProviderTransport {
     /// Perform one provider exchange.
+    ///
+    /// # Errors
+    ///
+    /// - `TransportError` when no complete reply comes back: a connection,
+    ///   TLS, or read failure, or an expired deadline. `output_observed`
+    ///   records whether part of the body had already been read.
     fn send(&self, body: &str) -> Result<TransportReply, TransportError>;
 
     /// Perform one exchange carrying the request's idempotency key.
@@ -67,6 +73,11 @@ pub trait ProviderTransport {
     /// production transport and the test rig override this. `complete` always
     /// calls it with [`crate::LlmRequest::request_hash`], and every retry
     /// passes the same value.
+    ///
+    /// # Errors
+    ///
+    /// - `TransportError` under the same conditions as [`Self::send`], to
+    ///   which the default implementation forwards.
     fn send_with_idempotency_key(
         &self,
         idempotency_key: &str,

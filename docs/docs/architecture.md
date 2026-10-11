@@ -1414,9 +1414,9 @@ Windows / macOS / Linux 桌面安装包 + CLI。文档仍 GitHub Pages。营销�
 - **18 个零调用点根导出** —— 裁决是「常量留 `pub`（9 个契约拼写），函数删/降」。
   复核时**零调用点的函数已经 0 个**，剩的正好 9 个常量
   （context 8：`DEFAULT_TOKEN_ESTIMATE_COEFFICIENT` / `EMPTY_MARKER` / `EVIDENCE_FLOOR` /
-  `HISTORY_GUARD_ROUNDS` / `HISTORY_GUARD_TOKENS` / `SUMMARY_VERSION_V1` /
+  `HISTORY_GUARD_ROUNDS` / `HISTORY_GUARD_TOKENS` / `SUMMARY_VERSION` /
   `UNTRUSTED_CLOSE` / `UNTRUSTED_OPEN_PREFIX`；retrieve 1：`CJK_TOKENIZER_NAME`）；
-- **`SummaryV1::parse_stored`** —— 接进生产，落点是 `select_history` 的 fail-closed 闸，
+- **`Summary::parse_stored`** —— 接进生产，落点是 `select_history` 的 fail-closed 闸，
   闸的形状是**恒等**（`parse_stored(&item.body).is_ok_and(|p| &p == record)`），不是
   「两个较弱的检查都过」。R16 查出后者会动数据正确性：`validate_against_text` 只查三样
   （version、空字段标记、chunk_hash 子串在文本里），`covered_turns` 等字段仍可分叉，而

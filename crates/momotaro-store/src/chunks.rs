@@ -24,8 +24,8 @@ const CHUNK_COLUMNS: &str = "chunk_id, source_key, revision_hash, ordinal, headi
 /// What one replace found and kept: `chunk_id`s retained because a reference
 /// still names them, and `chunk_id`s that were referenced but already absent
 /// when the replace ran — the trace an out-of-band wipe leaves behind (a ref
-/// whose row was never written lands here too) (ADR 0022: a wipe "must emit
-/// drift, not silent re-verification"). Both lists are sorted.
+/// whose row was never written lands here too) — a wipe must emit drift,
+/// not silent re-verification. Both lists are sorted.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ChunkReplaceReport {
     /// Rows kept as they were because `answer_citations` or
@@ -51,7 +51,7 @@ fn read_chunk_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chunk> {
 
 /// The `chunk_id`s that `answer_citations` and `run_context_items` still
 /// name for one `(source_key, revision_hash)` — the rows a replace may not
-/// delete or overwrite (ADR 0022's retainer set). A name only counts inside
+/// delete or overwrite (the retainer set). A name only counts inside
 /// its own five-tuple: a reference to another `(source_key, revision_hash)`
 /// neither pins a row here nor enters this replace's drift.
 ///
@@ -107,7 +107,7 @@ fn referenced_chunk_ids(
 }
 
 /// Replaces one revision's chunks and its source's `graph_links` rows inside
-/// the caller's transaction (ADR 0022: `chunks` is a retained projection).
+/// the caller's transaction (`chunks` is a retained projection).
 ///
 /// Every row is written under the `source_key` / `revision_hash` arguments —
 /// the delete key — so a row struct's own fields cannot disagree with them,
@@ -120,7 +120,7 @@ fn referenced_chunk_ids(
 /// away. The returned [`ChunkReplaceReport`] lists the kept ids and any
 /// referenced id that was already absent when the replace ran: an out-of-band
 /// whole-table wipe surfaces through this path as drift, not as silent
-/// re-verification (ADR 0022).
+/// re-verification.
 pub(crate) fn replace_chunks_tx(
     tx: &rusqlite::Transaction<'_>,
     source_key: &str,
@@ -185,12 +185,17 @@ pub(crate) fn replace_chunks_tx(
 impl crate::Store {
     /// Atomically replaces one source revision's chunks — except rows an
     /// `answer_citations` or `run_context_items` row still names, which are
-    /// retained exactly as they are (ADR 0022) — and the same source's
-    /// `graph_links` rows (ADR 0027: the edges ride the file's own content
-    /// transaction — D40's unit).
+    /// retained exactly as they are — and the same source's
+    /// `graph_links` rows (the edges ride the file's own content
+    /// transaction).
     ///
     /// Returns the retained `chunk_id`s and any referenced id that was
     /// already absent when the replace ran; see [`ChunkReplaceReport`].
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the transaction cannot be opened, any
+    ///   statement of the replace fails, or the commit fails.
     pub fn replace_chunks(
         &mut self,
         source_key: &str,
@@ -205,6 +210,11 @@ impl crate::Store {
     }
 
     /// Returns one chunk by its deterministic identifier.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the query fails; a `chunk_id` with no row
+    ///   is `Ok(None)`, not an error.
     pub fn get_chunk(&self, chunk_id: &str) -> Result<Option<Chunk>, StoreError> {
         self.connection
             .query_row(
@@ -219,6 +229,11 @@ impl crate::Store {
     /// Returns every chunk whose owning revision is the current one.
     ///
     /// Ordered by `(source_key, ordinal)`.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when the query cannot be prepared or a row
+    ///   cannot be read.
     pub fn all_current_chunks(&self) -> Result<Vec<Chunk>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT c.*
@@ -233,6 +248,10 @@ impl crate::Store {
     }
 
     /// Returns row counts used by the `stats` projection.
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::Sqlite` when any of the count queries fails.
     pub fn counts(&self) -> Result<SourceCounts, StoreError> {
         let sources = self.connection.query_row(
             "SELECT COUNT(DISTINCT source_key) FROM source_revisions",
@@ -459,7 +478,7 @@ mod tests {
         );
     }
 
-    /// Contract (ADR 0022 / `architecture.md` §8.1): rows a reference names
+    /// Contract: rows a reference names
     /// stay. Fixture ids stand for `hash(sk, rh, ordinal)`; a coalescing
     /// policy shrinks the revision to one chunk, so the cited chunks at
     /// ordinals 1 and 2 are absent from the incoming set — only retention can
@@ -516,7 +535,7 @@ mod tests {
         );
     }
 
-    /// Contract (`architecture.md` §8.1): `chunk_hash` is policy, `chunk_id`
+    /// Contract: `chunk_hash` is policy, `chunk_id`
     /// is not — a new hash function re-ingests the same identifiers with new
     /// hashes. The cited row's hash must not move under the citation: the
     /// five-tuple's `chunk_hash` may not silently go invalid.
@@ -557,7 +576,7 @@ mod tests {
         assert!(report.drift.is_empty());
     }
 
-    /// ADR 0022: "Deleting unreferenced rows is allowed." Retention pins
+    /// Deleting unreferenced rows is allowed. Retention pins
     /// named rows, not the whole revision — an uncited sibling goes when the
     /// replace replaces it.
     #[test]
@@ -593,8 +612,8 @@ mod tests {
         assert!(report.drift.is_empty());
     }
 
-    /// Contract (ADR 0022): "Wiping the table is disaster recovery with the
-    /// current policy and must emit drift, not silent re-verification." The
+    /// Contract: wiping the table is disaster recovery with the current
+    /// policy and must emit drift, not silent re-verification. The
     /// recovery ingest reproduces the rows byte for byte, so every five-tuple
     /// would verify again — the replace must still say the references lost
     /// their rows.
@@ -732,7 +751,7 @@ mod tests {
         );
     }
 
-    /// ADR 0022: "Retrieval hits do not pin rows." The audit of what a query
+    /// Retrieval hits do not pin rows. The audit of what a query
     /// once returned must not keep chunks alive — pinning every searched
     /// chunk would make deleting unreferenced rows impossible.
     #[test]

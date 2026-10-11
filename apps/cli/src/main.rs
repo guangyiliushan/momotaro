@@ -1,6 +1,8 @@
 //! Thin command-line entry point for Momotaro.
 
 #![forbid(unsafe_code)]
+#![warn(rustdoc::all)]
+#![warn(rustdoc::unescaped_backticks)]
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -38,7 +40,7 @@ struct Cli {
     command: Command,
 }
 
-/// The `--mode` vocabulary (`docs/docs/usage.md`, "Search").
+/// The `--mode` vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum SearchMode {
     /// Pure Tantivy BM25, zero LLM tokens.
@@ -53,7 +55,7 @@ enum Command {
     Init,
 
     /// Check workspace health without mutating it, or read the last ingest
-    /// batch back (`--coverage`, ADR 0026).
+    /// batch back (`--coverage`).
     Doctor {
         /// Report what the most recent ingest run (`index` or `watch`) did to
         /// each file, read from
@@ -106,8 +108,8 @@ enum Command {
         client_request_id: Option<String>,
 
         /// Retrieval mode. `ask` answers with one LLM call regardless — the
-        /// flag exists to say so when it is given `expand` (usage.md), not to
-        /// change what ask does.
+        /// flag exists to say so when it is given `expand`, not to change what
+        /// ask does.
         #[arg(long, default_value = "lexical")]
         mode: SearchMode,
 
@@ -130,10 +132,10 @@ enum Command {
     /// Rebuild the Tantivy index from canonical chunks (canonical data untouched).
     RebuildIndex,
 
-    /// Keep the store current with the vault while it changes (D40).
+    /// Keep the store current with the vault while it changes.
     Watch,
 
-    /// Bring the store up to date with the whole vault in one pass (D40 §4.4).
+    /// Bring the store up to date with the whole vault in one pass.
     Reconcile,
 }
 
@@ -162,8 +164,8 @@ fn print_error(json: bool, error: RunError) -> ExitCode {
 }
 
 /// The cap on `--top` (search): the pre-allocation tantivy does is driven by
-/// this number alone (probe S1-2: 20M -> 460 MB peak commit), so a typo must
-/// not become a memory spike. `--top 0` stays legal — it returns nothing.
+/// this number alone (a measured 20M -> 460 MB peak commit), so a typo must not
+/// become a memory spike. `--top 0` stays legal — it returns nothing.
 const SEARCH_TOP_CAP: usize = 1000;
 
 fn main() -> ExitCode {
@@ -196,8 +198,8 @@ fn main() -> ExitCode {
         },
         Command::Doctor { coverage } => {
             if coverage {
-                // The audit log's read path (ADR 0026): what the last `index`
-                // run did to each file, including the ones it refused.
+                // The audit log's read path: what the last `index` run did to each
+                // file, including the ones it refused.
                 return match coverage_report(&root) {
                     Ok(Some(report)) => print_success(
                         cli.json,
@@ -246,8 +248,7 @@ fn main() -> ExitCode {
                     let payload =
                         serde_json::to_string_pretty(&report).expect("health report serializes");
                     print_success(cli.json, payload, &format_health(&report));
-                    // A health check that cannot fail a script is not a check
-                    // (docs/docs/usage.md, "Exit codes").
+                    // A health check that cannot fail a script is not a check.
                     if is_healthy(&report) {
                         ExitCode::SUCCESS
                     } else {
@@ -366,9 +367,8 @@ fn main() -> ExitCode {
                 session_id: session,
             };
             if mode == SearchMode::Expand {
-                // `--mode` is search's retrieval mode (usage.md): an ask
-                // that silently ignored it would be an ask that lied about
-                // what it did.
+                // `--mode` is search's retrieval mode: an ask that silently ignored
+                // it would be an ask that lied about what it did.
                 return print_error(
                     cli.json,
                     RunError::PolicyRefused(
@@ -395,9 +395,8 @@ fn main() -> ExitCode {
             match ask_workspace(&root, &query, &options, &*transport) {
                 Ok(report) => {
                     // A failed run still prints its answer and its explicit
-                    // failure marks (architecture §14.1.5) — and still exits
-                    // non-zero: nothing is dressed as success (usage.md,
-                    // "Exit codes").
+                    // failure marks — and still exits non-zero: nothing is dressed as
+                    // success.
                     let exit = if ask_succeeded(&report.status) {
                         ExitCode::SUCCESS
                     } else {
@@ -416,8 +415,8 @@ fn main() -> ExitCode {
             }
         }
         Command::Trace { run_id } => {
-            // The run engine's open sweeps (harness §2), so a crashed run
-            // reads back as `failed(interrupted)` here — trace 可用.
+            // The run engine's open-time sweep, so a crashed run reads back as
+            // `failed(interrupted)` here — trace 可用.
             match trace_workspace(&root, &run_id) {
                 Ok(trace) => {
                     if cli.json {
@@ -504,8 +503,8 @@ fn search_output_lines(output: &SearchOutput) -> Vec<String> {
     lines
 }
 
-/// Whether one completed `ask` succeeded (`usage.md`, "Exit codes"): a run
-/// that reached `finished` does, everything else does not. The caller turns
+/// Whether one completed `ask` succeeded: a run that reached `finished`
+/// does, everything else does not. The caller turns
 /// it into `ExitCode`.
 ///
 /// Named rather than left inline because driving the binary to a *completed*
@@ -524,7 +523,7 @@ mod tests {
     /// Both directions, because both promises are load-bearing: a `finished`
     /// run that exited non-zero would fail every script, and a `failed` run
     /// that exited zero would dress a failure as success — the exact claim
-    /// `usage.md` "Exit codes" makes.
+    /// the exit-code contract makes.
     #[test]
     fn the_ask_exit_verdict_follows_the_run_status() {
         assert!(ask_succeeded("finished"), "a run that finished is success");

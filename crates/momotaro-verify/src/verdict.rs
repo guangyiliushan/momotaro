@@ -4,8 +4,8 @@ use crate::status::{VerificationKind, VerificationStatus, VerifyDetail};
 
 /// One independent verification result.
 ///
-/// `reference.md`: "A verification is an independent result produced by
-/// deterministic code." Nothing here is a model's opinion — this crate holds
+/// A verification is an independent result produced by deterministic
+/// code. Nothing here is a model's opinion — this crate holds
 /// no LLM slot and spends no tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Verification {
@@ -70,16 +70,16 @@ pub struct AnswerVerdict {
 }
 
 impl AnswerVerdict {
-    /// Whether the answer's evidence holds up (architecture §14.1.5).
+    /// Whether the answer's evidence holds up.
     ///
     /// Four conditions, all of them required:
     ///
     /// 1. there is at least one citation — "verified" is a positive claim,
-    ///    and `reference.md` applies the same rule to sparks ("Empty
-    ///    citations make the card `unverified`");
+    ///    and the same rule applies to sparks: "Empty citations make the card
+    ///    `unverified`";
     /// 2. every citation reported `passed` — an `unsupported` or `skipped`
-    ///    citation has not been verified, and §14.1.5 says an answer with a
-    ///    failed citation is not fully verified;
+    ///    citation has not been verified, and an answer with a failed
+    ///    citation is not fully verified;
     /// 3. no integrity check reported `failed` — bytes that are gone make the
     ///    answer unverifiable even though its citations still resolve against
     ///    the stored chunk text;
@@ -92,8 +92,8 @@ impl AnswerVerdict {
     /// nothing was ever going to be read:
     ///
     /// * `no_local_bytes` — no store row, no `local_path`, or a stored path
-    ///   this crate *refuses* by form or by containment. ADR 0024 calls
-    ///   imports a trust boundary; a `local_path` that escapes the workspace
+    ///   this crate *refuses* by form or by containment. Imports are a trust
+    ///   boundary; a `local_path` that escapes the workspace
     ///   is bad data, and bad data is not evidence about the answer. The
     ///   citation itself still verified against the store.
     /// * `byte_hash_unchecked` — the bytes *were* read and only the hash
@@ -101,14 +101,51 @@ impl AnswerVerdict {
     ///
     /// The distinction is evidence, not effort: a *missing* file is an
     /// evidence signal (the bytes are gone) and vetoes; a *refused* path is a
-    /// data-quality signal and does not. The substance for the first bullet
-    /// comes from `docs/docs/adr/snapshot-excludes-paper-bytes.md`: *"search,
+    /// data-quality signal and does not. For a paper source: *search,
     /// citations, and trace still work from chunk text; opening the PDF is a
-    /// local `source_missing` / `source_integrity` failure."* That is a
+    /// local `source_missing` / `source_integrity` failure.* That is a
     /// statement about the *citation*, not a licence to call an unread answer
     /// verified.
     ///
     /// Derived, never stored: there is one place this can be true or false.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use momotaro_verify::{
+    ///     AnswerVerdict, Verification, VerificationKind, VerificationStatus, VerifyDetail,
+    /// };
+    ///
+    /// let passed = Verification {
+    ///     kind: VerificationKind::Citation,
+    ///     status: VerificationStatus::Passed,
+    ///     detail: None,
+    /// };
+    /// let verified = AnswerVerdict {
+    ///     citations: vec![passed],
+    ///     integrity: Vec::new(),
+    /// };
+    /// assert!(verified.fully_verified());
+    ///
+    /// // No citations is no positive claim.
+    /// let empty = AnswerVerdict {
+    ///     citations: Vec::new(),
+    ///     integrity: Vec::new(),
+    /// };
+    /// assert!(!empty.fully_verified());
+    ///
+    /// // A failed integrity check vetoes the answer even though every citation
+    /// // still passed.
+    /// let vetoed = AnswerVerdict {
+    ///     citations: vec![passed],
+    ///     integrity: vec![Verification {
+    ///         kind: VerificationKind::SourceIntegrity,
+    ///         status: VerificationStatus::Failed,
+    ///         detail: Some(VerifyDetail::SourceMissing),
+    ///     }],
+    /// };
+    /// assert!(!vetoed.fully_verified());
+    /// ```
     pub fn fully_verified(&self) -> bool {
         !self.citations.is_empty()
             && self

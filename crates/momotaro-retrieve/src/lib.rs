@@ -3,9 +3,50 @@
 //! Owns the index schema, the CJK bigram tokenizer, and query execution.
 //! Depends only on contracts and tantivy — never on the store, which stays
 //! the canonical home of chunk text.
+//!
+//! # Examples
+//!
+//! Index one source's chunks, commit, and search:
+//!
+//! ```no_run
+//! use momotaro_contracts::{Chunk, OriginClass};
+//! use momotaro_retrieve::SearchIndex;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let index = SearchIndex::open_or_create(std::path::Path::new(".momotaro/index"))?;
+//! let mut writer = index.writer(20_000_000)?;
+//!
+//! let chunk = Chunk {
+//!     chunk_id: "chunk-1".to_owned(),
+//!     source_key: "note:notes/fourier.md".to_owned(),
+//!     revision_hash: "rev-1".to_owned(),
+//!     ordinal: 0,
+//!     heading_path: Some("Fourier".to_owned()),
+//!     text: "傅里叶变换将信号从时域映射到频域。".to_owned(),
+//!     locator_json: r#"{"start_byte":0}"#.to_owned(),
+//!     chunk_hash: "chash-1".to_owned(),
+//!     token_estimate: 12,
+//! };
+//! SearchIndex::upsert_source(
+//!     &mut writer,
+//!     index.fields(),
+//!     "note:notes/fourier.md",
+//!     "傅里叶笔记",
+//!     OriginClass::Owner,
+//!     std::slice::from_ref(&chunk),
+//! )?;
+//! writer.commit()?;
+//!
+//! let hits = index.search("傅里叶", 5)?;
+//! println!("{} hit(s)", hits.len());
+//! # Ok(())
+//! # }
+//! ```
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(rustdoc::all)]
+#![warn(rustdoc::unescaped_backticks)]
 
 pub(crate) mod boost;
 // The modules are crate-private: what is API is the root re-export list below,
@@ -357,7 +398,7 @@ mod tests {
     #[test]
     fn a_chunk_with_no_class_is_refused_not_defaulted() {
         // Fail-closed, and the reason matters: silently calling a source `owner`
-        // is a doubled weight in T1.8 and nobody would ever see the mistake.
+        // is a doubled weight and nobody would ever see the mistake.
         let si = ram_index();
         let mut writer = si.writer(20_000_000).expect("writer");
         let chunks = [chunk("r-1", "r/a.md", 0, None, "alpha beta")];

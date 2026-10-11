@@ -1,7 +1,6 @@
-//! W3.5 硬验收:前缀字节稳定回归(相邻 run 公共前缀字节级一致)。
+//! 前缀字节稳定回归(相邻 run 公共前缀字节级一致)。
 //!
-//! 契约来源:`docs/docs/context-retrieval.md` §1(请求确定性与缓存稳定)与
-//! §1.1(evidence 三层排序)、`architecture.md` §12(build_context 十阶段)。
+//! 契约来源:请求确定性与缓存稳定、evidence 三层排序、build_context 十阶段。
 //!
 //! 断言的核心性质:**相邻 run 的完整 provider 请求字节是下一个 run 请求字节的
 //! 前缀**(在未压缩窗口内),且 session 内已出现过的 chunk 位置守恒。任何把
@@ -71,7 +70,7 @@ fn lcp_len(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
-/// 硬验收:相邻 run 的公共前缀字节级一致——上一 run 的**完整请求字节**必须是
+/// 相邻 run 的公共前缀字节级一致——上一 run 的**完整请求字节**必须是
 /// 下一 run 请求字节的前缀(未压缩窗口内)。
 ///
 /// 杀的突变:① 时间戳/run_id 泄进 system 级内容;② 历史轮被重渲染而不是逐字节
@@ -607,7 +606,7 @@ fn the_stage_deltas_sum_to_the_fragments_across_every_reverse_accounting_branch(
 /// The budget stage's accounting matches drops by slot, not by
 /// first-match-by-key: a dropped history turn whose id spells a dropped
 /// evidence fragment's `chunk_hash` used to have the wrong object's tokens
-/// subtracted (probe P4: −150 where −107 was due), and the stage deltas then
+/// subtracted (−150 where −107 was due), and the stage deltas then
 /// stopped totalling the fragment bodies. The invariant at the end is the
 /// tooth: discount either collision drop with the other's tokens and it
 /// fails.
@@ -690,7 +689,7 @@ fn the_budget_delta_uses_the_dropped_object_not_its_key_namesake() {
 /// *evidence* fragment whose `chunk_hash` spells a kept turn's `history_id`
 /// must not pull that turn's hashes out of `injected` — the turn is still in
 /// the request, and content still in front of the model stays blacklisted
-/// (§3 第 4 条; probe P4 measured the namesake releasing it).
+/// (the namesake used to release it).
 #[test]
 fn a_dropped_evidence_namesake_does_not_release_a_kept_turns_hashes() {
     let mut input = base_input();
@@ -768,7 +767,7 @@ fn a_dropped_evidence_namesake_does_not_release_a_kept_turns_hashes() {
 /// The stage-1/2/5 deltas count the **escaped** text the fragments actually
 /// carry: caller content containing `<<<` is rewritten by
 /// `escape_content_sentinels` on the way into a body, and counting the raw
-/// input drifted the deltas and `raw_total` apart (probe P2: 40 vs 47) —
+/// input drifted the deltas and `raw_total` apart (40 vs 47) —
 /// audit-only, but an audit that lies is not one.
 #[test]
 fn sentinel_text_in_caller_content_does_not_drift_the_deltas() {
@@ -796,7 +795,7 @@ fn sentinel_text_in_caller_content_does_not_drift_the_deltas() {
 }
 
 /// The build reports survivor **indices**, so the run layer can tell which
-/// of two hits sharing one `chunk_hash` became the fragment (probe R3a-F2):
+/// of two hits sharing one `chunk_hash` became the fragment:
 /// hash membership read the dropped twin as included, and the
 /// `duplicate_chunk_hash` code could never land on a row because the twin
 /// was indistinguishable from its survivor.
@@ -847,7 +846,7 @@ fn the_build_keeps_the_survivors_index_not_its_hash() {
 
 /// A fragment without a `chunk_hash` is dropped by the citation check, and
 /// its omission row must still be nameable: the audit outlet showed
-/// `(,incomplete_citation)` before (probe A4-C1).
+/// `(,incomplete_citation)` before.
 #[test]
 fn an_empty_chunk_hash_omission_still_has_a_name() {
     let mut input = base_input();
@@ -874,7 +873,7 @@ fn an_empty_chunk_hash_omission_still_has_a_name() {
     );
 }
 
-/// §3 第 4 条:已注入过的 evidence 按 chunk_hash 去重,不因多轮重复占预算。
+/// 已注入过的 evidence 按 chunk_hash 去重,不因多轮重复占预算。
 #[test]
 fn already_injected_evidence_never_re_enters() {
     let mut input = base_input();
@@ -998,7 +997,7 @@ fn a_fragment_without_a_complete_citation_is_dropped_fail_closed() {
 }
 
 /// 预算 level 3(history)按**近轮优先**申领:两轮都放得下单独一条、放不下
-/// 两条时,新的一轮留下、旧的一轮显式省略(§2 先到先得不回填 + §3 近轮全量)。
+/// 两条时,新的一轮留下、旧的一轮显式省略(先到先得不回填 + 近轮全量)。
 #[test]
 fn history_budget_claims_recent_turns_first() {
     let mut input = base_input();
@@ -1055,7 +1054,7 @@ fn history_budget_claims_recent_turns_first() {
     );
 }
 
-/// §3 第 4 条 的第二半:history 已携带全文的 chunk(hash 记在 referenced_chunk_hashes)
+/// 去重的第二半:history 已携带全文的 chunk(hash 记在 referenced_chunk_hashes)
 /// 即使 session.injected 为空,也不得重复进 evidence 占预算。
 #[test]
 fn history_referenced_chunks_dedup_without_session_injection() {
@@ -1146,7 +1145,7 @@ fn an_older_turn_never_survives_when_a_newer_one_was_dropped() {
     assert!(!result.final_user_body().contains("xxxx"));
 }
 
-/// evidence 兜底是**全局下界 3**(§2.1),不是档位下界——survey 在紧预算下
+/// evidence 兜底是**全局下界 3**,不是档位下界——survey 在紧预算下
 /// 也只保 3 条,不因 tier_min=8 强行放大。
 #[test]
 fn the_evidence_floor_is_three_even_for_survey_under_a_tight_budget() {
@@ -1191,7 +1190,7 @@ fn the_evidence_floor_is_three_even_for_survey_under_a_tight_budget() {
 }
 
 /// request_bytes 的黄金字节:线格式是 run 层取 request_hash 的契约,布局
-/// 突变必须红(测试质量镜 F06)。
+/// 突变必须红。
 #[test]
 fn the_request_wire_layout_is_pinned_by_golden_bytes() {
     let mut input = base_input();

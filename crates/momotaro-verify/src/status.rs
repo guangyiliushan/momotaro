@@ -2,28 +2,40 @@
 //! codes that say *which* judgement fired.
 //!
 //! These spellings are a contract, not an implementation detail. The four
-//! states are what `verifications.status` stores (`docs/docs/reference.md`
-//! "Verification states"); the three kinds are what `verifications.kind`
-//! stores (`docs/docs/architecture.md` §8.1 and the `migration.rs` column
-//! comment). Nothing in this crate writes those columns — `momotaro-run`
+//! states are what `verifications.status` stores; the three kinds are what
+//! `verifications.kind` stores (see the `migration.rs` column comment).
+//! Nothing in this crate writes those columns — `momotaro-run`
 //! does — but every spelling it hands over has to match them byte for byte.
 //!
-//! [`VerificationKind::Math`] is reserved exactly as architecture §14.2
-//! reserves it: no code in this crate ever produces it, because 1.0 has no
-//! CAS. It exists so a stored `math` row still reads back as a kind.
+//! [`VerificationKind::Math`] is reserved: no code in this crate ever
+//! produces it, because the product has no CAS yet. It exists so a stored `math` row still reads back as a kind.
 
 use serde::Serialize;
 
 /// The outcome of one verification (`verifications.status`).
 ///
-/// The four states and their meanings come from `docs/docs/reference.md`
-/// ("Verification states"): `passed` means verification succeeded, `failed`
-/// means it explicitly failed, `unsupported` means this build cannot verify
+/// The four states and their meanings: `passed` means verification
+/// succeeded, `failed` means it explicitly failed, `unsupported` means this build cannot verify
 /// the target, `skipped` means verification was disabled.
 ///
 /// The one rule the whole crate is built around: **only an exact match can
 /// produce [`Self::Passed`].** Anything half-checked reports `unsupported`
 /// or `failed` — never `passed`.
+///
+/// # Examples
+///
+/// ```
+/// use momotaro_verify::VerificationStatus;
+///
+/// assert_eq!(VerificationStatus::Passed.as_str(), "passed");
+/// assert_eq!(VerificationStatus::Failed.as_str(), "failed");
+/// assert_eq!(
+///     VerificationStatus::from_code("skipped"),
+///     Some(VerificationStatus::Skipped)
+/// );
+/// // An unrecognised stored value is `None`, never a guess.
+/// assert_eq!(VerificationStatus::from_code("ok"), None);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationStatus {
@@ -75,7 +87,7 @@ impl VerificationStatus {
 /// What the verification was against (`verifications.kind`).
 ///
 /// `citation` and `source_integrity` are produced by this crate. `math` is
-/// reserved (architecture §14.2) and has no producer in 0.x.
+/// reserved and has no producer today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationKind {
@@ -120,6 +132,19 @@ impl VerificationKind {
 ///
 /// Every variant has at least one reachable input; see the per-criterion
 /// tests beside each judgement.
+///
+/// # Examples
+///
+/// ```
+/// use momotaro_verify::VerifyDetail;
+///
+/// assert_eq!(VerifyDetail::ChunkMissing.as_str(), "chunk_missing");
+/// assert_eq!(
+///     VerifyDetail::from_code("text_not_locatable"),
+///     Some(VerifyDetail::TextNotLocatable)
+/// );
+/// assert_eq!(VerifyDetail::from_code("boom"), None);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerifyDetail {
@@ -127,11 +152,10 @@ pub enum VerifyDetail {
     DisabledByPolicy,
     /// The citation names a context item this run never handed the model.
     ///
-    /// Architecture §14.1 rule 4 marks a fabricated citation
-    /// `citation_invalid`. The same spelling sits in §18's error taxonomy,
-    /// but that one is a `run_events` field: §18 says those categories are
-    /// written into `run_events`, which has no `category` column, so they
-    /// live in its `data_json`. This crate reports only the verification's
+    /// A fabricated citation is marked `citation_invalid`. The same spelling
+    /// sits in the run-event error taxonomy, but that one is a `run_events`
+    /// field: those categories are written into `run_events`, which has no
+    /// `category` column, so they live in its `data_json`. This crate reports only the verification's
     /// `details_json` slot — the event-side wiring is `momotaro-run`'s.
     CitationInvalid,
     /// The store could not be read while looking for the chunk.
@@ -152,7 +176,7 @@ pub enum VerifyDetail {
     ByteHashUnchecked,
     /// There are no local bytes to check: no store row, no `local_path`, or a
     /// stored path this crate refuses — by form or because it resolves
-    /// outside the workspace (ADR 0024) — not the same as "the bytes are
+    /// outside the workspace — not the same as "the bytes are
     /// gone", which is [`Self::SourceMissing`].
     NoLocalBytes,
     /// The source bytes could not be read for a reason other than absence.
@@ -216,9 +240,8 @@ mod tests {
     /// matches", so a test that iterates `ALL` cannot notice a variant being
     /// dropped from it — the variant disappears from every assertion at once
     /// and `from_code` then rejects a spelling this crate itself emits. Two of
-    /// these spellings are contract wording, not ours: `citation_invalid` is
-    /// architecture §14.1 rule 4 / §18, and `source_missing` is
-    /// `adr/note-rename-is-a-new-source.md`, `reference.md` and §18.
+    /// these spellings are contract wording, not ours: `citation_invalid` and
+    /// `source_missing` are spellings other producers already write.
     const DETAIL_SPELLINGS: [&str; 12] = [
         "disabled_by_policy",
         "citation_invalid",

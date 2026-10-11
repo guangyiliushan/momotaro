@@ -25,6 +25,21 @@ pub fn sha256_of(bytes: &[u8]) -> String {
 }
 
 /// `hex(sha256("momotaro-revision-v1\0" + normalized))`.
+///
+/// # Examples
+///
+/// ```
+/// use momotaro_ingest::revision_hash;
+///
+/// let hash = revision_hash("abc");
+/// assert_eq!(
+///     hash,
+///     "2876c774fe6e0f91739bdd2bfac9f6a5600268458b89bea9cdbef79c6e4eea4f"
+/// );
+/// // The same text keeps its identity; different text does not.
+/// assert_eq!(revision_hash("abc"), hash);
+/// assert_ne!(revision_hash("abd"), hash);
+/// ```
 pub fn revision_hash(normalized: &str) -> String {
     sha256_hex(&[REVISION_DOMAIN, normalized.as_bytes()])
 }
@@ -35,6 +50,12 @@ pub fn revision_hash(normalized: &str) -> String {
 /// source it belongs to. Binary content never goes through `normalize_markdown`,
 /// so this hashes exactly what the file holds, and it streams: a vault may hold
 /// a video, and reading one into memory to hash it would be the whole file.
+///
+/// # Errors
+///
+/// - The `std::io::Error` from the underlying `reader.read` when the stream
+///   fails mid-hash. The digest is abandoned and the error is returned
+///   unchanged.
 pub fn revision_hash_reader(reader: &mut impl std::io::Read) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(REVISION_DOMAIN);

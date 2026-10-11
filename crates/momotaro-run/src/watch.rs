@@ -1,16 +1,16 @@
-//! The vault watcher: events are hints, reconciliation is the truth (D40).
+//! The vault watcher: events are hints, reconciliation is the truth.
 //!
 //! Everything a platform watcher reports is treated the same way — as a hint
-//! that one path may deserve a look (D40 §4.2). The hint is never the input to
+//! that one path may deserve a look. The hint is never the input to
 //! a write: a path is gated with a stat and, when that stat is racy, with the
 //! file's own bytes, and only then does anything reach the store. The four
-//! reconciliation triggers (D40 §4.4) are what turns an observation the event
+//! reconciliation triggers are what turns an observation the event
 //! stream could not carry — a dropped event, a storm, a file changed while the
 //! process was down — back into the truth.
 //!
 //! # What this module has no instrument for
 //!
-//! Two of D40's cases cannot be produced on any CI machine, and no test here
+//! Two of the cases below cannot be produced on any CI machine, and no test here
 //! pretends otherwise:
 //!
 //! * **A real platform overflow.** Linux `IN_Q_OVERFLOW` and FSEvents
@@ -21,7 +21,7 @@
 //!   instrument** for it: the gap is closed by the daily and startup
 //!   reconciliations, and said here.
 //! * **A real network volume**, whose event delivery we promise nothing about
-//!   (D40 §4.8). The verdict comes from `momotaro_platform`, whose own tests
+//!   The verdict comes from `momotaro_platform`, whose own tests
 //!   pin the label rule; an end-to-end case is a hand-run probe.
 
 use std::collections::HashSet;
@@ -44,13 +44,13 @@ use crate::index_service::{BatchOutcome, BatchShape, WATCH_PLAN, run_batch};
 use crate::reconcile::reconcile;
 use crate::{NETWORK_VOLUME_NOTE, RunError, database_path, load_config, vault_scope};
 
-/// D40 §4.5: how long a path's events are held before they are acted on.
+/// How long a path's events are held before they are acted on.
 ///
 /// `notify-debouncer-full` picks its own tick at a quarter of this unless told
 /// otherwise, which is what keeps a burst of saves to a single pass.
 const DEBOUNCE: Duration = Duration::from_millis(500);
 
-/// D40 §4.4: one debounce batch naming more paths than this is an event storm,
+/// One debounce batch naming more paths than this is an event storm,
 /// and is answered with a full reconciliation rather than N rescans.
 ///
 /// A threshold, not a measurement — nothing in notify's contract describes
@@ -58,7 +58,7 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 /// a reconciliation costs, and it is a constant so a test can pin both sides.
 const STORM_PATHS: usize = 256;
 
-/// D40 §4.4: how long a reconcile waits for its cookie before carrying on.
+/// How long a reconcile waits for its cookie before carrying on.
 ///
 /// Watchman errors out when its cookie does not come back; a reconcile here
 /// does not. Waiting is an optimisation — walking without it is still correct,
@@ -66,31 +66,31 @@ const STORM_PATHS: usize = 256;
 /// a listener was slow.
 const COOKIE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// D40 §4.5: the delay queue's wait, after the five backoffs.
+/// The delay queue's wait, after the five backoffs.
 const TORN_DELAY: Duration = Duration::from_secs(30);
 
-/// D40 §4.5: the mtime has to hold still for at least this long between two
+/// The mtime has to hold still for at least this long between two
 /// stats before a torn read is retried, so a writer mid-flush cannot look
 /// stable for an instant and then move again.
 const MTIME_STABLE_GAP: Duration = Duration::from_millis(64);
 
-/// D40 §4.4's second trigger: once a day, from inside the running watcher.
+/// The daily trigger: once a day, from inside the running watcher.
 const DAILY: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// The sentinel file's name, in the vault root (D40 §4.4).
+/// The sentinel file's name, in the vault root.
 ///
 /// Dot-prefixed so the walker never indexes it and the blacklist never
 /// rescans it — and recognised *before* the blacklist, which is what makes it
 /// a protocol message rather than a file.
 const SENTINEL_NAME: &str = ".momotaro-reconcile-sentinel";
 
-/// D40 §4.6: dropped at the event layer, before any filesystem question.
+/// Dropped at the event layer, before any filesystem question.
 ///
-/// Two rules, both the walker's own (§5 第 1 条): anything under a
+/// Two rules, both the walker's own: anything under a
 /// dot-prefixed directory, and any dot-prefixed file — except an iCloud
 /// eviction stub, which the walker keeps precisely so a row can say what
 /// happened to the note it stands for. On top of those sit the five
-/// editor-temporary shapes §4.6 names: a single `index` walk meets them once,
+/// editor-temporary shapes: a single `index` walk meets them once,
 /// a live watcher would otherwise chase them on every keystroke.
 ///
 /// The sentinel is dot-prefixed like every other leaf here, so it *is*
@@ -111,8 +111,8 @@ fn blacklisted(vault_root: &Path, path: &Path) -> bool {
             // A dot-prefixed directory drops its whole subtree. A dot-prefixed
             // file drops too — except an iCloud eviction stub, which the walker
             // keeps precisely so a row can say what happened to the note it
-            // stands for (D42): dropping it here would be the two-truths case
-            // §4.6 says cannot happen.
+            // stands for: dropping it here would be the two-truths case
+            // that must not happen.
             let stub = leaf && name.to_str().is_some_and(momotaro_ingest::icloud_stub);
             if !stub {
                 return true;
@@ -125,10 +125,10 @@ fn blacklisted(vault_root: &Path, path: &Path) -> bool {
     false
 }
 
-/// One of §4.6's five editor-temporary shapes, on a leaf name only.
+/// One of the five editor-temporary shapes, on a leaf name only.
 ///
 /// `.~lock.*#` is dot-prefixed and so already covered by the rule above; it is
-/// spelled out because §4.6 spells it out, and a reader checking this list
+/// spelled out anyway, and a reader checking this list
 /// against the contract should find every entry.
 fn editor_temporary(name: &str) -> bool {
     (name.starts_with(".~lock.") && name.ends_with('#'))
@@ -138,7 +138,7 @@ fn editor_temporary(name: &str) -> bool {
         || name.ends_with(".tmp")
 }
 
-/// Which of D40 §4.4's four triggers fired.
+/// Which of the four triggers fired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Trigger {
@@ -152,7 +152,7 @@ pub enum Trigger {
     EventStorm,
 }
 
-/// What a debounced batch of events amounts to (D40 §4.2 / §4.4).
+/// What a debounced batch of events amounts to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WatchAction {
     /// Nothing survived the blacklist: the events were about junk.
@@ -162,14 +162,14 @@ enum WatchAction {
     /// loop's own.
     Reconcile(Trigger),
     /// These paths deserve a look. A rename arrives as its two paths, which is
-    /// D40 §4.2's delete+create already folded (ADR 0014).
+    /// the delete+create pair already folded.
     Rescan(Vec<PathBuf>),
 }
 
 /// Turns one debounced batch into what the watcher should do with it.
 ///
 /// Pure and total: no filesystem question is asked here, because the blacklist
-/// (§4.6) is a name rule, and the rescan is where facts get established.
+/// is a name rule, and the rescan is where facts get established.
 #[must_use]
 fn actions_for(events: &[DebouncedEvent], vault_root: &Path) -> WatchAction {
     if events.iter().any(|debounced| debounced.event.need_rescan()) {
@@ -199,7 +199,7 @@ fn actions_for(events: &[DebouncedEvent], vault_root: &Path) -> WatchAction {
     WatchAction::Rescan(paths)
 }
 
-/// How long to wait before retry number `failures + 1` (D40 §4.5), or `None`
+/// How long to wait before retry number `failures + 1`, or `None`
 /// when the delay queue has been served and the path belongs to the daily
 /// reconciliation.
 ///
@@ -214,7 +214,7 @@ fn retry_delay(failures: u32) -> Option<Duration> {
     }
 }
 
-/// Whether `path` has held still for [`MTIME_STABLE_GAP`] (D40 §4.5).
+/// Whether `path` has held still for [`MTIME_STABLE_GAP`].
 ///
 /// Two stats that far apart and identical say the writer has stopped; anything
 /// else means the file is still moving and reading it now would tear again.
@@ -226,7 +226,7 @@ fn mtime_stable(path: &Path) -> std::io::Result<bool> {
 }
 
 /// Whether two stats describe the same file state — the rule `mtime_stable`
-/// applies to the two it takes (D40 §4.5).
+/// applies to the two it takes.
 ///
 /// Both halves are load-bearing: size alone misses a rewrite of equal length,
 /// and mtime alone misses a filesystem that stamps only seconds. Pinned by
@@ -241,7 +241,7 @@ pub(crate) fn same_stat(first: &std::fs::Metadata, second: &std::fs::Metadata) -
     )
 }
 
-/// Whether two stat states describe the same file (D40 §4.5's stable window).
+/// Whether two stat states describe the same file (the stable window).
 ///
 /// Values rather than `&Metadata`, because both halves have to be pinned and
 /// no test can change a file's length while leaving its mtime alone: size
@@ -264,7 +264,7 @@ fn same_state(
 pub enum WatchLine {
     /// A rescan batch finished.
     Batch {
-        /// The `ingest.*` batch these rows belong to (ADR 0026).
+        /// The `ingest.*` batch these rows belong to.
         batch_id: String,
         /// Paths the gate let through.
         ///
@@ -285,8 +285,7 @@ pub enum WatchLine {
         /// A deletion lands here too: nothing was rebuilt for a file that is
         /// gone, and the removal itself is named by `removed`.
         unchanged: u64,
-        /// Keys the walk no longer names, which this batch recorded as gone
-        /// (D40 §4.2's delete half).
+        /// Keys the walk no longer names, which this batch recorded as gone.
         removed: u64,
         /// Paths the gate threw away — named paths the batch never processed
         /// at all.
@@ -298,13 +297,13 @@ pub enum WatchLine {
         /// (`rescanned + dropped` names them all), never both.
         dropped: u64,
     },
-    /// The recommended backend would not start and polling took over (D40 §4.1).
+    /// The recommended backend would not start and polling took over.
     Degraded {
         /// What failed, in the platform's own words.
         reason: String,
     },
     /// The vault sits on a network volume, which is not promised to be
-    /// real-time (D40 §4.8, D31). The sentence rides the line itself so the
+    /// real-time. The sentence rides the line itself so the
     /// JSON exit carries it too — `--json` and the human line must not
     /// promise different things.
     NetworkVolume {
@@ -312,7 +311,7 @@ pub enum WatchLine {
         message: String,
     },
     /// The reconcile cookie could not be used, so the walk ran without it
-    /// (D40 §4.4): still correct, just possibly one event behind. `reason` says
+    /// still correct, just possibly one event behind. `reason` says
     /// whether the sentinel refused to be written or simply never came back.
     CookieSkipped {
         /// Why the cookie was not established.
@@ -320,12 +319,12 @@ pub enum WatchLine {
     },
     /// A path ran out of retry attempts — a torn read that would not settle,
     /// or a file that kept moving under the commit — and was left to the daily
-    /// reconciliation (D40 §4.5 / §4.7).
+    /// reconciliation.
     RetriesExhausted {
         /// The path that gave up.
         path: String,
     },
-    /// A reconciliation ran, and why (D40 §4.4).
+    /// A reconciliation ran, and why.
     Reconciled {
         /// Which of the four triggers fired.
         trigger: Trigger,
@@ -400,7 +399,7 @@ struct Retry {
     when: Instant,
 }
 
-/// The two backends D40 §4.1 allows, so the fallback does not make every
+/// The two backends this module allows, so the fallback does not make every
 /// caller generic over `notify`'s watcher types.
 ///
 /// The payload is never *read*: it exists to own the debouncer for as long as
@@ -411,12 +410,12 @@ enum Backend {
     /// The platform's own: inotify, FSEvents, `ReadDirectoryChangesW`.
     Recommended(notify_debouncer_full::Debouncer<notify::RecommendedWatcher, RecommendedCache>),
     /// The fallback, used only when the recommended one would not start — and
-    /// never for a network volume, which D40 §4.8 refuses to pretend to support.
+    /// never for a network volume, which is never pretended to be supported.
     Polling(notify_debouncer_full::Debouncer<PollWatcher, RecommendedCache>),
 }
 
-/// Opens the backend D40 §4.1 describes: the platform's own if it starts,
-/// polling if it does not — and neither, for a network volume (D40 §4.8).
+/// Opens the backend: the platform's own if it starts,
+/// polling if it does not — and neither, for a network volume.
 ///
 /// The receiver comes back with it because only the successful attempt owns
 /// the channel the loop drains.
@@ -441,7 +440,7 @@ fn open_backend(
 
     let reason = failure.unwrap_or_else(|| "the filesystem backend did not start".to_owned());
     if network {
-        // D40 §4.8: no pretending. The network-volume warning has already been
+        // No pretending: the network-volume warning has already been
         // emitted; this is the backend refusing as well.
         return Err(RunError::WatcherUnavailable {
             reason: format!("{reason}; the vault is on a network volume, which is not supported"),
@@ -472,12 +471,31 @@ fn open_backend(
     Ok((Backend::Polling(polling), rx))
 }
 
-/// Run the watcher until the process stops (D40 §4.1 / §4.4).
+/// Run the watcher until the process stops.
 ///
 /// The backend is opened *before* the startup reconciliation, so the event
-/// stream is live when the walk begins — that is what makes D40 §4.4's cookie
+/// stream is live when the walk begins — that is what makes the cookie
 /// mean anything. `emit` is called once per thing that happened and is the
 /// only way anything reaches a terminal.
+///
+/// # Errors
+///
+/// - `RunError::ConfigRead` / `RunError::ConfigParse` when `momotaro.toml`
+///   cannot be read or parsed.
+/// - `RunError::VaultOutsideWorkspace` when the configured vault resolves
+///   outside the workspace.
+/// - `RunError::VaultMissing` when the resolved vault path is not a
+///   directory.
+/// - `RunError::WatcherUnavailable` when neither the recommended nor the
+///   polling filesystem backend can watch the vault.
+/// - `RunError::Ingest` when a vault path check or walk fails.
+/// - What a batch surfaces from the startup/daily reconciliation and the
+///   per-event rescan: `RunError::IndexUnusable`,
+///   `RunError::StoreUnhealthy`, `RunError::Store`, `RunError::Retrieve`,
+///   `RunError::Io` and `RunError::Invariant`, plus the config and vault
+///   re-checks each batch performs. Transient store/IO failures on the
+///   per-event path are reported as degraded lines and retried, not
+///   returned.
 pub fn watch(root: impl AsRef<Path>, emit: &mut dyn FnMut(&WatchLine)) -> Result<(), RunError> {
     let root = root.as_ref();
     let config = load_config(root)?;
@@ -487,7 +505,7 @@ pub fn watch(root: impl AsRef<Path>, emit: &mut dyn FnMut(&WatchLine)) -> Result
     }
     let sentinel = vault_root.join(SENTINEL_NAME);
     let network = momotaro_platform::volume_info(&vault_root).remote == Some(true);
-    // D31 wants this said out loud rather than discovered later as "my edits
+    // This is said out loud rather than discovered later as "my edits
     // never show up". Detection is Windows-only: every other platform reports
     // "unknown" and this stays silent rather than guessing.
     if network {
@@ -499,7 +517,7 @@ pub fn watch(root: impl AsRef<Path>, emit: &mut dyn FnMut(&WatchLine)) -> Result
     // Held for its `Drop`, which stops the debouncer's thread.
     let (_backend, rx) = open_backend(&vault_root, network, emit)?;
     let mut retries: Vec<Retry> = Vec::new();
-    // Trigger 1 of D40 §4.4, with the cookie.
+    // Trigger 1, with the cookie.
     run_reconcile(
         root,
         &vault_root,
@@ -522,7 +540,7 @@ pub fn watch(root: impl AsRef<Path>, emit: &mut dyn FnMut(&WatchLine)) -> Result
         let timeout = timeout.clamp(Duration::from_millis(10), Duration::from_millis(250));
         match rx.recv_timeout(timeout) {
             // A debouncer error means notify could not deliver: the daily
-            // reconciliation is what covers it (D40 §4.4).
+            // reconciliation is what covers it.
             Ok(Ok(events)) => apply(
                 root,
                 &vault_root,
@@ -553,7 +571,7 @@ pub fn watch(root: impl AsRef<Path>, emit: &mut dyn FnMut(&WatchLine)) -> Result
     }
 }
 
-/// Applies one debounced batch (D40 §4.2).
+/// Applies one debounced batch.
 fn apply(
     root: &Path,
     vault_root: &Path,
@@ -599,14 +617,14 @@ fn apply(
                 schedule(retries, path, failures, emit);
             }
             // After, not before: the hint must never be written ahead of the
-            // data it describes (ADR 0026), and a rename's create half is that
+            // data it describes, and a rename's create half is that
             // data.
             record_moves(root, vault_root, events)
         }
     }
 }
 
-/// ADR 0014's rename hint: `source_moved(old_key, new_key)`.
+/// The rename hint: `source_moved(old_key, new_key)`.
 ///
 /// A hint, and only a hint — nothing here UPDATEs a stored `source_key` (the
 /// column is identity and identity is not mutable). It gets a batch of its own
@@ -646,7 +664,7 @@ fn record_moves(root: &Path, vault_root: &Path, events: &[DebouncedEvent]) -> Re
             continue;
         };
         // A directory rename is not a source move: neither side is a Source
-        // identity (ADR 0014), and the hint would name two keys that never
+        // identity, and the hint would name two keys that never
         // existed while the files that actually moved get none. The
         // destination is the side that exists after the rename, so asking
         // whether it is a directory is what separates the two cases.
@@ -670,7 +688,7 @@ fn record_moves(root: &Path, vault_root: &Path, events: &[DebouncedEvent]) -> Re
     Ok(())
 }
 
-/// Where the reconcile cookie may be written (D40 §4.4).
+/// Where the reconcile cookie may be written.
 ///
 /// A hostile vault can put a link — or a hard link — at a fixed name inside the
 /// vault. Writing through either would truncate a file outside it and then
@@ -781,7 +799,7 @@ fn write_cookie(path: &Path) -> bool {
         .is_ok()
 }
 
-/// One gated batch over the paths an event batch named (D40 §4.2).
+/// One gated batch over the paths an event batch named.
 ///
 /// Returns the batch rather than scheduling its own retries: the retry queue
 /// owns the attempt count, and a caller that took a path out of that queue
@@ -828,7 +846,7 @@ fn rescan(
     })
 }
 
-/// Puts a path back on the schedule (D40 §4.5).
+/// Puts a path back on the schedule.
 ///
 /// `failures` is what has *already* happened. The queue is the other source
 /// of that number, and it is the wrong one to ask after a path has been taken
@@ -884,7 +902,7 @@ fn failures_of(retries: &[Retry], path: &Path) -> u32 {
         .map_or(0, |retry| retry.failures)
 }
 
-/// Runs whatever is due on the torn queue (D40 §4.5).
+/// Runs whatever is due on the torn queue.
 fn drain_retries(
     root: &Path,
     retries: &mut Vec<Retry>,
@@ -922,7 +940,7 @@ fn drain_retries(
     Ok(())
 }
 
-/// D40 §4.4: a reconciliation, with the cookie when a watcher is listening.
+/// A reconciliation, with the cookie when a watcher is listening.
 ///
 /// The cookie is written into the vault, the channel is drained until it comes
 /// back, and only then does the walk start. Everything that happened before the
@@ -980,7 +998,7 @@ fn run_reconcile(
     if !caught_up {
         // The walk is still correct without the cookie — waiting is an
         // optimisation — but the reader deserves to know it ran one event
-        // behind (D40 §4.4).
+        // behind.
         let reason = if !plain {
             "the sentinel path already holds content this workspace did not write"
         } else if !wrote {
@@ -1085,7 +1103,7 @@ mod tests {
     ///
     /// Windows only: a directory junction needs no privilege there, while a
     /// file symlink does, and the unix leg covers the same guard with a real
-    /// symlink (Q03 is the related platform survivor).
+    /// symlink.
     #[cfg(windows)]
     #[test]
     fn a_junction_is_foreign_whatever_its_target_holds() {
@@ -1114,13 +1132,17 @@ mod tests {
     }
 
     /// `DAILY` is the interval the reconcile scheduler is promised
-    /// (D40 §4.4: at most once a day). Every arithmetic mutant of
+    /// (at most once a day). Every arithmetic mutant of
     /// `24 * 60 * 60` — `+`, `/`, or either operand changed — produced a
     /// different interval and nothing in the workspace noticed: a `0` here
     /// would reconcile the whole vault on every tick of the main loop.
     #[test]
     fn the_reconcile_interval_is_a_day() {
-        assert_eq!(DAILY.as_secs(), 86_400, "D40 §4.4 promises one a day");
+        assert_eq!(
+            DAILY.as_secs(),
+            86_400,
+            "the daily reconcile interval is one day"
+        );
     }
 
     /// A rename event that does not carry a pair is skipped, not indexed.
@@ -1141,7 +1163,7 @@ mod tests {
     }
 
     /// `same_stat` is the rule `mtime_stable` applies to the two stats it
-    /// takes (D40 §4.5) — and its own doc claims it is "pinned by tests that
+    /// takes — and its own doc claims it is "pinned by tests that
     /// need neither the sleep nor a racing writer". Until now nothing called
     /// it: only `same_state` was pinned, so `same_stat -> true` — which would
     /// let the retry path read a file that is still moving — left the
@@ -1163,7 +1185,7 @@ mod tests {
 
         assert!(
             !same_stat(&first, &second),
-            "a rewrite that changes the size is a different state — this is              the rule the D40 §4.5 gate applies before a retry reads again"
+            "a rewrite that changes the size is a different state — this is              the rule the gate applies before a retry reads again"
         );
         assert!(
             mtime_stable(&dir.path().join("missing")).is_err(),
@@ -1171,7 +1193,7 @@ mod tests {
         );
     }
 
-    /// The anomaly CI cannot produce: notify's own rescan notice (D40 §4.4).
+    /// The anomaly CI cannot produce: notify's own rescan notice.
     ///
     /// `IN_Q_OVERFLOW` and FSEvents `KernelDropped` both arrive as this flag,
     /// so one synthetic value covers both platforms' real failures.
@@ -1187,19 +1209,19 @@ mod tests {
         assert_eq!(
             actions_for(&dropped_events(), &vault),
             WatchAction::Reconcile(Trigger::DroppedEvents),
-            "a platform that says it lost events is answered with the truth (D40 §4.4)"
+            "a platform that says it lost events is answered with the truth"
         );
     }
 
     #[test]
     fn the_blacklist_drops_what_the_walker_never_keeps() {
         let vault = vault();
-        // §5 第 1 条: dot-prefixed directories and files, both shared with the
+        // Dot-prefixed directories and files, both shared with the
         // walker — otherwise one vault answers two ways.
         assert!(blacklisted(&vault, &vault.join(".obsidian/app.json")));
         assert!(blacklisted(&vault, &vault.join("deep/.git/config")));
         assert!(blacklisted(&vault, &vault.join(".gitignore")));
-        // §4.6's five editor-temporary shapes.
+        // The five editor-temporary shapes.
         assert!(blacklisted(&vault, &vault.join("~$report.docx")));
         assert!(blacklisted(&vault, &vault.join("note.md.swp")));
         assert!(blacklisted(&vault, &vault.join("note.md~")));
@@ -1220,7 +1242,7 @@ mod tests {
         // The `leaf` conjunct on the stub rule: a hidden *directory* named
         // like an iCloud stub is still a hidden directory, and its subtree
         // drops like any dot-directory's — the walker prunes it there, and
-        // keeping it here would be the one-store-two-answers shape §4.6
+        // keeping it here would be the one-store-two-answers shape the blacklist
         // forbids. (`.x.icloud` as a whole path IS a stub shape, but never a
         // directory in the middle of one.)
         assert!(blacklisted(&vault, &vault.join(".x.icloud/sub.md")));
@@ -1229,7 +1251,7 @@ mod tests {
     #[test]
     fn the_icloud_stub_is_not_dropped() {
         // The walker keeps eviction stubs so a row can say what happened to the
-        // note (D42); a watcher that dropped them would answer differently. The
+        // note; a watcher that dropped them would answer differently. The
         // name has to be a *real* stub — dot-prefixed, ending `.icloud` — or
         // the assertion passes for the wrong reason: `note.md.icloud` has no
         // leading dot, so it was never hidden in the first place.
@@ -1237,7 +1259,7 @@ mod tests {
         let stub = vault.join(".note.md.icloud");
         assert!(
             momotaro_ingest::icloud_stub(".note.md.icloud"),
-            "the fixture is the shape D42 describes"
+            "the fixture is the iCloud eviction-stub shape"
         );
         assert!(
             !blacklisted(&vault, &stub),
@@ -1251,7 +1273,7 @@ mod tests {
 
     #[test]
     fn a_rename_arrives_as_both_of_its_paths() {
-        // D40 §4.2: rename is delete+create, already folded by the debouncer
+        // Rename is delete+create, already folded by the debouncer
         // into one event carrying (from, to).
         let vault = vault();
         let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
@@ -1265,7 +1287,7 @@ mod tests {
 
     #[test]
     fn the_sentinel_is_dropped_by_the_rule_every_other_dot_file_is() {
-        // The cookie is dot-prefixed, so §4.6's blacklist is what keeps it out
+        // The cookie is dot-prefixed, so the blacklist is what keeps it out
         // of a rescan — one rule, not a special case beside it. The cookie
         // itself is found by scanning the raw events where it is used, which
         // is the only place that needs to see it.
@@ -1281,7 +1303,7 @@ mod tests {
 
     #[test]
     fn a_network_volume_is_refused_rather_than_degraded() {
-        // D40 §4.8: never talk a network volume into a backend this project
+        // Never talk a network volume into a backend this project
         // does not promise. Both calls watch a path that cannot be watched, so
         // the *reason* and the *broadcast* are what differ — and that is
         // exactly what the mutant that drops the `network` branch erases.
@@ -1324,7 +1346,7 @@ mod tests {
 
     #[test]
     fn a_paired_rename_leaves_a_source_moved_hint() {
-        // ADR 0014 + §4.2: the hint is written only for a rename the debouncer
+        // The hint is written only for a rename the debouncer
         // actually paired, it never rewrites `source_key`, and it names both
         // ends. An unpaired disappearance is a deletion, and the batch's
         // removal row has already said so — so it earns no hint.
@@ -1382,7 +1404,7 @@ mod tests {
             rows[0].data_json
         );
 
-        // A directory rename writes no hint at all (ADR 0014): it used to
+        // A directory rename writes no hint at all: it used to
         // land as `source_moved(note:sub -> note:sub2)` — two keys that never
         // existed as sources — while the files that actually moved got none.
         std::fs::create_dir_all(vault.join("sub")).expect("dir");
@@ -1451,7 +1473,7 @@ mod tests {
 
     #[test]
     fn the_retry_schedule_escalates_and_then_gives_up() {
-        // D40 §4.5 spelled out: five backoffs, the delay queue, then the daily
+        // The schedule spelled out: five backoffs, the delay queue, then the daily
         // reconciliation owns it. The give-up must also take the path *out* of
         // the queue — leaving it in would make the next drain try again for
         // ever with a count that can no longer grow.
@@ -1507,7 +1529,7 @@ mod tests {
 
     #[test]
     fn a_sentinel_holding_someone_elses_bytes_is_never_written() {
-        // D40 §4.4 through the exploit a hostile vault can actually stage: a
+        // Through the exploit a hostile vault can actually stage: a
         // hard link at the cookie's name. `is_file` says yes to that — the
         // bytes are what tell the two apart.
         let dir = tempfile::tempdir().expect("temp dir");
@@ -1742,8 +1764,8 @@ mod tests {
 
     #[test]
     fn the_torn_schedule_backs_off_then_parks_then_gives_up() {
-        // Five attempts, the delay queue, then the daily reconciliation owns it
-        // (D40 §4.5). Pinned value by value: a schedule that drifts is a
+        // Five attempts, the delay queue, then the daily reconciliation owns it.
+        // Pinned value by value: a schedule that drifts is a
         // schedule no test noticed.
         assert_eq!(retry_delay(0), Some(Duration::from_millis(100)));
         assert_eq!(retry_delay(1), Some(Duration::from_millis(200)));
@@ -1786,7 +1808,7 @@ mod tests {
         std::fs::write(&path, "one").expect("write");
         assert!(mtime_stable(&path).expect("stat"));
     }
-    /// The recheck measured this shape for real (A2-11): a `\ud800`-named
+    /// The recheck measured this shape for real: a `\ud800`-named
     /// file made the watcher exit before the fix, and WTF-16 makes an
     /// unpaired surrogate a legal Windows file name — so the witness is the
     /// real thing, not a stand-in. It drives both repaired seams at once:

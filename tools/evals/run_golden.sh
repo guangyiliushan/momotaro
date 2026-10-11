@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the CLI, indexes the fixture vault in a scratch workspace and gates the
-# golden set. Shared by `tools/evals/README.md` and the CI `instruments` job, so
+# golden set. Shared by the CI `instruments` job, so
 # the recipe, the thresholds and the reported numbers cannot drift apart.
 #
 # Usage: tools/evals/run_golden.sh [scratch-directory]
@@ -110,10 +110,10 @@ rm -rf "$scratch"
 mkdir -p "$scratch/vault"
 cp -r crates/momotaro-run/tests/fixtures/vault/. "$scratch/vault/"
 # Eval-owned corpus expansion: hard negatives, poison samples, one
-# bad-frontmatter note (W2.3 handover). Inventory and roles: tools/evals/README.md.
+# bad-frontmatter note (with the frontmatter work).
 cp -r tools/evals/fixtures/. "$scratch/vault/"
 printf '[vault]\npath = "vault"\n' > "$scratch/momotaro.toml"
-# D42: an iCloud eviction stub is not content — it never enters the index, so
+# An iCloud eviction stub is not content — it never enters the index, so
 # the retrieval numbers below cannot move because of it — and its audit row is
 # the only reason a report can say a note was evicted on some other device.
 printf 'stub text\n' > "$scratch/vault/.note.md.icloud"
@@ -129,7 +129,7 @@ fi
 
 (cd "$scratch" && "$binary" init && "$binary" index)
 
-# The retrieval numbers say nothing about the ingest audit trail (ADR 0026): a
+# The retrieval numbers say nothing about the ingest audit trail: a
 # deleted `ingest.coverage` write would still score 0.9167. The batch is checked
 # here so the instrument cannot call a broken indexer healthy.
 "$python" - "$scratch" <<'PY'
@@ -146,13 +146,13 @@ stub = connection.execute(
     "select count(*) from store_events where reason_code = 'icloud_placeholder'"
 ).fetchone()[0]
 if stub != 1:
-    print(f"FAIL: icloud_placeholder rows {stub!r}, expected 1 (D42)")
+    print(f"FAIL: icloud_placeholder rows {stub!r}, expected 1")
     sys.exit(1)
 frontmatter = connection.execute(
     "select count(*) from store_events where reason_code = 'frontmatter_parse_error'"
 ).fetchone()[0]
 if frontmatter != 1:
-    print(f"FAIL: frontmatter_parse_error rows {frontmatter!r}, expected 1 (D41.5)")
+    print(f"FAIL: frontmatter_parse_error rows {frontmatter!r}, expected 1")
     sys.exit(1)
 print(f"store_events ok: {counts} (+1 icloud_placeholder, +1 frontmatter_parse_error)")
 PY

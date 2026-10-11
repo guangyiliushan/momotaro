@@ -1,5 +1,5 @@
 //! The CLI surfaces of `ask`, `trace` and `stats` — the two outlets and the
-//! five policy flags (`docs/docs/usage.md`).
+//! five policy flags.
 //!
 //! The engine under them is driven in-process through the run service with
 //! the fake provider rig; the tests then spawn the binary against the same
@@ -314,8 +314,8 @@ fn ask_and_expand_refuse_without_allow_network() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     ready_workspace(&tempdir);
 
-    // architecture §7: network is off until it is asked for, and a provider
-    // call is a network call. The refusal must be the policy one, not whatever
+    // Network is off until it is asked for, and a provider call is a network
+    // call. The refusal must be the policy one, not whatever
     // the endpoint configuration would have said.
     for args in [
         vec!["ask", "--json", "谱定理"],

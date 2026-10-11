@@ -1,4 +1,4 @@
-//! What a vault file's name or attributes mean on another platform (D42).
+//! What a vault file's name or attributes mean on another platform.
 //!
 //! One home for the three sync-disk boundaries: a Windows cloud placeholder
 //! whose bytes are not on this device, an iCloud eviction stub standing in for
@@ -59,6 +59,11 @@ pub fn is_cloud_placeholder(attrs: u32) -> bool {
 /// The read goes through `fs::metadata`, which opens with no access mode and
 /// reads a handle's attributes rather than the file's bytes — nothing here
 /// hydrates a placeholder, which is the whole point.
+///
+/// # Errors
+///
+/// - The `std::io::Error` from `fs::metadata` when the path cannot be read:
+///   it does not exist, or the filesystem refuses access.
 #[cfg(windows)]
 pub fn attributes_of(path: &Path) -> std::io::Result<u32> {
     use std::os::windows::fs::MetadataExt;
@@ -70,6 +75,11 @@ pub fn attributes_of(path: &Path) -> std::io::Result<u32> {
 ///
 /// There is no such attribute off Windows, and zero is the truthful answer —
 /// which also costs no syscall, so callers can ask unconditionally.
+///
+/// # Errors
+///
+/// Infallible: this arm reads no filesystem state and always returns `Ok(0)`.
+/// The `Result` is kept so callers see one signature on every platform.
 #[cfg(not(windows))]
 pub fn attributes_of(_path: &Path) -> std::io::Result<u32> {
     Ok(0)

@@ -1,6 +1,6 @@
 //! Output types and the decoder for one OpenAI-compatible completion body.
 //!
-//! Recording rule (architecture §16): the provider reports what it reports and
+//! Recording rule: the provider reports what it reports and
 //! we write it down; a token field the provider omits stays `None` (= NULL in
 //! `llm_turns`) and is never faked as zero.
 
@@ -28,6 +28,24 @@ pub enum FinishReason {
 
 impl FinishReason {
     /// Parse the wire spelling.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use momotaro_llm::FinishReason;
+    ///
+    /// assert_eq!(FinishReason::from_wire("stop"), FinishReason::Stop);
+    /// assert_eq!(
+    ///     FinishReason::from_wire("tool_calls"),
+    ///     FinishReason::ToolCalls
+    /// );
+    /// // A spelling this build does not model is preserved, never dropped.
+    /// assert_eq!(
+    ///     FinishReason::from_wire("made_up"),
+    ///     FinishReason::Other("made_up".to_string())
+    /// );
+    /// assert_eq!(FinishReason::Other("stop".to_string()).as_str(), "stop");
+    /// ```
     pub fn from_wire(raw: &str) -> Self {
         match raw {
             "stop" => Self::Stop,
@@ -63,7 +81,7 @@ pub struct Usage {
     /// The provider's actual billing basis (after cache discounts), when it
     /// reports one.
     pub billable_tokens: Option<u64>,
-    /// Thinking tokens inside the output (billed at output rates, D26),
+    /// Thinking tokens inside the output (billed at output rates),
     /// reported as `usage.completion_tokens_details.reasoning_tokens`.
     pub reasoning_tokens: Option<u64>,
 }
@@ -112,9 +130,9 @@ struct WireMessage {
 /// message — becomes a typed [`LlmErrorKind::Malformed`] failure, never a
 /// panic. A body existed, so these failures carry `output_observed: true`:
 /// whatever the provider billed is spent, and a retry is off the table. Any
-/// usage the body still lets us read is kept on the failure (§16: the
+/// usage the body still lets us read is kept on the failure: the
 /// provider reports, we record — a half-readable body is no reason to drop
-/// the numbers it did report).
+/// the numbers it did report.
 ///
 /// Wire field sources: `text` ← `choices[0].message.content`,
 /// `finish_reason` ← `choices[0].finish_reason`, `raw_ref` ← `id`, and the
@@ -182,8 +200,8 @@ fn best_effort_usage(body: &str) -> Option<Usage> {
 /// Read one `usage` object field-wise — the single wire reader for both the
 /// completion path and the salvage path. A field the provider omitted or
 /// mistyped stays `None`: a half-readable usage object still reports its
-/// readable numbers, and nothing is invented (§16: provider reports, we
-/// record — 不报为 NULL, a reported zero is `Some(0)`).
+/// readable numbers, and nothing is invented: provider reports, we
+/// record — 不报为 NULL, a reported zero is `Some(0)`.
 fn usage_from_value(usage: &serde_json::Value) -> Usage {
     fn number(object: &serde_json::Value, key: &str) -> Option<u64> {
         object.get(key).and_then(serde_json::Value::as_u64)
@@ -418,7 +436,7 @@ mod tests {
             let error = parse_response(body).expect_err("must fail");
             assert_eq!(error.kind, LlmErrorKind::Malformed);
             // The body existed: this failure is post-output and must never
-            // be retried (architecture §16, retry only before output).
+            // be retried (retry only before output).
             assert!(error.output_observed);
         }
     }
@@ -426,7 +444,7 @@ mod tests {
     #[test]
     fn a_null_or_missing_finish_reason_is_not_a_readable_completion() {
         // Intentional strictness, pinned: the terminal status is a recorded
-        // field (reference.md, LLM turn), so a completion without one is not
+        // field of the turn, so a completion without one is not
         // a completion. Tolerating null would be a contract change.
         for body in [
             r#"{"choices": [{"message": {"content": "hi"}, "finish_reason": null}]}"#,
@@ -519,7 +537,7 @@ mod tests {
 
     #[test]
     fn a_malformed_body_keeps_the_usage_it_still_lets_us_read() {
-        // §16: provider reports, we record — "no choices" is a failure, but
+        // Provider reports, we record — "no choices" is a failure, but
         // the numbers the body carries are spent money and must not vanish.
         let body = json!({
             "usage": {"prompt_tokens": 100, "completion_tokens": 3},

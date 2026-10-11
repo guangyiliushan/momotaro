@@ -7,7 +7,7 @@
 //! function of the endpoint and the credential: it performs no I/O and is what
 //! the offline tests drive.
 //!
-//! Three properties the tests pin down (grill ruling Q3, 2026-09-30):
+//! Three properties the tests pin down:
 //!
 //! * **4xx/5xx are replies, not errors.** `http_status_as_error(false)` keeps a
 //!   provider's status and body visible so `error::classify` can turn them into
@@ -45,7 +45,7 @@ use ureq::tls::{RootCerts, TlsConfig};
 use crate::transport::{ProviderTransport, TransportError, TransportReply};
 
 /// Appended to the configured base URL: this build speaks the OpenAI-compatible
-/// chat-completions protocol (`docs/docs/architecture.md` §7, `[model]`).
+/// chat-completions protocol (`[model]`).
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 
 /// The optional throttling hint the retry policy reads before replaying.
@@ -129,11 +129,48 @@ pub struct HttpTransport {
 }
 
 impl HttpTransport {
-    /// Builds a transport for `base_url` (`docs/docs/architecture.md` §7), e.g.
+    /// Builds a transport for `base_url`, e.g.
     /// `https://api.example.com/v1`.
     ///
     /// Performs no I/O. The key is optional — a local endpoint may need none —
     /// and an empty key is treated as no key rather than as `Bearer `.
+    ///
+    /// # Errors
+    ///
+    /// The same refusals as [`Self::with_turn_timeout`], with only the
+    /// default deadline pinned:
+    ///
+    /// - `TransportConfigError::EndpointNotHttp`,
+    ///   `TransportConfigError::EndpointWithoutHost`,
+    ///   `TransportConfigError::EndpointWithUserInfo` when the base URL is
+    ///   not a usable absolute `http://` / `https://` URL;
+    /// - `TransportConfigError::UnusableApiKey`,
+    ///   `TransportConfigError::PlainHttpWithApiKey` when the key cannot
+    ///   safely travel (bad shape, or cleartext over non-loopback HTTP);
+    /// - `TransportConfigError::EndpointWithFragment` when the base URL
+    ///   carries a fragment the appended path suffix would silently lose.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use momotaro_llm::{HttpTransport, TransportConfigError};
+    ///
+    /// let transport = HttpTransport::new("https://api.example.com/v1", None)
+    ///     .expect("a usable base URL");
+    /// // The chat-completions path is part of the endpoint it will POST to.
+    /// assert_eq!(
+    ///     transport.endpoint(),
+    ///     "https://api.example.com/v1/chat/completions"
+    /// );
+    /// assert_eq!(transport.origin(), "https://api.example.com");
+    /// assert!(!transport.has_api_key());
+    ///
+    /// // A key must not travel in cleartext to a public host.
+    /// assert!(matches!(
+    ///     HttpTransport::new("http://api.example.com/v1", Some("not-a-real-key")),
+    ///     Err(TransportConfigError::PlainHttpWithApiKey)
+    /// ));
+    /// ```
     pub fn new(base_url: &str, api_key: Option<&str>) -> Result<Self, TransportConfigError> {
         Self::with_turn_timeout(base_url, api_key, RESPONSE_TIMEOUT)
     }
@@ -145,8 +182,23 @@ impl HttpTransport {
     /// it exists so an endpoint that accepts and then stalls cannot hold a run
     /// open for ever. How generous it needs to be depends on the model — a
     /// slow-but-valid long answer must not be cut — so the number belongs to
-    /// `[policy].provider_turn_timeout_s` (`harness.md` §4) and not to a
+    /// `[policy].provider_turn_timeout_s` and not to a
     /// constant here.
+    ///
+    /// # Errors
+    ///
+    /// - `TransportConfigError::EndpointNotHttp` when `base_url` is not an
+    ///   absolute `http://` / `https://` URL.
+    /// - `TransportConfigError::EndpointWithoutHost` when the URL has no
+    ///   host (`https://`, `https:///v1`).
+    /// - `TransportConfigError::EndpointWithUserInfo` when the endpoint
+    ///   embeds a credential.
+    /// - `TransportConfigError::UnusableApiKey` when the key, if any, is
+    ///   not printable ASCII without spaces.
+    /// - `TransportConfigError::PlainHttpWithApiKey` when a key would
+    ///   travel over non-loopback plain HTTP.
+    /// - `TransportConfigError::EndpointWithFragment` when `base_url`
+    ///   carries a fragment.
     pub fn with_turn_timeout(
         base_url: &str,
         api_key: Option<&str>,
@@ -186,7 +238,7 @@ impl HttpTransport {
         }
         // The suffix goes *before* a query, not after it. By-string appending
         // put `/chat/completions` inside the query and the request landed on a
-        // path that never exists (probe: `http::Uri` parses it the way ureq
+        // path that never exists (`http::Uri` parses it the way ureq
         // does, and `ureq-proto`'s `prelude()` writes the request line from
         // `path_and_query()`). Azure-style bases carry `?api-version=…`, and
         // that shape must keep working — with the suffix in front.
@@ -470,7 +522,7 @@ mod tests {
 
     #[test]
     fn a_query_on_the_base_keeps_the_suffix_before_it_and_a_fragment_is_refused() {
-        // The probe shape: by-string appending made the request line
+        // By-string appending made the request line
         // `/v1?api-version=…/chat/completions` — suffix inside the query, path
         // that never exists. Structural join puts the suffix first, and a
         // trailing separator before the `?` must not double up.
@@ -501,7 +553,7 @@ mod tests {
 
     #[test]
     fn the_agent_verifies_against_the_platform_certificate_store() {
-        // The whole point of grill ruling Q3: no static Mozilla bundle.
+        // The whole point: no static Mozilla bundle.
         let transport = HttpTransport::new("https://api.example.com/v1", None).expect("transport");
         let tls = transport.agent.config().tls_config();
         assert!(
@@ -590,7 +642,7 @@ mod tests {
         );
 
         // Every shape the rule rejects, not only the control character: a
-        // narrower rule would still pass the probe above while letting a
+        // narrower rule would still pass the control-character check while letting a
         // space or a non-ASCII byte reach the socket.
         for (label, key) in [
             ("a space", "sk-a b"),
@@ -960,7 +1012,7 @@ mod tests {
 
     #[test]
     fn the_feature_surface_carries_no_static_root_bundle() {
-        // Grill ruling Q3: ureq's `webpki-roots` must not be in this build.
+        // ureq's `webpki-roots` must not be in this build.
         // The lockfile is the artefact that proves it — a feature flip lands
         // here as a red test instead of as a silent extra crate.
         //

@@ -1,4 +1,4 @@
-//! Reciprocal-rank fusion for `--mode expand` (`architecture.md` §10.2).
+//! Reciprocal-rank fusion for `--mode expand`.
 //!
 //! Fusing ranked lists is a pure function: same input lists, same output —
 //! including the order, ties included. Nothing here reads a clock, a map with
@@ -12,8 +12,7 @@ use momotaro_contracts::RetrievalHit;
 ///
 /// 60 is the conventional choice in the RRF literature; it is a property of the
 /// ranking rule rather than a tuning surface, so the workspace has no
-/// configuration for it (`architecture.md` §7 lists the knobs and this is not
-/// one).
+/// configuration for it.
 pub const RRF_K: u32 = 60;
 
 /// One accumulated hit: the row itself plus every list's contribution to it.
@@ -48,6 +47,38 @@ struct Fused {
 /// Duplicate chunks inside one list are impossible (`SearchIndex::search`
 /// returns each chunk at most once) but are tolerated: the contributions simply
 /// accumulate.
+///
+/// # Examples
+///
+/// ```
+/// use momotaro_contracts::RetrievalHit;
+/// use momotaro_retrieve::fuse_rrf;
+///
+/// fn hit(chunk_id: &str) -> RetrievalHit {
+///     RetrievalHit {
+///         rank: 1,
+///         source_key: format!("note:{chunk_id}.md"),
+///         revision_hash: "rev-1".to_owned(),
+///         chunk_id: chunk_id.to_owned(),
+///         chunk_hash: format!("chash-{chunk_id}"),
+///         ordinal: 0,
+///         heading_path: None,
+///         score: 0.0,
+///         locator_json: r#"{"start_byte":0}"#.to_owned(),
+///     }
+/// }
+///
+/// // One ranked list per query; a chunk found by both lists scores both shares.
+/// let fused = fuse_rrf(&[vec![hit("a"), hit("b")], vec![hit("b"), hit("a")]]);
+/// let expected = 1.0 / 61.0 + 1.0 / 62.0;
+/// assert_eq!(fused.len(), 2);
+/// assert!((fused[0].score - expected).abs() < 1e-15);
+/// assert!((fused[1].score - expected).abs() < 1e-15);
+/// // The scores tie, so the documented tie-break decides: source_key first,
+/// // never the order the lists were passed in.
+/// assert_eq!(fused[0].chunk_id, "a");
+/// assert_eq!(fused[0].rank, 1);
+/// ```
 pub fn fuse_rrf(lists: &[Vec<RetrievalHit>]) -> Vec<RetrievalHit> {
     // Keyed by chunk_id in a `BTreeMap` so accumulation itself has a defined
     // order too — nothing downstream may depend on hash iteration order.
@@ -281,7 +312,7 @@ mod tests {
             .next()
             .expect("the sort_by body");
 
-        // Position, not presence: §10.2 specifies an *order*, and `contains`
+        // Position, not presence: the fusion rule specifies an *order*, and `contains`
         // would accept the four keys in any sequence.
         let keys = [
             ".total_cmp(&left.hit.score)",

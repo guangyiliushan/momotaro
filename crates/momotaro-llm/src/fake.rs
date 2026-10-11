@@ -71,6 +71,12 @@ impl FakeLlm {
     ///
     /// A call that bypassed the keyed seam has no key; tests that care about
     /// the key go through `complete`, which always uses that seam.
+    ///
+    /// # Panics
+    ///
+    /// When call `index` has no recorded key — no such call happened, or
+    /// it reached the rig through `send` and bypassed the keyed seam
+    /// (`FakeLlm: call #<index> was not keyed`).
     pub fn sent_idempotency_key(&self, index: usize) -> String {
         self.sent_keys
             .borrow()

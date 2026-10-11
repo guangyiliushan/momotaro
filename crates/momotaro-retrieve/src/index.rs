@@ -40,6 +40,12 @@ pub struct IndexWriterHandle {
 
 impl IndexWriterHandle {
     /// Commits all queued operations, making them visible to searchers.
+    ///
+    /// # Errors
+    ///
+    /// - `RetrieveError::Tantivy` when Tantivy cannot flush and publish the
+    ///   queued operations (an I/O failure while writing the segment, or a
+    ///   writer whose worker thread has died).
     pub fn commit(&mut self) -> Result<(), RetrieveError> {
         self.inner.commit()?;
         Ok(())
@@ -54,6 +60,12 @@ impl IndexWriterHandle {
     /// exactly that reason; the handle was dropped at the end of a block and the
     /// merge was still ~1.4 s from finishing. Consumes the handle, as
     /// `wait_merging_threads` itself does.
+    ///
+    /// # Errors
+    ///
+    /// - `RetrieveError::Tantivy` when a worker or merging thread failed:
+    ///   the shutdown joins them and surfaces the failure instead of
+    ///   swallowing it.
     pub fn finish(self) -> Result<(), RetrieveError> {
         self.inner.wait_merging_threads()?;
         Ok(())
@@ -114,6 +126,15 @@ impl SearchIndex {
     /// The `cjk` tokenizer is registered on both paths. The directory is
     /// created when absent. A stale or foreign on-disk index surfaces as
     /// [`RetrieveError::SchemaMismatch`] instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// - `RetrieveError::Io` when the index directory cannot be created.
+    /// - `RetrieveError::Tantivy` when the existing index cannot be opened,
+    ///   the new one cannot be created, or the reader cannot be started.
+    /// - `RetrieveError::SchemaMismatch` when the on-disk schema is not the
+    ///   Momotaro one (a missing field, or one with the wrong type, storage,
+    ///   or tokenizer) — a stale or foreign index, to be rebuilt.
     pub fn open_or_create(dir: &Path) -> Result<SearchIndex, RetrieveError> {
         let has_meta = Self::exists(dir);
         let index = if has_meta {
@@ -156,6 +177,13 @@ impl SearchIndex {
     }
 
     /// Creates a writer with the given total memory budget in bytes.
+    ///
+    /// # Errors
+    ///
+    /// - `RetrieveError::Tantivy` when Tantivy refuses the writer: the
+    ///   per-thread memory arena would fall below its minimum, an index
+    ///   lockfile already exists (another writer holds the index), or the
+    ///   index directory cannot be reached.
     pub fn writer(&self, heap_bytes: usize) -> Result<IndexWriterHandle, RetrieveError> {
         Ok(IndexWriterHandle {
             inner: self.index.writer(heap_bytes)?,
@@ -178,6 +206,13 @@ impl SearchIndex {
     /// Deletes every document tagged with `source_key`, then adds one
     /// document per chunk. Nothing is committed; call
     /// [`IndexWriterHandle::commit`] once after a batch.
+    ///
+    /// # Errors
+    ///
+    /// - `RetrieveError::Tantivy` when the writer cannot queue a document:
+    ///   Tantivy fails the add when the indexing worker behind the writer is
+    ///   no longer alive. The `delete_term` half of the call is infallible —
+    ///   an invalid term is ignored, not reported.
     pub fn upsert_source(
         writer: &mut IndexWriterHandle,
         fields: &Fields,
@@ -199,11 +234,19 @@ impl SearchIndex {
     /// Drops every indexed chunk of one source.
     ///
     /// The derived half of a deletion: SQLite keeps the revision as history
-    /// (ADR 0014) and `graph_links` are pruned in the same batch, but a
+    /// and `graph_links` are pruned in the same batch, but a
     /// document left in Tantivy would keep answering searches for a file that
     /// is gone — which is the one place "eventually consistent" would be a
     /// lie the user can see. Nothing is committed; call
     /// [`IndexWriterHandle::commit`] once after a batch.
+    ///
+    /// # Errors
+    ///
+    /// Infallible in the current implementation: the deletion is queued
+    /// through Tantivy's `delete_term`, which has no error path — an invalid
+    /// term is ignored rather than reported — so it always returns `Ok(())`.
+    /// The `Result` matches the call shape of `upsert_source` and
+    /// `rebuild_from`.
     pub fn remove_source(
         writer: &mut IndexWriterHandle,
         fields: &Fields,
@@ -221,6 +264,14 @@ impl SearchIndex {
     /// are looked up per `chunk.source_key` (an empty title is fine; a missing
     /// class is refused — guessing one would silently mis-weight the source).
     /// Returns the number of chunks queued. Nothing is committed.
+    ///
+    /// # Errors
+    ///
+    /// - `RetrieveError::MissingOrigin` when a chunk's `source_key` has no
+    ///   entry in `origins` (a class is never guessed).
+    /// - `RetrieveError::Tantivy` when clearing the index or queuing a
+    ///   document fails — Tantivy reports a writer whose indexing worker is
+    ///   no longer alive.
     pub fn rebuild_from(
         writer: &mut IndexWriterHandle,
         fields: &Fields,
@@ -259,6 +310,32 @@ impl SearchIndex {
     /// without any external reader handle. Equal scores tie-break by
     /// `source_key` ascending, then `ordinal` ascending; `rank` is
     /// 1-based.
+    ///
+    /// # Errors
+    ///
+    /// - `RetrieveError::Tantivy` when the reader reload, the search itself,
+    ///   or a document fetch fails.
+    /// - `RetrieveError::Tantivy` (a schema error inside it) when a stored
+    ///   `ordinal` is missing or outside `u32` — a damaged document fails the
+    ///   search instead of being reported as position 0.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use momotaro_retrieve::SearchIndex;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let index = SearchIndex::open_or_create(std::path::Path::new(".momotaro/index"))?;
+    /// let hits = index.search("gradient descent", 10)?;
+    /// for hit in &hits {
+    ///     println!("#{} {} (score {})", hit.rank, hit.chunk_id, hit.score);
+    /// }
+    ///
+    /// // A query with no alphanumeric character matches nothing, and is no error.
+    /// assert!(index.search("  !!!  ", 10)?.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn search(&self, query: &str, top_k: usize) -> Result<Vec<RetrievalHit>, RetrieveError> {
         self.parse_fell_back.store(false, AtomicOrdering::Relaxed);
         let normalized = normalize_query(query);

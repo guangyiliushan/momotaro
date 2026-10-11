@@ -19,7 +19,7 @@ outside both the pnpm and Cargo workspaces (see docs/docs/python-rust.md).
   average.
 - `fixtures/` — eval-owned vault notes copied into the scratch vault by
   `run_golden.sh`: three semi-relevant notes, one no-info glossary, two poison
-  samples, one bad-frontmatter note (the W2.3 handover: `reason_code =
+  samples, one bad-frontmatter note (`reason_code =
   frontmatter_parse_error` is asserted on the ingest audit row), plus two
   dedicated answer notes (`eigenvalue.md`, `kernel-def.md`) that re-anchor the
   `特征值 特征向量` / `kernel` queries onto notes that actually answer them.
