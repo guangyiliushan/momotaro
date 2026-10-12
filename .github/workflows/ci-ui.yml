@@ -2,6 +2,10 @@ name: ui
 
 on:
   push:
+    # Both keys are required together: `tags-ignore` alone (no `branches`)
+    # silently disables branch triggering per the workflow-syntax docs.
+    branches:
+      - "**"
     tags-ignore:
       - "**"
     paths:

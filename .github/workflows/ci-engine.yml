@@ -2,8 +2,12 @@ name: engine
 
 on:
   push:
-    # Tag pushes bypass path filters (GitHub runs the workflow for a new tag
+    # Both keys are required together: `tags-ignore` alone (no `branches`)
+    # silently disables branch triggering per the workflow-syntax docs.
+    # Tag pushes bypass path filters anyway (a new tag runs the workflow
     # regardless), and release moments belong to release-desktop alone.
+    branches:
+      - "**"
     tags-ignore:
       - "**"
     paths:
