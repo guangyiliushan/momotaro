@@ -111,17 +111,6 @@ jobs:
       - name: Test
         shell: bash
         run: bash tools/gates.sh --only test
-      # TEMPORARY diagnosis aid (remove once the windows test leg is green).
-      - name: Surface failing tests (temporary)
-        if: failure()
-        shell: bash
-        run: |
-          grep -B 2 -A 14 "panicked at" /tmp/momotaro-gates.log | head -80 | while IFS= read -r line; do
-            echo "::error::${line:0:350}"
-          done
-          grep -E "test result: FAILED" /tmp/momotaro-gates.log | while IFS= read -r line; do
-            echo "::error::${line:0:350}"
-          done
 
   deny:
     # Supply chain: licenses, advisories, yanks, sources. A policy file nobody
