@@ -60,13 +60,17 @@ jobs:
           projectPath: apps/desktop
           tagName: app-v__VERSION__
           releaseName: "Momotaro v__VERSION__"
-          # macOS first-launch note: ad-hoc signed (no Apple certificate),
-          # so Gatekeeper asks for right-click > Open or a Security override.
+          # Signing guidance per research doc 11 (D44 minimal tier):
+          # macOS ad-hoc -> right-click > Open; Windows unsigned ->
+          # SmartScreen "More info" > "Run anyway"; every asset's sha256
+          # is published alongside (cargo of the release job verifies).
           releaseBody: >-
             See the assets to download this version and install.
             macOS: the app is ad-hoc signed; on first launch right-click it
             and choose Open (or allow it in System Settings > Privacy &
             Security).
+            Windows: SmartScreen may appear; choose "More info" > "Run
+            anyway". Verify downloads against the published SHA256 sums.
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
