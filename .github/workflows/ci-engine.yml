@@ -10,7 +10,7 @@ on:
       - "rust-toolchain.toml"
       - "deny.toml"
       - "tools/evals/**"
-      - ".github/workflows/rust.yml"
+      - ".github/workflows/ci-engine.yml"
   pull_request:
     paths:
       - "crates/**"
@@ -20,7 +20,7 @@ on:
       - "rust-toolchain.toml"
       - "deny.toml"
       - "tools/evals/**"
-      - ".github/workflows/rust.yml"
+      - ".github/workflows/ci-engine.yml"
   schedule:
     # Advisories and yanks land between commits. On a schedule the whole file
     # runs against the default branch, so a dependency that was fine yesterday
