@@ -627,8 +627,25 @@ mod tests {
     #[test]
     fn a_local_path_that_would_escape_the_workspace_is_not_read() {
         // `local_path` is workspace-relative by contract; this crate refuses
-        // anything that is not, rather than resolving it.
-        let f = fixture(Some("../../outside.md"));
+        // anything that is not, rather than resolving it. The refusal is by
+        // form — it fires before the filesystem is consulted — so like the
+        // rooted-path sibling below, this fixture stores the escaping path
+        // without materializing bytes for it. Writing the probe bytes for
+        // real is what broke CI: two ParentDir hops from a Linux runner's
+        // /tmp/.tmpXXXX land at `/`, and `/outside.md` is root-owned, while
+        // Windows and local hosts resolve the same hops into a writable
+        // user directory. The bytes were never the point; `NoLocalBytes` is
+        // the form check's verdict either way.
+        let mut f = fixture(None);
+        f.store
+            .update_revision_fingerprint(
+                SOURCE_KEY,
+                REVISION,
+                "{}",
+                "../../outside.md",
+                "outside.md",
+            )
+            .expect("point the revision at an escaping path");
         let source = StoreSource::new(&f.store, f.root());
         let v = integrity(&source, SOURCE_KEY, REVISION);
         assert_eq!(v.status, VerificationStatus::Unsupported);
