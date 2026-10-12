@@ -1,0 +1,33 @@
+[package]
+name = "app"
+version = "0.0.1"
+description = "Momotaro desktop shell"
+authors = ["guangyiliushan"]
+license = ""
+repository = ""
+edition = "2024"
+rust-version = "1.90"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7.2", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.12.3", features = [] }
+tauri-plugin-log = "2"
+
+# Standalone crate: deliberately NOT a member of the root workspace. Joining
+# it would drag the tauri/wry/webkit dependency tree into the engine CI's
+# `cargo test --workspace` and `clippy --workspace`, whose ubuntu leg does not
+# install the webkit system libraries. The empty `[workspace]` table marks
+# this manifest as its own workspace root, with its own lockfile and target
+# directory (which `release-desktop.yml`'s rust-cache maps explicitly).
+[workspace]
