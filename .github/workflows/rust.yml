@@ -4,7 +4,7 @@ on:
   push:
     paths:
       - "crates/**"
-      - "apps/**"
+      - "apps/cli/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -14,7 +14,7 @@ on:
   pull_request:
     paths:
       - "crates/**"
-      - "apps/**"
+      - "apps/cli/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -30,37 +30,86 @@ on:
 permissions:
   contents: read
 
+# 8/10 surveyed repos (tokio among them): a new push to the same PR cancels the
+# in-flight run. schedule events group by SHA, so nightly runs never cancel
+# each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
 jobs:
+  # Every gate below is one `--only` of `tools/gates.sh`: the suite a
+  # contributor replays locally is the suite CI runs, so the two cannot drift
+  # apart. What CI keeps for itself is the *split* — one job per gate, so a
+  # red is named, gates run in parallel instead of behind the slowest one, and
+  # a clippy fix never re-runs the test suite (ripgrep / tokio / crabnebula
+  # all use this shape).
+  #
+  # fmt and doc are platform-independent: one ubuntu leg. clippy keeps both
+  # legs — `#[cfg(windows)]` code only compiles on the windows leg, and the
+  # ubuntu leg is the only place `#[cfg(unix)]` code is seen. The two checks
+  # the gates script does not own stay in `instruments`: `perf_smoke` and the
+  # eval-harness self-tests.
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Node 20 actions are removed from runners; pin 40-char SHAs.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Format
+        run: bash tools/gates.sh --only fmt
+
+  clippy:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Clippy
+        run: bash tools/gates.sh --only clippy
+
+  doc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Doc
+        run: bash tools/gates.sh --only doc
+
   test:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+    timeout-minutes: 60
     steps:
-      # Node 20 actions are removed from runners; pin 40-char SHAs on the Node 24 line.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Every gate below is one `--only` of `tools/gates.sh`: the suite a
-      # contributor replays locally is the suite this job runs, so the two
-      # cannot drift apart. What the job keeps for itself is the *split* —
-      # separate steps, so a red is named — and the two checks the script does
-      # not own (`perf_smoke`, the eval harness self-tests).
-      - name: Format
-        run: bash tools/gates.sh --only fmt
-      - name: Clippy
-        run: bash tools/gates.sh --only clippy
-      - name: Doc
-        run: bash tools/gates.sh --only doc
       - name: Test
         shell: bash
         run: bash tools/gates.sh --only test
+
   deny:
     # Supply chain: licenses, advisories, yanks, sources. A policy file nobody
-    # runs is decoration.
+    # runs is decoration. Runs on every change by design (deny.toml header):
+    # a new advisory is disclosed the day it lands, not on the next cron.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
@@ -81,6 +130,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install toolchain

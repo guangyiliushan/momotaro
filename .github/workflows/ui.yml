@@ -25,6 +25,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
 jobs:
   test:
     # One leg is the whole contract: the tests under `apps/desktop` and
@@ -32,6 +36,7 @@ jobs:
     # paths, no shell — so a second OS would re-run the same assertions. A
     # matrix is the answer the day one of those becomes untrue.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # No `version` input: the action reads `packageManager` from the root
