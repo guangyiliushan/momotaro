@@ -3864,6 +3864,25 @@ mod tests {
     fn content_edit_creates_exactly_one_new_revision_and_keeps_old() {
         let (dir, vault) = fixture_workspace();
 
+        // CI machines index within the same whole-second tick the fixtures
+        // were written in, and a stored stamp equal to the file's own write
+        // second is the racy case: the unchanged files get refreshed (counted
+        // as indexed) instead of skipped, which is exactly what this test
+        // must not allow. Backdate the fixtures past the racy window — the
+        // same pattern the rewrite test above uses for its past-dated mtime.
+        let backdated = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        for entry in fs::read_dir(&vault).expect("read vault") {
+            let entry = entry.expect("vault entry");
+            if entry.file_type().expect("file type").is_file() {
+                fs::File::options()
+                    .write(true)
+                    .open(entry.path())
+                    .expect("open for attributes")
+                    .set_modified(backdated)
+                    .expect("backdate the fixture file");
+            }
+        }
+
         let first = index_workspace(dir.path(), None).expect("first index");
         assert_eq!(first.revisions_created, 5);
         let baseline = store_of(dir.path()).counts().expect("counts");
@@ -4463,6 +4482,12 @@ mod tests {
             "the report has to carry what the probe answered, not a constant: \
              {report:?}"
         );
+        // The probe answers only on Windows — `volume_info` is documented
+        // "Windows only: everywhere else this costs no syscall and returns
+        // UNKNOWN" — so the field is `Some` only where a volume API exists.
+        // Elsewhere the equality assert above already pins the contract: the
+        // report carries the probe's `None`, never a constant.
+        #[cfg(windows)]
         assert!(
             report.network_volume.is_some(),
             "this workspace's volume is answerable, so the field is too: {report:?}"

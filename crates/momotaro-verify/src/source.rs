@@ -1184,11 +1184,28 @@ mod tests {
              that is the whole point of this fixture"
         );
         // The premise: joining it keeps the base and lands *inside* this
-        // workspace, so containment would forgive it and only the form check
-        // can refuse it. Without this the fixture could pass for an
-        // unrelated reason and would pin nothing about the `RootDir` arm.
+        // workspace (canonically), so containment would forgive it and only
+        // the form check can refuse it. Without this the fixture could pass
+        // for an unrelated reason and would pin nothing about the `RootDir`
+        // arm.
+        //
+        // The comparison has to be canonical-to-canonical. A raw
+        // `starts_with(f.root())` pits the *stored spelling* of the root
+        // against the *canonicalized* address this fixture is built from,
+        // and the two spellings diverge wherever the temp directory carries
+        // an 8.3 short name: the GitHub Actions Windows runner hands the job
+        // `TEMP=C:\Users\RUNNERADMIN~1\...` while `fs::canonicalize` expands
+        // the alias to `runneradmin`, so component-wise they are different
+        // paths and the raw check panicked on CI while passing on a
+        // long-spelled host. `canonicalize_existing_ancestor` is the same
+        // walk production containment takes, so it answers the question the
+        // premise is actually about.
+        let joined = f.root().join(&rooted);
+        let resolved = canonicalize_existing_ancestor(&joined)
+            .expect("the walk up to the workspace root succeeds")
+            .expect("the workspace root itself resolves, so the walk-up lands");
         assert!(
-            f.root().join(&rooted).starts_with(f.root()),
+            resolved.starts_with(&full),
             "premise: a rooted path built from the workspace's own address \
              must resolve inside it"
         );

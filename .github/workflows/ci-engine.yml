@@ -103,23 +103,6 @@ jobs:
       - name: Test
         shell: bash
         run: bash tools/gates.sh --only test
-      # TEMPORARY diagnosis aid: surface the failing tests as check-run
-      # annotations (publicly readable) until the red is root-caused.
-      # Remove this step once `test` is green again.
-      - name: Surface failing tests (temporary)
-        if: failure()
-        shell: bash
-        run: |
-          grep -n "panicked at" /tmp/momotaro-gates.log | head -6
-          grep -B 2 -A 14 "panicked at" /tmp/momotaro-gates.log | head -80 | while IFS= read -r line; do
-            echo "::error::${line:0:350}"
-          done
-          grep -E "test result: FAILED|^failures:$" /tmp/momotaro-gates.log | while IFS= read -r line; do
-            echo "::error::${line:0:350}"
-          done
-          awk '/^failures:/{flag=1;next}/^$/{flag=0}flag' /tmp/momotaro-gates.log | head -12 | while IFS= read -r line; do
-            echo "::error::name ${line:0:250}"
-          done
 
   deny:
     # Supply chain: licenses, advisories, yanks, sources. A policy file nobody
