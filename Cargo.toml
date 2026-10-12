@@ -81,3 +81,8 @@ ureq = { version = "3.4", default-features = false, features = [
   "platform-verifier",
   "gzip",
 ] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+description = "Momotaro CLI"
+repository = "https://github.com/guangyiliushan/momotaro"
 
 [dependencies]
 clap = { workspace = true }
@@ -14,3 +16,8 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 momotaro-llm = { workspace = true, features = ["test-util"] }
 momotaro-store = { workspace = true }
+
+# cargo-dist (dist-workspace.toml) skips publish=false packages unless they
+# explicitly opt in; this binary IS the release artifact.
+[package.metadata.dist]
+dist = true
