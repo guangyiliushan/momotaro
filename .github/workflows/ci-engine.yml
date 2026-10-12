@@ -110,10 +110,15 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          tail -n 150 /tmp/momotaro-gates.log || exit 0
-          grep -E "failures:|test result: FAILED|^error" /tmp/momotaro-gates.log | head -5
-          awk '/^failures:/{flag=1;next}/^$/{flag=0}flag' /tmp/momotaro-gates.log | head -20 | while IFS= read -r line; do
-            echo "::error::${line:0:300}"
+          grep -n "panicked at" /tmp/momotaro-gates.log | head -6
+          grep -B 2 -A 14 "panicked at" /tmp/momotaro-gates.log | head -80 | while IFS= read -r line; do
+            echo "::error::${line:0:350}"
+          done
+          grep -E "test result: FAILED|^failures:$" /tmp/momotaro-gates.log | while IFS= read -r line; do
+            echo "::error::${line:0:350}"
+          done
+          awk '/^failures:/{flag=1;next}/^$/{flag=0}flag' /tmp/momotaro-gates.log | head -12 | while IFS= read -r line; do
+            echo "::error::name ${line:0:250}"
           done
 
   deny:
