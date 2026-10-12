@@ -2,6 +2,8 @@ name: ui
 
 on:
   push:
+    tags-ignore:
+      - "**"
     paths:
       - "apps/**"
       - "packages/**"
