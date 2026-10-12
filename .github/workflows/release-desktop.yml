@@ -1,0 +1,66 @@
+name: release-desktop
+
+# Desktop CD per the 06 investigation: official tauri-action pipeline,
+# three legs (windows nsis / ubuntu-22.04 deb+appimage / macos arm64 dmg),
+# tag-triggered draft releases. Dormant until Phase A lands
+# apps/desktop/src-tauri (see research/2026-10-12-CI构筑调查/11).
+
+on:
+  push:
+    tags:
+      - "app-v*"
+  workflow_dispatch:
+  # Dispatch builds WITHOUT a release (tauri-action only creates/releases
+  # when tagName is set), so it doubles as a three-leg build smoke.
+
+permissions:
+  contents: write
+
+# One group per ref: a tag never cancels another tag's release build.
+concurrency:
+  group: release-desktop-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: ""
+          - platform: ubuntu-22.04
+            args: ""
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      # Official bundle dependencies (distribute/pipelines/github).
+      - name: Install Linux bundle dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: "apps/desktop/src-tauri -> target"
+      - uses: tauri-apps/tauri-action@944946e3e4cac6603d1fe8f514171e9ecd3c78aa # v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/desktop
+          tagName: app-v__VERSION__
+          releaseName: "Momotaro v__VERSION__"
+          releaseBody: "See the assets to download this version and install."
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
