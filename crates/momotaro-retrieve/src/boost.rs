@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn the_ladder_is_pinned_to_its_numbers() {
-        // The ADR's ladder in numbers: owner 2.0 / paper 1.0 / web 0.6. The
+        // The boost ladder in numbers: owner 2.0 / paper 1.0 / web 0.6. The
         // ratio tests around this one only *bound* the web weight from above;
         // a `0.6 -> 0.9` mutation survived every one of them.
         let close = |value: f32, want: f32| (value - want).abs() < 1e-6;

@@ -1,0 +1,18 @@
+{
+  "version.label": {
+    "message": "Next",
+    "description": "The label for version current"
+  },
+  "sidebar.docs.category.concepts": {
+    "message": "コンセプト",
+    "description": "The label for category 'Concepts' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.guides": {
+    "message": "ガイド",
+    "description": "The label for category 'Guides' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.reference": {
+    "message": "リファレンス",
+    "description": "The label for category 'Reference' in sidebar 'docs'"
+  }
+}

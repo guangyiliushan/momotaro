@@ -404,7 +404,7 @@ mod tests {
         );
 
         // Names alone would let the shape rot: the `UNIQUE` is the access path
-        // the ADR leans on (so no second index is added), and both indexes are
+        // (so no second index is added), and both indexes are
         // meant to be *partial*. Mutations that drop either stayed green until
         // these text assertions existed.
         let table_sql = object_sql(&store, "store_events");

@@ -2981,7 +2981,7 @@ mod tests {
         assert_ne!(first.batch_id, report.batch_id, "two runs are two batches");
         assert!(
             report.batch_id.starts_with("index-"),
-            "the shape the ADR documents: {}",
+            "the batch-id shape: {}",
             report.batch_id
         );
     }

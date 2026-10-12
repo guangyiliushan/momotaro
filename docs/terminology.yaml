@@ -1,0 +1,205 @@
+# Single source of every term this site uses. The glossary pages for all
+# three locales are generated from this file (scripts/build-glossary.mjs):
+# never edit the generated pages by hand, and never introduce a second word
+# for a concept that is named here.
+version: 1
+terms:
+  - id: workspace
+    en: "workspace"
+    zh: "工作区"
+    ja: "ワークスペース"
+    definition:
+      en: "A directory that contains `momotaro.toml` and owns exactly one database, with the paper bytes beside it."
+      zh: "包含 `momotaro.toml` 的目录；独占一个数据库，论文原文就放在数据库旁边。"
+      ja: "`momotaro.toml` を含むディレクトリ。1 つのデータベースを持ち、論文の原本はそのそばに置かれます。"
+    avoid: ["vault", "project", "profile", "app-data store"]
+
+  - id: vault
+    en: "vault"
+    zh: "笔记库"
+    ja: "保管庫"
+    definition:
+      en: "The single notes tree a workspace points at."
+      zh: "工作区指向的那一棵笔记目录树。"
+      ja: "ワークスペースが指す、唯一のノートツリー。"
+    avoid: ["library", "knowledge base", "corpus"]
+
+  - id: source
+    en: "source"
+    zh: "来源"
+    ja: "ソース"
+    definition:
+      en: "One note, paper, or web document the library can cite; its identity is the source key, not a row id and not a live filesystem path."
+      zh: "库可以引用的一个笔记、论文或网页文档；它的身份是来源键，不是行号，也不是随时会变的文件路径。"
+      ja: "ライブラリが引用できるノート・論文・ウェブ文書の 1 つ。その同一性はソースキーであり、行 ID や生きたファイルパスではありません。"
+    avoid: ["file", "document"]
+
+  - id: source-key
+    en: "source key"
+    zh: "来源键"
+    ja: "ソースキー"
+    definition:
+      en: "The scheme-prefixed identity of a source (`note:` / `arxiv:`), NFC-normalized and never case-folded."
+      zh: "来源的带方案前缀的身份（`note:` / `arxiv:`），做 NFC 归一、永不做大小写折叠。"
+      ja: "ソースのスキーム付き同一性（`note:` / `arxiv:`）。NFC 正規化され、大文字小文字は決して畳み込まれません。"
+    avoid: ["canonical file path", "database id", "URL as key"]
+
+  - id: source-revision
+    en: "source revision"
+    zh: "来源修订"
+    ja: "ソースリビジョン"
+    definition:
+      en: "An immutable byte snapshot of a source; updates append a new revision instead of overwriting."
+      zh: "来源的一份不可变字节快照；更新是追加一个新修订，而不是覆盖旧的。"
+      ja: "ソースの不変のバイトスナップショット。更新は上書きではなく、新しいリビジョンの追加です。"
+    avoid: ["version", "file", "document"]
+
+  - id: chunk
+    en: "chunk"
+    zh: "块"
+    ja: "チャンク"
+    definition:
+      en: "A deterministic projection of one source revision; the unit retrieval finds and citations locate."
+      zh: "某个来源修订的确定性投影；检索命中和引文定位都以它为单位。"
+      ja: "1 つのソースリビジョンの決定的な射影。検索が当て、引用が指す単位です。"
+    avoid: ["passage", "embedding", "canonical fact"]
+
+  - id: origin-class
+    en: "origin class"
+    zh: "来源类别"
+    ja: "オリジンクラス"
+    definition:
+      en: "Who authored the bytes: `owner` | `paper` | `web` | `agent` | `system`."
+      zh: "字节的作者是谁：`owner` | `paper` | `web` | `agent` | `system`。"
+      ja: "バイトの書き手が誰か: `owner` | `paper` | `web` | `agent` | `system`。"
+    avoid: ["trust score", "provenance"]
+
+  - id: project
+    en: "project"
+    zh: "项目"
+    ja: "プロジェクト"
+    definition:
+      en: "A named collection of sources (and, later, annotations and pinned sparks); deleting it never deletes sources."
+      zh: "有名有姓的一组来源（以后还包括批注与已收下的启发卡）；删掉项目永远不删来源。"
+      ja: "名前の付いたソースのまとまり（将来は注釈やピン留めしたスパークも含む）。プロジェクトを削除してもソースは削除されません。"
+    avoid: ["workspace", "folder", "tenant"]
+
+  - id: session
+    en: "session"
+    zh: "会话"
+    ja: "セッション"
+    definition:
+      en: "A conversation thread bound to zero or one project at creation; that binding sets the default retrieval scope."
+      zh: "一条对话线索，创建时绑定零个或一个项目；这个绑定决定默认检索范围。"
+      ja: "作成時に 0 個または 1 個のプロジェクトに結び付く会話のひも。その結び付きが既定の検索範囲を決めます。"
+    avoid: ["chat", "thread", "project"]
+
+  - id: annotation
+    en: "annotation"
+    zh: "批注"
+    ja: "注釈"
+    definition:
+      en: "A human note pinned to a source revision and locator; its origin class is always `owner`."
+      zh: "钉在某个来源修订与定位点上的手写笔记；来源类别永远是 `owner`。"
+      ja: "ソースリビジョンとロケータに留められた人手のメモ。オリジンクラスは常に `owner` です。"
+    avoid: ["comment", "highlight", "memory"]
+
+  - id: spark
+    en: "spark"
+    zh: "启发卡"
+    ja: "スパーク"
+    definition:
+      en: "An agent-proposed, citation-backed card (`proposed` | `pinned` | `dismissed`); only a pinned spark with a citation is a retrieval source."
+      zh: "由 agent 提出、带引用的卡片（`proposed` | `pinned` | `dismissed`）；只有被收下且带引用的启发卡才是检索来源。"
+      ja: "エージェントが提案する引用付きカード（`proposed` | `pinned` | `dismissed`）。引用を持つピン留め済みスパークだけが検索ソースになります。"
+    avoid: ["memory", "idea", "wiki page"]
+
+  - id: profile
+    en: "profile"
+    zh: "配置档"
+    ja: "プロファイル"
+    definition:
+      en: "A named bundle of run defaults (model slots, policy, toolset); not memory and not notes."
+      zh: "一组有名有姓的运行默认值（模型槽位、策略、工具集）；不是记忆，也不是笔记。"
+      ja: "名前の付いた実行既定値の束（モデルスロット・ポリシー・ツールセット）。メモリでもノートでもありません。"
+    avoid: ["persona", "memory", "user profile"]
+
+  - id: run
+    en: "run"
+    zh: "运行"
+    ja: "ラン"
+    definition:
+      en: "One accepted, auditable unit of work; its terminal status is driven by terminal events recorded with it."
+      zh: "一次被受理、可审计的工作单元；终态由与它同时记录下来的终止事件决定。"
+      ja: "受理された、監査可能な作業の 1 単位。終端状態は同じ記録に書かれた終端イベントが決めます。"
+    avoid: ["job", "request", "agent loop"]
+
+  - id: ask
+    en: "ask"
+    zh: "提问运行"
+    ja: "アスク"
+    definition:
+      en: "A run that retrieves and builds context in code, then makes at most one provider turn."
+      zh: "一次先在代码里做检索与上下文构建、然后至多向模型发起一次调用的运行。"
+      ja: "コード側で検索とコンテキスト構築を行い、そのあとプロバイダー呼び出しを多くとも 1 回だけ行うラン。"
+    avoid: ["agent", "tool loop", "chat completion"]
+
+  - id: same-library-retrieval
+    en: "same-library retrieval"
+    zh: "同库检索"
+    ja: "同一ライブラリ検索"
+    definition:
+      en: "One lexical index over owner notes and papers; a query returns mixed origin classes, ranked with origin boosts."
+      zh: "一份同时覆盖手写笔记与论文的词法索引；一次查询返回混合来源类别，按来源加权排序。"
+      ja: "手書きノートと論文を 1 つの語彙索引で扱い、クエリはオリジンクラスが混ざった結果をオリジン加重付きで返します。"
+    avoid: ["hybrid search", "knowledge graph"]
+
+  - id: context-scope
+    en: "context scope"
+    zh: "上下文范围"
+    ja: "コンテキスト範囲"
+    definition:
+      en: "P1 (the bound project's sources, or the whole vault when unbound) versus P2 (the rest); it shapes what enters model context, not what retrieval recorded."
+      zh: "P1（已绑定项目的来源，未绑定时为整个笔记库）与 P2（其余部分）之分；它决定什么进入模型上下文，不影响检索记录了什么。"
+      ja: "P1（結び付いたプロジェクトのソース、未結び付けなら保管庫全体）と P2（それ以外）の区別。モデルのコンテキストに入るものを決め、検索が記録するものには影響しません。"
+    avoid: ["search filter", "permission", "tenant"]
+
+  - id: citation
+    en: "citation"
+    zh: "引用"
+    ja: "引用"
+    definition:
+      en: "The five-tuple that anchors a claim to bytes: source key, revision, locator, quote, hash."
+      zh: "把一条论断锚定到具体字节的五元组：来源键、修订、定位、引文、哈希。"
+      ja: "主張をバイトに固定する五つ組: ソースキー・リビジョン・ロケータ・引用文・ハッシュ。"
+    avoid: ["reference", "footnote", "link"]
+
+  - id: verification
+    en: "verification"
+    zh: "引用校验"
+    ja: "検証"
+    definition:
+      en: "Checking a citation against the recorded bytes; a failure is shown as a first-class state, never suppressed."
+      zh: "把引用与记录下来的字节核对；失败是显式的一等状态，绝不藏着不说。"
+      ja: "引用を記録されたバイトと照合すること。失敗は第一級の状態として示され、決して握りつぶされません。"
+    avoid: ["fact check", "spell check"]
+
+  - id: trace
+    en: "trace"
+    zh: "回放"
+    ja: "トレース"
+    definition:
+      en: "The recorded reconstruction of a run — query, evidence, prompt, model answer and verdict — replayable after the fact."
+      zh: "对一次运行的完整复原记录——查询、证据、提示、模型回答与校验结论——事后可回放。"
+      ja: "ランの記録された再構成（クエリ・証拠・プロンプト・モデルの回答・判定）。事後に再生できます。"
+    avoid: ["log", "history"]
+
+  - id: feed
+    en: "feed"
+    zh: "订阅流"
+    ja: "フィード"
+    definition:
+      en: "An RSS / Atom / JSON Feed source polled by the workspace, imported via OPML; feed papers enter the library through a confirmation gate."
+      zh: "由工作区轮询的 RSS / Atom / JSON Feed 来源，可用 OPML 批量导入；订阅流里的论文要过确认门才进库。"
+      ja: "ワークスペースが巡回する RSS / Atom / JSON Feed のソース。OPML で一括取り込みでき、フィード内の論文は確認ゲートを通ってからライブラリに入ります。"
+    avoid: ["reader", "newsletter"]
