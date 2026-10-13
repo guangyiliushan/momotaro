@@ -2747,6 +2747,25 @@ mod tests {
             &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vault"),
             &vault,
         );
+        // Backdate every fixture file past the racy window: on a fast CI
+        // machine the copy and the first index land inside the same
+        // whole-second tick, and a stored stamp equal to the file's own
+        // write second makes a second run refresh (count as indexed) the
+        // unchanged files instead of skipping them — which is exactly the
+        // skip-count arithmetic three tests pin. Local hosts straddle the
+        // tick by luck, which is the "local green, CI red" shape.
+        let backdated = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        for entry in fs::read_dir(&vault).expect("read vault") {
+            let entry = entry.expect("vault entry");
+            if entry.file_type().expect("file type").is_file() {
+                fs::File::options()
+                    .write(true)
+                    .open(entry.path())
+                    .expect("open for attributes")
+                    .set_modified(backdated)
+                    .expect("backdate the fixture file");
+            }
+        }
         write_config(dir.path(), &vault);
         init_workspace(dir.path()).expect("init");
         (dir, vault)
@@ -4463,6 +4482,12 @@ mod tests {
             "the report has to carry what the probe answered, not a constant: \
              {report:?}"
         );
+        // The probe answers only on Windows — `volume_info` is documented
+        // "Windows only: everywhere else this costs no syscall and returns
+        // UNKNOWN" — so the field is `Some` only where a volume API exists.
+        // Elsewhere the equality assert above already pins the contract: the
+        // report carries the probe's `None`, never a constant.
+        #[cfg(windows)]
         assert!(
             report.network_volume.is_some(),
             "this workspace's volume is answerable, so the field is too: {report:?}"

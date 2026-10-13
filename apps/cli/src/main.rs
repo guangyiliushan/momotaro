@@ -137,6 +137,18 @@ enum Command {
 
     /// Bring the store up to date with the whole vault in one pass.
     Reconcile,
+
+    /// Serve the token-authed LAN API for paired controllers.
+    Serve {
+        /// `ip:port` to bind. `0.0.0.0` binds every interface; the pairing
+        /// URL names the address phones should dial.
+        #[arg(long, default_value = "0.0.0.0:7731")]
+        addr: String,
+
+        /// The pairing token. Omitted = generate a fresh one at startup.
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 fn print_success(json: bool, payload: String, human: &str) -> ExitCode {
@@ -458,6 +470,35 @@ fn main() -> ExitCode {
             ),
             Err(error) => print_error(cli.json, error),
         },
+        Command::Serve { addr, token } => {
+            let token = match token {
+                Some(token) => token,
+                None => momotaro_server::generate_token(),
+            };
+            let pairing = momotaro_server::pairing_url(&addr, &token);
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "bind": addr, "pairing_url": pairing })
+                );
+            } else {
+                eprintln!("pairing url: {pairing}");
+                eprintln!("token: {token}");
+                eprintln!("Ctrl+C stops the server.");
+            }
+            let config = momotaro_server::ServerConfig {
+                workspace: root.clone(),
+                bind: addr,
+                token,
+            };
+            match momotaro_server::serve(config) {
+                Ok(never) => match never {},
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Command::RebuildIndex => match rebuild_index(&root) {
             Ok(report) => {
                 if cli.json {

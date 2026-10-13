@@ -1,0 +1,89 @@
+name: ui
+
+on:
+  push:
+    # Both keys are required together: `tags-ignore` alone (no `branches`)
+    # silently disables branch triggering per the workflow-syntax docs.
+    branches:
+      - "**"
+    tags-ignore:
+      - "**"
+    paths:
+      - "apps/**"
+      - "packages/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "turbo.json"
+      - "tools/gates.sh"
+      - ".github/workflows/ci-ui.yml"
+  pull_request:
+    paths:
+      - "apps/**"
+      - "packages/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "turbo.json"
+      - "tools/gates.sh"
+      - ".github/workflows/ci-ui.yml"
+  schedule:
+    # Keep the JavaScript supply-chain gate on the same cadence as Rust's.
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  # JS 质量门按产品面组织：gate = 全 workspace 的 lint/typecheck/build；
+  # vitest = apps/desktop + packages/ui 的测试（gates.sh --only ts，本地=CI 单源）。
+  # job 名跨 workflow 唯一（官方：required status check 只认 job 名，重名会产生
+  # 歧义结果）——engine 侧已有 `test`，这里不得再出现第二个 `test`。
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Lint, typecheck, and build
+        run: pnpm turbo run lint typecheck build
+
+  vitest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: TypeScript tests
+        run: bash tools/gates.sh --only ts
+
+  audit:
+    # Blocking on schedule, matching engine's daily cargo-deny convention.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Audit production dependencies
+        run: pnpm audit --prod

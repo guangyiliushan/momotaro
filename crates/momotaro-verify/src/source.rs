@@ -627,8 +627,25 @@ mod tests {
     #[test]
     fn a_local_path_that_would_escape_the_workspace_is_not_read() {
         // `local_path` is workspace-relative by contract; this crate refuses
-        // anything that is not, rather than resolving it.
-        let f = fixture(Some("../../outside.md"));
+        // anything that is not, rather than resolving it. The refusal is by
+        // form — it fires before the filesystem is consulted — so like the
+        // rooted-path sibling below, this fixture stores the escaping path
+        // without materializing bytes for it. Writing the probe bytes for
+        // real is what broke CI: two ParentDir hops from a Linux runner's
+        // /tmp/.tmpXXXX land at `/`, and `/outside.md` is root-owned, while
+        // Windows and local hosts resolve the same hops into a writable
+        // user directory. The bytes were never the point; `NoLocalBytes` is
+        // the form check's verdict either way.
+        let mut f = fixture(None);
+        f.store
+            .update_revision_fingerprint(
+                SOURCE_KEY,
+                REVISION,
+                "{}",
+                "../../outside.md",
+                "outside.md",
+            )
+            .expect("point the revision at an escaping path");
         let source = StoreSource::new(&f.store, f.root());
         let v = integrity(&source, SOURCE_KEY, REVISION);
         assert_eq!(v.status, VerificationStatus::Unsupported);
@@ -1184,11 +1201,28 @@ mod tests {
              that is the whole point of this fixture"
         );
         // The premise: joining it keeps the base and lands *inside* this
-        // workspace, so containment would forgive it and only the form check
-        // can refuse it. Without this the fixture could pass for an
-        // unrelated reason and would pin nothing about the `RootDir` arm.
+        // workspace (canonically), so containment would forgive it and only
+        // the form check can refuse it. Without this the fixture could pass
+        // for an unrelated reason and would pin nothing about the `RootDir`
+        // arm.
+        //
+        // The comparison has to be canonical-to-canonical. A raw
+        // `starts_with(f.root())` pits the *stored spelling* of the root
+        // against the *canonicalized* address this fixture is built from,
+        // and the two spellings diverge wherever the temp directory carries
+        // an 8.3 short name: the GitHub Actions Windows runner hands the job
+        // `TEMP=C:\Users\RUNNERADMIN~1\...` while `fs::canonicalize` expands
+        // the alias to `runneradmin`, so component-wise they are different
+        // paths and the raw check panicked on CI while passing on a
+        // long-spelled host. `canonicalize_existing_ancestor` is the same
+        // walk production containment takes, so it answers the question the
+        // premise is actually about.
+        let joined = f.root().join(&rooted);
+        let resolved = canonicalize_existing_ancestor(&joined)
+            .expect("the walk up to the workspace root succeeds")
+            .expect("the workspace root itself resolves, so the walk-up lands");
         assert!(
-            f.root().join(&rooted).starts_with(f.root()),
+            resolved.starts_with(&full),
             "premise: a rooted path built from the workspace's own address \
              must resolve inside it"
         );

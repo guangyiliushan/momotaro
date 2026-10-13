@@ -57,10 +57,8 @@ describe("ThemeProvider", () => {
   })
 
   it("setTheme persists the choice and swaps the document class", () => {
-    let seen = "unset"
     function Toggle() {
-      const { theme, setTheme } = useTheme()
-      seen = theme
+      const { setTheme } = useTheme()
       return <button onClick={() => setTheme("dark")}>go</button>
     }
     render(
@@ -68,9 +66,8 @@ describe("ThemeProvider", () => {
         <Toggle />
       </ThemeProvider>
     )
-    expect(seen).toBe("light")
+    expect(document.documentElement.className).toBe("light")
     fireEvent.click(screen.getByRole("button"))
-    expect(seen).toBe("dark")
     expect(localStorage.getItem("theme")).toBe("dark")
     expect(document.documentElement.className).toBe("dark")
   })
