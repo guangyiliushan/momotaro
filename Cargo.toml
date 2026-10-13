@@ -10,6 +10,8 @@ members = [
   "crates/momotaro-context",
   "crates/momotaro-verify",
   "crates/momotaro-platform",
+  "crates/momotaro-protocol",
+  "crates/momotaro-server",
   "apps/cli",
 ]
 
@@ -28,6 +30,8 @@ momotaro-llm = { path = "crates/momotaro-llm" }
 momotaro-context = { path = "crates/momotaro-context" }
 momotaro-verify = { path = "crates/momotaro-verify" }
 momotaro-platform = { path = "crates/momotaro-platform" }
+momotaro-protocol = { path = "crates/momotaro-protocol" }
+momotaro-server = { path = "crates/momotaro-server" }
 clap = { version = "4.5", features = ["derive"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

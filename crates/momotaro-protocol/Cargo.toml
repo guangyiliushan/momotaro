@@ -1,0 +1,12 @@
+[package]
+name = "momotaro-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Wire types and pairing/auth vocabulary shared by the desktop server and the mobile controller"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+[dev-dependencies]
+serde_json = { workspace = true }

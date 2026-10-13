@@ -1,0 +1,19 @@
+[package]
+name = "momotaro-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "LAN REST API over the Momotaro engine: token-authed, blocking, deliberately tiny"
+
+[dependencies]
+momotaro-protocol = { workspace = true }
+momotaro-run = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tiny_http = "0.12"
+getrandom = "0.3"
+hex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

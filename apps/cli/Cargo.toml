@@ -8,6 +8,7 @@ description = "Momotaro CLI"
 repository = "https://github.com/guangyiliushan/momotaro"
 
 [dependencies]
+momotaro-server = { workspace = true }
 clap = { workspace = true }
 momotaro-run = { workspace = true }
 serde_json = { workspace = true }
