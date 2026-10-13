@@ -81,12 +81,6 @@ use crate::render::{canonical_tools_json, render_evidence_block};
 use crate::render::{escape_content_sentinels, validate_evidence_block};
 use crate::types::ContentKind as CKind;
 
-/// The unsigned estimator spelling stored on fragments and reused by every
-/// pipeline stage. `tokens` is its signed accounting twin.
-fn item_tokens(text: &str) -> u32 {
-    momotaro_contracts::estimate_tokens(text)
-}
-
 /// One item travelling through the pipeline stages.
 struct WorkItem {
     key: String,
@@ -146,7 +140,7 @@ pub fn build_context_with_clock(
     // writes `<<<` (measured 40 vs 47). Audit-only surface, but an audit
     // that lies is not one.
     let question_body = escape_content_sentinels(&input.query);
-    let question_tokens = item_tokens(&question_body);
+    let question_tokens = momotaro_contracts::estimate_tokens(&question_body);
     let question_delta = i64::from(question_tokens);
     stages.push(StageRecord {
         stage: Stage::NormalizeQuery,
@@ -163,8 +157,8 @@ pub fn build_context_with_clock(
     let started = clock();
     let (tools_json, tool_omissions) = canonical_tools_json(&input.tool_definitions);
     let policy_body = escape_content_sentinels(&input.policy_text);
-    let policy_tokens = item_tokens(&policy_body);
-    let tools_tokens = item_tokens(&tools_json);
+    let policy_tokens = momotaro_contracts::estimate_tokens(&policy_body);
+    let tools_tokens = momotaro_contracts::estimate_tokens(&tools_json);
     let policy_delta = i64::from(policy_tokens) + i64::from(tools_tokens);
     stages.push(StageRecord {
         stage: Stage::LoadPolicy,
@@ -199,7 +193,7 @@ pub fn build_context_with_clock(
                 CKind::Text
             },
             body: item.body.clone(),
-            token_estimate: item_tokens(&item.body),
+            token_estimate: momotaro_contracts::estimate_tokens(&item.body),
             source_ref_json: None,
             visibility: Visibility::Provider,
             level: budget_level_of(FragmentKind::History),
@@ -231,7 +225,7 @@ pub fn build_context_with_clock(
             role: Role::User,
             content_kind: CKind::Text,
             body: item.text.clone(),
-            token_estimate: item_tokens(&item.text),
+            token_estimate: momotaro_contracts::estimate_tokens(&item.text),
             source_ref_json: Some(evidence_source_ref(item)),
             visibility: Visibility::Provider,
             level: budget_level_of(FragmentKind::Evidence),
@@ -288,7 +282,7 @@ pub fn build_context_with_clock(
         },
     );
     let instructions_body = escape_content_sentinels(&input.instructions);
-    let instructions_tokens = item_tokens(&instructions_body);
+    let instructions_tokens = momotaro_contracts::estimate_tokens(&instructions_body);
     work.push(WorkItem {
         key: "instructions".to_string(),
         fragment_id: String::new(),
@@ -345,7 +339,7 @@ pub fn build_context_with_clock(
             render_drop_slots.push(item_slot);
             continue;
         }
-        let rendered_tokens = item_tokens(&rendered);
+        let rendered_tokens = momotaro_contracts::estimate_tokens(&rendered);
         render_delta += i64::from(rendered_tokens) - i64::from(item.token_estimate);
         item.body = rendered;
         item.token_estimate = rendered_tokens;
@@ -875,7 +869,7 @@ mod lowering_tests {
             role: Role::User,
             content_kind: ContentKind::Text,
             body: body.to_string(),
-            token_estimate: item_tokens(body),
+            token_estimate: momotaro_contracts::estimate_tokens(body),
             source_ref_json: None,
             visibility,
             level: budget_level_of(FragmentKind::Evidence),

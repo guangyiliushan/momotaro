@@ -57,7 +57,7 @@ mod index;
 mod query;
 mod schema;
 
-pub use cjk::{CJK_TOKENIZER_NAME, CjkTokenizer};
+pub use cjk::{CJK_TOKENIZER_NAME, CjkTokenStream, CjkTokenizer};
 pub use fusion::{RRF_K, fuse_rrf};
 pub use index::{IndexWriterHandle, SearchIndex};
 pub use query::{is_searchable, normalize_query};
@@ -95,6 +95,14 @@ mod tests {
     use tantivy::{TantivyDocument, Term};
 
     use super::*;
+
+    #[test]
+    fn the_token_stream_type_is_nameable_through_the_crate_root() {
+        // The analyzer's associated `TokenStream` type must be spellable by a
+        // downstream implementer; the root re-export is what makes it so.
+        // Compile-time only — the value is never constructed.
+        let _: Option<crate::CjkTokenStream> = None;
+    }
 
     /// Indexes one source as owner content.
     ///

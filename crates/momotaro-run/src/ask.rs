@@ -1999,12 +1999,7 @@ fn sanitize_lines(text: &str) -> String {
 /// The stored-verdict side of the rebuild: one row to one judgement. An
 /// unparseable row is `None`, which fails the rebuild closed.
 fn verification_from_row(row: &VerificationRecord) -> Option<Verification> {
-    let kind = match row.kind.as_str() {
-        "citation" => VerificationKind::Citation,
-        "source_integrity" => VerificationKind::SourceIntegrity,
-        "math" => VerificationKind::Math,
-        _ => return None,
-    };
+    let kind = VerificationKind::from_code(&row.kind)?;
     let status = VerificationStatus::from_code(&row.status)?;
     let detail = match serde_json::from_str::<serde_json::Value>(&row.details_json) {
         Ok(value) => value

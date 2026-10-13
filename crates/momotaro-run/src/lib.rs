@@ -2346,6 +2346,79 @@ mod tests {
             store.sweep_interrupted_runs().expect("sweep").is_empty(),
             "and it is terminal, not dangling"
         );
+
+        // "Terminal" must be the *failed* terminal carrying the failure
+        // payload — a `finished` event, or a payload-less one, would tell the
+        // trace reader a different story than the one that happened.
+        let connection =
+            rusqlite::Connection::open(dir.path().join(".momotaro/momotaro.db")).expect("raw open");
+        let run_id: String = connection
+            .query_row("SELECT run_id FROM runs", [], |row| row.get(0))
+            .expect("one run");
+        drop(connection);
+        let trace = store.run_trace(&run_id).expect("trace").expect("exists");
+        assert_eq!(trace.run.status, "failed", "{trace:?}");
+        let terminal = trace.events.last().expect("a terminal event");
+        assert_eq!(
+            terminal.event_type, "run.failed",
+            "the terminal is the failed one"
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(&terminal.data_json).expect("payload is JSON");
+        assert_eq!(
+            payload["category"], "llm_auth",
+            "the taxonomy category landed"
+        );
+        assert_eq!(payload["attribution"], "user", "and its attribution");
+    }
+
+    #[test]
+    fn a_store_error_after_acceptance_is_left_to_the_next_sweep() {
+        // An error this layer cannot name lands no failure payload: the run
+        // is left for the sweep, whose condition is "ended without terminal".
+        // The seam is what makes the state reachable — production passes
+        // `run_expand`, and no other constructor leaves a store failure
+        // between the run row and the terminal write.
+        let dir = indexed_fixture();
+        add_model_config(dir.path(), "test-model");
+        let fake = momotaro_llm::fake::FakeLlm::new();
+
+        let error = crate::index_service::expand_search_workspace_with(
+            dir.path(),
+            "谱定理",
+            5,
+            false,
+            true,
+            &fake,
+            |_store, _index, _run_id, _query, _top_k, _config, _model, _transport, _now| {
+                Err(RunError::Store(momotaro_store::StoreError::Invariant(
+                    "injected: a store step failed after acceptance",
+                )))
+            },
+        )
+        .expect_err("the injected store error must come back");
+        assert!(matches!(error, RunError::Store(_)), "{error}");
+        assert_eq!(
+            fake.call_count(),
+            0,
+            "the injected worker fails without touching the provider"
+        );
+
+        // The run exists and is not terminal — the sweep finds it, closes it
+        // once, and the closed state is the sweep's `failed`.
+        let mut store = Store::open(dir.path().join(".momotaro/momotaro.db")).expect("open");
+        assert_eq!(store.run_count().expect("count"), 1, "one run was accepted");
+        let swept = store.sweep_interrupted_runs().expect("sweep");
+        assert_eq!(swept.len(), 1, "the sweep finds the dangling run");
+        assert!(
+            store.sweep_interrupted_runs().expect("sweep").is_empty(),
+            "closing it is one-shot"
+        );
+        let trace = store
+            .run_trace(&swept[0])
+            .expect("trace")
+            .expect("the run exists");
+        assert_eq!(trace.run.status, "failed", "{trace:?}");
     }
 
     #[test]
@@ -7331,6 +7404,42 @@ mod tests {
         assert_eq!(report.scanned, 2, "both files are still there");
         assert_eq!(report.changed, 0, "and neither changed");
         assert_eq!(report.removed, 0, "nothing was deleted");
+        let _ = dir;
+    }
+
+    #[test]
+    fn an_absence_is_counted_once_and_not_again_by_the_next_pass() {
+        // `removed` is "keys whose absence this run recorded for the first
+        // time": the demotion consumes the key, so a second pass over the
+        // same missing file must count zero.
+        let (dir, vault, root) = settled_workspace();
+        fs::remove_file(vault.join("a.md")).expect("remove the file");
+
+        let first = reconcile(&root).expect("first reconcile");
+        assert_eq!(first.removed, 1, "the absence is recorded once");
+
+        let second = reconcile(&root).expect("second reconcile");
+        assert_eq!(
+            second.removed, 0,
+            "already recorded as gone; not counted again"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn a_file_that_comes_back_and_leaves_again_is_counted_again() {
+        let (dir, vault, root) = settled_workspace();
+        fs::remove_file(vault.join("a.md")).expect("remove the file");
+        let first = reconcile(&root).expect("first reconcile");
+        assert_eq!(first.removed, 1, "the first departure counts");
+
+        fs::write(vault.join("a.md"), "# A\n\nfirst body\n").expect("bring it back");
+        let back = reconcile(&root).expect("reconcile sees it return");
+        assert_eq!(back.removed, 0, "a return is not a removal");
+
+        fs::remove_file(vault.join("a.md")).expect("remove it again");
+        let gone_again = reconcile(&root).expect("second departure");
+        assert_eq!(gone_again.removed, 1, "the second departure counts again");
         let _ = dir;
     }
 

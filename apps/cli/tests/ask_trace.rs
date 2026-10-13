@@ -288,6 +288,42 @@ fn expand_search_without_an_endpoint_is_refused_before_any_llm_call() {
 }
 
 #[test]
+fn an_ask_given_a_search_mode_is_refused_by_name() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    ready_workspace(&tempdir);
+
+    // `--mode` is search's retrieval mode: an ask that silently ignored it
+    // would be an ask that lied about what it did. The refusal must come by
+    // name on both exits, and before any run row exists.
+    let (stdout, stderr, ok) = run_cli(tempdir.path(), &["ask", "谱定理", "--mode", "expand"]);
+    assert!(!ok, "ask with a search mode is refused: {stdout}{stderr}");
+    let message = format!("{stdout}{stderr}");
+    assert!(
+        message.contains("search's retrieval mode"),
+        "the refusal names the flag: {message}"
+    );
+
+    let (stdout, stderr, ok) = run_cli(
+        tempdir.path(),
+        &["ask", "谱定理", "--mode", "expand", "--json"],
+    );
+    assert!(!ok, "the json exit refuses too: {stdout}{stderr}");
+    let message = format!("{stdout}{stderr}");
+    assert!(
+        message.contains("search's retrieval mode"),
+        "the JSON exit says the same words: {message}"
+    );
+
+    let store =
+        momotaro_store::Store::open(tempdir.path().join(".momotaro/momotaro.db")).expect("open");
+    assert_eq!(
+        store.run_count().expect("count"),
+        0,
+        "no run row was created"
+    );
+}
+
+#[test]
 fn expand_search_refuses_under_no_llm_by_name() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     ready_workspace(&tempdir);

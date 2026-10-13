@@ -85,10 +85,14 @@ pub(crate) fn select_history(history: &[HistoryItem]) -> HistorySelection {
         let ok = match &item.summary {
             // The stored text and the record the caller handed over have
             // to be **the same summary**, not merely two that survive the
-            // same checks. `validate_against_text` proves three things
-            // (version, no bare-empty fields, hashes present in the text);
-            // `covered_turns`, `first_kept_item_id`, `tokens_before`,
-            // `user_decisions`, `open_questions`, `next_action_hint` and `evidence_refs` title/claim may
+            // same checks. `validate_against_text` checks three things and
+            // nothing else: the version is this build's, no scalar or list
+            // entry sits bare-empty where the `(none)` marker belongs, and
+            // each `evidence_refs` chunk hash appears in the text. It
+            // compares **no content** — `covered_turns` ids, the
+            // `first_kept_item_id` value, `tokens_before`, every decision,
+            // question and hint, each title and claim, and the list's length
+            // and order may
             // still differ. That is not a theoretical split — `covered` below
             // is built from the *record* while `item.body` is what gets
             // replayed, so a record claiming one extra covered turn demotes a

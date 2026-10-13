@@ -144,11 +144,26 @@ fn the_fifteen_steps_land_the_tables_and_the_answer_verifies() {
         "the answer is stored verbatim, quote included"
     );
     assert_eq!(report.citations.len(), 1);
-    assert!(report.citations[0].verified, "{report:?}");
-    assert_eq!(report.citations[0].quoted_text, quote);
+    let citation = &report.citations[0];
+    assert!(citation.verified, "{report:?}");
+    assert_eq!(citation.quoted_text, quote);
+    // The five-tuple — revision_hash / chunk_id / chunk_hash / locator /
+    // quote — is what makes the citation locatable; every part must survive
+    // into the report, not just the hash.
+    assert!(!citation.revision_hash.is_empty(), "{citation:?}");
+    assert!(!citation.chunk_id.is_empty(), "{citation:?}");
+    assert!(!citation.chunk_hash.is_empty(), "{citation:?}");
+    // Not merely non-empty: the locator must name a byte interval a reader
+    // can cut — a placeholder document would satisfy any emptiness check.
+    let locator: serde_json::Value =
+        serde_json::from_str(&citation.locator_json).expect("the locator is JSON");
+    let start = locator
+        .get("start_byte")
+        .and_then(serde_json::Value::as_u64);
+    let end = locator.get("end_byte").and_then(serde_json::Value::as_u64);
     assert!(
-        !report.citations[0].chunk_hash.is_empty(),
-        "the citation carries the five-tuple"
+        start.zip(end).is_some_and(|(start, end)| end >= start),
+        "the locator names a byte interval: {locator}"
     );
 
     // The three tables carry rows (the hard shape), and the timeline

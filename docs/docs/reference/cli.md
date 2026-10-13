@@ -32,7 +32,8 @@ Command-specific options worth knowing:
   nothing). `--mode lexical|expand` picks pure BM25 (default) or one LLM
   rewrite before retrieval.
 - `ask`: `--session <id>` continues an existing session; `--client-request-id
-  <id>` makes a retried request replay-safe.
+  <id>` makes a retried request replay-safe. `ask` refuses `--mode expand`: an
+  answer always takes at most one model turn.
 - `doctor`: `--coverage` reports what the most recent index run did to each
   file, instead of checking health.
 

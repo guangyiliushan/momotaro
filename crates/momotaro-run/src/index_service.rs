@@ -105,7 +105,7 @@ pub(crate) struct Batch {
 
 impl Batch {
     /// Opens a batch whose id reads as what it is.
-    pub fn new(plan: EventPlan) -> Self {
+    pub(crate) fn new(plan: EventPlan) -> Self {
         Self {
             id: crate::stamp_id(plan.prefix),
             plan,
@@ -114,7 +114,7 @@ impl Batch {
     }
 
     /// The next sequence number in this batch.
-    pub fn next_seq(&mut self) -> i64 {
+    pub(crate) fn next_seq(&mut self) -> i64 {
         self.seq += 1;
         self.seq
     }
@@ -138,7 +138,7 @@ pub(crate) struct BatchShape {
 
 impl BatchShape {
     /// A batch over the whole walk that takes the walk's word for what changed.
-    pub fn full(plan: EventPlan) -> Self {
+    pub(crate) fn full(plan: EventPlan) -> Self {
         Self {
             plan,
             only: None,
@@ -147,7 +147,7 @@ impl BatchShape {
     }
 
     /// The watcher's batch: these paths only, each one gated before it is read.
-    pub fn watched(plan: EventPlan, only: HashSet<PathBuf>) -> Self {
+    pub(crate) fn watched(plan: EventPlan, only: HashSet<PathBuf>) -> Self {
         Self {
             plan,
             only: Some(only),
@@ -734,7 +734,8 @@ pub fn coverage_report(root: impl AsRef<Path>) -> Result<Option<CoverageReport>,
     let store = Store::open(database_path(root))?;
     // Anchored on the batch's opener: a `source_moved` hint shares this domain
     // and has no shell, so "the newest row" is not "the last ingest run".
-    let Some(batch_id) = store.latest_batch_opened_in("ingest", "ingest.started")? else {
+    let Some(batch_id) = store.latest_batch_opened_in(INGEST_PLAN.domain, INGEST_PLAN.started)?
+    else {
         return Ok(None);
     };
     let events = store.store_events_for_batch(&batch_id)?;
@@ -760,8 +761,8 @@ fn count_codes(report: &mut CoverageReport, event: &momotaro_store::StoreEvent) 
             .and_then(|list| serde_json::from_value::<Vec<String>>(list.clone()).ok())
             .unwrap_or_default()
     };
-    let mut degradation_codes = list("degradations");
-    let mut warning_codes = list("warnings");
+    let mut degradation_codes = list(DEGRADATIONS_KEY);
+    let mut warning_codes = list(WARNINGS_KEY);
     if degradation_codes.is_empty()
         && warning_codes.is_empty()
         && let Some(code) = event.reason_code.as_deref()
@@ -833,9 +834,10 @@ fn summarize_coverage(batch_id: &str, events: &[momotaro_store::StoreEvent]) -> 
         finished: false,
     };
     for event in events {
-        match event.event_type.as_str() {
-            "ingest.finished" => report.finished = true,
-            "ingest.coverage" => match event.outcome.as_deref() {
+        if event.event_type == INGEST_PLAN.finished {
+            report.finished = true;
+        } else if event.event_type == INGEST_PLAN.coverage {
+            match event.outcome.as_deref() {
                 Some(outcome) if outcome == FileOutcome::INDEXED => {
                     report.indexed += 1;
                     count_codes(&mut report, event);
@@ -858,8 +860,7 @@ fn summarize_coverage(batch_id: &str, events: &[momotaro_store::StoreEvent]) -> 
                     reason_code: event.reason_code.clone(),
                     message: event.message.clone(),
                 }),
-            },
-            _ => {}
+            }
         }
     }
     report
@@ -2180,7 +2181,7 @@ X
             (concat!("store.commit_run", "_answer("), 1),
             (concat!("store.commit_run", "_terminal("), 1),
             (concat!("store.append_run", "_event("), 2),
-            // The session row is the ask module's tenth write
+            // The session row is the ask module's eleventh write
             // site. It is a different family from the run units, so without
             // this needle a hand-spliced `create_session` would move the
             // count to zero and stay invisible — which is the exact hole the
@@ -3497,6 +3498,12 @@ struct RowPayload<'a> {
     stale: &'a [(String, String)],
 }
 
+/// The two `data_json` keys a coverage row carries: one spelling for the
+/// writer and the reader. Tests keep their own literals on purpose — those
+/// are what pins these values.
+const DEGRADATIONS_KEY: &str = "degradations";
+const WARNINGS_KEY: &str = "warnings";
+
 /// The `data_json` payload for one coverage row, or `{}` when it carries none.
 ///
 /// Pure, so the shape has a test without a store: each list is written only
@@ -3506,7 +3513,7 @@ fn payload_json(payload: &RowPayload<'_>) -> String {
     let mut object = serde_json::Map::new();
     if !payload.degradations.is_empty() {
         object.insert(
-            "degradations".to_owned(),
+            DEGRADATIONS_KEY.to_owned(),
             serde_json::json!(
                 payload
                     .degradations
@@ -3518,7 +3525,7 @@ fn payload_json(payload: &RowPayload<'_>) -> String {
     }
     if !payload.warnings.is_empty() {
         object.insert(
-            "warnings".to_owned(),
+            WARNINGS_KEY.to_owned(),
             serde_json::json!(
                 payload
                     .warnings
@@ -6106,6 +6113,46 @@ pub fn expand_search_workspace<T: momotaro_llm::ProviderTransport + ?Sized>(
     allow_network: bool,
     transport: &T,
 ) -> Result<SearchOutput, RunError> {
+    expand_search_workspace_with(
+        root,
+        query,
+        top_k,
+        no_llm,
+        allow_network,
+        transport,
+        run_expand,
+    )
+}
+
+/// Same as [`expand_search_workspace`], with the post-acceptance work
+/// injected: the gates, the run row and its two opening events run unchanged,
+/// then `work` stands in for [`run_expand`]. The seam exists because the
+/// state a store or index failure leaves behind after acceptance — a run
+/// with no terminal event, closed by the sweep — cannot be constructed from
+/// outside; production passes `run_expand` itself.
+pub(crate) fn expand_search_workspace_with<T, W>(
+    root: impl AsRef<Path>,
+    query: &str,
+    top_k: usize,
+    no_llm: bool,
+    allow_network: bool,
+    transport: &T,
+    work: W,
+) -> Result<SearchOutput, RunError>
+where
+    T: momotaro_llm::ProviderTransport + ?Sized,
+    W: FnOnce(
+        &mut Store,
+        &SearchIndex,
+        &str,
+        &str,
+        usize,
+        &WorkspaceConfig,
+        &str,
+        &T,
+        i64,
+    ) -> Result<Vec<SearchHit>, RunError>,
+{
     // ---- the gates, every one of them before a run row exists --------------
     crate::validate_expand_policy(no_llm)?;
     let root = root.as_ref();
@@ -6159,7 +6206,7 @@ pub fn expand_search_workspace<T: momotaro_llm::ProviderTransport + ?Sized>(
     )?;
 
     // ---- the work ---------------------------------------------------------
-    let result = run_expand(
+    let result = work(
         &mut store,
         &search_index,
         &run_id,

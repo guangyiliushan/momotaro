@@ -570,16 +570,26 @@ mod tests {
     /// parameter is what lands in `timeout_global`.
     #[test]
     fn the_turn_deadline_is_the_one_it_was_built_with() {
+        // 5, not the run chain's 7: with two different fixture values a
+        // hard-coded `turn_timeout()` return can match at most one witness.
         let transport = HttpTransport::with_turn_timeout(
             "https://api.example.com/v1",
             None,
-            Duration::from_secs(7),
+            Duration::from_secs(5),
         )
         .expect("transport");
         assert_eq!(
             transport.agent.config().timeouts().global,
-            Some(Duration::from_secs(7)),
+            Some(Duration::from_secs(5)),
             "the deadline is a parameter, not a constant"
+        );
+        // And the accessor the run layer reads answers the same number: a
+        // witness that only reaches into the agent config would let a
+        // hard-coded `turn_timeout()` pass.
+        assert_eq!(
+            transport.turn_timeout(),
+            Some(Duration::from_secs(5)),
+            "the accessor reads back what the transport was built with"
         );
     }
 

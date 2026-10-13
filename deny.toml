@@ -2,17 +2,18 @@
 # on a daily schedule, so a new advisory against an already-pinned dependency is
 # disclosed without anyone having to remember to look.
 #
-# One class is only weakly covered, stated here because the sentence above
-# cannot. `unsound = "Workspace"` is the default we run, and under it an
-# advisory is surfaced when the affected crate is a *direct* dependency of this
-# workspace — so `ureq`, `clap`, `tantivy`… would be disclosed, a transitive
-# one would not, and a workspace member is never reported at all (it has no
-# package source, so it is dropped before scope is even considered).
+# One class needs its scope spelled out, because the sentence above cannot.
+# At cargo-deny's default `workspace` scope an advisory is surfaced only when
+# the affected crate is a *direct* dependency — so `ureq`, `clap`, `tantivy`…
+# would be disclosed, a transitive one would not, and a workspace member is
+# never reported at all (it has no package source, so it is dropped before
+# scope is even considered).
 # `lru 0.16.4` (RUSTSEC-2026-0253, fixed >= 0.18.2, unreachable while tantivy
-# pins `^0.16.3`) is transitive — via `tantivy` — so it is silent today;
-# `unsound = "all"` is what would surface it, and that run goes red until the
-# tantivy upgrade lands. That upgrade is registered as its own task — this is
-# the disclosure that covers it until then.
+# pins `^0.16.3`) is transitive — via `tantivy` — so the default `workspace`
+# scope cannot see it at all; `transitive` or wider can. This workspace runs
+# `unsound = "all"` and carries the advisory as an explicit exemption under
+# `[advisories]` below; that entry holds the rationale, the route to the fix
+# (tantivy 0.27.0) and the re-review date.
 
 [graph]
 # Every target we build for, so a Windows-only or test-only dependency cannot

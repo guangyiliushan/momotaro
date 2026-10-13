@@ -620,9 +620,12 @@ mod tests {
 
     #[test]
     fn every_column_round_trips() {
-        // The read mapper is by name, so a swap between two `Option<String>`
-        // columns is invisible to any test that leaves them `None`. This one
-        // gives every column a value and compares the whole row.
+        // The read mapper is by name, so a swap between two columns is
+        // invisible to any test that leaves the pair alone. This one gives
+        // every column a value and compares the whole row — and pins `id`
+        // with a literal and `recorded_at` with a range before that compare:
+        // a swapped pair fails those, where a row the test built from itself
+        // would agree with itself.
         let (_dir, mut store) = temp_store();
         let batch = "feed-1";
         store
@@ -646,8 +649,18 @@ mod tests {
             .expect("read")
             .pop()
             .expect("one event");
+        // The first row of a fresh store is id 1, and `recorded_at` is the
+        // transaction time of this write — the wall clock, not a copy of
+        // another column. Both are asserted before the row compare so a
+        // swapped pair cannot agree with itself.
+        assert_eq!(stored.id, 1, "the first row is id 1");
+        assert!(
+            stored.recorded_at > 1_000_000,
+            "recorded_at is its own column: {}",
+            stored.recorded_at
+        );
         let expected = StoreEvent {
-            id: stored.id,
+            id: 1,
             occurred_at: 1_000_000,
             recorded_at: stored.recorded_at,
             batch_id: batch.to_owned(),

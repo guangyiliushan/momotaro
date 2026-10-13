@@ -27,7 +27,7 @@ sidebar_position: 1
 值得知道的命令专属选项：
 
 - `search`：`-n/--top <N>` 限制命中数（默认 10；`0` 合法，返回空）。`--mode lexical|expand` 选择纯 BM25（默认）或检索前先做一次 LLM 改写。
-- `ask`：`--session <id>` 接续已有会话；`--client-request-id <id>` 让重试的请求防重放。
+- `ask`：`--session <id>` 接续已有会话；`--client-request-id <id>` 让重试的请求防重放。`ask` 拒绝 `--mode expand`：回答始终至多一次模型调用。
 - `doctor`：`--coverage` 报告最近一次索引对每个文件做了什么，而不是检查健康。
 
 ## 全局选项 {/* #global-options */}

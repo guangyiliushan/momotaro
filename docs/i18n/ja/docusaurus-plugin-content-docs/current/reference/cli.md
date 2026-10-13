@@ -27,7 +27,7 @@ sidebar_position: 1
 知っておく価値のあるコマンド固有オプション：
 
 - `search`：`-n/--top <N>` はヒット数の上限（既定 10。`0` も合法で何も返しません）。`--mode lexical|expand` は純粋な BM25（既定）か、検索前の LLM 書き換え 1 回を選びます。
-- `ask`：`--session <id>` は既存セッションの続き；`--client-request-id <id>` は再試行されるリクエストを再生安全にします。
+- `ask`：`--session <id>` は既存セッションの続き；`--client-request-id <id>` は再試行されるリクエストを再生安全にします。`ask` は `--mode expand` を拒否します：回答は常に多くとも 1 回のモデル呼び出しです。
 - `doctor`：`--coverage` は健全性検査ではなく、直近のインデックス実行が各ファイルに何をしたかを報告します。
 
 ## グローバルオプション {/* #global-options */}

@@ -130,9 +130,10 @@ jobs:
           command: check
 
   instruments:
-    # The three checks `cargo test` cannot see: the ignored performance smoke, the
-    # golden-set guards, and the retrieval golden set. All three lived outside CI, which is
-    # how a ranking change could merge green.
+    # The four checks `cargo test` cannot see: the ignored performance smoke,
+    # the golden-set guards, the eval-harness self-tests, and the retrieval
+    # golden set. All four lived outside CI, which is how a ranking change
+    # could merge green.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

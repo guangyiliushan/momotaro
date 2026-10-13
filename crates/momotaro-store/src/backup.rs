@@ -95,6 +95,7 @@ pub(crate) fn verify_artifact(path: &Path) -> Result<(), StoreError> {
 mod tests {
     use super::*;
     use crate::Store;
+    use std::time::Duration;
 
     #[test]
     fn a_failed_verification_publishes_nothing_and_cleans_up() {
@@ -293,6 +294,23 @@ mod tests {
         let first =
             backup_before_migration(&store.connection, dir.path(), 1, 2).expect("first backup");
         verify_artifact(&first).expect("the first artifact verifies");
+        let first_bytes = fs::read(&first).expect("read the first artifact");
+
+        // The database moves on between the two backups, so if the refused run
+        // ever published its own snapshot at the first's name the bytes would
+        // differ. And the second backup is pushed into a new second so that a
+        // published snapshot would land under a *different* name — both halves
+        // of "a refused backup publishes nothing" are deterministic here.
+        store
+            .connection
+            .pragma_update(None, "user_version", 3)
+            .expect("move the database on");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch");
+        std::thread::sleep(Duration::from_millis(
+            u64::from(1000 - now.subsec_millis()) + 50,
+        ));
 
         let error = backup_before_migration_with(&store.connection, dir.path(), 1, 2, |_| {
             Err(StoreError::BackupFailed(
@@ -302,11 +320,33 @@ mod tests {
         .expect_err("the refused second backup must fail");
         assert!(matches!(error, StoreError::BackupFailed(_)), "{error}");
 
-        assert!(
-            first.exists(),
-            "the first artifact survives a failed second backup"
+        let mut artifacts: Vec<PathBuf> = fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("backup-v1-to-v2-"))
+            })
+            .collect();
+        artifacts.sort();
+        assert_eq!(
+            artifacts,
+            vec![first.clone()],
+            "a refused backup publishes nothing: the first artifact is the only one"
         );
+
         verify_artifact(&first).expect("the surviving artifact still verifies");
+        let survivor = fs::read(&first).expect("read the surviving artifact");
+        let first_difference = survivor.iter().zip(&first_bytes).position(|(a, b)| a != b);
+        assert!(
+            survivor == first_bytes,
+            "the survivor is the first original, not a replacement \
+             (first difference at {first_difference:?}, {} vs {} bytes)",
+            survivor.len(),
+            first_bytes.len()
+        );
         assert!(path.exists(), "the live database is untouched");
     }
 }
