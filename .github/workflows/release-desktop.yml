@@ -1,9 +1,9 @@
 name: release-desktop
 
-# Desktop CD per the 06 investigation: official tauri-action pipeline,
-# three legs (windows nsis / ubuntu-22.04 deb+appimage / macos arm64 dmg),
-# tag-triggered draft releases. Live since Phase A: src-tauri landed and
-# app-v0.0.1 first-flighted all three legs (see research doc 11).
+# Desktop CD: the official tauri-action pipeline over three legs —
+# windows nsis, ubuntu-22.04 deb+appimage, macos arm64 dmg — as
+# tag-triggered draft releases. Live since the Tauri shell landed
+# (apps/desktop/src-tauri); app-v0.0.1 first-flighted all three legs.
 
 on:
   push:
@@ -63,9 +63,9 @@ jobs:
           # which is the official build-only configuration.
           tagName: ${{ github.event_name == 'push' && 'app-v__VERSION__' || '' }}
           releaseName: ${{ github.event_name == 'push' && 'Momotaro v__VERSION__' || '' }}
-          # Signing guidance per research doc 11 (D44 minimal tier):
-          # macOS ad-hoc -> right-click > Open; Windows unsigned ->
-          # SmartScreen "More info" > "Run anyway". Integrity: GitHub
+          # Signing: the minimal unsigned tier — macOS ad-hoc
+          # (right-click > Open on first launch), Windows unsigned
+          # (SmartScreen "More info" > "Run anyway"). Integrity: GitHub
           # attaches a sha256 digest to every release asset — point users
           # at that instead of promising a checksum file we do not produce.
           releaseBody: >-

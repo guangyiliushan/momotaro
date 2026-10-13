@@ -6,7 +6,7 @@ rust-version.workspace = true
 publish = false
 
 [features]
-# Enables the `fake` test rig for downstream integration tests (W3.9).
+# Enables the `fake` test rig for downstream integration tests.
 test-util = []
 
 [dependencies]
