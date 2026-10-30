@@ -137,8 +137,12 @@ import sqlite3, sys
 db = sys.argv[1].rstrip("/\\") + "/.momotaro/momotaro.db"
 connection = sqlite3.connect(db)
 counts = dict(connection.execute("select type, count(*) from store_events group by type"))
-# 5 vault fixtures + 9 eval fixtures + 1 icloud stub = 15 coverage rows.
-expected = {"ingest.started": 1, "ingest.finished": 1, "ingest.coverage": 15}
+# 5 vault fixtures + 15 eval fixtures (9 zh/en + 6 ja) + 1 icloud stub = 21
+# coverage rows. **This number tracks the fixture count on purpose** — it is the
+# tripwire for a missing `ingest.coverage` write, so it stays a literal. Adding
+# a fixture means adding one here; a derived count would stop catching the bug
+# it exists to catch.
+expected = {"ingest.started": 1, "ingest.finished": 1, "ingest.coverage": 21}
 if counts != expected:
     print(f"FAIL: store_events {counts!r}, expected {expected!r}")
     sys.exit(1)

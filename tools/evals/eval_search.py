@@ -213,7 +213,7 @@ def print_report(title: str, report: dict) -> None:
     print()
 
 
-def gate_failures(main_report: dict, inj_report: dict, args) -> list[str]:
+def gate_failures(main_report: dict, inj_report: dict, args, ja_report: dict | None = None) -> list[str]:
     """Gate lines to fail on; empty means pass. Pure — tested without a CLI.
 
     MRR floors are tripwires on ranking. Hits are gated per row instead of by
@@ -246,6 +246,17 @@ def gate_failures(main_report: dict, inj_report: dict, args) -> list[str]:
     ceiling("hard-negative seats (main)", args.max_hn_seats, hn_total)
     ceiling("poison seats (main)", args.max_poison_seats, main_report["poison_seats"])
     ceiling("poison seats (injection)", args.max_inj_poison_seats, inj_report["poison_seats"])
+    # D211：ja 是**独立门**，不与 en/zh 的分数混算；D211 硬约束 2：
+    # `known_miss` 白名单必须有上限，不能靠白名单把门买绿。
+    if ja_report is not None:
+        floor("ja mrr", args.floor_ja_mrr, ja_report["mrr"])
+        ja_unexpected = ja_report["unexpected_misses"]
+        if args.fail_on_unexpected_miss and ja_unexpected:
+            lines.append(
+                f"FAIL: {ja_unexpected} ja unexpected miss(es) — sub-1.0 rows outside the known_miss whitelist"
+            )
+        ja_misses = sum(ja_report["known_misses"].values())
+        ceiling("ja known-miss (whitelist size)", args.max_ja_known_miss, ja_misses)
     return lines
 
 
@@ -263,6 +274,8 @@ def main() -> int:
     parser.add_argument("--max-hn-seats", type=int, default=None)
     parser.add_argument("--max-poison-seats", type=int, default=None)
     parser.add_argument("--max-inj-poison-seats", type=int, default=None)
+    parser.add_argument("--floor-ja-mrr", type=float, default=None)
+    parser.add_argument("--max-ja-known-miss", type=int, default=None)
     args = parser.parse_args()
 
     try:
@@ -279,6 +292,11 @@ def main() -> int:
         poison_keys = set(poison_values)
         main_report = evaluate(golden["queries"], args.cli, args.workspace, args.k, poison_keys)
         inj_report = evaluate(golden["injection"], args.cli, args.workspace, args.k, poison_keys)
+        # D211：日文段独立评估、独立成门 —— 总分允许「en 涨 5 分掩盖 ja 跌 5 分」，
+        # 「某语言优先」在总分结构里不可表达。ja 的门只看 ja 的行。
+        ja_entries = golden.get("queries_ja") or []
+        validate_entries(ja_entries, "queries_ja") if ja_entries else None
+        ja_report = evaluate(ja_entries, args.cli, args.workspace, args.k, poison_keys) if ja_entries else None
     except (RuntimeError, ValueError, OSError) as exc:
         # Harness failure, not a metric regression: distinct exit code so CI
         # triage does not mistake a crashed search or bad golden file for a
@@ -288,6 +306,14 @@ def main() -> int:
 
     print_report("report A: utility (main set)", main_report)
     print_report("report A: utility (injection subset)", inj_report)
+    if ja_report is not None:
+        # D213：四类边缘各自成行，红绿独立 —— 「grader 能失败」必须逐类可证。
+        print_report("report A: utility (ja set, independent gate)", ja_report)
+        print("== report A': ja by edge (D213 —— 每类独立，不许互相抵消) ==")
+        for entry, row in zip(golden["queries_ja"], ja_report["per_query"]):
+            edge = entry.get("edge", "?")
+            print(f"  {edge:22s} {row['recall']:.3f}   {entry['query']}")
+        print()
     hn = main_report["hn_seats"]
     print("== report B: robustness (top-k seats owned by offenders) ==")
     print(
@@ -298,7 +324,7 @@ def main() -> int:
     print(f"poison seats (injection subset):  {inj_report['poison_seats']}")
     print()
 
-    failures = gate_failures(main_report, inj_report, args)
+    failures = gate_failures(main_report, inj_report, args, ja_report)
     for line in failures:
         print(line)
     return 1 if failures else 0

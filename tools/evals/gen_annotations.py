@@ -514,12 +514,99 @@ def check_known_miss(row: dict, label: str) -> None:
         sys.exit(1)
 
 
+# ── 日文段（D211：每语言独立门）──────────────────────────────────────────
+# 四类边缘各至少一条（D213）：
+#   E1 归一化等价  正文存**分离**形态 か+゙，查询用预组合 が → 无 NFC 则必漏
+#   E2 活用形      查询用**不逐字出现**的活用形 → 靠折叠/形态素才命中
+#   E3 混排        日英对照 → D204 的弱点场景
+#   E4 纯汉字日文  零假名 → D204 J1 的已知盲点
+# `edge` 字段是 D213 的门标签；`known_miss` 是**有上限**的白名单（D211 硬约束）。
+JA = [
+    {
+        # E1 归一化等价：查询用**预组合** が(U+304C)，正文只存**分离** か+゙(U+304B U+3099)。
+        # 两者 bigram 零重叠（见 gen_ja_fixtures.py 的 E1 注释），所以无 NFC 必漏 ——
+        # 这才是测 NFC，不是测召回。
+        "query": "が行",
+        "edge": "E1-normalization",
+        "sufficient": ["note:ja-normalized.md"],
+        "hard_negatives": [
+            {"key": "note:ja-kanji-only.md", "kind": "no_info",
+             "why": "纯汉字日文，不含任何假名，与 E1 的目标词无重叠"},
+        ],
+        "known_miss": {
+            "reason": "displaced",
+            "why": "预期漏：摄取侧无 NFC（D206 未落地），分离形态 か+゙ 与预组合 が 的 "
+                   "bigram 零重叠，检索必然命不中。D206 落地后此行必须转绿。",
+        },
+    },
+    {
+        "query": "書かない",
+        "edge": "E2-conjugation",
+        "sufficient": ["note:ja-conjugation.md"],
+        "hard_negatives": [
+            {"key": "note:ja-particle.md", "kind": "no_info",
+             "why": "助词标本，不含任何动词词干"},
+        ],
+        "known_miss": {
+            "reason": "displaced",
+            "why": "预期漏：无活用形还原（D205 的三件套未落地）。書かない 不逐字出现在"
+                   "正文里，bigram 重叠不足以召回。D205 落地后此行必须转绿。",
+        },
+    },
+    {
+        "query": "次元削減",
+        "edge": "E3-mixed",
+        "sufficient": ["note:ja-mixed.md"],
+        "hard_negatives": [
+            {"key": "note:ja-kanji-only.md", "kind": "semi_relevant",
+             "why": "纯汉字日文也含次元削減手法，词面重叠但没有英文对照那半边"},
+        ],
+    },
+    {
+        "query": "数値計算法",
+        "edge": "E4-kanji-only",
+        "sufficient": ["note:ja-kanji-only.md"],
+        "hard_negatives": [
+            {"key": "note:ja-mixed.md", "kind": "semi_relevant",
+             "why": "同为日文技术笔记但没有数値計算法这一条目"},
+        ],
+    },
+    {
+        "query": "固有値問題",
+        "edge": "baseline",
+        "sufficient": ["note:ja-kanji-only.md"],
+        "hard_negatives": [
+            {"key": "note:ja-normalized.md", "kind": "semi_relevant",
+             "why": "讲固有値与固有ベクトル的分解，但不提固有値問題这个问法"},
+        ],
+    },
+    {
+        "query": "助詞",
+        "edge": "baseline",
+        "sufficient": ["note:ja-particle.md"],
+        "hard_negatives": [
+            {"key": "note:ja-conjugation.md", "kind": "no_info",
+             "why": "动词活用标本，不含助词相关内容"},
+        ],
+    },
+    {
+        "query": "波ダッシュ",
+        "edge": "baseline",
+        "sufficient": ["note:ja-wave.md"],
+        "hard_negatives": [
+            {"key": "note:ja-particle.md", "kind": "no_info",
+             "why": "助词标本，不含任何波ダッシュ内容"},
+        ],
+    },
+]
+
+
 def main() -> None:
     check = "--check" in sys.argv[1:]
     fixture_hygiene()
     reachability_hygiene()
     known = corpus_keys()
-    for entry in MAIN:
+    for entry in MAIN + JA:
         for key in entry["sufficient"]:
             if key not in known:
                 print(f"FAIL: sufficient key not in corpus: {key!r}")
@@ -571,6 +658,7 @@ def main() -> None:
             "every top-5 seat they take."
         ),
         "queries": MAIN,
+        "queries_ja": JA,
         "injection": injection,
         "poison_keys": POISON_KEYS,
     }
