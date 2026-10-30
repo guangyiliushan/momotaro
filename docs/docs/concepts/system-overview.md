@@ -5,17 +5,15 @@ type: concept
 sidebar_position: 2
 ---
 
-# System overview {/* #system-overview */}
+# System overview
 
 This page is the map: the few parts the workbench is made of, where they
 run, and which part to look at when something needs to change.
 
-## The parts and the path of a piece of work {/* #parts */}
+## The parts and the path of a piece of work
 
 ```mermaid
 flowchart LR
-    accTitle: The parts of the workbench and the path of a piece of work
-    accDescr: The command line drives everything. Indexing reads your notes tree, records the store and updates the search index. Retrieval reads the index; context building assembles the material for one model call; citation checks hold the answer against the recorded bytes and hand the result back to the command line.
     CLI["Command line"] --> INDEXING["Indexing"]
     NOTES["Notes tree"] --> INDEXING
     INDEXING --> STORE[("The store")]
@@ -35,7 +33,7 @@ A question travels the other way: **retrieval** reads the index, **context
 building** assembles what may enter a single model turn, and **citation
 checks** hold the answer against the recorded bytes before you see it.
 
-## The parts, one line each {/* #list */}
+## The parts, one line each
 
 - **Indexing** picks up what changed in your notes, normalizes it, and
   records the result — revisions, chunks, and the audit events around them.
@@ -55,12 +53,10 @@ checks** hold the answer against the recorded bytes before you see it.
 - **The command line** is the surface today: it takes your commands and
   shows results. Later surfaces call the same parts.
 
-## Where everything runs {/* #where */}
+## Where everything runs
 
 ```mermaid
 flowchart TB
-    accTitle: Local first — one machine, one outbound connection
-    accDescr: Your notes, the store and the search index all live in one workspace directory on your machine. Indexing, search and trace work offline. The single outbound connection goes to the model endpoint you configure, and only when you run ask or an expanded search.
     subgraph M["Your machine"]
         direction LR
         WB["The workbench"] --> NOTES["Notes tree"]
@@ -75,7 +71,7 @@ connection is the model endpoint you configure. A workspace is a directory:
 copying it copies the desk — and nothing about your library is collected or
 sent anywhere.
 
-## Which part changes when {/* #changes */}
+## Which part changes when
 
 | When the change is about… | The part to look at |
 |---|---|
@@ -90,7 +86,7 @@ sent anywhere.
 This map deliberately stops at component names: components are what stays
 stable while their internals change.
 
-## Where to go next {/* #next */}
+## Where to go next
 
 - [The domain model](domain-model.md) — the nouns, each defined in one
   line.

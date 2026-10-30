@@ -162,14 +162,14 @@ impl CitationSource for StoreSource<'_> {
             // The workspace root is itself a link we cannot follow: nothing
             // under it can be there. That is a confirmed absence, not an I/O
             // failure — reporting it `unsupported` would let an answer with no
-            // reachable source come back fully verified.
+            // reachable source come back fully grounded.
             return Ok(BytesState::Missing);
         };
         let joined = self.workspace_root.join(relative);
         let Some(resolved) = canonicalize_existing_ancestor(&joined)? else {
             // Exactly the predicate the root arm answers — the entry exists
             // and resolves nowhere — so exactly the same verdict: the bytes
-            // named by the row are provably absent, and `fully_verified()`
+            // named by the row are provably absent, and `fully_grounded()`
             // vetoes on it.
             // `metadata` is never called on the path, so the link is not read
             // through either; that half is pinned by
@@ -573,7 +573,7 @@ mod tests {
         let answer =
             crate::verify_answer(&source, VerifyPolicy::enabled(), &["f0001"], &[citation()]);
         assert!(
-            !answer.fully_verified(),
+            !answer.fully_grounded(),
             "an integrity hash mismatch must veto the answer"
         );
     }
@@ -833,7 +833,7 @@ mod tests {
     /// here would make this reader disagree with `momotaro-ingest::path`
     /// (which carries the spelling through to its own `stat`), so it is
     /// registered, not papered over: a malformed stored spelling that we
-    /// cannot open is reported `unsupported`, and `fully_verified()` does not
+    /// cannot open is reported `unsupported`, and `fully_grounded()` does not
     /// claim otherwise.
     #[test]
     fn a_read_failure_is_reported_as_unavailable_not_as_missing() {
@@ -861,11 +861,11 @@ mod tests {
         // The "failed check" side of the split, at answer level: the file is
         // really there, the OS just refused the path as written — so this is
         // `unsupported`, never `source_missing`, *and* because that read never
-        // ran the answer is not fully verified.
+        // ran the answer is not fully grounded.
         let answer =
             crate::verify_answer(&source, VerifyPolicy::enabled(), &["f0001"], &[citation()]);
         assert!(
-            !answer.fully_verified(),
+            !answer.fully_grounded(),
             "an integrity check that never ran must not leave the answer verified"
         );
     }
@@ -891,14 +891,14 @@ mod tests {
 
         let answer =
             crate::verify_answer(&source, VerifyPolicy::enabled(), &["f0001"], &[citation()]);
-        assert!(!answer.fully_verified());
+        assert!(!answer.fully_grounded());
     }
 
     /// A workspace root on a server that is not there. This is a *transport*
     /// failure, not a statement about the bytes: `light-citation`'s
     /// non-negotiable rule is that a network failure is never reported as
     /// "this work does not exist", so the verdict stays `unsupported` — but
-    /// the answer still may not come back fully verified, because nothing was
+    /// the answer still may not come back fully grounded, because nothing was
     /// checked. Killing the `file_name() == None` exit into `Ok(None)` here
     /// would flip this to `source_missing` and break that rule.
     #[cfg(windows)]
@@ -923,7 +923,7 @@ mod tests {
         let answer =
             crate::verify_answer(&source, VerifyPolicy::enabled(), &["f0001"], &[citation()]);
         assert!(
-            !answer.fully_verified(),
+            !answer.fully_grounded(),
             "an answer whose workspace root could not be reached was never checked"
         );
     }
@@ -984,7 +984,7 @@ mod tests {
     /// A workspace root that is not there is the largest confirmed absence
     /// there is — every byte under it is gone. Reporting it `unsupported`
     /// instead would let an answer whose sources are all unverifiable come
-    /// back `fully_verified()`.
+    /// back `fully_grounded()`.
     #[test]
     fn a_workspace_root_that_is_gone_reports_missing_bytes() {
         let f = fixture(Some("notes/a.md"));
@@ -1005,14 +1005,14 @@ mod tests {
             "the chunks are in the store; only the bytes are unreachable"
         );
         assert!(
-            !answer.fully_verified(),
-            "an answer with no reachable source is not fully verified"
+            !answer.fully_grounded(),
+            "an answer with no reachable source is not fully grounded"
         );
     }
 
     /// A junction whose target has been removed — the end-to-end verdict: the
     /// entry exists and resolves nowhere, so the bytes named by the row are
-    /// provably absent and the answer must not come back fully verified.
+    /// provably absent and the answer must not come back fully grounded.
     ///
     /// The verdict is identical with and without the walk's refusal to
     /// re-append the name, so the refusal itself is pinned by
@@ -1055,7 +1055,7 @@ mod tests {
         let answer =
             crate::verify_answer(&source, VerifyPolicy::enabled(), &["f0001"], &[citation()]);
         assert!(
-            !answer.fully_verified(),
+            !answer.fully_grounded(),
             "an answer whose cited source resolves nowhere was never checked"
         );
     }
@@ -1094,8 +1094,8 @@ mod tests {
         let answer =
             crate::verify_answer(&source, VerifyPolicy::enabled(), &["f0001"], &[citation()]);
         assert!(
-            !answer.fully_verified(),
-            "an answer whose workspace root resolves nowhere is not fully verified"
+            !answer.fully_grounded(),
+            "an answer whose workspace root resolves nowhere is not fully grounded"
         );
     }
 
@@ -1103,7 +1103,7 @@ mod tests {
     /// its own inputs for the same reason. Without that step the walk bottoms
     /// out at `""`, `file_name()` is `None`, and the error makes an
     /// unreachable source look like an I/O failure: `unsupported`, which does
-    /// **not** veto `fully_verified()`.
+    /// **not** veto `fully_grounded()`.
     #[test]
     fn a_relative_workspace_root_that_is_gone_reports_missing_bytes() {
         let f = fixture(Some("notes/a.md"));
@@ -1123,8 +1123,8 @@ mod tests {
             "the chunks are in the store; only the bytes are unreachable"
         );
         assert!(
-            !answer.fully_verified(),
-            "an answer with no reachable source is not fully verified"
+            !answer.fully_grounded(),
+            "an answer with no reachable source is not fully grounded"
         );
     }
 

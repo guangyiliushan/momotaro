@@ -25,7 +25,7 @@
 //! integrity check reports the loss.
 //!
 //! This crate never writes. Persisting `verifications` rows and the
-//! `answer_citations.verified` flag is `momotaro-run`'s step 12.
+//! `answer_citations.located` flag is `momotaro-run`'s step 12.
 //!
 //! # Examples
 //!
@@ -50,9 +50,9 @@
 //!
 //! let verdict = verify_answer(&source, VerifyPolicy::enabled(), &["f0001"], &[citation]);
 //! println!("{:?}", verdict.citations[0].status);
-//! // `fully_verified()` is the one derived flag: every citation passed and no
+//! // `fully_grounded()` is the one derived flag: every citation passed and no
 //! // integrity check vetoes the answer.
-//! println!("fully verified: {}", verdict.fully_verified());
+//! println!("fully grounded: {}", verdict.fully_grounded());
 //! # Ok(())
 //! # }
 //! ```
@@ -73,7 +73,7 @@ pub use citation::Citation;
 pub use error::VerifyError;
 pub use source::{BytesState, CitationSource, StoreSource};
 pub use status::{VerificationKind, VerificationStatus, VerifyDetail};
-pub use verdict::{AnswerVerdict, Verification};
+pub use verdict::{AnswerVerdict, LocatedSpan, Verification};
 pub use verify::{VerifyPolicy, verify_answer};
 
 #[cfg(test)]

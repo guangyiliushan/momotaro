@@ -238,7 +238,7 @@ CREATE TABLE IF NOT EXISTS answer_citations (
   chunk_hash TEXT NOT NULL,
   locator_json TEXT NOT NULL,
   quoted_text TEXT NOT NULL,
-  verified INTEGER NOT NULL,
+  located INTEGER NOT NULL,
   PRIMARY KEY (answer_id, citation_index)
 );
 CREATE TABLE IF NOT EXISTS verifications (
@@ -352,6 +352,89 @@ CREATE INDEX idx_history_items_session ON history_items(session_id);",
         "DROP INDEX IF EXISTS idx_llm_turns_run;
 DROP INDEX IF EXISTS idx_llm_turns_run_seq;
 CREATE UNIQUE INDEX idx_llm_turns_run_seq ON llm_turns(run_id, seq);",
+    ),
+    // 9 -> 10: the answer body as a span sequence.
+    //
+    // `answers.text` is a *render* of these rows, not the body: the spans are
+    // what the answer is, and until now they were rebuilt from
+    // `answer_citations` — which loses two things the check actually found.
+    // `verdict_note` (why a span is not grounded) and the located byte and
+    // sentence ranges have nowhere to live in the citation row, so a rebuilt
+    // span reported zeroes and no reason. This table is the body.
+    //
+    // Same DROP-then-CREATE discipline as steps 7–9: `IF NOT EXISTS` matches
+    // the *name*, so a stale index of this name on another table would skip
+    // creation and leave the pair unprotected.
+    (
+        10,
+        "CREATE TABLE IF NOT EXISTS answer_spans (
+            answer_id TEXT NOT NULL,
+            span_index INTEGER NOT NULL,
+            source_key TEXT NOT NULL,
+            revision_hash TEXT NOT NULL,
+            chunk_id TEXT NOT NULL,
+            chunk_hash TEXT NOT NULL,
+            sentence_start INTEGER NOT NULL,
+            sentence_end INTEGER NOT NULL,
+            byte_start INTEGER NOT NULL,
+            byte_end INTEGER NOT NULL,
+            source_text TEXT NOT NULL,
+            verdict TEXT NOT NULL,
+            verdict_note TEXT,
+            PRIMARY KEY (answer_id, span_index)
+        );
+DROP INDEX IF EXISTS idx_answer_spans_answer;
+CREATE INDEX idx_answer_spans_answer ON answer_spans(answer_id);",
+    ),
+    // 10 -> 11: evidence metadata layer (D47-D51).
+    //
+    // One step for three things because they are one concern: how a source is
+    // *known about*, as opposed to the source's own bytes. `source_revisions`
+    // is an immutable byte snapshot and stays that way — the three freshness
+    // stamps describe the *fetch*, not the bytes, so they live beside it in
+    // `source_freshness` rather than in it.
+    (
+        11,
+        "CREATE TABLE IF NOT EXISTS source_freshness (
+  source_key TEXT NOT NULL,
+  revision_hash TEXT NOT NULL,
+  fetched_at INTEGER,
+  source_updated_at INTEGER,
+  version_anchor_raw TEXT,
+  PRIMARY KEY (source_key, revision_hash)
+);
+-- G2 / D50: the version axis. Kept apart from the disposition axis on
+-- purpose: being replaced is not the same as being retracted, and the
+-- vocabulary has no type that means both.
+CREATE TABLE IF NOT EXISTS source_relations (
+  source_key TEXT NOT NULL,
+  relation_type TEXT NOT NULL,
+  target_key TEXT,
+  vocabulary TEXT NOT NULL,
+  raw_value TEXT NOT NULL,
+  record_id TEXT NOT NULL DEFAULT '',
+  source_system TEXT NOT NULL,
+  fetched_at INTEGER NOT NULL,
+  PRIMARY KEY (source_key, relation_type, vocabulary, source_system, raw_value, target_key, record_id)
+);
+CREATE INDEX idx_source_relations_source ON source_relations(source_key);
+-- G1 / D47-D49: the disposition axis. Append-only: one target can carry
+-- several notices from several registries and none of them wins by recency
+-- (D49). The primary key keeps those rows apart instead of collapsing them.
+CREATE TABLE IF NOT EXISTS source_disposition (
+  source_key TEXT NOT NULL,
+  disposition_type TEXT NOT NULL,
+  effective_at INTEGER,
+  vocabulary TEXT NOT NULL,
+  source_system TEXT NOT NULL,
+  raw_value TEXT NOT NULL,
+  record_id TEXT NOT NULL DEFAULT '',
+  note TEXT,
+  fetched_at INTEGER NOT NULL,
+  PRIMARY KEY (source_key, disposition_type, vocabulary, source_system, raw_value, record_id)
+);
+CREATE INDEX idx_source_disposition_source ON source_disposition(source_key);
+CREATE INDEX idx_source_disposition_type ON source_disposition(disposition_type);",
     ),
 ];
 

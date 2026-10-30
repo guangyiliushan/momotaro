@@ -5,11 +5,11 @@ type: task
 sidebar_position: 3
 ---
 
-# 保持库与笔记同步 {/* #keep-the-store-current */}
+# 保持库与笔记同步
 
 笔记库从不静止：文件被编辑、改名、删除、从别处拖进来。库靠两条命令保持诚实——它们共用同一个原语：一趟完整遍历，由每个文件自己的字节决定究竟什么变了。
 
-## 监视 {/* #watch */}
+## 监视
 
 ```bash
 momotaro watch
@@ -21,7 +21,7 @@ momotaro watch
 
 加 `--json` 时，每行是一个带 `kind` 标记的对象（`batch`、`reconciled`、`degraded`、`network_volume` 等），脚本能分辨它们。网络盘上的监视会如实说明，并且**不承诺**实时性。
 
-## 对账 {/* #reconcile */}
+## 对账
 
 ```bash
 momotaro reconcile
@@ -31,17 +31,17 @@ momotaro reconcile
 
 加 `--json` 时打印一个汇总对象：`batch_id`、`scanned`、`changed`、`removed`、`events`。它碰过的每个文件都会记录在审计日志里，这一趟做了什么，事后可以复查。
 
-## 什么时候用哪个 {/* #which */}
+## 什么时候用哪个
 
 - 大部分日子都在写作、想让检索结果跟着保存保持新鲜？让 `watch` 常驻。
 - 离开一段时间回来，或有事在工具没运行时动过文件？跑一次 `reconcile`。
 - 脚本与别的机器：`reconcile` 是有界的、安全的那次调用；`watch` 会一直跑到被停。
 
-## 打断是安全的 {/* #interrupt */}
+## 打断是安全的
 
 停下任意一条命令——哪怕在最糟的时刻——都不需要收拾。每个文件的行与它的数据一起提交，所以跑到一半被打断的一批，就当作还没发生过，下次启动时对账补回差异。你永远不需要手工修复状态。
 
-## 去哪里继续 {/* #next */}
+## 去哪里继续
 
 - [重建与恢复](rebuild-and-recover.md)——另一条修复路径：检索索引。
 - [领域模型](../concepts/domain-model.md)——修订与块同文件的关系。

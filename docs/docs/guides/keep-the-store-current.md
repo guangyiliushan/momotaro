@@ -5,14 +5,14 @@ type: task
 sidebar_position: 3
 ---
 
-# Keep the store current {/* #keep-the-store-current */}
+# Keep the store current
 
 A vault is never still: files get edited, renamed, deleted, dropped in from
 elsewhere. The store stays truthful through two commands that share one
 primitive — a full walk of the vault that decides, from each file's own bytes,
 what actually changed.
 
-## Watch {/* #watch */}
+## Watch
 
 ```bash
 momotaro watch
@@ -33,7 +33,7 @@ With `--json`, each line is one object tagged `kind` (`batch`, `reconciled`,
 `degraded`, `network_volume`, …), so a script can tell them apart. A watch on
 a network drive says so and is **not** promised to be real-time.
 
-## Reconcile {/* #reconcile */}
+## Reconcile
 
 ```bash
 momotaro reconcile
@@ -48,7 +48,7 @@ With `--json` it prints a single summary object: `batch_id`, `scanned`,
 `changed`, `removed`, `events`. Each file it touches is recorded in the audit
 log, so what the pass did is reviewable afterwards.
 
-## Which one when {/* #which */}
+## Which one when
 
 - Writing most days and wanting search results to stay fresh as you save?
   Leave `watch` running.
@@ -57,14 +57,14 @@ log, so what the pass did is reviewable afterwards.
 - Scripts and other machines: `reconcile` is the safe, finite call; `watch`
   runs until stopped.
 
-## Interrupting is safe {/* #interrupt */}
+## Interrupting is safe
 
 Stopping either command — even at the worst moment — needs no cleanup. Each
 file's rows commit together with its data, so a batch interrupted part-way
 simply has not happened yet, and the next startup reconciles the difference.
 You never have to repair state by hand.
 
-## Where to go next {/* #next */}
+## Where to go next
 
 - [Rebuild and recover](rebuild-and-recover.md) — the other repair path: the
   search index.

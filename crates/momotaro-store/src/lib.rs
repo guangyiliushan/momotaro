@@ -662,6 +662,12 @@ impl Store {
             (None, None)
         };
 
+        let (sources_with_chunks, spans) = if initialized {
+            (Some(self.sources_with_chunks()?), self.span_counts()?)
+        } else {
+            (None, (None, None))
+        };
+
         Ok(StatsReport {
             status: health.status,
             schema_version: health.schema_version,
@@ -669,7 +675,42 @@ impl Store {
             initialized,
             sources,
             chunks,
+            sources_with_chunks,
+            spans_total: spans.0,
+            spans_ungrounded: spans.1,
         })
+    }
+
+    /// Current sources that yielded at least one chunk (D86).
+    fn sources_with_chunks(&self) -> Result<u64, StoreError> {
+        Ok(self.connection.query_row(
+            "SELECT COUNT(DISTINCT c.source_key) FROM chunks c
+               JOIN source_revisions r
+                 ON r.source_key = c.source_key
+                AND r.revision_hash = c.revision_hash
+              WHERE r.is_current = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
+    }
+
+    /// Stored answer spans: (total, ungrounded) (D86).
+    ///
+    /// Both are `None` when no span has ever been stored: an empty store has
+    /// no rate to speak of, and reporting zeros would read as "everything was
+    /// checked and grounded" when the truth is "nothing was checked".
+    fn span_counts(&self) -> Result<(Option<u64>, Option<u64>), StoreError> {
+        let (total, ungrounded) = self.connection.query_row(
+            "SELECT COUNT(*), SUM(CASE WHEN verdict = 'ungrounded' THEN 1 ELSE 0 END)
+               FROM answer_spans",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1).unwrap_or(0))),
+        )?;
+        if total == 0 {
+            Ok((None, None))
+        } else {
+            Ok((Some(total as u64), Some(ungrounded as u64)))
+        }
     }
 }
 
@@ -1521,7 +1562,7 @@ mod tests {
                 ("chunk_hash", "TEXT", true, None, 0),
                 ("locator_json", "TEXT", true, None, 0),
                 ("quoted_text", "TEXT", true, None, 0),
-                ("verified", "INTEGER", true, None, 0),
+                ("located", "INTEGER", true, None, 0),
             ],
         ),
         (
@@ -1738,7 +1779,7 @@ mod tests {
             window.init_schema().expect("initialize");
             window
                 .connection
-                .execute_batch("DROP INDEX idx_graph_links_from; PRAGMA user_version = 5;")
+                .execute_batch("DROP INDEX idx_graph_links_from; DROP INDEX IF EXISTS idx_source_disposition_source; DROP INDEX IF EXISTS idx_source_disposition_type; DROP INDEX IF EXISTS idx_source_relations_source; DROP TABLE IF EXISTS source_disposition; DROP TABLE IF EXISTS source_relations; DROP TABLE IF EXISTS source_freshness; PRAGMA user_version = 5;")
                 .expect("rewind to the window shape");
         }
         let mut window = Store::open(&window_path).expect("reopen window store");
@@ -1777,6 +1818,13 @@ mod tests {
                      DROP INDEX idx_verifications_run;
                      DROP INDEX idx_runs_session;
                      DROP INDEX idx_history_items_session;
+                     DROP INDEX IF EXISTS idx_answer_spans_answer;
+                     DROP INDEX IF EXISTS idx_source_disposition_source;
+                     DROP INDEX IF EXISTS idx_source_disposition_type;
+                     DROP INDEX IF EXISTS idx_source_relations_source;
+                     DROP TABLE IF EXISTS source_disposition;
+                     DROP TABLE IF EXISTS source_relations;
+                     DROP TABLE IF EXISTS source_freshness;
                      PRAGMA user_version = 6;",
                 )
                 .expect("rewind to the schema-6 shape");
@@ -1844,6 +1892,13 @@ mod tests {
                 .execute_batch(
                     "DROP INDEX idx_runs_session;
                      DROP INDEX idx_history_items_session;
+                     DROP INDEX IF EXISTS idx_answer_spans_answer;
+                     DROP INDEX IF EXISTS idx_source_disposition_source;
+                     DROP INDEX IF EXISTS idx_source_disposition_type;
+                     DROP INDEX IF EXISTS idx_source_relations_source;
+                     DROP TABLE IF EXISTS source_disposition;
+                     DROP TABLE IF EXISTS source_relations;
+                     DROP TABLE IF EXISTS source_freshness;
                      PRAGMA user_version = 7;",
                 )
                 .expect("rewind to the schema-7 shape");
@@ -1911,6 +1966,12 @@ mod tests {
                      DROP INDEX idx_answers_run;
                      DROP INDEX idx_verifications_run;
                      CREATE INDEX idx_answers_run ON chunks(source_key);
+                     DROP INDEX IF EXISTS idx_source_disposition_source;
+                     DROP INDEX IF EXISTS idx_source_disposition_type;
+                     DROP INDEX IF EXISTS idx_source_relations_source;
+                     DROP TABLE IF EXISTS source_disposition;
+                     DROP TABLE IF EXISTS source_relations;
+                     DROP TABLE IF EXISTS source_freshness;
                      PRAGMA user_version = 6;",
                 )
                 .expect("rewind to a colliding schema 6");
@@ -2063,6 +2124,12 @@ mod tests {
                     "DROP INDEX idx_runs_session;
                      DROP INDEX idx_history_items_session;
                      CREATE INDEX idx_runs_session ON chunks(source_key);
+                     DROP INDEX IF EXISTS idx_source_disposition_source;
+                     DROP INDEX IF EXISTS idx_source_disposition_type;
+                     DROP INDEX IF EXISTS idx_source_relations_source;
+                     DROP TABLE IF EXISTS source_disposition;
+                     DROP TABLE IF EXISTS source_relations;
+                     DROP TABLE IF EXISTS source_freshness;
                      PRAGMA user_version = 7;",
                 )
                 .expect("rewind to a colliding schema 7");
@@ -2552,13 +2619,14 @@ mod tests {
         // this asserts what the schema *declares* — a new or dropped explicit
         // index is a schema change this test must see (the step-5 assertion deferred
         // to the graph-links work, extended by step 7's four `run_id`
-        // indexes and step 8's two `session_id` indexes).
+        // indexes, step 8's two `session_id` indexes, step 10's span key, and step 11's three evidence-metadata indexes).
         let dir = tempfile::tempdir().expect("temp dir");
         let mut store = Store::open(dir.path().join("momotaro.db")).expect("open");
         store.init_schema().expect("init");
         assert_eq!(
             declared_indexes(&store),
             [
+                "idx_answer_spans_answer",
                 "idx_answers_run",
                 "idx_chunks_rev",
                 "idx_graph_links_from",
@@ -2567,6 +2635,9 @@ mod tests {
                 "idx_retrievals_run",
                 "idx_revisions_current",
                 "idx_runs_session",
+                "idx_source_disposition_source",
+                "idx_source_disposition_type",
+                "idx_source_relations_source",
                 "idx_store_events_external",
                 "idx_store_events_source",
                 "idx_verifications_run",

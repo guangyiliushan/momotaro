@@ -5,13 +5,13 @@ type: task
 sidebar_position: 5
 ---
 
-# Rebuild and recover {/* #rebuild-and-recover */}
+# Rebuild and recover
 
 The search index is a derived artifact: everything in it can be built again
 from canonical storage. This page is the recovery path for when it cannot be
 opened — and the exit-code rules that make scripting against it safe.
 
-## The recovery walk {/* #walk */}
+## The recovery walk
 
 1. **Ask the workspace what it thinks:**
 
@@ -40,7 +40,7 @@ opened — and the exit-code rules that make scripting against it safe.
    momotaro search "the query that failed"
    ```
 
-## Never indexed is not broken {/* #never-indexed */}
+## Never indexed is not broken
 
 A workspace that was never indexed is *ready*, not invalid — nothing is wrong
 yet. `search` on it tells you to run `index`. Keep the two states apart:
@@ -51,7 +51,7 @@ And `index` cannot repair a missing or unreadable index: it only adds files
 the store has not seen. When the index itself is the problem, the command is
 `rebuild-index` — the message says so instead of quietly indexing zero files.
 
-## Exit codes for scripts {/* #exit-codes */}
+## Exit codes for scripts
 
 - `0` success, `1` failure — with one deliberate exception: `doctor` gates on
   **health**, so an uninitialized or invalid workspace exits `1` even though
@@ -64,7 +64,7 @@ the store has not seen. When the index itself is the problem, the command is
   `N errors` (N > 0) still exits `0`, because every failure was recorded and
   the batch completed.
 
-## Where to go next {/* #next */}
+## Where to go next
 
 - [Keep the store current](keep-the-store-current.md) — the other repair
   path: keeping up with vault changes.

@@ -5,11 +5,11 @@ type: reference
 sidebar_position: 1
 ---
 
-# 命令行参考 {/* #cli */}
+# 命令行参考
 
 所有命令共用同一个二进制与同样的三个全局选项。这一页列出存在什么、吃什么参数、怎么退出——有意不列出未来版本可能添加的每一个 flag。
 
-## 命令 {/* #commands */}
+## 命令
 
 | 命令 | 做什么 |
 |---|---|
@@ -30,7 +30,7 @@ sidebar_position: 1
 - `ask`：`--session <id>` 接续已有会话；`--client-request-id <id>` 让重试的请求防重放。`ask` 拒绝 `--mode expand`：回答始终至多一次模型调用。
 - `doctor`：`--coverage` 报告最近一次索引对每个文件做了什么，而不是检查健康。
 
-## 全局选项 {/* #global-options */}
+## 全局选项
 
 | 选项 | 含义 |
 |---|---|
@@ -39,7 +39,7 @@ sidebar_position: 1
 | `--allow-network` | 允许需要它的命令访问网络。Beta 默认关闭。 |
 | `-h`, `--help` / `-V`, `--version` | 帮助与版本。 |
 
-## 退出码 {/* #exit-codes */}
+## 退出码
 
 - **`0`** 成功、**`1`** 失败——只有一处刻意的例外：`doctor` 以*健康*为准入门槛，未初始化或 invalid 的工作区即便报告打印正常也退 `1`。（`doctor --coverage` 是报告不是检查：只要日志读得到就退 `0`。）
 - 用法错误（未知参数或子命令）退 **`2`**——而且连 `--json` 也拿不到 JSON 体，因为解析在程序自己的错误出口运行之前就失败了。
@@ -47,7 +47,7 @@ sidebar_position: 1
 
 这些规则背后的道理——以及它们为之存在的恢复路径——在[重建与恢复](../guides/rebuild-and-recover.md)。
 
-## 例：`stats` {/* #example-stats */}
+## 例：`stats`
 
 ```text
 status: ready
@@ -60,7 +60,7 @@ chunks: 2
 
 `--json` 携带同样的字段。尚不可知的计数在两个出口都打印 `unknown`——绝不伪造一个 `0`。
 
-## 去哪里继续 {/* #next */}
+## 去哪里继续
 
 - [配置](configuration.md)——`momotaro.toml` 文件。
 - [快速开始](../guides/quickstart.md)——命令的实际顺序。

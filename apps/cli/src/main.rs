@@ -86,6 +86,11 @@ enum Command {
 
         /// Retrieval mode: `lexical` (default, zero LLM) or `expand` (one
         /// short LLM rewrite before retrieval).
+        ///
+        /// `expand` is an **experimental slot**: it fuses the rewritten query
+        /// lists with reciprocal-rank fusion, which is not the ranking layer and
+        /// has not been admitted against the dual reading D109 asks for. Numbers
+        /// it produces are unadmitted until then.
         #[arg(long, default_value = "lexical")]
         mode: SearchMode,
     },
@@ -123,7 +128,7 @@ enum Command {
     },
 
     /// Replay one run: what was retrieved, what the model saw, and how every
-    /// citation verified.
+    /// citation resolves to the source bytes it names.
     Trace {
         /// The run id `ask` reported.
         run_id: String,

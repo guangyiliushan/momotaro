@@ -3,6 +3,14 @@
 //! Fusing ranked lists is a pure function: same input lists, same output —
 //! including the order, ties included. Nothing here reads a clock, a map with
 //! a random seed, or the query text itself.
+//!
+//! **Status: experimental slot (D109).** RRF is not the ranking layer — the
+//! ranking is `bm25 × class_weight`, and RRF throws away score magnitudes to
+//! work on ranks alone. It is admitted to `--mode expand` only, and only as an
+//! explicit opt-in. Per D109 the admission gate is the **D99 dual reading**
+//! (retrieval-level *and* context-level, against the `tools/evals/` baseline);
+//! **that comparison has not been run**, so this is wired in production ahead of
+//! its gate. Treat the numbers this produces as unadmitted until it has been.
 
 use std::collections::BTreeMap;
 
@@ -10,9 +18,12 @@ use momotaro_contracts::RetrievalHit;
 
 /// The smoothing constant in `score = Σ 1 / (k + rank)`.
 ///
-/// 60 is the conventional choice in the RRF literature; it is a property of the
-/// ranking rule rather than a tuning surface, so the workspace has no
-/// configuration for it.
+/// **60 is a literature convention, not an optimum.** The rule is insensitive to
+/// `k` across a wide range, which is why the choice is usually described as "not
+/// critical" — that is a claim about *insensitivity*, not evidence that 60 is
+/// best. It is kept as a constant so fusion stays a pure function with one
+/// shape; it is not a tuning surface, and no measurement in this workspace
+/// ranks 60 above 10 or 50.
 pub const RRF_K: u32 = 60;
 
 /// One accumulated hit: the row itself plus every list's contribution to it.

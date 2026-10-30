@@ -16,11 +16,11 @@ _Avoid_: library, knowledge base, corpus, second tree in the same workspace
 One note, paper, or (later) web document the library can cite. Identity is a Source key, not a row id and not a live filesystem path. Renaming a note creates a new Source; old keys are not rewritten.
 
 **Source key**:
-A scheme-prefixed logical identity. 0.x schemes are `note:` and `arxiv:` only; DOI is metadata, not a key. The scheme-specific tail is NFC-normalized and never case-folded. Absolute paths and display names live elsewhere.
-_Avoid_: canonical file path, absolute path, database id, URL-as-key, doi-as-key in 0.x
+A scheme-prefixed logical identity. 0.x schemes are `note:` and `paper:` only; DOI is metadata, not a key. The scheme names a **source type**, never a product or a provider (`paper:`, not `arxiv:`) — the provider is metadata on the revision. The scheme-specific tail is NFC-normalized and never case-folded. Absolute paths and display names live elsewhere.
+_Avoid_: canonical file path, absolute path, database id, URL-as-key, doi-as-key in 0.x, provider-as-scheme
 
 **Source revision**:
-An immutable byte snapshot of a Source (`revision_hash` of normalized bytes). Updates append a revision; they do not overwrite. An arXiv vN is a new revision of `arxiv:<id>`, not a new Source. A journal DOI is related metadata, not a key. Missing bytes leave the row in place; opening fails as source integrity, never as a deleted revision.
+An immutable byte snapshot of a Source (`revision_hash` of normalized bytes). Updates append a revision; they do not overwrite. An arXiv vN is a new revision of `paper:<arxiv-id>`, not a new Source; arXiv is the provider of that paper, recorded as revision metadata, not as its key scheme. A journal DOI is related metadata, not a key. Missing bytes leave the row in place; opening fails as source integrity, never as a deleted revision.
 _Avoid_: version (when you mean revision_hash), file, document, doi-as-source
 
 **Chunk**:
@@ -28,8 +28,8 @@ A deterministic projection of one Source revision: the retrieval and citation lo
 _Avoid_: canonical fact, Tantivy document, embedding, passage (when you mean the stored row)
 
 **Origin class**:
-Who authored the bytes: `owner` | `paper` | `web` | `agent` | `system`. Orthogonal to Source kind (`note` | `paper` | `web` | `attachment`).
-_Avoid_: trust score, provenance (provenance is the citation five-tuple)
+Who authored the bytes: `owner` | `paper` | `web` | `agent` | `system`. Orthogonal to Source kind (`note` | `paper` | `web` | `attachment`). This is the **authorship axis** — it may weight retrieval, because "the user wrote this" is a fact about provenance, not a judgement of reliability. It is not the **authority axis** (how independently checkable a claim is), which is display-only, never enters scoring, and is not a closed ranking.
+_Avoid_: trust score, provenance (provenance is the citation five-tuple), authority, reliability score
 
 ## Human desk
 

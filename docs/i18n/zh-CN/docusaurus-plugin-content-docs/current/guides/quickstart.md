@@ -5,11 +5,11 @@ type: task
 sidebar_position: 1
 ---
 
-# 快速开始 {/* #quickstart */}
+# 快速开始
 
 这一页从零开始，走到一个可搜索的工作区和第一次带引用的回答。0.x 版是命令行工具，从项目源码构建；预编译安装包随第一个正式版本到来。
 
-## 1. 构建命令行 {/* #build */}
+## 1. 构建命令行
 
 需要 Rust 工具链。在项目检出目录里：
 
@@ -21,7 +21,7 @@ cargo build --release -p momotaro-cli
 
 二进制落在 `target/release/`——`momotaro-cli`（Windows 上是 `momotaro-cli.exe`）。本页余下部分把它写作 `momotaro`。
 
-## 2. 让工作区指向你的笔记 {/* #workspace */}
+## 2. 让工作区指向你的笔记
 
 [工作区](../glossary.md#workspace)是一个包含 `momotaro.toml`、独占一个数据库的目录。创建它，并在里面放一个笔记文件夹：
 
@@ -51,7 +51,7 @@ workspace initialized
 
 已经有笔记树了——一个 Obsidian 文件夹、一个研究目录？把 `[vault] path` 指向它，而不是新建一个：工作台读的是纯 Markdown，原样保留你的 front matter，绝不改写你的文件。
 
-## 3. 索引笔记 {/* #index */}
+## 3. 索引笔记
 
 往 `notes/` 里放两篇 Markdown，然后：
 
@@ -73,7 +73,7 @@ momotaro doctor
 workspace is ready (SQLite 3.53.2)
 ```
 
-## 4. 检索 {/* #search */}
+## 4. 检索
 
 ```bash
 momotaro search "spectral theorem PCA"
@@ -88,7 +88,7 @@ momotaro search "spectral theorem PCA"
 
 词法检索零模型 token、可离线。只有 `ask` 与展开检索会碰到 provider；其余全部——索引、`doctor`、回放、重建——都不需要它。脚本要读结果时加 `--json`。
 
-## 5. 带引用地提问 {/* #ask */}
+## 5. 带引用地提问
 
 提问要花一次模型调用，因此需要 provider。配置里只写环境变量名；值留在你的环境里：
 
@@ -107,7 +107,7 @@ momotaro ask "谱定理和 PCA 是什么关系？" --allow-network
 
 回答会带着引用、[运行](../glossary.md#run) id，以及一条可直接粘贴的下一条命令回来。每条引用都已在你看之前与记录下来的字节核对过——校验失败会怎样，见[检索与引用](../concepts/retrieval-and-citations.md)。
 
-## 去哪里继续 {/* #next */}
+## 去哪里继续
 
 - [带引用的提问](ask-with-citations.md)——会话、重试与网络策略。
 - [保持库与笔记同步](keep-the-store-current.md)——监视笔记库并对账。

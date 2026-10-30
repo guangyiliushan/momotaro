@@ -5,7 +5,7 @@ type: reference
 sidebar_position: 2
 ---
 
-# Configuration {/* #configuration */}
+# Configuration
 
 A Momotaro workspace is a directory that contains a `momotaro.toml` file and
 owns one database (`.momotaro/`). The config file is short by design: it
@@ -24,14 +24,14 @@ api_key_env  = "MOMOTARO_API_KEY"
 allow_network = false
 ```
 
-## `[vault]` — where the notes are {/* #vault */}
+## `[vault]` — where the notes are
 
 - `path` — the notes tree to index, relative to the workspace (or absolute,
   but it must resolve **inside** the workspace; `vault == workspace root` is
   legal). Stored records are workspace-relative, which is why the vault cannot
   live elsewhere.
 
-## `[model]` — the provider endpoint {/* #model */}
+## `[model]` — the provider endpoint
 
 - `model_id` — the model to ask for.
 - `base_url_env` — the **name** of the environment variable that holds the
@@ -44,20 +44,20 @@ The endpoint is only needed the moment something actually talks to a model —
 `ask` and `search --mode expand`. Until then, the rest of the toolchain is
 offline by construction.
 
-## `[policy]` — what is allowed by default {/* #policy */}
+## `[policy]` — what is allowed by default
 
 - `allow_network` — Beta ships conservative: network access is **off** unless
   you allow it, per command (`--allow-network`) or once here. While it is off,
   `ask` and `search --mode expand` are refused before any connection is made.
 
-## Two habits that keep a workspace healthy {/* #habits */}
+## Two habits that keep a workspace healthy
 
 - **Secrets never enter the file.** Only environment-variable names do; the
   values live where secrets belong.
 - **Sync the notes, not the workspace.** The `.momotaro/` directory holds a
   database; sync services corrupt databases. Sync the vault folder only.
 
-## Where to go next {/* #next */}
+## Where to go next
 
 - [Command line reference](cli.md) — every command and its options.
 - [Quickstart](../guides/quickstart.md) — all of this in action.

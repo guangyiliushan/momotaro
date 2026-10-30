@@ -2,6 +2,26 @@
 
 use crate::status::{VerificationKind, VerificationStatus, VerifyDetail};
 
+/// Where a quoted span sits inside the chunk it was located in.
+///
+/// The byte range is what the check ran on; the sentence range is what a
+/// reader reads. Both are reported because the two are not the same thing —
+/// a quote can start mid-sentence — and a verdict that named only one would
+/// force the caller to guess the other.
+///
+/// Ranges are half-open: `start` inclusive, `end` exclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocatedSpan {
+    /// First byte of the quote inside the chunk text.
+    pub byte_start: usize,
+    /// One past the last byte of the quote.
+    pub byte_end: usize,
+    /// First sentence of the quote inside the chunk (0-based).
+    pub sentence_start: usize,
+    /// One past the last sentence the quote touches.
+    pub sentence_end: usize,
+}
+
 /// One independent verification result.
 ///
 /// A verification is an independent result produced by deterministic
@@ -15,6 +35,8 @@ pub struct Verification {
     pub status: VerificationStatus,
     /// Which judgement fired, absent for a clean `passed`.
     pub detail: Option<VerifyDetail>,
+    /// Where the quote was found, when one was looked for and found.
+    pub located: Option<LocatedSpan>,
 }
 
 impl Verification {
@@ -24,6 +46,7 @@ impl Verification {
             kind,
             status: VerificationStatus::Passed,
             detail: None,
+            located: None,
         }
     }
 
@@ -33,6 +56,7 @@ impl Verification {
             kind,
             status: VerificationStatus::Failed,
             detail: Some(detail),
+            located: None,
         }
     }
 
@@ -42,6 +66,7 @@ impl Verification {
             kind,
             status: VerificationStatus::Unsupported,
             detail: Some(detail),
+            located: None,
         }
     }
 
@@ -51,7 +76,18 @@ impl Verification {
             kind,
             status: VerificationStatus::Skipped,
             detail: Some(detail),
+            located: None,
         }
+    }
+
+    /// Attaches where the quote was found.
+    ///
+    /// Kept separate from the constructors because a location is a fact about
+    /// the search, not about the verdict: a check that failed and one that
+    /// passed both "looked", and only one found anything.
+    pub(crate) fn at(mut self, span: LocatedSpan) -> Self {
+        self.located = Some(span);
+        self
     }
 }
 
@@ -79,7 +115,7 @@ impl AnswerVerdict {
     ///    `unverified`";
     /// 2. every citation reported `passed` — an `unsupported` or `skipped`
     ///    citation has not been verified, and an answer with a failed
-    ///    citation is not fully verified;
+    ///    citation is not fully grounded;
     /// 3. no integrity check reported `failed` — bytes that are gone make the
     ///    answer unverifiable even though its citations still resolve against
     ///    the stored chunk text;
@@ -120,19 +156,20 @@ impl AnswerVerdict {
     ///     kind: VerificationKind::Citation,
     ///     status: VerificationStatus::Passed,
     ///     detail: None,
+    ///     located: None,
     /// };
     /// let verified = AnswerVerdict {
     ///     citations: vec![passed],
     ///     integrity: Vec::new(),
     /// };
-    /// assert!(verified.fully_verified());
+    /// assert!(verified.fully_grounded());
     ///
     /// // No citations is no positive claim.
     /// let empty = AnswerVerdict {
     ///     citations: Vec::new(),
     ///     integrity: Vec::new(),
     /// };
-    /// assert!(!empty.fully_verified());
+    /// assert!(!empty.fully_grounded());
     ///
     /// // A failed integrity check vetoes the answer even though every citation
     /// // still passed.
@@ -142,11 +179,12 @@ impl AnswerVerdict {
     ///         kind: VerificationKind::SourceIntegrity,
     ///         status: VerificationStatus::Failed,
     ///         detail: Some(VerifyDetail::SourceMissing),
+    ///         located: None,
     ///     }],
     /// };
-    /// assert!(!vetoed.fully_verified());
+    /// assert!(!vetoed.fully_grounded());
     /// ```
-    pub fn fully_verified(&self) -> bool {
+    pub fn fully_grounded(&self) -> bool {
         !self.citations.is_empty()
             && self
                 .citations

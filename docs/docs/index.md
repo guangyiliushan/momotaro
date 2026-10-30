@@ -6,14 +6,14 @@ description: Momotaro documentation — a local-first research workbench. Start 
 type: meta
 ---
 
-# Momotaro {/* #momotaro */}
+# Momotaro
 
 A local-first research workbench for serious study. You judge, annotate and
 write; the agent retrieves, compares and proposes. The pages here describe
 stable behavior — the concepts, the decisions, and the workflows you can rely
 on today.
 
-## Start here {/* #route-table */}
+## Start here
 
 | I want to… | Where to go |
 |---|---|
@@ -30,13 +30,13 @@ on today.
 | Keep the store in step with my notes | [Keep the store current](guides/keep-the-store-current.md) |
 | Recover a broken search index | [Rebuild and recover](guides/rebuild-and-recover.md) |
 
-## Languages {/* #languages */}
+## Languages
 
 Every page ships in English, 简体中文 and 日本語 — each under its own path,
 none privileged. The language menu in the top bar switches between them;
 untranslated pages fall back to English.
 
-## For contributors {/* #contributors */}
+## For contributors
 
 The rules every page here follows — voice, accessibility, terminology,
 translation — live in the [Writing guide](writing-guide.md).

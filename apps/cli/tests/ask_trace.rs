@@ -44,8 +44,8 @@ fn planted_run(tempdir: &tempfile::TempDir) -> String {
         .expect("chunk")
         .expect("row");
     let quote = quote_span(&chunk.text);
-    let content =
-        format!("谱定理保证对称矩阵可以对角化 [f0003]。\n\nCitations:\n[f0003] {quote}\n");
+    // The model selects spans; it does not write the answer.
+    let content = format!("[f0003] {quote}\n");
     let body = serde_json::json!({
         "id": "chatcmpl-1",
         "choices": [{"message": {"content": content}, "finish_reason": "stop"}],

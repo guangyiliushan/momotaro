@@ -5,13 +5,13 @@ type: task
 sidebar_position: 1
 ---
 
-# Quickstart {/* #quickstart */}
+# Quickstart
 
 This page walks from nothing to a searchable workspace and a first cited
 answer. The beta is a command-line tool built from the project's source;
 prebuilt installers arrive with the first full release.
 
-## 1. Build the command line {/* #build */}
+## 1. Build the command line
 
 You need a Rust toolchain. From a checkout of the project:
 
@@ -24,7 +24,7 @@ cargo build --release -p momotaro-cli
 The binary lands in `target/release/` — `momotaro-cli`, or `momotaro-cli.exe`
 on Windows. The rest of this page writes it as `momotaro`.
 
-## 2. Point a workspace at your notes {/* #workspace */}
+## 2. Point a workspace at your notes
 
 A [workspace](../glossary.md#workspace) is a directory that contains a
 `momotaro.toml` file and owns exactly one database. Create one with a notes
@@ -61,7 +61,7 @@ Point `[vault] path` at it instead of creating a fresh one: the workbench
 reads plain Markdown, keeps your front matter intact, and never rewrites
 your files.
 
-## 3. Index the notes {/* #index */}
+## 3. Index the notes
 
 Put a couple of Markdown files into `notes/`, then:
 
@@ -86,7 +86,7 @@ momotaro doctor
 workspace is ready (SQLite 3.53.2)
 ```
 
-## 4. Search {/* #search */}
+## 4. Search
 
 ```bash
 momotaro search "spectral theorem PCA"
@@ -104,7 +104,7 @@ expanded search ever reach a provider; everything else — index, doctor,
 trace, rebuild — runs without one. Add `--json` when a script should read
 the result.
 
-## 5. Ask, with citations {/* #ask */}
+## 5. Ask, with citations
 
 Asking spends one model turn, so it needs a provider. The config names
 environment variables; the values stay in your environment:
@@ -127,7 +127,7 @@ ready-to-paste next command. Every citation has already been checked against
 the recorded bytes — [retrieval and citations](../concepts/retrieval-and-citations.md)
 explains what happens when a check fails.
 
-## Where to go next {/* #next */}
+## Where to go next
 
 - [Ask with citations](ask-with-citations.md) — sessions, retries, and the
   network policy.

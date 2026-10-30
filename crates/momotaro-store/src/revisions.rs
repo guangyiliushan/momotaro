@@ -18,7 +18,7 @@ fn numbered_placeholders(keys: &HashSet<&str>) -> String {
 /// A new source revision to append; the store owns the `is_current` flag.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewSourceRevision<'a> {
-    /// Canonical identity, e.g. vault-relative path or `arxiv:NNNN.NNNNN`.
+    /// Canonical identity, e.g. vault-relative path or `paper:NNNN.NNNNN`.
     pub source_key: &'a str,
     /// `sha256` over normalized source bytes.
     pub revision_hash: &'a str,
@@ -79,6 +79,9 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRevision> {
         metadata_json: row.get("metadata_json")?,
         ingested_at: row.get("ingested_at")?,
         is_current: row.get::<_, i64>("is_current")? != 0,
+        fetched_at: row.get("fetched_at")?,
+        source_updated_at: row.get("source_updated_at")?,
+        version_anchor_raw: row.get("version_anchor_raw")?,
     })
 }
 
@@ -88,10 +91,18 @@ fn query_current(
 ) -> Result<Option<SourceRevision>, StoreError> {
     let revision = connection
         .query_row(
-            "SELECT source_key, revision_hash, kind, title, uri, local_path, raw_name,
-                    origin_class, metadata_json, ingested_at, is_current
+            "SELECT source_revisions.source_key, source_revisions.revision_hash,
+                    source_revisions.kind, source_revisions.title, source_revisions.uri,
+                    source_revisions.local_path, source_revisions.raw_name,
+                    source_revisions.origin_class, source_revisions.metadata_json,
+                    source_revisions.ingested_at, source_revisions.is_current,
+                    source_freshness.fetched_at, source_freshness.source_updated_at,
+                    source_freshness.version_anchor_raw
              FROM source_revisions
-             WHERE source_key = ?1 AND is_current = 1",
+             LEFT JOIN source_freshness
+               ON source_freshness.source_key = source_revisions.source_key
+              AND source_freshness.revision_hash = source_revisions.revision_hash
+             WHERE source_revisions.source_key = ?1 AND source_revisions.is_current = 1",
             params![source_key],
             read_row,
         )

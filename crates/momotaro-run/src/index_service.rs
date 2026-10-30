@@ -6266,6 +6266,9 @@ fn search_spec(
         thinking: config.model_thinking()?,
         model: model.to_owned(),
         max_output_tokens: REWRITE_MAX_TOKENS,
+        // D7: one provider turn, declared. The budget and the run must agree;
+        // `llm_turns.seq` is what the run actually spent.
+        max_provider_turns: 1,
         max_context_tokens: config.policy.max_context_tokens,
         allow_network: crate::network_permitted(config, allow_network),
         allow_write: config.policy.allow_write,

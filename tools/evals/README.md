@@ -53,22 +53,48 @@ A hard-coded `$PWD/target/debug/momotaro-cli` silently runs a **stale** one
 whenever `CARGO_TARGET_DIR` (or a target triple) diverges from that path —
 exactly the trap `run_golden.sh` was fixed to stop walking into.
 
-## Recorded baseline (v0.2, cjk bigram, 2026-10-09)
+## Recorded baseline (v0.5, cjk bigram, 2026-10-30)
 
-Grown golden set: 15 main (12 + 3 multi-key) + 45 injection, 14-note corpus
-(5 base vault + 9 eval fixtures):
+15 main (12 + 3 multi-key) + 45 injection, 14-note corpus (5 base vault + 9
+eval fixtures). Three changes stand under these numbers: the query is a bag of
+analyzer terms; the rank stage takes each source's best chunk before any
+source's second; and the notes use the vocabulary the questions are asked with.
 
 ```text
-main  recall@5: 0.9000    mrr: 0.8222    misses: 0 unexpected, 2 displaced
-inj   recall@5: 0.5000    mrr: 0.3667    misses: 12 fused, 12 displaced
-hard-negative seats (main): 24  (semi_relevant 14, no_info 10)
-poison seats (main): 8         (injection subset: 38)
+main  recall@5: 1.0000    mrr: 0.8778    misses: 0 unexpected, 0 displaced
+inj   recall@5: 0.9444    mrr: 0.4104    misses: 0 fused, 4 displaced
+hard-negative seats (main): 31  (semi_relevant 17, no_info 14)
+poison seats (main): 14         (injection subset: 90)
 ```
 
+The third of those was the one that mattered. Three annotations were
+unreachable rather than outranked: `pca.md` answered `PCA 方差` while never
+writing 方差 (it said "covariance matrix"), and the eigenvalue notes discussed
+the definition and the method without using those words. Retrieval matches on
+terms, so no ranking rule could have put them first — and the miss rows read as
+a ranking problem for as long as nothing measured reachability. The notes now
+use the query's vocabulary, and `gen_annotations.py` refuses an annotation
+whose evidence never carries the query's terms. Main is at recall 1.0.
+
+What is left in injection is the attack surface itself: two poison samples
+carry the shell text verbatim and take two of the five seats, and the sufficient
+source is sixth behind `only-code` and `semi-pca-sklearn`. Retrieval retrieving
+is not the injection defence; the untrusted-content delimiters and the prompt
+hierarchy are, and this set is the retrieval surface only.
+
+The floors sit within one minimal step (`0.05/N`) of the readings (`0.877` /
+`0.410`) and the seat ceilings exactly at them, so losing the gain trips. The
+known-miss ceilings ratcheted down in the same changes: `fused` stays **0**,
+`displaced` 12 → 9 → 8 → **4**.
+
 Prior baselines, kept for the story: the first 5-file vault (12 queries,
-2026-09) scored `recall@5 0.9583 / mrr 0.9028`; the expanded corpus
-(2026-09-26) scored `0.9167 / 0.8333` on main and `0.5000 / 0.3519` on the
-first injection subset, with 19 / 11 / 33 seats.
+2026-09) scored `recall@5 0.9583 / mrr 0.9028`; the expanded corpus (2026-09-26)
+scored `0.9167 / 0.8333` on main and `0.5000 / 0.3519` on the first injection
+subset, with 19 / 11 / 33 seats; the grown set at 2026-10-09 scored
+`0.9000 / 0.8222` on main and `0.5000 / 0.3667` on injection, with 24 / 8 / 38;
+after the query fix (2026-10-29) main `0.9000 / 0.8556` and injection
+`0.8667 / 0.4107`, with 25 / 8 / 87; after the rank stage (2026-10-30) main
+`0.9333 / 0.8556` and injection `0.8889 / 0.4107`, with 31 / 15 / 90.
 
 ## What the misses are (and what the gates do about them)
 
@@ -81,31 +107,34 @@ exactly at baseline.
 
 Two strata of accepted failure, both measured, both whitelisted with a `why`:
 
-- **fused (12 rows)** — the query analyzer's own face: a whitespace-free base
-  query (`傅里叶变换`, `谱定理`, `正交对角化`, `雅可比方法`) is fused by every
-  injection shell into one phrase chunk no document contains; under the
-  `system:` family only the shell word hits, the poison sample. This is a
-  tokenizer property, not retrieval quality. If the analyzer ever tokenizes
-  these, the rows pass and the whitelist entries simply stop applying. The
-  split keeps this stratum from diluting the robustness story: of the rows the
-  analyzer can actually parse, injection recall is `1.0` for 21/33 — the gap
-  there is ranking, not tokenization. (Fixing the analyzer is a separate
-  decision — the `cjk_tokenizer` config seam.)
-- **displaced (14 rows: 2 main + 12 injection)** — hits were retrieved but the
-  sufficient source fell out of top-5:
-  - `PCA 方差` (and its injection shells) — the recorded hard-negative harm:
-    semi-pca-sklearn / fourier / long-mixed / the glossary / the poison sample
-    fill all seats. This annotation is what makes the harm visible.
-  - `SVD 协方差` (injection shells only) — shell text boosts the long notes'
-    lexical overlap; pca.md drops out.
-  - `RBF kernel 定义 调参` (injection shells only) — semi-kernel-svm.md is
-    pushed out by shell noise; the base query is clean.
-  - `特征值 定义 求法` — the new multi-key finding: sufficient member
-    eigenvalue.md owns 4 of the 5 seats (four chunks) and fourier's aside
-    takes the last, so long-mixed.md's 求法 never lands. One source's own
-    chunks crowd out the other sufficient member. The rank-stage same-source
-    demotion ("BM25 分数断崖的同文档段落降权") is the
-    designed fix; until then this row names the gap.
+- **fused (0 rows)** — gone, and it was never the tokenizer's face. What looked
+  like the analyzer refusing to split a whitespace-free base query was
+  `QueryParser` turning the shell-plus-first-word chunk into a `PhraseQuery` no
+  document holds; the search then answered on whatever followed the last space.
+  Terms now come from the analyzer one at a time, so the rows pass, and the
+  whitelist no longer names them. The ceiling is 0, so any phrase-shaped query
+  trips it as an unexpected miss rather than being absorbed.
+- **displaced (4 rows, injection only)** — hits were retrieved but the
+  sufficient source fell out of top-5. Every window holds five distinct sources
+  and both poison samples are in two of them:
+  - `RBF kernel 定义 调参` (all three shells) — semi-kernel-svm.md is sixth
+    behind poison-ignore / poison-system / only-code / semi-pca-sklearn /
+    kernel-def. The base query is clean, and it was clean before the shells too.
+  - `PCA 方差` (the `system:` shell only) — pca.md is sixth behind the two
+    poison samples, semi-pca-sklearn, fourier and long-mixed. It passes on the
+    main set and on the other two shells.
+
+  Three rows used to sit here for a different reason entirely: the annotated
+  sufficient source never contained the words the question was asked with.
+  `pca.md` wrote "covariance matrix" where the query said 方差; the eigenvalue
+  notes discussed the definition and the method without those words. Retrieval
+  matches on terms, so those rows could not have been won by ranking — and they
+  read as ranking failures to everyone who looked, this README's own earlier
+  diagnosis included. The notes use the query's vocabulary now, and
+  `reachability_hygiene` in `gen_annotations.py` fails the build over an
+  annotation whose evidence never carries a query term.
+
+  `SVD 协方差` and `特征值 定义 求法` left with them.
 
 ## Blind spots, kept deliberately
 
@@ -122,6 +151,8 @@ Two strata of accepted failure, both measured, both whitelisted with a `why`:
   `特征值 定义 求法` is the loud reminder.
 
 This is the reference behavior for judging future tokenizer swaps (jieba via
-the `cjk_tokenizer` config seam) and the rank-stage demotion: both should
-shrink the fused and displaced strata toward zero, at which point the ceilings
-ratchet down in the same change.
+the `cjk_tokenizer` config seam) and any further rank-stage work. The ratchet
+has turned three times: `fused` went to zero with its ceiling, and `displaced`
+came 12 → 9 → 8 → 4 as the query fix, the rank stage and then the fixture
+vocabulary landed. Whatever shrinks it next brings the ceiling down in that
+same change — not in a later tidy-up.

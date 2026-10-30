@@ -114,13 +114,9 @@ fn enqueue_cited_reply(fake: &FakeLlm, workspace: &Path, query: &str) -> String 
         .expect("chunk")
         .expect("row");
     let quote = quote_span(&chunk.text);
-    let content = format!(
-        "谱定理保证对称矩阵可以对角化，PCA 正是协方差矩阵的谱分解 [f0003]。
-
-Citations:
-[f0003] {quote}
-"
-    );
+    // The model selects spans; it does not write the answer. One line per
+    // span, and the renderer assembles them.
+    let content = format!("[f0003] {quote}\n");
     fake.enqueue_reply(200, completion_body(&content));
     quote
 }
@@ -136,7 +132,7 @@ fn the_fifteen_steps_land_the_tables_and_the_answer_verifies() {
     let report =
         ask_workspace(tempdir.path(), "谱定理", &network_allowed(), &fake).expect("ask runs");
     assert_eq!(report.status, "finished", "{report:?}");
-    assert!(report.fully_verified, "{report:?}");
+    assert!(report.fully_grounded, "{report:?}");
     assert_eq!(fake.call_count(), 1, "ask calls the provider exactly once");
     let answer_text = report.answer_text.as_deref().expect("answer text");
     assert!(
@@ -145,7 +141,7 @@ fn the_fifteen_steps_land_the_tables_and_the_answer_verifies() {
     );
     assert_eq!(report.citations.len(), 1);
     let citation = &report.citations[0];
-    assert!(citation.verified, "{report:?}");
+    assert!(citation.located, "{report:?}");
     assert_eq!(citation.quoted_text, quote);
     // The five-tuple — revision_hash / chunk_id / chunk_hash / locator /
     // quote — is what makes the citation locatable; every part must survive
@@ -247,7 +243,7 @@ fn the_fifteen_steps_land_the_tables_and_the_answer_verifies() {
     assert_eq!(payload["citations"], 1, "{payload}");
     assert_eq!(
         payload["failed"], 0,
-        "the one citation verified, so nothing failed in it: {payload}"
+        "the one citation located, so nothing failed in it: {payload}"
     );
 }
 
@@ -480,7 +476,7 @@ fn a_killed_ask_reads_back_failed_interrupted_on_reopen() {
 
 /// The failure matrix: 引用失败显式标记，不伪装成功. Every citation
 /// failure keeps the answer on record and marks the verdict explicitly —
-/// 引用失败时回答可以输出，但不是 fully verified.
+/// 引用失败时回答可以输出，但不是 fully grounded.
 mod citation_failures {
     use super::*;
 
@@ -494,17 +490,10 @@ mod citation_failures {
     fn a_quote_that_is_not_in_the_chunk_fails_by_name() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         ready_workspace(&tempdir);
-        let report = ask_with_content(
-            tempdir.path(),
-            "answer [f0003]
-
-Citations:
-[f0003] this span is not in the chunk
-",
-        );
+        let report = ask_with_content(tempdir.path(), "[f0003] this span is not in the chunk\n");
         assert_eq!(report.status, "failed", "{report:?}");
-        assert!(!report.fully_verified);
-        // The answer is still output, with its failure spelled.
+        assert!(!report.fully_grounded);
+        // The selection is still output, with its failure spelled.
         assert!(report.answer_text.is_some(), "the answer is not swallowed");
         assert_eq!(report.citations.len(), 1);
         assert_eq!(report.citations[0].status, "failed");
@@ -524,14 +513,7 @@ Citations:
     fn a_fabricated_marker_fails_as_citation_invalid() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         ready_workspace(&tempdir);
-        let report = ask_with_content(
-            tempdir.path(),
-            "answer [f9999]
-
-Citations:
-[f9999] a quote from nowhere
-",
-        );
+        let report = ask_with_content(tempdir.path(), "[f9999] a quote from nowhere\n");
         assert_eq!(report.status, "failed");
         assert_eq!(
             report.citations[0].detail.as_deref(),
@@ -540,10 +522,10 @@ Citations:
     }
 
     #[test]
-    fn a_marker_without_its_block_line_fails_explicitly() {
+    fn a_selection_line_without_a_quote_fails_explicitly() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         ready_workspace(&tempdir);
-        let report = ask_with_content(tempdir.path(), "answer [f0003] cited but never quoted");
+        let report = ask_with_content(tempdir.path(), "[f0003]");
         assert_eq!(report.status, "failed");
         assert_eq!(
             report.citations[0].detail.as_deref(),
@@ -553,13 +535,10 @@ Citations:
     }
 
     #[test]
-    fn a_malformed_block_line_fails_instead_of_hiding() {
+    fn prose_the_model_wrote_anyway_fails_instead_of_hiding() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         ready_workspace(&tempdir);
-        let report = ask_with_content(
-            tempdir.path(),
-            "answer [f0003]\n\n\nCitations:\n[f0003] a real quote\nnot a citation line",
-        );
+        let report = ask_with_content(tempdir.path(), "[f0003] a real quote\nnot a selection line");
         // The good citation may pass; the malformed line is an explicit
         // failure, never silently dropped (architecture 14.1 rule 4).
         assert_eq!(report.status, "failed", "{report:?}");
@@ -576,13 +555,12 @@ Citations:
         let tempdir = tempfile::tempdir().expect("tempdir");
         ready_workspace(&tempdir);
         let fake = FakeLlm::new();
-        let report = ask_workspace(
-            tempdir.path(),
-            "zzz-no-such-term-anywhere",
-            &network_allowed(),
-            &fake,
-        )
-        .expect("ask runs");
+        // One nonsense token, not several ordinary words. A query is a bag of
+        // terms, so `zzz-no-such-term-anywhere` matches whatever holds `no`,
+        // `such` or `term` — and the test would then be about the fixture
+        // instead of about the empty retrieval it is here to pin.
+        let report =
+            ask_workspace(tempdir.path(), "zzzqxvvv", &network_allowed(), &fake).expect("ask runs");
         assert_eq!(report.status, "failed");
         assert_eq!(
             report.failure_note.as_deref(),
@@ -881,9 +859,31 @@ fn a_successful_exchange_records_every_usage_column_on_the_turn() {
     // number that goes missing — not a NULL standing for "unreported" either
     // way.
     let fake = FakeLlm::new();
+    // A real span selection (an empty reply is `EmptyBody` and fails — that is
+    // a different case). The usage payload carries every column the provider
+    // can report, so a write that goes missing is a number that goes missing —
+    // not a NULL standing for "unreported" either way.
+    let search = momotaro_run::search_workspace(tempdir.path(), "谱定理", 10).expect("search");
+    let store = Store::open(tempdir.path().join(".momotaro/momotaro.db")).expect("open");
+    let chunk = store
+        .get_chunk(&search.hits[0].hit.chunk_id)
+        .expect("chunk")
+        .expect("row");
+    let content = format!("[f0003] {}\n", quote_span(&chunk.text));
     fake.enqueue_reply(
         200,
-        r#"{"id":"chatcmpl-ask","choices":[{"message":{"content":"an answer with no citations"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5,"cached_tokens":1,"billable_tokens":2,"completion_tokens_details":{"reasoning_tokens":7}}}"#,
+        serde_json::json!({
+            "id": "chatcmpl-ask",
+            "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 3,
+                "completion_tokens": 5,
+                "cached_tokens": 1,
+                "billable_tokens": 2,
+                "completion_tokens_details": {"reasoning_tokens": 7},
+            },
+        })
+        .to_string(),
     );
     let report =
         ask_workspace(tempdir.path(), "谱定理", &network_allowed(), &fake).expect("ask runs");
@@ -958,7 +958,7 @@ fn rebuilding_the_index_leaves_run_history_untouched() {
     let quote = enqueue_cited_reply(&fake, tempdir.path(), "谱定理");
     let report =
         ask_workspace(tempdir.path(), "谱定理", &network_allowed(), &fake).expect("ask runs");
-    assert!(report.fully_verified, "{report:?}");
+    assert!(report.fully_grounded, "{report:?}");
     let before = trace_workspace(tempdir.path(), &report.run_id).expect("trace");
 
     momotaro_run::rebuild_index(tempdir.path()).expect("rebuild");
@@ -1035,7 +1035,9 @@ fn a_malformed_summary_row_never_reaches_the_model_as_a_turn() {
             &momotaro_contracts::AnswerRecord {
                 answer_id: "ans-planted".to_owned(),
                 run_id: planted_run.clone(),
+                spans: Vec::new(),
                 text: "planted".to_owned(),
+                connective_bytes: 0,
                 prompt_hash: "ph".to_owned(),
                 created_at: PLANTED_AT,
                 decision_rationale: None,
@@ -1109,7 +1111,7 @@ fn a_malformed_summary_row_never_reaches_the_model_as_a_turn() {
         &request[..request.len().min(400)]
     );
     assert!(
-        request.contains("谱定理保证对称矩阵可以对角化"),
+        request.contains(first.answer_text.as_deref().unwrap_or_default()),
         "the raw turns do replay, so this really is a multi-round request"
     );
 }

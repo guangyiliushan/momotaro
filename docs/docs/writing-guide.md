@@ -5,7 +5,7 @@ type: meta
 sidebar_position: 5
 ---
 
-# Writing guide {/* #writing-guide */}
+# Writing guide
 
 This site is written for people, not for the codebase. Code changes
 constantly; the pages here describe the stable things — what the product is,
@@ -14,7 +14,7 @@ symbols, or line numbers. A fact may be checked against the repository while
 a page is being written, but no reader ever needs the repository to
 understand it.
 
-## Documentation principles {/* #principles */}
+## Documentation principles
 
 These rules outrank style. They are what keeps the site correct while the
 code keeps changing.
@@ -59,7 +59,7 @@ One exception stays closed on purpose: a future contributor-facing section
 could cite code the way developer guides in other projects do. That switch
 flips only by an explicit decision — no page may drift into it.
 
-## Languages {/* #languages */}
+## Languages
 
 - English is the default locale; Simplified Chinese (`zh-CN`) and Japanese
   (`ja`) are peers: every locale lives under its own path segment, and no
@@ -70,14 +70,14 @@ flips only by an explicit decision — no page may drift into it.
 - A page may ship in English first. Missing translations fall back to
   English until a milestone (such as a release) requires full parity.
 
-## The page contract {/* #page-contract */}
+## The page contract
 
 Every page:
 
 1. opens with one sentence that says what the page is for;
 2. carries a `description` in its front matter — one sentence, at most 150
    characters; it is what search results and the machine-readable index show;
-3. gives every heading an explicit ID (`## A title {/* #an-id */}`) so that
+3. gives every heading an explicit ID (`## A title`) so that
    links survive translation, which would otherwise change the auto-generated
    anchors;
 4. covers exactly one idea; a page that answers two questions is two pages;
@@ -85,7 +85,7 @@ Every page:
 6. declares its `type:` in the front matter — `concept`, `task`,
    `reference`, `troubleshooting` or `meta`.
 
-## Voice and style {/* #voice */}
+## Voice and style
 
 English pages follow the conversational, second-person, active-voice,
 present-tense register of the Google developer documentation style guide:
@@ -103,7 +103,7 @@ Chinese sentences, correct casing for product names (`Momotaro`, `GitHub`,
 Japanese pages follow the same principles; once the first Japanese content
 lands, its pass gets the same treatment — machine first, editing pass second.
 
-## Accessibility {/* #accessibility */}
+## Accessibility
 
 - Every informative image carries alt text that describes what the image
   *does*, not what it looks like; decorative images use an empty `alt=""`.
@@ -114,21 +114,19 @@ lands, its pass gets the same treatment — machine first, editing pass second.
   name or position in a list.
 - Write out `and` as a word, not `+`; screen readers handle words.
 
-## Diagrams {/* #diagrams */}
+## Diagrams
 
 - Diagrams are written as text (Mermaid) and live in the page like any
   other content; they translate with it.
-- Every diagram carries a title (`accTitle`) and a description
-  (`accDescr`) for readers who use assistive technology, and the sentence
-  next to it says what it shows — a page must read completely with every
-  diagram skipped.
+- No diagram-only information: the sentence next to a diagram says what it
+  shows, so a page must read completely with every diagram skipped.
 - Keep a diagram under ten nodes. Labels come from this site's
   vocabulary — component names in plain words — never file names, symbol
   names or code shorthand.
 - A diagram is added only when it earns its place: a structure, a flow or
   a lifecycle that the prose genuinely benefits from seeing drawn.
 
-## Terminology {/* #terminology */}
+## Terminology
 
 - The single source of terms is `terminology.yaml`; the glossary page is
   generated from it. Never introduce a second word for a concept that is
@@ -137,7 +135,7 @@ lands, its pass gets the same treatment — machine first, editing pass second.
 - When a term in Chinese has more than one common rendering, `terminology.yaml`
   decides; the decision is written down, not re-argued per page.
 
-## Translation-friendly by construction {/* #translation-friendly */}
+## Translation-friendly by construction
 
 Beyond explicit heading IDs: avoid idioms, cultural references, humour and
 seasonal examples; write dates and units unambiguously; let one sentence
@@ -145,11 +143,11 @@ carry one instruction. These rules exist so that the Chinese draft, the
 English page and the Japanese page can all be reviewed by the same
 checklist.
 
-## Code comments and names {/* #comments */}
+## Code comments and names
 
 Source files follow the same discipline as pages do.
 
-### Names {/* #names */}
+### Names
 
 Identifiers — modules, types, functions, constants, variables, tests,
 fixtures — never carry version codenames. A version number exists only as a
@@ -160,7 +158,7 @@ version in its name, it spells the version out — `…_at_schema_2`, never
 identifiers, comments and test messages carry the fact, not where it
 happened.
 
-### Comments {/* #comment-rules */}
+### Comments
 
 1. Layer by audience: the contract a caller sees goes in `///` doc comments
    (`//!` at the head of a crate or module); implementation motives,
@@ -193,7 +191,7 @@ happened.
    roots enable the `rustdoc::all` and `rustdoc::unescaped_backticks`
    warnings.
 
-## Review and tooling {/* #review */}
+## Review and tooling
 
 - Chinese pages are checked by zhlint and autocorrect; English pages by Vale
   (Google style package plus a project vocabulary) once English editing

@@ -5,7 +5,7 @@ type: task
 sidebar_position: 4
 ---
 
-# Inspect a run {/* #trace-a-run */}
+# Inspect a run
 
 Every [run](../glossary.md#run) is recorded so it can be answered after the
 fact. The `ask` answer prints the id; hand it to `trace`:
@@ -27,14 +27,12 @@ The replay answers four questions in order:
 
 Add `--json` when a script should read any of it.
 
-## The life of a run {/* #life */}
+## The life of a run
 
 Every run follows the same path, and its ending is recorded with it:
 
 ```mermaid
 stateDiagram-v2
-    accTitle: The life of a run
-    accDescr: A run is accepted, begins, and ends in exactly one terminal state recorded with it — finished or failed. A trace replays the run from that record; nothing is reconstructed from memory.
     [*] --> accepted
     accepted --> running
     running --> finished
@@ -46,7 +44,7 @@ stateDiagram-v2
 The state names are the recorded values themselves — they keep their
 spelling in every language, and `trace` replays them as written.
 
-## Why this matters {/* #why */}
+## Why this matters
 
 A run you cannot replay is a run you cannot trust — that is the whole point of
 recording runs at all. When an answer feels wrong, the trace turns "the model
@@ -57,7 +55,7 @@ has a different fix.
 The same command works for the runs behind `search --mode expand`, which
 records its one query-rewriting turn the same way.
 
-## Where to go next {/* #next */}
+## Where to go next
 
 - [The citation loop](../concepts/retrieval-and-citations.md) — what the four
   answers mean together.

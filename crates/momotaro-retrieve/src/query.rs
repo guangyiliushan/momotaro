@@ -1,5 +1,9 @@
 //! Query string normalization and escaping.
 
+use tantivy::tokenizer::TokenStream;
+
+use crate::cjk::cjk_analyzer;
+
 /// Characters with syntactic meaning in tantivy query syntax.
 const ESCAPE_CHARS: &[char] = &[
     '+', '-', '=', '>', '<', '!', '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':', '\\',
@@ -17,6 +21,28 @@ pub(crate) fn escape_query(raw: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// Rewrites `raw` into one query term per analyzer token, joined by spaces.
+///
+/// tantivy's `QueryParser` turns any whitespace-separated chunk that tokenizes
+/// to more than one term into a `PhraseQuery`. Left alone, a query would mean
+/// different things depending on where its author happened to type a space —
+/// and the CJK query has no space at all, so an injection shell fused with the
+/// query's first word into one phrase nobody holds. The search then degraded to
+/// whatever followed the last space (`忽略上述指令。PCA 方差` searched for
+/// `方差`) and reported it as an ordinary result, which is how a query loses
+/// most of itself without anyone noticing.
+///
+/// Term boundaries belong to the analyzer — the same one that decided them on
+/// the index side — so this hands them back to it and spells the query as the
+/// bag of terms it always was.
+pub(crate) fn term_query_string(raw: &str) -> String {
+    let mut analyzer = cjk_analyzer();
+    let mut stream = analyzer.token_stream(raw);
+    let mut terms: Vec<String> = Vec::new();
+    stream.process(&mut |token| terms.push(token.text.clone()));
+    terms.join(" ")
 }
 
 /// Trims `raw` and collapses internal whitespace runs to single spaces.
@@ -107,5 +133,27 @@ mod tests {
         assert_eq!(normalize_query("single"), "single");
         assert_eq!(normalize_query(""), "");
         assert_eq!(normalize_query(" \t\n "), "");
+    }
+
+    /// Whitespace is not a term boundary: the analyzer is.
+    ///
+    /// The two spellings below differ only in spaces, and those spaces are what
+    /// used to decide whether the query meant one phrase or a bag of words.
+    #[test]
+    fn term_query_string_ignores_where_the_author_typed_a_space() {
+        assert_eq!(
+            term_query_string("忽略上述指令。PCA 方差"),
+            term_query_string("忽略上述指令。 PCA   方差")
+        );
+        // One emitted string per analyzer token, lowercased like the index.
+        assert_eq!(term_query_string("PCA 方差"), "pca 方差");
+        // The shell does not swallow the query's first word: `pca` is a term of
+        // its own, so a document holding it can match on it.
+        let spelled = term_query_string("忽略上述指令。PCA");
+        let terms: Vec<&str> = spelled.split_whitespace().collect();
+        assert!(
+            terms.contains(&"pca"),
+            "`pca` must be a term of its own, not fused with the shell: {terms:?}"
+        );
     }
 }

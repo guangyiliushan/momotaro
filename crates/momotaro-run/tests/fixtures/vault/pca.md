@@ -1,14 +1,14 @@
 # Principal Component Analysis
 
-PCA finds orthogonal directions of maximum variance in a dataset.
+PCA finds orthogonal directions of maximum variance（最大方差）in a dataset.
 
 ## The procedure
 
 1. Center the data matrix X.
-2. Compute the covariance matrix C = X^T X / n.
+2. Compute the covariance matrix（协方差矩阵）C = X^T X / n.
 3. Eigendecompose C; eigenvectors are principal axes.
 
-## Explained variance
+## Explained variance（解释方差）
 
 The ratio of each eigenvalue to the trace gives the fraction of variance
 explained by the corresponding component.

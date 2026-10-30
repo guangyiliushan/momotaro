@@ -20,9 +20,9 @@
 //! so the row's is what lands.
 
 use momotaro_contracts::{
-    AnswerCitationRecord, AnswerRecord, ContextItemRecord, HistoryItemRecord, LlmTurnRecord,
-    RetrievalHitRecord, RetrievalRecord, RunEventRecord, RunRecord, RunTrace, TerminalEvent,
-    VerificationRecord,
+    AnswerCitationRecord, AnswerRecord, AnswerSpanRecord, ContextItemRecord, HistoryItemRecord,
+    LlmTurnRecord, RetrievalHitRecord, RetrievalRecord, RunEventRecord, RunRecord, RunTrace,
+    TerminalEvent, VerificationRecord,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
@@ -789,7 +789,7 @@ impl Store {
             tx.execute(
                 "INSERT INTO answer_citations (
                     answer_id, citation_index, source_key, revision_hash, chunk_id,
-                    chunk_hash, locator_json, quoted_text, verified
+                    chunk_hash, locator_json, quoted_text, located
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     answer.answer_id,
@@ -800,7 +800,34 @@ impl Store {
                     citation.chunk_hash,
                     citation.locator_json,
                     citation.quoted_text,
-                    citation.verified as i64,
+                    citation.located as i64,
+                ],
+            )?;
+        }
+        // The spans are the answer's body; `answers.text` above is their
+        // render. Written in the same transaction as the answer so a run never
+        // lands with a text and no spans to account for it.
+        for span in &answer.spans {
+            tx.execute(
+                "INSERT INTO answer_spans (
+                    answer_id, span_index, source_key, revision_hash, chunk_id,
+                    chunk_hash, sentence_start, sentence_end, byte_start, byte_end,
+                    source_text, verdict, verdict_note
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    answer.answer_id,
+                    span.span_index,
+                    span.source_key,
+                    span.revision_hash,
+                    span.chunk_id,
+                    span.chunk_hash,
+                    span.sentence_start,
+                    span.sentence_end,
+                    span.byte_start,
+                    span.byte_end,
+                    span.source_text,
+                    span.verdict.as_str(),
+                    span.verdict_note,
                 ],
             )?;
         }
@@ -1193,6 +1220,26 @@ impl Store {
                 answer.citations = statement
                     .query_map(params![answer.answer_id], map_citation)?
                     .collect::<Result<Vec<_>, _>>()?;
+                // The body is the span rows. A row written before schema 10
+                // has none, and its body is rebuilt from the citations — the
+                // same projection the writer used, so read and write agree.
+                // The derived copy reports zeroes and no reason, because the
+                // citation row never carried them; that is the fidelity the
+                // span table exists to restore, not a bug to paper over.
+                let mut statement = self.connection.prepare(
+                    "SELECT span_index, source_key, revision_hash, chunk_id, chunk_hash,
+                     sentence_start, sentence_end, byte_start, byte_end,
+                     source_text, verdict, verdict_note
+                     FROM answer_spans WHERE answer_id = ?1 ORDER BY span_index",
+                )?;
+                answer.spans = statement
+                    .query_map(params![answer.answer_id], map_span)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                if answer.spans.is_empty() {
+                    answer.spans = momotaro_contracts::spans_from_citations(&answer.citations);
+                }
+                answer.connective_bytes =
+                    momotaro_contracts::connective_bytes(&answer.spans, &answer.text);
                 Some(answer)
             }
             None => None,
@@ -1286,7 +1333,7 @@ const SELECT_ANSWER: &str = "SELECT
 
 const SELECT_CITATION: &str = "SELECT
         citation_index, source_key, revision_hash, chunk_id, chunk_hash,
-        locator_json, quoted_text, verified
+        locator_json, quoted_text, located
     FROM answer_citations";
 
 const SELECT_HISTORY_ITEM: &str = "SELECT
@@ -1523,7 +1570,9 @@ fn map_answer(row: &rusqlite::Row<'_>) -> Result<AnswerRecord, rusqlite::Error> 
     Ok(AnswerRecord {
         answer_id: row.get(0)?,
         run_id: row.get(1)?,
+        spans: Vec::new(),
         text: row.get(2)?,
+        connective_bytes: 0,
         prompt_hash: row.get(3)?,
         created_at: row.get(4)?,
         decision_rationale: row.get(5)?,
@@ -1542,7 +1591,39 @@ fn map_citation(row: &rusqlite::Row<'_>) -> Result<AnswerCitationRecord, rusqlit
         chunk_hash: row.get(4)?,
         locator_json: row.get(5)?,
         quoted_text: row.get(6)?,
-        verified: row.get::<_, i64>(7)? != 0,
+        located: row.get::<_, i64>(7)? != 0,
+    })
+}
+
+fn map_span(row: &rusqlite::Row<'_>) -> Result<AnswerSpanRecord, rusqlite::Error> {
+    let spelling: String = row.get(10)?;
+    let note: Option<String> = row.get(11)?;
+    // A spelling this build cannot read is not a verdict anybody asked for,
+    // so it lands as `UnGrounded` with the reason spelled — the span is
+    // carried, and the surprise is visible instead of guessed away.
+    let (verdict, verdict_note) = match momotaro_contracts::SpanVerdict::from_code(&spelling) {
+        Some(verdict) => (verdict, note),
+        None => (
+            momotaro_contracts::SpanVerdict::UnGrounded,
+            Some(match note {
+                Some(note) => format!("{note}; unreadable verdict {spelling:?}"),
+                None => format!("unreadable verdict {spelling:?}"),
+            }),
+        ),
+    };
+    Ok(AnswerSpanRecord {
+        span_index: row.get(0)?,
+        source_key: row.get(1)?,
+        revision_hash: row.get(2)?,
+        chunk_id: row.get(3)?,
+        chunk_hash: row.get(4)?,
+        sentence_start: row.get(5)?,
+        sentence_end: row.get(6)?,
+        byte_start: row.get(7)?,
+        byte_end: row.get(8)?,
+        source_text: row.get(9)?,
+        verdict,
+        verdict_note,
     })
 }
 
@@ -1943,7 +2024,7 @@ mod tests {
                 chunk_hash: "ch".to_owned(),
                 locator_json: "{}".to_owned(),
                 quoted_text: "quote".to_owned(),
-                verified: false,
+                located: false,
             });
         store
             .commit_run_answer(
@@ -2220,6 +2301,90 @@ mod tests {
             "a second turn with the same (run_id, seq) is refused"
         );
     }
+    #[test]
+    fn the_span_body_round_trips_including_the_verdict_note_and_the_ranges() {
+        // A span is not a citation: it carries where the check found the quote
+        // and why it is not grounded. A span rebuilt from citations drops
+        // both, so this fixture puts a non-zero range and a note on the row
+        // and requires them back — if the read path ever falls through to the
+        // projection, the zeroes give it away.
+        let (_dir, mut store) = temp_store();
+        let mut run = new_run("run-spans");
+        run.client_request_id = Some("req-spans".to_owned());
+        store
+            .commit_run_create(&run, &event(momotaro_contracts::run_event::ACCEPTED, 100))
+            .expect("create");
+        store
+            .commit_run_start(
+                "run-spans",
+                &event(momotaro_contracts::run_event::STARTED, 110),
+            )
+            .expect("start");
+
+        let mut span = momotaro_contracts::spans_from_citations(&[AnswerCitationRecord {
+            citation_index: 0,
+            source_key: "note:a.md".to_owned(),
+            revision_hash: "h1".to_owned(),
+            chunk_id: "c1".to_owned(),
+            chunk_hash: "ch1".to_owned(),
+            locator_json: "{}".to_owned(),
+            quoted_text: "sky is blue".to_owned(),
+            located: false,
+        }])
+        .remove(0);
+        span.sentence_start = 3;
+        span.sentence_end = 5;
+        span.byte_start = 40;
+        span.byte_end = 51;
+        span.verdict = momotaro_contracts::SpanVerdict::UnGrounded;
+        span.verdict_note = Some("text_not_locatable".to_owned());
+
+        let answer = AnswerRecord {
+            answer_id: "ans-spans".to_owned(),
+            run_id: "run-spans".to_owned(),
+            text: momotaro_contracts::render_answer_spans(std::slice::from_ref(&span)),
+            connective_bytes: 0,
+            prompt_hash: "ph".to_owned(),
+            created_at: 160,
+            decision_rationale: None,
+            assumptions: None,
+            supersedes: None,
+            spans: vec![span],
+            citations: Vec::new(),
+        };
+        store
+            .commit_run_answer(
+                "run-spans",
+                &answer,
+                &[],
+                &event(momotaro_contracts::run_event::ANSWER_FINALIZED, 170),
+            )
+            .expect("commit");
+
+        let trace = store
+            .run_trace("run-spans")
+            .expect("trace")
+            .expect("the run has a trace");
+        let back = trace.answer.expect("the answer came back");
+        let span = &back.spans[0];
+        assert_eq!(
+            (
+                span.sentence_start,
+                span.sentence_end,
+                span.byte_start,
+                span.byte_end
+            ),
+            (3, 5, 40, 51),
+            "the located ranges survive the round trip"
+        );
+        assert_eq!(
+            span.verdict_note.as_deref(),
+            Some("text_not_locatable"),
+            "the reason survives too — a derived span would report neither"
+        );
+        assert_eq!(span.verdict, momotaro_contracts::SpanVerdict::UnGrounded);
+    }
+
     /// Everything one run wrote, read back field for field: the write side
     /// and the read side must not be two truths (a column swap on either side
     /// goes red here).
@@ -2335,25 +2500,35 @@ mod tests {
             )
             .expect("verifications");
 
+        let citations = vec![AnswerCitationRecord {
+            citation_index: 0,
+            source_key: "note:a.md".to_owned(),
+            revision_hash: "h1".to_owned(),
+            chunk_id: "c1".to_owned(),
+            chunk_hash: "ch1".to_owned(),
+            locator_json: "{\"start_line\":1}".to_owned(),
+            quoted_text: "sky is blue".to_owned(),
+            located: true,
+        }];
+        let spans = momotaro_contracts::spans_from_citations(&citations);
+        // The text is the render of the spans, not free prose: under the
+        // span-as-body invariant a row that carries text no span accounts for
+        // is not a valid answer. Deriving both here keeps the fixture honest,
+        // so a round trip has nothing to disagree about.
+        let text = momotaro_contracts::render_answer_spans(&spans);
+        let connective_bytes = momotaro_contracts::connective_bytes(&spans, &text);
         let answer = AnswerRecord {
             answer_id: "ans-1".to_owned(),
             run_id: "run-1".to_owned(),
-            text: "the sky is Rayleigh-scattered [f0001: sky is blue]".to_owned(),
+            spans,
+            text,
+            connective_bytes,
             prompt_hash: "ph".to_owned(),
             created_at: 160,
             decision_rationale: None,
             assumptions: None,
             supersedes: None,
-            citations: vec![AnswerCitationRecord {
-                citation_index: 0,
-                source_key: "note:a.md".to_owned(),
-                revision_hash: "h1".to_owned(),
-                chunk_id: "c1".to_owned(),
-                chunk_hash: "ch1".to_owned(),
-                locator_json: "{\"start_line\":1}".to_owned(),
-                quoted_text: "sky is blue".to_owned(),
-                verified: true,
-            }],
+            citations,
         };
         let history = vec![HistoryItemRecord {
             history_id: "hist-1".to_owned(),
@@ -2492,7 +2667,9 @@ mod tests {
         AnswerRecord {
             answer_id: format!("ans-{run_id}"),
             run_id: run_id.to_owned(),
+            spans: Vec::new(),
             text: "the answer".to_owned(),
+            connective_bytes: 0,
             prompt_hash: "ph".to_owned(),
             created_at: 160,
             decision_rationale: None,

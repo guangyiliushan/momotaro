@@ -5,7 +5,7 @@ type: task
 sidebar_position: 4
 ---
 
-# 回放一次运行 {/* #trace-a-run */}
+# 回放一次运行
 
 每一次[运行](../glossary.md#run)都有记录，因此事后都能回答。`ask` 的答案会打印 id，把它交给 `trace`：
 
@@ -22,14 +22,12 @@ momotaro trace <run_id>
 
 脚本要读其中任何一项时，加 `--json`。
 
-## 一次运行的生命周期 {/* #life */}
+## 一次运行的生命周期
 
 每次运行都走同一条路，终点与它一起被记录下来：
 
 ```mermaid
 stateDiagram-v2
-    accTitle: 一次运行的生命周期
-    accDescr: 运行先被受理，随后开跑，最后以恰好一个写进记录的终态收场——finished 或 failed。回放从记录里复原这次运行；没有任何东西靠记忆重构。
     [*] --> accepted
     accepted --> running
     running --> finished
@@ -40,13 +38,13 @@ stateDiagram-v2
 
 状态名就是记录下来的取值本身——任何语言里都保持原拼写，`trace` 也按原样回放。
 
-## 为什么值得做 {/* #why */}
+## 为什么值得做
 
 回放不了的一次运行，是信不过的一次运行——记录运行的全部意义就在这里。当一个答案感觉不对劲时，回放把"模型说了奇怪的话"变成具体的问题：是检索漏了、上下文缺了合适的片段、还是某条论断没过检查。每一种都有不同的修法。
 
 同一条命令也适用于 `search --mode expand` 背后的运行——它那次改写查询的调用同样被记录下来。
 
-## 去哪里继续 {/* #next */}
+## 去哪里继续
 
 - [引用循环](../concepts/retrieval-and-citations.md)——四个答案合在一起意味着什么。
 - [带引用的提问](ask-with-citations.md)——运行 id 从哪里来。

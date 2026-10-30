@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 /// The schema version understood by this build.
-pub const CURRENT_SCHEMA_VERSION: u32 = 9;
+pub const CURRENT_SCHEMA_VERSION: u32 = 11;
 
 /// A versioned SQLite schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +292,28 @@ pub struct StatsReport {
     pub sources: Option<u64>,
     /// Number of chunks across current revisions, when known.
     pub chunks: Option<u64>,
+    /// Current sources that yielded at least one chunk.
+    ///
+    /// D86's first gate-level metric, stored as a **count** with
+    /// [`Self::sources`] as its denominator rather than as a ratio: a
+    /// floating ratio is not `Eq`, and comparing one is comparing a rounding
+    /// artefact. A source with no chunks is either an attachment (fine) or an
+    /// extraction failure (not fine); the count alone cannot tell them apart,
+    /// which is why it is a **signal** and not a gate — the threshold is
+    /// filled in from an observed distribution, never invented here.
+    pub sources_with_chunks: Option<u64>,
+    /// Stored answer spans, total.
+    ///
+    /// The denominator of [`Self::spans_ungrounded`].
+    pub spans_total: Option<u64>,
+    /// Stored answer spans whose verdict is `ungrounded`.
+    ///
+    /// D86's second gate-level metric. Not a quality score — a span is
+    /// `ungrounded` when it could not be located, which is an honest state,
+    /// not a wrong answer. A rising count says "the assembly is claiming more
+    /// than the bytes back", which is the failure this metric exists to
+    /// surface. **Stored as a count**, for the reason above.
+    pub spans_ungrounded: Option<u64>,
 }
 
 /// What kind of content a source revision holds.
@@ -405,7 +427,7 @@ impl std::str::FromStr for OriginClass {
 /// One immutable version of a source.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceRevision {
-    /// Canonical identity, e.g. vault-relative path or `arxiv:NNNN.NNNNN`.
+    /// Canonical identity, e.g. vault-relative path or `paper:NNNN.NNNNN`.
     pub source_key: String,
     /// `sha256` over normalized source bytes.
     pub revision_hash: String,
@@ -427,8 +449,72 @@ pub struct SourceRevision {
     pub metadata_json: String,
     /// Unix epoch seconds at ingestion.
     pub ingested_at: i64,
+    /// When **we** fetched these bytes (UTC epoch seconds).
+    ///
+    /// The consumption-side stamp. Together with [`Self::source_updated_at`]
+    /// and [`Self::version_anchor_raw`] it answers "what am I looking at, and
+    /// how stale might it be" — see [`SourceRevision::freshness_state`].
+    pub fetched_at: Option<i64>,
+    /// When the **source** says it last changed (UTC epoch seconds).
+    ///
+    /// Self-reported, and therefore not comparable with [`Self::fetched_at`]
+    /// as if both were clocks we own. Missing means missing: it is never
+    /// back-filled with the current time (D51).
+    pub source_updated_at: Option<i64>,
+    /// The version anchor **exactly as the source spelled it**.
+    ///
+    /// Free text on purpose — `Cochrane Handbook version 6.5 (2024); chapter
+    /// last updated October 2019` is two layers and slicing it apart would
+    /// invent a structure the source never claimed. Evidence a human reads,
+    /// never something sorted on.
+    pub version_anchor_raw: Option<String>,
     /// Whether this is the newest revision for the source key.
     pub is_current: bool,
+}
+
+/// What a revision's three freshness stamps add up to.
+///
+/// The stamps are **not** a freshness score. They are three facts of different
+/// kinds (our clock, the source's own claim, the source's own words), and the
+/// only honest summary of them is how much of the story is present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FreshnessState {
+    /// All three stamps are present; the reader can judge staleness.
+    Known,
+    /// At least one stamp is missing. **Not** "fresh" and not "stale" — the
+    /// question is unanswerable, which is its own state.
+    Unjudgeable,
+}
+
+impl FreshnessState {
+    /// The state as the wire vocabulary spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Known => "known",
+            Self::Unjudgeable => "unjudgeable",
+        }
+    }
+}
+
+impl SourceRevision {
+    /// How much of the freshness story these bytes carry.
+    ///
+    /// A missing stamp is **never** back-filled (D51): the current time would
+    /// claim the source was touched today, which is exactly the lie the stamp
+    /// exists to prevent.
+    pub fn freshness_state(&self) -> FreshnessState {
+        let complete = self.fetched_at.is_some()
+            && self.source_updated_at.is_some()
+            && self
+                .version_anchor_raw
+                .as_deref()
+                .is_some_and(|raw| !raw.trim().is_empty());
+        if complete {
+            FreshnessState::Known
+        } else {
+            FreshnessState::Unjudgeable
+        }
+    }
 }
 
 /// The searchable unit derived from one source revision.
@@ -1100,6 +1186,16 @@ pub fn estimate_tokens(text: &str) -> u32 {
 }
 
 /// What kind of work one run performs (the closed set).
+///
+/// The wire spelling is stable and append-only: a new mode is appended, never
+/// inserted, so stored `runs.mode` values never need rewriting.
+///
+/// **Contract-reserved modes.** `Plan` / `Research` / `Goal` / `Omakase` are in
+/// the closed set because the design names them (D194), not because this build
+/// runs them. [`RunMode::is_implemented`] is the honest answer to "does this
+/// build do that", and anything that starts a run must ask it first — an
+/// unimplemented mode is a structured refusal, never a silent fall-back onto a
+/// different mode. A silently-wrong mode is the failure this exists to prevent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunMode {
@@ -1111,6 +1207,14 @@ pub enum RunMode {
     PaperAdd,
     /// Spark card generation.
     Spark,
+    /// A plan artifact built from a task graph. Contract-reserved (D194).
+    Plan,
+    /// A survey run that freezes a protocol before it screens. Contract-reserved (D194).
+    Research,
+    /// A long-horizon goal run. Contract-reserved (D194).
+    Goal,
+    /// An automated run that settles the brief with a human first. Contract-reserved (D194).
+    Omakase,
 }
 
 impl RunMode {
@@ -1121,6 +1225,29 @@ impl RunMode {
             Self::Search => "search",
             Self::PaperAdd => "paper_add",
             Self::Spark => "spark",
+            Self::Plan => "plan",
+            Self::Research => "research",
+            Self::Goal => "goal",
+            Self::Omakase => "omakase",
+        }
+    }
+
+    /// Whether this build can actually run a mode in it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use momotaro_contracts::RunMode;
+    ///
+    /// assert!(RunMode::Ask.is_implemented());
+    /// assert!(RunMode::Search.is_implemented());
+    /// assert!(!RunMode::Goal.is_implemented(), "contract-reserved, not built");
+    /// ```
+    #[must_use]
+    pub const fn is_implemented(self) -> bool {
+        match self {
+            Self::Ask | Self::Search | Self::PaperAdd | Self::Spark => true,
+            Self::Plan | Self::Research | Self::Goal | Self::Omakase => false,
         }
     }
 }
@@ -1214,6 +1341,126 @@ impl TerminalEvent {
     }
 }
 
+/// The A2A three-zone partition of a run's lifecycle (D93).
+///
+/// `runs.status` stores five flat values; this is the **read** side of the same
+/// fact. The two layers are a projection, not a replacement: the store keeps
+/// what it keeps, and this is the classification a caller asks for. Nothing is
+/// migrated and nothing is rewritten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunZone {
+    /// Accepted but not started — nothing to do yet.
+    Pending,
+    /// In progress — the run is the thing that moves it.
+    Actionable,
+    /// Over — nothing in the run will change the outcome again.
+    Terminal,
+}
+
+impl RunZone {
+    /// The wire spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Actionable => "actionable",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+/// The zone a `runs.status` value belongs to (D93).
+///
+/// # Examples
+///
+/// ```
+/// use momotaro_contracts::{run_zone, RunZone};
+///
+/// assert_eq!(run_zone("accepted"), RunZone::Pending);
+/// assert_eq!(run_zone("running"), RunZone::Actionable);
+/// assert_eq!(run_zone("failed"), RunZone::Terminal);
+/// ```
+#[must_use]
+pub fn run_zone(status: &str) -> RunZone {
+    match status {
+        "accepted" => RunZone::Pending,
+        "running" => RunZone::Actionable,
+        // `finished`, `failed` and `cancelled` are all terminal: the run is
+        // over whichever way it went.
+        _ => RunZone::Terminal,
+    }
+}
+
+/// Whether the run is over, whichever way it went (D93).
+///
+/// "Finished" here means **over**, not "it worked" — that is exactly the split
+/// the two booleans exist to make. A run that failed is finished.
+///
+/// # Examples
+///
+/// ```
+/// use momotaro_contracts::run_is_finished;
+///
+/// assert!(run_is_finished("finished"));
+/// assert!(run_is_finished("failed"));
+/// assert!(!run_is_finished("running"));
+/// ```
+#[must_use]
+pub fn run_is_finished(status: &str) -> bool {
+    run_zone(status) == RunZone::Terminal
+}
+
+/// Whether the run is over **and** the work landed (D93).
+///
+/// The two halves are deliberately separate: `run_is_finished("failed")` is
+/// true while `run_is_success("failed")` is false. Collapsing them back into
+/// one word is what makes "ran to completion but got it wrong" unstatable.
+///
+/// # Examples
+///
+/// ```
+/// use momotaro_contracts::run_is_success;
+///
+/// assert!(run_is_success("finished"));
+/// assert!(!run_is_success("failed"), "over, but not a success");
+/// assert!(!run_is_success("running"), "not over yet");
+/// ```
+#[must_use]
+pub fn run_is_success(status: &str) -> bool {
+    status == "finished"
+}
+
+/// Why a run failed, as the wire vocabulary spells it.
+///
+/// Spelled `provider_budget_exhausted` and **not** `budget_exhausted` on
+/// purpose: `momotaro_context::OmittedReason::BudgetExhausted` already means
+/// "the context build dropped a fragment to fit the budget", which is a
+/// different thing in a different crate. Two reasons sharing one spelling is
+/// how a reader starts guessing which of them a log line meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RunFailureReason {
+    /// The run spent its declared provider-turn budget and stopped rather
+    /// than truncate silently (D76).
+    ProviderBudgetExhausted,
+}
+
+impl RunFailureReason {
+    /// The reason as the wire vocabulary spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderBudgetExhausted => "provider_budget_exhausted",
+        }
+    }
+
+    /// The reason a stored spelling names, or `None` for anything else.
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "provider_budget_exhausted" => Some(Self::ProviderBudgetExhausted),
+            _ => None,
+        }
+    }
+}
+
 /// The run-event vocabulary as one
 /// spelling source. `run.finished` / `run.failed` / `run.cancelled` are
 /// spelled by [`TerminalEvent`] and not repeated here — `cancelled` among
@@ -1268,6 +1515,18 @@ pub struct RunSpec {
     pub allow_network: bool,
     /// Whether tools may write files (this build defaults conservative: false).
     pub allow_write: bool,
+    /// How many provider turns this run may spend, declared up front.
+    ///
+    /// D7 says a run makes at most one provider turn — but a rule nobody can
+    /// count is a rule nobody can check. This is the **budget declaration**;
+    /// the actual count lives in `llm_turns.seq` and the `llm.*` events. The
+    /// two are deliberately the same measure: what the spec allows, what the
+    /// run spent.
+    ///
+    /// Separate from [`Self::max_context_tokens`] (how much room a single
+    /// turn gets) and from the retrieval budget (how many tool calls) — three
+    /// budgets, three units.
+    pub max_provider_turns: u32,
 }
 
 /// Why a [`RunSpec`] was refused. Typed so the caller reports the field,
@@ -1287,6 +1546,10 @@ pub enum RunSpecError {
     /// fixed levels honest.
     #[error("run spec: max_context_tokens is zero")]
     ZeroContext,
+    /// The provider-turn budget is zero — the run could not call the model
+    /// at all, so it was never going to answer.
+    #[error("run spec: max_provider_turns is zero")]
+    ZeroProviderTurns,
 }
 
 impl RunSpec {
@@ -1298,6 +1561,7 @@ impl RunSpec {
     /// - `RunSpecError::EmptyModel` when `model` is empty after trimming.
     /// - `RunSpecError::ZeroOutput` when `max_output_tokens` is zero.
     /// - `RunSpecError::ZeroContext` when `max_context_tokens` is zero.
+    /// - `RunSpecError::ZeroProviderTurns` when `max_provider_turns` is zero.
     ///
     /// # Examples
     ///
@@ -1314,6 +1578,7 @@ impl RunSpec {
     ///     max_context_tokens: 8192,
     ///     allow_network: false,
     ///     allow_write: false,
+    ///     max_provider_turns: 1,
     /// };
     /// assert!(spec.validate().is_ok());
     ///
@@ -1332,6 +1597,9 @@ impl RunSpec {
         }
         if self.max_context_tokens == 0 {
             return Err(RunSpecError::ZeroContext);
+        }
+        if self.max_provider_turns == 0 {
+            return Err(RunSpecError::ZeroProviderTurns);
         }
         Ok(())
     }
@@ -1639,8 +1907,18 @@ pub struct AnswerRecord {
     pub answer_id: String,
     /// The run that produced it.
     pub run_id: String,
-    /// The answer body as output.
+    /// The answer body: an ordered span sequence. This is what the answer
+    /// *is*; [`Self::text`] is only how it renders.
+    pub spans: Vec<AnswerSpanRecord>,
+    /// The rendered view of `spans`: the spans joined by the fixed connective
+    /// set. A projection, like `runs.status` — it can be recomputed from
+    /// `spans` and must never carry factual text that no span accounts for.
     pub text: String,
+    /// Bytes of `text` that are connective rather than span. The answer
+    /// budget caps this: connective text is the only channel through which
+    /// ungrounded prose could slip in, so it is counted, not trusted. Stored
+    /// as a count rather than a ratio so comparisons stay exact.
+    pub connective_bytes: i64,
     /// Hash of the prompt bytes the answer answered.
     pub prompt_hash: String,
     /// When it was written.
@@ -1675,7 +1953,207 @@ pub struct AnswerCitationRecord {
     /// The text the answer claims to be quoting.
     pub quoted_text: String,
     /// Whether deterministic verification passed this citation at save time.
-    pub verified: bool,
+    pub located: bool,
+}
+
+/// The mechanical verdict of one answer span.
+///
+/// This is produced **only** by `momotaro-verify`. Nothing that can ask a
+/// model is involved: a model cannot declare its own span grounded, because
+/// nothing in the verification path can ask one. The verdict is a required
+/// field on [`AnswerSpanRecord`] rather than an option — a span without a
+/// verdict is not renderable, so "half-checked" cannot reach the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpanVerdict {
+    /// The span's bytes match the stored chunk exactly, and the width is
+    /// within the span budget.
+    Grounded,
+    /// The span could not be checked, or its bytes did not match. This is an
+    /// honest state, not a failure of the answer.
+    UnGrounded,
+    /// Two sources carry the same span differently. Both are reported.
+    Contradicted,
+}
+
+impl SpanVerdict {
+    /// The verdict as the wire vocabulary spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Grounded => "grounded",
+            Self::UnGrounded => "ungrounded",
+            Self::Contradicted => "contradicted",
+        }
+    }
+
+    /// The verdict a stored spelling names, or `None` for anything else.
+    ///
+    /// `None` rather than a default: an unknown spelling is a row this build
+    /// cannot read, and guessing `UnGrounded` would turn a storage surprise
+    /// into a verdict nobody asked for.
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "grounded" => Some(Self::Grounded),
+            "ungrounded" => Some(Self::UnGrounded),
+            "contradicted" => Some(Self::Contradicted),
+            _ => None,
+        }
+    }
+}
+
+/// One span of an answer: **the answer body is an ordered sequence of these**.
+///
+/// A span is a slice of source bytes. The answer is what those slices say,
+/// joined by a fixed connective set; there is no factual text outside spans.
+/// That is what makes a claim mechanically checkable — the verifier compares
+/// the bytes, and there is nothing else in the answer to check.
+///
+/// Two fields describe where in the chunk the span sits: the sentence range
+/// (the source side is segmented into sentences) and the byte range (what the
+/// verifier actually compares). The sentence range is the identity a human
+/// reads; the byte range is the identity the check runs on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerSpanRecord {
+    /// Position of this span in the answer's span sequence.
+    pub span_index: i64,
+    /// Canonical source identity of the chunk this span comes from.
+    pub source_key: String,
+    /// Revision the span binds to. Binding to a revision is what keeps the
+    /// byte range stable across edits to the source.
+    pub revision_hash: String,
+    /// The chunk the span points at.
+    pub chunk_id: String,
+    /// Content hash the span claims for that chunk.
+    pub chunk_hash: String,
+    /// First sentence of the span inside the chunk (inclusive).
+    pub sentence_start: i32,
+    /// One past the last sentence of the span (exclusive).
+    pub sentence_end: i32,
+    /// First byte of the span inside the chunk text (inclusive).
+    pub byte_start: i32,
+    /// One past the last byte of the span (exclusive).
+    pub byte_end: i32,
+    /// The source bytes this span carries, verbatim.
+    pub source_text: String,
+    /// The mechanical verdict. Always present; a span without one is not
+    /// renderable.
+    pub verdict: SpanVerdict,
+    /// Why the verdict is not `Grounded`, when it is not. Present for
+    /// `UnGrounded` and `Contradicted` so the reason is auditable.
+    pub verdict_note: Option<String>,
+}
+
+/// The widest span, in bytes, that may still be called a span.
+///
+/// A span is a **stretch** of source bytes, not a whole passage: past some
+/// width the model is no longer selecting what answers the question, it is
+/// quoting around it. [`SpanVerdict::Grounded`] requires the width to be
+/// within this budget, so the bound is part of the verdict's meaning and not
+/// a tuning knob.
+///
+/// **The value is project-chosen, not standard-backed** (see `REV-03` D133:
+/// quality measures give formulas, never thresholds). It is a provisional
+/// bound to be replaced by an observed distribution, the same way the
+/// gate-level metrics get filled in.
+pub const SPAN_BYTE_LIMIT: usize = 4096;
+
+/// The connective set a rendered answer may use: a single space.
+///
+/// Deliberately tiny. The connective is the **only** non-span text an answer
+/// may contain, so the smaller the set the smaller the channel through which
+/// ungrounded prose could slip. A space claims nothing — no sentence boundary,
+/// no relationship between the spans — and that is exactly right: those are
+/// things the source would have to say, and the source says them *inside*
+/// spans.
+pub const SPAN_CONNECTIVES: [&str; 1] = [" "];
+
+/// The share of rendered text that may be connective before the answer is
+/// refused. A span sequence with no connectives reads as a list of fragments;
+/// one with too many is prose wearing a citation. The budget is what keeps
+/// the answer on the right side of that line.
+pub const CONNECTIVE_RATIO_LIMIT: f64 = 0.15;
+
+/// Renders an ordered span sequence into the answer's text view.
+///
+/// Nothing here is model-provided: the words are the spans' own bytes and the
+/// joiners come from [`SPAN_CONNECTIVES`]. That is what makes [`AnswerRecord::text`]
+/// a projection of `spans` instead of an independent body — recompute it and
+/// you get the same bytes.
+pub fn render_answer_spans(spans: &[AnswerSpanRecord]) -> String {
+    let mut out = String::new();
+    for (index, span) in spans.iter().enumerate() {
+        if index > 0 {
+            out.push_str(SPAN_CONNECTIVES[index % SPAN_CONNECTIVES.len()]);
+        }
+        out.push_str(&span.source_text);
+    }
+    out
+}
+
+/// The bytes of `rendered` that are connective rather than span.
+///
+/// Computed from the rendered bytes and the spans that produced them, so it
+/// cannot be asserted by whoever assembled the answer.
+pub fn connective_bytes(spans: &[AnswerSpanRecord], rendered: &str) -> i64 {
+    let span_bytes: usize = spans.iter().map(|s| s.source_text.len()).sum();
+    let total = rendered.len();
+    i64::try_from(total.saturating_sub(span_bytes)).unwrap_or_default()
+}
+
+/// The share of `rendered` that is connective rather than span.
+///
+/// Derived from the rendered bytes and the spans that produced them, so the
+/// assembler cannot assert it.
+pub fn connective_ratio(spans: &[AnswerSpanRecord], rendered: &str) -> f64 {
+    let total = rendered.len();
+    if total == 0 {
+        return 0.0;
+    }
+    let connective = connective_bytes(spans, rendered).max(0) as f64;
+    connective / total as f64
+}
+
+/// Whether the rendered answer spends more than [`CONNECTIVE_RATIO_LIMIT`] of
+/// its bytes on connective text.
+///
+/// Over the limit the answer is prose wearing citations: the spans are real,
+/// but the words joining them are carrying claims they cannot back. That is
+/// an `ungrounded` outcome (D69), and the caller must lower the span verdicts
+/// accordingly — a span's verdict describes the answer as assembled, not only
+/// the bytes in isolation.
+pub fn connective_ratio_over_limit(spans: &[AnswerSpanRecord], rendered: &str) -> bool {
+    connective_ratio(spans, rendered) > CONNECTIVE_RATIO_LIMIT
+}
+
+/// Rebuilds the span sequence from the citation rows of the same answer.
+///
+/// A citation and a span are the same fact seen from two sides: the citation
+/// is what the answer asserts about a source, the span is the bytes that
+/// assertion carries. Until spans have their own column, this projection is
+/// how a stored answer gets its body back — and it is the same projection the
+/// writer used, so read and write agree by construction.
+pub fn spans_from_citations(citations: &[AnswerCitationRecord]) -> Vec<AnswerSpanRecord> {
+    citations
+        .iter()
+        .enumerate()
+        .map(|(index, citation)| AnswerSpanRecord {
+            span_index: i64::try_from(index).unwrap_or_default(),
+            source_key: citation.source_key.clone(),
+            revision_hash: citation.revision_hash.clone(),
+            chunk_id: citation.chunk_id.clone(),
+            chunk_hash: citation.chunk_hash.clone(),
+            sentence_start: 0,
+            sentence_end: 0,
+            byte_start: 0,
+            byte_end: i32::try_from(citation.quoted_text.len()).unwrap_or_default(),
+            source_text: citation.quoted_text.clone(),
+            verdict: if citation.located {
+                SpanVerdict::Grounded
+            } else {
+                SpanVerdict::UnGrounded
+            },
+            verdict_note: None,
+        })
+        .collect()
 }
 
 /// One `history_items` row: an appended conversation turn — history is
@@ -1738,6 +2216,144 @@ pub struct RunTrace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn span(index: i64, text: &str) -> AnswerSpanRecord {
+        AnswerSpanRecord {
+            span_index: index,
+            source_key: "note:a.md".to_owned(),
+            revision_hash: "h1".to_owned(),
+            chunk_id: format!("c{index}"),
+            chunk_hash: format!("ch{index}"),
+            sentence_start: 0,
+            sentence_end: 1,
+            byte_start: 0,
+            byte_end: i32::try_from(text.len()).unwrap_or_default(),
+            source_text: text.to_owned(),
+            verdict: SpanVerdict::Grounded,
+            verdict_note: None,
+        }
+    }
+
+    #[test]
+    fn the_rendered_answer_carries_no_bytes_outside_its_spans() {
+        // The answer is what the spans say. Whatever the renderer adds is
+        // connective and comes from a fixed set, so there is nowhere for the
+        // model to put prose: a span is the only thing that reaches the text.
+        let spans = vec![span(0, "sky is blue"), span(1, "water is wet")];
+        let rendered = render_answer_spans(&spans);
+        assert_eq!(rendered, "sky is blue water is wet");
+        assert_eq!(connective_bytes(&spans, &rendered), 1);
+    }
+
+    #[test]
+    fn the_spans_render_in_their_declared_order() {
+        // Order is the sequence's order, not `span_index`. The index is an
+        // identity; the sequence is the body. Shuffling the indices must not
+        // shuffle the answer.
+        let spans = vec![span(2, "third"), span(0, "first"), span(1, "second")];
+        assert_eq!(render_answer_spans(&spans), "third first second");
+    }
+
+    #[test]
+    fn the_connective_count_is_derived_from_bytes_not_asserted() {
+        let spans = vec![span(0, "sky is blue")];
+        let rendered = render_answer_spans(&spans);
+        assert_eq!(connective_bytes(&spans, &rendered), 0);
+
+        // Prose the spans do not account for is *measured*, not believed: the
+        // count comes from the bytes on hand, so a writer cannot claim a low
+        // ratio while shipping an answer that is mostly its own words.
+        let prose = "the sky is Rayleigh-scattered [f0001: sky is blue]";
+        assert_eq!(connective_bytes(&spans, prose), 39);
+    }
+
+    #[test]
+    fn a_connective_heavy_rendering_crosses_the_budget() {
+        // One real span, then prose the spans do not account for. Past the
+        // limit the answer is prose wearing a citation: the words joining the
+        // spans are carrying claims nothing checked.
+        let spans = vec![span(0, "ok")];
+        let mostly_prose = format!("{} {}", "the rest of this sentence is ours.", "ok");
+        assert!(mostly_prose.len() > 2);
+        let rendered = "the rest of this sentence is ours. ok";
+        assert!(connective_ratio(&spans, rendered) > CONNECTIVE_RATIO_LIMIT);
+        assert!(connective_ratio_over_limit(&spans, rendered));
+    }
+
+    #[test]
+    fn a_rendered_span_sequence_is_within_the_connective_budget() {
+        // The projection itself contributes only the joiners, which is the
+        // whole point of a tiny connective set: the renderer cannot spend the
+        // budget, so a normal answer is never refused for its own joiners.
+        let spans = vec![span(0, "sky is blue"), span(1, "water is wet")];
+        let rendered = render_answer_spans(&spans);
+        assert_eq!(connective_bytes(&spans, &rendered), 1);
+        assert!(!connective_ratio_over_limit(&spans, &rendered));
+    }
+
+    #[test]
+    fn an_empty_rendering_is_not_over_the_connective_budget() {
+        // No answer, no ratio. A divide-by-zero would turn "nothing rendered"
+        // into a refusal, which is the wrong shape for an empty result.
+        assert_eq!(connective_ratio(&[], ""), 0.0);
+        assert!(!connective_ratio_over_limit(&[], ""));
+    }
+
+    #[test]
+    fn a_span_has_a_width_budget_that_bounds_the_grounded_verdict() {
+        // `Grounded` claims the model selected what answers the question. A
+        // quote that matched but swallows a whole passage is quoting around
+        // the question, so the bound is part of the verdict's meaning.
+        let too_wide = "x".repeat(SPAN_BYTE_LIMIT + 1);
+        assert!(too_wide.len() > SPAN_BYTE_LIMIT);
+        assert!("x".repeat(SPAN_BYTE_LIMIT).len() <= SPAN_BYTE_LIMIT);
+    }
+
+    #[test]
+    fn a_verdict_has_exactly_three_spellings() {
+        // No wildcard: a fourth verdict must be spelled here and in `as_str`,
+        // which is what keeps `ungrounded` from being swallowed by a catch-all.
+        for (verdict, spelling) in [
+            (SpanVerdict::Grounded, "grounded"),
+            (SpanVerdict::UnGrounded, "ungrounded"),
+            (SpanVerdict::Contradicted, "contradicted"),
+        ] {
+            assert_eq!(verdict.as_str(), spelling);
+        }
+    }
+
+    #[test]
+    fn spans_rebuild_from_citations_verdict_and_all() {
+        let citations = vec![
+            AnswerCitationRecord {
+                citation_index: 0,
+                source_key: "note:a.md".to_owned(),
+                revision_hash: "h1".to_owned(),
+                chunk_id: "c1".to_owned(),
+                chunk_hash: "ch1".to_owned(),
+                locator_json: "{}".to_owned(),
+                quoted_text: "sky is blue".to_owned(),
+                located: true,
+            },
+            AnswerCitationRecord {
+                citation_index: 1,
+                source_key: "note:b.md".to_owned(),
+                revision_hash: "h2".to_owned(),
+                chunk_id: "c2".to_owned(),
+                chunk_hash: "ch2".to_owned(),
+                locator_json: "{}".to_owned(),
+                quoted_text: "water is wet".to_owned(),
+                located: false,
+            },
+        ];
+        let spans = spans_from_citations(&citations);
+        assert_eq!(spans.len(), 2);
+        // The verdict follows the citation's check, so a citation that failed
+        // never comes back as a grounded span.
+        assert_eq!(spans[0].verdict, SpanVerdict::Grounded);
+        assert_eq!(spans[1].verdict, SpanVerdict::UnGrounded);
+        assert_eq!(spans[1].source_text, "water is wet");
+    }
 
     #[test]
     fn schema_version_round_trips_as_scalar() {
@@ -2402,6 +3018,79 @@ mod tests {
     }
 
     #[test]
+    fn every_run_status_projects_to_a_zone_and_the_two_booleans() {
+        // D93 asks for this explicitly: the projection is a pure function over
+        // the five stored values, so every mapping is pinned here. A sixth
+        // status added without being added to this table is the "漏映射" the
+        // ruling warns about — the last assertion is the one that catches it.
+        let five = [
+            ("accepted", RunZone::Pending, false, false),
+            ("running", RunZone::Actionable, false, false),
+            ("finished", RunZone::Terminal, true, true),
+            ("failed", RunZone::Terminal, true, false),
+            ("cancelled", RunZone::Terminal, true, false),
+        ];
+        for (status, zone, finished, success) in five {
+            assert_eq!(run_zone(status), zone, "{status} zone");
+            assert_eq!(run_is_finished(status), finished, "{status} finished");
+            assert_eq!(run_is_success(status), success, "{status} success");
+        }
+
+        // "Over" and "it worked" are separate axes, not one word: there must
+        // be a status that is finished without being a success.
+        assert!(
+            five.iter().any(|(_, _, f, s)| *f && !*s),
+            "the split needs a run that is over without having worked"
+        );
+
+        // The wildcard arm maps anything unrecognised to `Terminal`, so the
+        // guard against a missed mapping has to be on the *names*: every status
+        // this crate can project to must be one of the five above.
+        for name in [
+            "accepted",
+            "running",
+            TerminalEvent::Finished.projected_status(),
+            TerminalEvent::Failed.projected_status(),
+            TerminalEvent::Cancelled.projected_status(),
+        ] {
+            assert!(
+                five.iter().any(|(s, ..)| *s == name),
+                "{name} is a status this crate produces but does not classify"
+            );
+        }
+    }
+
+    #[test]
+    fn the_implemented_modes_are_pinned_and_the_reserved_ones_are_named() {
+        // `is_implemented` is what stops a contract-reserved mode from being
+        // started by accident. The split is pinned in full so a mode cannot
+        // quietly become "supported" — or quietly stop being — without this
+        // line going red.
+        let implemented = [
+            RunMode::Ask,
+            RunMode::Search,
+            RunMode::PaperAdd,
+            RunMode::Spark,
+        ];
+        let reserved = [
+            RunMode::Plan,
+            RunMode::Research,
+            RunMode::Goal,
+            RunMode::Omakase,
+        ];
+        for mode in implemented {
+            assert!(mode.is_implemented(), "{} must run", mode.as_str());
+        }
+        for mode in reserved {
+            assert!(
+                !mode.is_implemented(),
+                "{} is contract-reserved and must not claim to run",
+                mode.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn the_run_enums_spell_the_same_on_the_wire() {
         // No wildcard in these matches: a new variant fails to compile here,
         // and the serde pin below then forces its spelling to agree.
@@ -2410,9 +3099,20 @@ mod tests {
             RunMode::Search,
             RunMode::PaperAdd,
             RunMode::Spark,
+            RunMode::Plan,
+            RunMode::Research,
+            RunMode::Goal,
+            RunMode::Omakase,
         ] {
             match mode {
-                RunMode::Ask | RunMode::Search | RunMode::PaperAdd | RunMode::Spark => {}
+                RunMode::Ask
+                | RunMode::Search
+                | RunMode::PaperAdd
+                | RunMode::Spark
+                | RunMode::Plan
+                | RunMode::Research
+                | RunMode::Goal
+                | RunMode::Omakase => {}
             }
             assert_eq!(
                 serde_json::to_string(&mode).expect("serialize"),
@@ -2529,12 +3229,13 @@ mod tests {
             max_context_tokens: 8192,
             allow_network: false,
             allow_write: false,
+            max_provider_turns: 1,
         };
         assert_eq!(
             serde_json::to_string(&spec).expect("serialize"),
             "{\"mode\":\"ask\",\"query\":\"q\",\"slot\":\"answer\",\"thinking\":\"medium\",\
              \"model\":\"m\",\"max_output_tokens\":4096,\"max_context_tokens\":8192,\
-             \"allow_network\":false,\"allow_write\":false}"
+             \"allow_network\":false,\"allow_write\":false,\"max_provider_turns\":1}"
         );
     }
 
@@ -2550,6 +3251,7 @@ mod tests {
             max_context_tokens: 1,
             allow_network: false,
             allow_write: false,
+            max_provider_turns: 1,
         };
         assert_eq!(good.validate(), Ok(()));
 

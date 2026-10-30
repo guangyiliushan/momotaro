@@ -798,6 +798,9 @@ pub fn stats(root: impl AsRef<Path>) -> Result<StatsReport, RunError> {
             initialized: false,
             sources: None,
             chunks: None,
+            sources_with_chunks: None,
+            spans_total: None,
+            spans_ungrounded: None,
         });
     }
 
@@ -1291,6 +1294,9 @@ mod tests {
             initialized: true,
             sources: Some(3),
             chunks: Some(5),
+            sources_with_chunks: Some(2),
+            spans_total: Some(4),
+            spans_ungrounded: Some(1),
         };
         let line = format_stats(&report);
         assert!(!line.contains('\u{1b}'), "{line:?}");

@@ -6,11 +6,11 @@ description: Momotaro 文档——一个本地优先的科研工作台。从任�
 type: meta
 ---
 
-# Momotaro {/* #momotaro */}
+# Momotaro
 
 一个为认真学习者打造的本地优先科研工作台。你判断、批注、写作；agent 检索、对照、提议。这里的页面只描述稳定的行为——你今天就能依赖的概念、决策与工作流。
 
-## 从这里开始 {/* #route-table */}
+## 从这里开始
 
 | 我想要…… | 去哪里 |
 |---|---|
@@ -27,10 +27,10 @@ type: meta
 | 让库跟上我的笔记 | [保持库与笔记同步](guides/keep-the-store-current.md) |
 | 救活一个坏掉的检索索引 | [重建与恢复](guides/rebuild-and-recover.md) |
 
-## 语言 {/* #languages */}
+## 语言
 
 每页都以 English、简体中文与日本語发布——各自住在自己的路径下，谁也不占优待。顶栏的语言菜单在它们之间切换；未翻译的页面回落到英文。
 
-## 给贡献者 {/* #contributors */}
+## 给贡献者
 
 这里每页遵守的规则——语气、无障碍、术语、翻译——在[写作规范](writing-guide.md)。

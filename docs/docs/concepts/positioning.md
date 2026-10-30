@@ -5,7 +5,7 @@ type: concept
 sidebar_position: 1
 ---
 
-# What Momotaro is {/* #what-momotaro-is */}
+# What Momotaro is
 
 Momotaro is a local-first research workbench for serious study. It turns your
 notes and papers into a desk that is searchable, citable and verifiable: you
@@ -13,7 +13,7 @@ judge, annotate and write; the agent retrieves, compares and proposes.
 
 > Deterministic first. AI where it matters. Every answer traceable.
 
-## What it is not {/* #not */}
+## What it is not
 
 - **Not a general research agent.** Momotaro does not run a task to the end on
   your behalf — no unattended experiments, no papers written for you.
@@ -26,7 +26,7 @@ judge, annotate and write; the agent retrieves, compares and proposes.
   single-user, and collaboration is an explicit future topic — not a hidden
   default.
 
-## The desk, not the driver {/* #desk-not-driver */}
+## The desk, not the driver
 
 | | A general research agent | Momotaro |
 |---|---|---|
@@ -36,7 +36,7 @@ judge, annotate and write; the agent retrieves, compares and proposes.
 | Knowledge | the model's word | only your writing is fact; AI output stays proposed |
 | Unit of work | a free tool loop | a project is the desk; a run is one auditable piece of work |
 
-## Three commitments {/* #commitments */}
+## Three commitments
 
 1. **Deterministic first.** Searching, chunking and citation checks consume no
    model tokens. The model is used where judgment is genuinely needed — at
@@ -48,14 +48,14 @@ judge, annotate and write; the agent retrieves, compares and proposes.
    [citations](../glossary.md#citation), and each citation points at exact
    bytes that were verifiable at the time of the [run](../glossary.md#run).
 
-## Where it is going {/* #direction */}
+## Where it is going
 
 The 0.x line is the engine phase, driven through the command line. The first
 full release is a cross-platform desktop app plus the CLI; a read-mostly
 mobile companion follows later. There is no product web backend — nothing
 leaves your machine except what you choose to publish.
 
-## Next {/* #next */}
+## Next
 
 The concepts behind the desk — sources, revisions, chunks, runs — are
 collected in [the domain model](domain-model.md).

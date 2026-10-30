@@ -5,13 +5,13 @@ type: reference
 sidebar_position: 1
 ---
 
-# Command line reference {/* #cli */}
+# Command line reference
 
 All commands share one binary and the same three global options. This page
 lists what exists, what it takes, and how it exits — deliberately not every
 flag a future version may add.
 
-## Commands {/* #commands */}
+## Commands
 
 | Command | Does |
 |---|---|
@@ -37,7 +37,7 @@ Command-specific options worth knowing:
 - `doctor`: `--coverage` reports what the most recent index run did to each
   file, instead of checking health.
 
-## Global options {/* #global-options */}
+## Global options
 
 | Option | Meaning |
 |---|---|
@@ -46,7 +46,7 @@ Command-specific options worth knowing:
 | `--allow-network` | Allow network access for commands that need it. Beta keeps it off by default. |
 | `-h`, `--help` / `-V`, `--version` | Help and version. |
 
-## Exit codes {/* #exit-codes */}
+## Exit codes
 
 - **`0`** success, **`1`** failure — with one deliberate exception: `doctor`
   gates on *health*, so an uninitialized or invalid workspace exits `1` even
@@ -61,7 +61,7 @@ Command-specific options worth knowing:
 The reasoning behind these rules — and the recovery path they exist for — is
 on [rebuild and recover](../guides/rebuild-and-recover.md).
 
-## Example: `stats` {/* #example-stats */}
+## Example: `stats`
 
 ```text
 status: ready
@@ -75,7 +75,7 @@ chunks: 2
 `--json` carries the same fields. A count that is not yet known prints
 `unknown` on both outlets — never a fabricated `0`.
 
-## Where to go next {/* #next */}
+## Where to go next
 
 - [Configuration](configuration.md) — the `momotaro.toml` file.
 - [Quickstart](../guides/quickstart.md) — the commands in sequence.

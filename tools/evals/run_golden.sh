@@ -162,26 +162,80 @@ PY
 # the whitelist's size is capped per reason (any growth trips). MRR floors sit
 # below the measured baseline by less than one minimal step (0.05/N: one query
 # demoted rank-4 to rank-5); seat ceilings sit exactly at baseline.
-# Re-baselined 2026-10-09 on the grown golden set (15 main / 45 injection;
-# eigenvalue.md + kernel-def.md added, `特征值 特征向量` / `kernel` re-anchored,
-# three multi-key sufficient sets):
-#   - main recall@5 0.9167 -> 0.9000 / mrr 0.8333 -> 0.8222: the two accepted
-#     displaced rows (`PCA 方差`, `特征值 定义 求法`) are whitelisted by name
-#     now — the average can no longer absorb a new miss;
-#   - injection: 12 fused (whitespace-free base queries; analyzer phrase
-#     fusion) + 12 displaced rows whitelisted; recall@5 0.5000 / mrr 0.3667
-#     stay the honest low baseline, but any NEW failure trips;
-#   - seat counts (24 / 8 / 38) are exact; any growth trips.
+# Re-baselined 2026-10-29 after the query stopped degrading into its last word.
+# `QueryParser` turns any whitespace-separated chunk that tokenizes to more than
+# one term into a `PhraseQuery`, and a CJK query has no whitespace, so an
+# injection shell fused with the query's first word into a phrase nobody holds.
+# The search then answered on whatever followed the last space — `忽略上述指令。
+# PCA 方差` searched for `方差` — and reported it as an ordinary result. Terms now
+# come from the analyzer, one term per token, so a query means the same thing
+# however its author spaced it.
+#
+# What that moved, and why the numbers below are what they are:
+#   - injection fused 12 -> 0: that stratum was entirely this bug. The ceiling
+#     ratchets to 0, so any phrase-shaped query trips it again;
+#   - injection displaced 12 -> 9 (recall@5 0.5000 -> 0.8667, mrr 0.3667 ->
+#     0.4107). What is left is three base queries under three shells, and
+#     `PCA 方差` fails on the main set too — the shell is no longer a cause. The
+#     ceiling ratchets to the measured 11 (2 main + 9 injection);
+#   - main mrr 0.8222 -> 0.8556 on unchanged recall, so both floors rise to sit
+#     within one minimal step (0.05/N) of the new baseline. Left where they
+#     were, the gate would not notice the gain being lost;
+#   - hard-negative seats 24 -> 25: the honest price of not making phrases. A
+#     multi-term chunk is now matched term by term, so one more semi-relevant
+#     note holds a seat on the main set. Raised to the measured count, not
+#     beyond it;
+#   - injection poison seats 38 -> 87: this gauge changed what it measures. The
+#     shelled queries used to degrade to a single word and so never searched for
+#     their own shell text; the poison samples had nothing to match. They match
+#     now because the query is actually run, and the poison notes carry that
+#     text verbatim. Retrieval retrieving is not the injection defence — the
+#     untrusted-content delimiters and the prompt hierarchy are (context
+#     pipeline, `render_fragments`), and this set is the retrieval surface only.
+#
+# Re-baselined 2026-10-30 after the rank stage stopped spending the window on
+# one source's duplicates. Each source's best chunk is now taken before any
+# source's second, so a note that cuts into several matching chunks cannot hold
+# the window and starve the other sources. That is a selection rule only: the
+# score is untouched, and the documented total order still decides how the
+# selected rows print.
+#
+# What that moved, and why the numbers below are what they are:
+#   - `特征值 定义 求法` lost three of its four rows and every remaining window
+#     is five distinct sources. Same-source crowding is gone; what is left is
+#     which source ranks high enough (`PCA 方差` has pca.md at six);
+#   - known-miss displaced ratchets 11 -> 8 in the same change;
+#   - the three seat ceilings go UP, and that is the price rather than a
+#     regression to paper over. The window used to spend its seats on one
+#     source's duplicate chunks, which is exactly what kept the lower-ranked
+#     sources out — semi_relevant, no_info and the poison samples among them.
+#     Stop wasting the seats and the window reaches further down the source
+#     list, where those live. Report A is the gate; report B is the harm gauge
+#     that says how much of the window is noise, and it is now telling the
+#     truth about a ranking problem instead of being suppressed by duplication.
+#
+# The same day, three annotations turned out to be unreachable rather than
+# outranked: `pca.md` answered `PCA 方差` while never writing 方差 (it said
+# "covariance matrix"), and the eigenvalue notes discussed the definition and
+# the method without using those words. Retrieval matches on terms, so no
+# ranking rule could have put them first. The notes now use the vocabulary the
+# questions are asked with, `gen_annotations.py` refuses an annotation whose
+# evidence never carries the query's terms, and main is at recall 1.0. What is
+# left in injection is the attack surface itself: two poison samples carry the
+# shell text verbatim and take two of the five seats.
+#
+# Everything below is a measured count set exactly at the reading. Any growth
+# trips; nothing here is a tolerance.
 "$python" "$repo/tools/evals/gen_annotations.py" --check
 "$python" "$repo/tools/evals/eval_search.py" \
   --workspace "$scratch" \
   --cli "$binary" \
   --k 5 \
   --fail-on-unexpected-miss \
-  --max-known-miss-fused 12 \
-  --max-known-miss-displaced 14 \
-  --floor-mrr 0.822 \
-  --floor-inj-mrr 0.366 \
-  --max-hn-seats 24 \
-  --max-poison-seats 8 \
-  --max-inj-poison-seats 38
+  --max-known-miss-fused 0 \
+  --max-known-miss-displaced 4 \
+  --floor-mrr 0.877 \
+  --floor-inj-mrr 0.410 \
+  --max-hn-seats 31 \
+  --max-poison-seats 14 \
+  --max-inj-poison-seats 90

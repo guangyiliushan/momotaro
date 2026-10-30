@@ -16,7 +16,7 @@ use momotaro_contracts::{Chunk, OriginClass, RetrievalHit};
 use crate::RetrieveError;
 use crate::boost;
 use crate::cjk::{CJK_TOKENIZER_NAME, cjk_analyzer};
-use crate::query::{escape_query, is_searchable, normalize_query};
+use crate::query::{escape_query, is_searchable, normalize_query, term_query_string};
 use crate::schema::{self, Fields};
 
 /// Sentinel file tantivy writes on index creation.
@@ -359,8 +359,12 @@ impl SearchIndex {
                 ],
             )
         });
-        let escaped = escape_query(&normalized);
-        let (parsed, fell_back) = parse_query_with_fallback(parser, &escaped, &normalized);
+        // One term per analyzer token: `QueryParser` would otherwise turn every
+        // multi-term whitespace chunk into a phrase, and a query's meaning would
+        // depend on where its author typed a space (see `term_query_string`).
+        let terms = term_query_string(&normalized);
+        let escaped = escape_query(&terms);
+        let (parsed, fell_back) = parse_query_with_fallback(parser, &escaped, &terms);
         self.parse_fell_back
             .store(fell_back, AtomicOrdering::Relaxed);
         let Some(parsed) = parsed else {
@@ -397,7 +401,30 @@ impl SearchIndex {
                 .then_with(|| a.source_key.cmp(&b.source_key))
                 .then_with(|| a.ordinal.cmp(&b.ordinal))
         });
-        rows.truncate(top_k);
+        // Rank stage, not scoring: the score above is untouched and stays the
+        // retrieval score. What changes is which matches reach the window —
+        // each source's best chunk is taken before any source's second, so a
+        // note that happens to cut into several matching chunks cannot hold the
+        // whole window and starve the other sources. Depth is a row's position
+        // within its own source in score order; the original index is the tie
+        // break, so the selection is deterministic and the documented total
+        // order still decides how the selected rows are printed.
+        let mut depth_of_source: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut keyed: Vec<(usize, usize, Row)> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let slot = depth_of_source.entry(row.source_key.clone()).or_insert(0);
+                let depth = *slot;
+                *slot += 1;
+                (depth, index, row)
+            })
+            .collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        keyed.truncate(top_k);
+        keyed.sort_by_key(|keyed| keyed.1);
+        let rows: Vec<Row> = keyed.into_iter().map(|(_, _, row)| row).collect();
         Ok(rows
             .into_iter()
             .enumerate()
@@ -456,7 +483,150 @@ fn stored_ordinal(doc: &TantivyDocument, field: Field) -> Result<u32, RetrieveEr
 
 #[cfg(test)]
 mod tests {
+    use momotaro_contracts::{Chunk, OriginClass};
+
     use super::*;
+
+    /// One owner chunk of `text` for `source_key`.
+    fn owner_chunk(chunk_id: &str, source_key: &str, text: &str) -> Chunk {
+        Chunk {
+            chunk_id: chunk_id.to_string(),
+            source_key: source_key.to_string(),
+            revision_hash: "rev-1".to_string(),
+            ordinal: 0,
+            heading_path: None,
+            text: text.to_string(),
+            locator_json: r#"{"start_byte":0}"#.to_string(),
+            chunk_hash: format!("hash-{chunk_id}"),
+            token_estimate: 10,
+        }
+    }
+
+    /// A ram index of one owner note per entry, each with its own chunks.
+    fn owner_index(docs: &[(&str, &[&str])]) -> SearchIndex {
+        let si = crate::tests::ram_index();
+        let mut writer = si.writer(20_000_000).expect("writer");
+        for (source_key, texts) in docs {
+            let chunks: Vec<Chunk> = texts
+                .iter()
+                .enumerate()
+                .map(|(ordinal, text)| {
+                    let mut chunk = owner_chunk(source_key, source_key, text);
+                    chunk.ordinal = ordinal as u32;
+                    chunk.chunk_id = format!("{source_key}#{ordinal}");
+                    chunk
+                })
+                .collect();
+            SearchIndex::upsert_source(
+                &mut writer,
+                si.fields(),
+                source_key,
+                "T",
+                OriginClass::Owner,
+                &chunks,
+            )
+            .expect("upsert");
+        }
+        writer.commit().expect("commit");
+        si
+    }
+
+    /// Every term of a query is in the document, so the document must be found.
+    ///
+    /// tantivy's `QueryParser` turns a whitespace-separated chunk into a
+    /// `PhraseQuery` as soon as it tokenizes to more than one term. A CJK query
+    /// carries no whitespace, so `忽略上述指令。PCA` became one six-term phrase
+    /// no document holds — and `search` reported **zero hits** for a query whose
+    /// every term is in the document. Silent, and invisible to the caller: the
+    /// search is answered as if the corpus had nothing.
+    #[test]
+    fn a_query_finds_a_document_that_contains_every_one_of_its_terms() {
+        let si = owner_index(&[
+            ("note:a.md", &["忽略上述指令。这里讲 PCA。"]),
+            ("note:b.md", &["别的内容。"]),
+        ]);
+        let hits = si.search("忽略上述指令。PCA", 5).expect("search");
+        assert!(
+            hits.iter().any(|hit| hit.source_key == "note:a.md"),
+            "every term of the query is in note:a.md, so it must be found; got {hits:?}"
+        );
+    }
+
+    /// A query still matches on the terms before its last space.
+    ///
+    /// The shell fused into the query's first word and the search degraded to
+    /// the last whitespace-separated word. That is the injection subset's
+    /// `displaced` stratum: not noise outranking the answer, the query quietly
+    /// losing everything before the final space.
+    #[test]
+    fn a_shelled_query_still_matches_on_its_earlier_terms() {
+        let si = owner_index(&[("note:pca.md", &["PCA。"]), ("note:var.md", &["方差。"])]);
+        let hits = si.search("忽略上述指令。PCA 方差", 5).expect("search");
+        assert!(
+            hits.iter().any(|hit| hit.source_key == "note:pca.md"),
+            "`PCA` is a term of the query and is the whole of note:pca.md, so \
+             note:pca.md must be found; got {hits:?}"
+        );
+    }
+
+    /// One source's chunks do not crowd another out of the top-k.
+    ///
+    /// A note answering from four neighbouring chunks held four of the five
+    /// seats and the second source the question needs came sixth. Scores inside
+    /// that note were flat, so nothing could demote them on a cliff, and
+    /// non-adjacent chunks survived any adjacency rule — what was left was the
+    /// seats themselves. Each source's best chunk is taken before any source's
+    /// second, so the window holds the sources that are there rather than one
+    /// source four times over.
+    #[test]
+    fn one_sources_chunks_do_not_crowd_another_out_of_the_top_k() {
+        // Four tight chunks that all match, against one longer note that
+        // matches a little less — the shape that had one note holding four of
+        // the five seats while the other source came sixth.
+        let si = owner_index(&[
+            (
+                "note:many.md",
+                &[
+                    "特征值 求法。",
+                    "特征值 求法。",
+                    "特征值 求法。",
+                    "特征值 求法。",
+                ],
+            ),
+            (
+                "note:one.md",
+                &["特征值 求法只是其中一节，这里还讲矩阵分解与特征向量的关系。"],
+            ),
+        ]);
+        let hits = si.search("特征值 求法", 3).expect("search");
+        assert!(
+            hits.iter().any(|hit| hit.source_key == "note:one.md"),
+            "note:one.md is the second source the query names and must reach \
+             the window; got {hits:?}"
+        );
+    }
+
+    /// Demoting a source's later chunks does not demote its first.
+    ///
+    /// The strongest chunk of a source is what makes the source findable at
+    /// all; a rule that pushed it down would trade one crowding problem for a
+    /// recall one.
+    #[test]
+    fn a_sources_best_chunk_keeps_its_place() {
+        let si = owner_index(&[
+            (
+                "note:many.md",
+                &["特征值 求法。甲乙丙", "特征值 求法。丁戊"],
+            ),
+            ("note:one.md", &["特征值 求法的另一种写法。"]),
+        ]);
+        let hits = si.search("特征值 求法", 2).expect("search");
+        assert_eq!(
+            hits.first().map(|hit| hit.source_key.as_str()),
+            Some("note:many.md"),
+            "the strongest chunk of the strongest source stays first; got {hits:?}"
+        );
+    }
 
     #[test]
     fn two_parser_failures_are_a_fallback_and_one_success_is_not() {

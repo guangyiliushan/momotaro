@@ -340,7 +340,7 @@ mod tests {
             .execute(
                 "INSERT INTO answer_citations
                     (answer_id, citation_index, source_key, revision_hash, chunk_id, chunk_hash,
-                     locator_json, quoted_text, verified)
+                     locator_json, quoted_text, located)
                  VALUES ('ans', 0, ?1, ?2, ?3, ?4, '{\"start_line\":0}', 'quote', 1)",
                 params![source_key, revision_hash, chunk_id, chunk_hash],
             )

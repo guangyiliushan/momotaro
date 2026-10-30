@@ -39,10 +39,10 @@ terms:
     zh: "来源键"
     ja: "ソースキー"
     definition:
-      en: "The scheme-prefixed identity of a source (`note:` / `arxiv:`), NFC-normalized and never case-folded."
-      zh: "来源的带方案前缀的身份（`note:` / `arxiv:`），做 NFC 归一、永不做大小写折叠。"
-      ja: "ソースのスキーム付き同一性（`note:` / `arxiv:`）。NFC 正規化され、大文字小文字は決して畳み込まれません。"
-    avoid: ["canonical file path", "database id", "URL as key"]
+      en: "The scheme-prefixed identity of a source (`note:` / `paper:`), NFC-normalized and never case-folded. The scheme names a source type, never a provider."
+      zh: "来源的带方案前缀的身份（`note:` / `paper:`），做 NFC 归一、永不做大小写折叠。方案名指的是来源类型，不是供应商。"
+      ja: "ソースのスキーム付き同一性（`note:` / `paper:`）。NFC 正規化され、大文字小文字は決して畳み込まれません。スキームはソースの型を指し、提供元を指すものではありません。"
+    avoid: ["canonical file path", "database id", "URL as key", "provider as scheme"]
 
   - id: source-revision
     en: "source revision"
@@ -64,15 +64,25 @@ terms:
       ja: "1 つのソースリビジョンの決定的な射影。検索が当て、引用が指す単位です。"
     avoid: ["passage", "embedding", "canonical fact"]
 
+  - id: span
+    en: "span"
+    zh: "跨度"
+    ja: "スパン"
+    definition:
+      en: "A quoted stretch of source bytes an answer is built from. An answer is a sequence of spans; the words between them are a fixed connector that claims nothing."
+      zh: "答案由之构成的一段被引用的源字节。答案是一串跨度；跨度之间的字词取自固定连接词集，它什么都不声称。"
+      ja: "答えが組み立てられる、引用されたソースバイトの一区切り。答えはスパンの列であり、その間の語は固定の接続語から取り、何も主張しません。"
+    avoid: ["quote", "citation", "excerpt", "snippet"]
+
   - id: origin-class
     en: "origin class"
     zh: "来源类别"
     ja: "オリジンクラス"
     definition:
-      en: "Who authored the bytes: `owner` | `paper` | `web` | `agent` | `system`."
-      zh: "字节的作者是谁：`owner` | `paper` | `web` | `agent` | `system`。"
-      ja: "バイトの書き手が誰か: `owner` | `paper` | `web` | `agent` | `system`。"
-    avoid: ["trust score", "provenance"]
+      en: "Who authored the bytes: `owner` | `paper` | `web` | `agent` | `system`. It records authorship, not reliability; how checkable a claim is belongs to a separate, display-only axis."
+      zh: "字节的作者是谁：`owner` | `paper` | `web` | `agent` | `system`。它记录的是作者身份，不是可靠程度；一个说法有多可核，属于另一条只作展示的轴。"
+      ja: "バイトの書き手が誰か: `owner` | `paper` | `web` | `agent` | `system`。作者性を記録するもので、信頼性ではありません。主張がどれだけ検証可能かは、別の表示専用の軸に属します。"
+    avoid: ["trust score", "provenance", "authority", "reliability score"]
 
   - id: project
     en: "project"

@@ -9,7 +9,7 @@ use crate::citation::Citation;
 use crate::error::VerifyError;
 use crate::source::{BytesState, CitationSource};
 use crate::status::{VerificationKind, VerifyDetail};
-use crate::verdict::{AnswerVerdict, Verification};
+use crate::verdict::{AnswerVerdict, LocatedSpan, Verification};
 
 /// Whether the judgements run at all.
 ///
@@ -147,11 +147,72 @@ pub fn verify_citation<S: CitationSource>(
     // chunk's own locator, so finding the quote here is what the locatability rule demands:
     // "引用文本必须能定位到原始 chunk". An empty quote has nothing to locate
     // and therefore cannot satisfy it.
-    if citation.quoted_text.is_empty() || !chunk.text.contains(&citation.quoted_text) {
-        return Verification::failed(VerificationKind::Citation, VerifyDetail::TextNotLocatable);
-    }
+    let located = match locate(&chunk.text, &citation.quoted_text) {
+        Some(span) => span,
+        None => {
+            return Verification::failed(
+                VerificationKind::Citation,
+                VerifyDetail::TextNotLocatable,
+            );
+        }
+    };
 
-    Verification::passed(VerificationKind::Citation)
+    Verification::passed(VerificationKind::Citation).at(located)
+}
+
+/// Whether a character ends a sentence.
+///
+/// Punctuation and line breaks only — a rule over the bytes, not a model's
+/// segmentation. Deterministic on purpose: the same chunk always yields the
+/// same sentence ranges, so a span's identity survives a re-run.
+fn ends_sentence(ch: char) -> bool {
+    matches!(
+        ch,
+        '。' | '．' | '.' | '!' | '?' | '！' | '？' | '\n' | '\r'
+    )
+}
+
+/// Byte offsets at which each sentence of `text` begins.
+fn sentence_starts(text: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for (offset, ch) in text.char_indices() {
+        if ends_sentence(ch) {
+            let next = offset + ch.len_utf8();
+            if next < text.len() {
+                starts.push(next);
+            }
+        }
+    }
+    starts
+}
+
+/// Where a quote sits inside the chunk: its bytes, and the sentences it touches.
+///
+/// The byte range is what the check ran on; the sentence range is what a
+/// reader reads. Both are reported because they are not the same thing — a
+/// quote can start mid-sentence and end mid-sentence — and a verdict naming
+/// only one would force the caller to guess the other.
+fn locate(text: &str, quote: &str) -> Option<LocatedSpan> {
+    if quote.is_empty() {
+        return None;
+    }
+    let byte_start = text.find(quote)?;
+    let byte_end = byte_start + quote.len();
+    let starts = sentence_starts(text);
+    // The sentence holding a byte is the last one that begins at or before it.
+    let sentence_of = |byte: usize| -> usize {
+        starts
+            .iter()
+            .rposition(|&start| start <= byte)
+            .unwrap_or_default()
+    };
+    Some(LocatedSpan {
+        byte_start,
+        byte_end,
+        sentence_start: sentence_of(byte_start),
+        // Half-open: one past the last sentence the quote touches.
+        sentence_end: sentence_of(byte_end - 1) + 1,
+    })
 }
 
 /// Checks whether the bytes named by one source revision are intact.
@@ -270,6 +331,53 @@ mod tests {
     use crate::status::VerificationStatus;
     use momotaro_contracts::Chunk;
     use std::cell::RefCell;
+
+    #[test]
+    fn a_located_quote_reports_its_bytes_and_the_sentences_it_touches() {
+        // Two sentences; the quote sits entirely inside the second.
+        let text = "First sentence. Second sentence here.";
+        let located = locate(text, "Second sentence").expect("locates");
+        assert_eq!(
+            (located.byte_start, located.byte_end),
+            (16, 16 + "Second sentence".len()),
+            "the bytes are the quote's own"
+        );
+        assert_eq!(
+            (located.sentence_start, located.sentence_end),
+            (1, 2),
+            "one sentence, half-open"
+        );
+    }
+
+    #[test]
+    fn a_quote_spanning_a_boundary_covers_both_sentences() {
+        let text = "Alpha ends. Beta runs on.";
+        let located = locate(text, "ends. Beta").expect("locates");
+        assert_eq!(
+            (located.sentence_start, located.sentence_end),
+            (0, 2),
+            "a quote that crosses the boundary touches both"
+        );
+    }
+
+    #[test]
+    fn cjk_sentence_marks_split_too() {
+        // The corpus is mixed CJK and Latin; a Latin-only rule would put the
+        // whole file in one sentence.
+        let text = "第一句。第二句在这里。";
+        let located = locate(text, "第二句").expect("locates");
+        assert_eq!((located.sentence_start, located.sentence_end), (1, 2));
+    }
+
+    #[test]
+    fn a_quote_that_is_absent_or_empty_is_not_located() {
+        assert_eq!(locate("alpha beta", "gamma"), None);
+        assert_eq!(
+            locate("alpha beta", ""),
+            None,
+            "an empty quote locates nothing"
+        );
+    }
     use std::collections::HashMap;
 
     const LOCATOR: &str =
@@ -655,7 +763,7 @@ mod tests {
 
     #[test]
     fn a_source_with_no_local_bytes_is_unsupported_rather_than_failed() {
-        // A web or arXiv source has no local bytes; that is not a defect.
+        // A web or paper source has no local bytes; that is not a defect.
         let source = source_with_bytes(BytesState::Absent);
         assert_integrity(
             &integrity(&source),
@@ -701,23 +809,23 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_whose_citations_all_pass_is_fully_verified() {
+    fn an_answer_whose_citations_all_pass_is_fully_grounded() {
         let source = source_with_chunk();
         let v = verdict(&source, &[citation()]);
         assert_eq!(v.citations.len(), 1);
-        assert!(v.fully_verified(), "expected fully verified");
+        assert!(v.fully_grounded(), "expected fully grounded");
     }
 
     #[test]
-    fn a_single_failing_citation_makes_the_answer_not_fully_verified() {
+    fn a_single_failing_citation_makes_the_answer_not_fully_grounded() {
         // The answer may still be output, but it is not
-        // fully verified.
+        // fully grounded.
         let source = source_with_chunk();
         let mut broken = citation();
         broken.chunk_hash = "chash-9".to_owned();
         let v = verdict(&source, &[citation(), broken]);
         assert!(
-            !v.fully_verified(),
+            !v.fully_grounded(),
             "one broken citation must veto the answer"
         );
         assert_eq!(v.citations.len(), 2, "both citations are still reported");
@@ -729,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_bytes_integrity_failure_makes_the_answer_not_fully_verified() {
+    fn a_missing_bytes_integrity_failure_makes_the_answer_not_fully_grounded() {
         // Old citations fail as source_missing / source_integrity, not as a
         // silent miss.
         let mut source = source_with_chunk();
@@ -743,7 +851,7 @@ mod tests {
             "the citation still verifies from chunk text"
         );
         assert!(
-            !v.fully_verified(),
+            !v.fully_grounded(),
             "the integrity failure must veto the answer"
         );
     }
@@ -758,20 +866,20 @@ mod tests {
             BytesState::Present { hash_matches: None },
         );
         let v = verdict(&source, &[citation()]);
-        assert!(v.fully_verified());
+        assert!(v.fully_grounded());
         assert_eq!(v.integrity.len(), 1);
         assert_eq!(v.integrity[0].status, VerificationStatus::Unsupported);
     }
 
     #[test]
-    fn an_answer_with_no_citations_is_not_fully_verified() {
+    fn an_answer_with_no_citations_is_not_fully_grounded() {
         // "Verified" is a positive claim. The same rule applies to sparks:
         // "Empty citations make the card `unverified`."
         let source = source_with_chunk();
         let v = verdict(&source, &[]);
         assert!(v.citations.is_empty());
         assert!(v.integrity.is_empty());
-        assert!(!v.fully_verified());
+        assert!(!v.fully_grounded());
     }
 
     #[test]
@@ -815,14 +923,14 @@ mod tests {
                 .iter()
                 .all(|c| c.status == VerificationStatus::Skipped)
         );
-        assert!(!v.fully_verified(), "skipped is not verified");
+        assert!(!v.fully_grounded(), "skipped is not verified");
     }
 
     /// An `unsupported` citation has not been verified either — and the store
     /// refusing to read is production-reachable (`source.chunk()` → `Err`),
     /// so this is the case an outage would land in.
     #[test]
-    fn an_unreadable_store_leaves_the_answer_not_fully_verified() {
+    fn an_unreadable_store_leaves_the_answer_not_fully_grounded() {
         let source = FakeSource {
             fail_chunk: true,
             ..FakeSource::default()
@@ -830,7 +938,7 @@ mod tests {
         let v = verdict(&source, &[citation()]);
         assert_eq!(v.citations[0].status, VerificationStatus::Unsupported);
         assert!(
-            !v.fully_verified(),
+            !v.fully_grounded(),
             "an unsupported citation has not been verified"
         );
     }
@@ -839,7 +947,7 @@ mod tests {
     /// kind of `unsupported`, and the one that must not be confused with the
     /// other two: `NoLocalBytes` is a source where nothing was ever going to
     /// be read — no store row, no `local_path`, or a stored path this crate
-    /// refuses by form or containment (a web or arXiv source, whose
+    /// refuses by form or containment (a web or paper source, whose
     /// citations still resolve from chunk text) — and `ByteHashUnchecked` is
     /// a check that
     /// ran to completion with a hash this build cannot recompute. Both are
@@ -860,8 +968,8 @@ mod tests {
             Some(VerifyDetail::SourceBytesUnavailable)
         );
         assert!(
-            !v.fully_verified(),
-            "an answer whose integrity check never ran is not fully verified"
+            !v.fully_grounded(),
+            "an answer whose integrity check never ran is not fully grounded"
         );
     }
 
@@ -869,7 +977,7 @@ mod tests {
     /// half on its own. Two revisions of one source plus a second source are
     /// three separate facts about the store, and each must be asked about:
     /// dropping one would let a missing-bytes failure vanish, and
-    /// `fully_verified()` would then return true on a source whose bytes are
+    /// `fully_grounded()` would then return true on a source whose bytes are
     /// gone.
     #[test]
     fn integrity_gets_one_entry_per_distinct_source_revision() {
@@ -956,7 +1064,7 @@ mod tests {
             "third"
         );
         assert!(
-            !v.fully_verified(),
+            !v.fully_grounded(),
             "a source whose bytes are gone vetoes the answer"
         );
     }
@@ -973,7 +1081,7 @@ mod tests {
 
         let answer = verify_answer(&source, VerifyPolicy::enabled(), &[], &[citation()]);
         assert!(
-            !answer.fully_verified(),
+            !answer.fully_grounded(),
             "an empty evidence set is not a verified answer"
         );
     }
